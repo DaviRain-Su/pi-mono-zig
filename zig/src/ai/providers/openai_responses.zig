@@ -15,6 +15,7 @@ const responses_api = @import("../shared/responses_api.zig");
 const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const CurrentBlock = responses_api.CurrentBlock;
 const deinitCurrentBlock = responses_api.deinitCurrentBlock;
@@ -3662,6 +3663,101 @@ test "VAL-RUNTIME-003 pre-aborted signal takes precedence over missing api key s
 
     try expectOnlyTerminalErrorResponses(&simple_stream, "Request was aborted", .aborted);
 }
+
+test "stream preserves partial Responses text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abort\"}}\n" ++
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+                "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try OpenAIResponsesProvider.stream(
+        allocator,
+        io,
+        streamErrorContractTestModel(url),
+        streamErrorContractTestContext(),
+        .{ .api_key = "test-key", .signal = &abort_signal },
+    );
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("resp_abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseSseStreamLines finalizes Responses tool call on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_eof_tool\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_eof\",\"call_id\":\"call_eof\",\"name\":\"lookup\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_eof\",\"delta\":\"{\\\"query\\\":\\\"local\\\"}\"}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, streamErrorContractTestModel("https://api.openai.com/v1"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_delta.content_index.?);
+    try std.testing.expectEqualStrings("{\"query\":\"local\"}", tool_delta.delta.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_eof|fc_eof", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("resp_eof_tool", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 1), done.message.?.content.len);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("local", done.message.?.content[0].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "parseSseStreamLines finalizes partial text before top-level error terminal error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;

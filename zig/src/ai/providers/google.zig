@@ -3,10 +3,11 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
-const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 pub const GoogleProvider = struct {
     pub const api = "google-generative-ai";
@@ -177,171 +178,19 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, error.RequestAborted);
-            return;
-        }
-
-        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        if (value.object.get("responseId")) |response_id| {
-            if (response_id == .string and output.response_id == null) {
-                output.response_id = try allocator.dupe(u8, response_id.string);
-            }
-        }
-
-        if (value.object.get("usageMetadata")) |usage_metadata| {
-            updateUsage(&output.usage, usage_metadata);
-            calculateCost(model, &output.usage);
-        }
-
-        const candidates_value = value.object.get("candidates") orelse continue;
-        if (candidates_value != .array or candidates_value.array.items.len == 0) continue;
-
-        const candidate = candidates_value.array.items[0];
-        if (candidate != .object) continue;
-
-        if (candidate.object.get("content")) |content_value| {
-            if (content_value == .object) {
-                if (content_value.object.get("parts")) |parts_value| {
-                    if (parts_value == .array) {
-                        for (parts_value.array.items) |part| {
-                            if (part != .object) continue;
-
-                            if (part.object.get("text")) |text_value| {
-                                if (text_value == .string and text_value.string.len > 0) {
-                                    const is_thinking = if (part.object.get("thought")) |thought_value|
-                                        thought_value == .bool and thought_value.bool
-                                    else
-                                        false;
-
-                                    if (current_block == null or !matchesCurrentBlock(current_block.?, is_thinking)) {
-                                        try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                        current_block = if (is_thinking)
-                                            .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
-                                        else
-                                            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
-                                        stream_ptr.push(.{
-                                            .event_type = if (is_thinking) .thinking_start else .text_start,
-                                            .content_index = @intCast(content_blocks.items.len),
-                                        });
-                                    }
-
-                                    if (current_block) |*block| {
-                                        switch (block.*) {
-                                            .text => |*text| {
-                                                try text.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (text.signature) |existing| allocator.free(existing);
-                                                        text.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                            .thinking => |*thinking| {
-                                                try thinking.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (thinking.signature) |existing| allocator.free(existing);
-                                                        thinking.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                        }
-                                    }
-
-                                    stream_ptr.push(.{
-                                        .event_type = if (is_thinking) .thinking_delta else .text_delta,
-                                        .content_index = @intCast(content_blocks.items.len),
-                                        .delta = try allocator.dupe(u8, text_value.string),
-                                        .owns_delta = true,
-                                    });
-                                }
-                            }
-
-                            if (part.object.get("functionCall")) |function_call_value| {
-                                if (function_call_value == .object) {
-                                    try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                    const name_value = function_call_value.object.get("name");
-                                    if (name_value == null or name_value.? != .string) continue;
-
-                                    const args = if (function_call_value.object.get("args")) |args_value|
-                                        try cloneJsonValue(allocator, args_value)
-                                    else
-                                        try emptyJsonObject(allocator);
-
-                                    const tool_call_id = if (function_call_value.object.get("id")) |id_value|
-                                        if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, &generated_tool_call_count)
-                                    else
-                                        try generateToolCallId(allocator, &generated_tool_call_count);
-
-                                    const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
-                                        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
-                                    else
-                                        null;
-
-                                    const tool_call = types.ToolCall{
-                                        .id = tool_call_id,
-                                        .name = try allocator.dupe(u8, name_value.?.string),
-                                        .arguments = args,
-                                        .thought_signature = thought_signature,
-                                    };
-                                    try content_blocks.append(allocator, .{ .tool_call = tool_call });
-                                    const content_index = content_blocks.items.len - 1;
-                                    try tool_calls.append(allocator, content_blocks.items[content_index].tool_call);
-
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_start,
-                                        .content_index = @intCast(content_index),
-                                    });
-
-                                    const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
-                                    defer allocator.free(args_json);
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_delta,
-                                        .content_index = @intCast(content_index),
-                                        .delta = try allocator.dupe(u8, args_json),
-                                        .owns_delta = true,
-                                    });
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_end,
-                                        .content_index = @intCast(content_index),
-                                        .tool_call = content_blocks.items[content_index].tool_call,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (candidate.object.get("finishReason")) |finish_reason| {
-            if (finish_reason == .string) {
-                output.stop_reason = if (tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
-            }
-        }
+    var handler = GoogleSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .generated_tool_call_count = &generated_tool_call_count,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(GoogleSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) {
+        return;
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
@@ -353,6 +202,210 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const GoogleSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    generated_tool_call_count: *usize,
+    model: types.Model,
+
+    pub fn extractDataLine(_: *GoogleSseLoopHandler, line: []const u8) ?[]const u8 {
+        return provider_stream.parseCanonicalSseDataLine(line);
+    }
+
+    pub fn isDoneData(_: *GoogleSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *GoogleSseLoopHandler, data: []const u8) !bool {
+        return try processGoogleSseData(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            self.generated_tool_call_count,
+            self.model,
+            data,
+        );
+    }
+
+    pub fn handleRuntimeFailure(self: *GoogleSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            self.model,
+            err,
+        );
+    }
+};
+
+fn processGoogleSseData(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    generated_tool_call_count: *usize,
+    model: types.Model,
+    data: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, stream_ptr, output, current_block, content_blocks, tool_calls, model, err);
+            return false;
+        },
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return true;
+    if (value.object.get("responseId")) |response_id| {
+        if (response_id == .string and output.response_id == null) {
+            output.response_id = try allocator.dupe(u8, response_id.string);
+        }
+    }
+    if (value.object.get("usageMetadata")) |usage_metadata| {
+        updateUsage(&output.usage, usage_metadata);
+        calculateCost(model, &output.usage);
+    }
+    const candidates_value = value.object.get("candidates") orelse return true;
+    if (candidates_value != .array or candidates_value.array.items.len == 0) return true;
+    const candidate = candidates_value.array.items[0];
+    if (candidate != .object) return true;
+    if (candidate.object.get("content")) |content_value| {
+        if (content_value == .object) {
+            if (content_value.object.get("parts")) |parts_value| {
+                if (parts_value == .array) {
+                    for (parts_value.array.items) |part| {
+                        if (part != .object) continue;
+
+                        if (part.object.get("text")) |text_value| {
+                            if (text_value == .string and text_value.string.len > 0) {
+                                const is_thinking = if (part.object.get("thought")) |thought_value|
+                                    thought_value == .bool and thought_value.bool
+                                else
+                                    false;
+
+                                if (current_block.* == null or !matchesCurrentBlock(current_block.*.?, is_thinking)) {
+                                    try finishCurrentBlock(allocator, current_block, content_blocks, stream_ptr);
+                                    current_block.* = if (is_thinking)
+                                        .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
+                                    else
+                                        .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
+                                    stream_ptr.push(.{
+                                        .event_type = if (is_thinking) .thinking_start else .text_start,
+                                        .content_index = @intCast(content_blocks.items.len),
+                                    });
+                                }
+
+                                if (current_block.*) |*block| {
+                                    switch (block.*) {
+                                        .text => |*text| {
+                                            try text.text.appendSlice(allocator, text_value.string);
+                                            if (part.object.get("thoughtSignature")) |signature_value| {
+                                                if (signature_value == .string and signature_value.string.len > 0) {
+                                                    if (text.signature) |existing| allocator.free(existing);
+                                                    text.signature = try allocator.dupe(u8, signature_value.string);
+                                                }
+                                            }
+                                        },
+                                        .thinking => |*thinking| {
+                                            try thinking.text.appendSlice(allocator, text_value.string);
+                                            if (part.object.get("thoughtSignature")) |signature_value| {
+                                                if (signature_value == .string and signature_value.string.len > 0) {
+                                                    if (thinking.signature) |existing| allocator.free(existing);
+                                                    thinking.signature = try allocator.dupe(u8, signature_value.string);
+                                                }
+                                            }
+                                        },
+                                    }
+                                }
+
+                                stream_ptr.push(.{
+                                    .event_type = if (is_thinking) .thinking_delta else .text_delta,
+                                    .content_index = @intCast(content_blocks.items.len),
+                                    .delta = try allocator.dupe(u8, text_value.string),
+                                    .owns_delta = true,
+                                });
+                            }
+                        }
+
+                        if (part.object.get("functionCall")) |function_call_value| {
+                            if (function_call_value == .object) {
+                                try finishCurrentBlock(allocator, current_block, content_blocks, stream_ptr);
+                                const name_value = function_call_value.object.get("name");
+                                if (name_value == null or name_value.? != .string) continue;
+
+                                const args = if (function_call_value.object.get("args")) |args_value|
+                                    try cloneJsonValue(allocator, args_value)
+                                else
+                                    try emptyJsonObject(allocator);
+
+                                const tool_call_id = if (function_call_value.object.get("id")) |id_value|
+                                    if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, generated_tool_call_count)
+                                else
+                                    try generateToolCallId(allocator, generated_tool_call_count);
+
+                                const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
+                                    if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
+                                else
+                                    null;
+
+                                const tool_call = types.ToolCall{
+                                    .id = tool_call_id,
+                                    .name = try allocator.dupe(u8, name_value.?.string),
+                                    .arguments = args,
+                                    .thought_signature = thought_signature,
+                                };
+                                try content_blocks.append(allocator, .{ .tool_call = tool_call });
+                                const content_index = content_blocks.items.len - 1;
+                                try tool_calls.append(allocator, content_blocks.items[content_index].tool_call);
+
+                                stream_ptr.push(.{
+                                    .event_type = .toolcall_start,
+                                    .content_index = @intCast(content_index),
+                                });
+
+                                const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+                                defer allocator.free(args_json);
+                                stream_ptr.push(.{
+                                    .event_type = .toolcall_delta,
+                                    .content_index = @intCast(content_index),
+                                    .delta = try allocator.dupe(u8, args_json),
+                                    .owns_delta = true,
+                                });
+                                stream_ptr.push(.{
+                                    .event_type = .toolcall_end,
+                                    .content_index = @intCast(content_index),
+                                    .tool_call = content_blocks.items[content_index].tool_call,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (candidate.object.get("finishReason")) |finish_reason| {
+        if (finish_reason == .string) {
+            output.stop_reason = if (tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
+        }
+    }
+
+    return true;
 }
 
 fn finalizeOutputFromPartials(
@@ -900,10 +953,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn isAbortRequested(options: ?types.StreamOptions) bool {
-    return abort_helper.isRequestedFromOptions(options);
-}
-
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return provider_json.cloneValue(allocator, value);
 }
@@ -1297,7 +1346,7 @@ test "parse stream emits thinking and tool call events" {
 
     const body = try allocator.dupe(
         u8,
-        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Need tool\"},{\"thoughtSignature\":\"tool-sig\",\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Berlin\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":2,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3,\"totalTokenCount\":30}}\n" ++
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Need tool\"},{\"thoughtSignature\":\"tool-sig\",\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Berlin\"}}},{\"text\":\"It is sunny.\"}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"cachedContentTokenCount\":2,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3,\"totalTokenCount\":30}}\n" ++
             "data: [DONE]\n",
     );
 
@@ -1327,24 +1376,44 @@ test "parse stream emits thinking and tool call events" {
     try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
+    const thinking_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
     const thinking_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
     try std.testing.expectEqualStrings("Need tool", thinking_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
     const tool_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
     try std.testing.expect(std.mem.indexOf(u8, tool_delta.delta.?, "Berlin") != null);
     const tool_end = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
     try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_start.content_index.?);
+    const text_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("It is sunny.", text_delta.delta.?);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
-    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
     try std.testing.expect(done.message.?.content[1] == .tool_call);
     try std.testing.expectEqualStrings("tool-sig", done.message.?.content[1].tool_call.thought_signature.?);
+    try std.testing.expectEqualStrings("It is sunny.", done.message.?.content[2].text.text);
     try std.testing.expect(done.message.?.tool_calls == null);
     try std.testing.expectEqual(@as(u32, 18), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.output);
@@ -1529,6 +1598,45 @@ test "stream on_response receives normalized Google response headers" {
     try std.testing.expect(stream.next() == null);
 }
 
+test "parseSseStreamLines keeps Google canonical-only SSE data tolerance" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        ": keepalive\n" ++
+            "event: content\n" ++
+            "data:{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"compact-ignored\"}]}}]}\n" ++
+            "\n" ++
+            " data: {\"responseId\":\"google-canonical\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"canonical\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":4,\"totalTokenCount\":7}}\r\n" ++
+            "data: [DONE]\n" ++
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"after-done\"}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-generative-ai", "google"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("canonical", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("google-canonical", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 4), done.message.?.usage.output);
+    try std.testing.expect(stream.next() == null);
+}
+
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {
     return .{
         .id = "runtime-test-model",
@@ -1577,6 +1685,42 @@ test "parseSseStreamLines preserves partial Google text before malformed termina
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
 }
 
+test "parseSseStreamLines finalizes partial Google text on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"responseId\":\"google-eof\",\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"eof-sig\",\"text\":\"partial eof\"}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-generative-ai", "google"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), delta.content_index.?);
+    try std.testing.expectEqualStrings("partial eof", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("partial eof", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("google-eof", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial eof", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("eof-sig", done.message.?.content[0].text.text_signature.?);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "stream returns error_event on setup failure instead of throwing" {
     const allocator = std.heap.page_allocator;
     const io = std.testing.io;
@@ -1617,6 +1761,61 @@ test "stream returns error_event on setup failure instead of throwing" {
     const result = stream.result().?;
     try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
+
+test "stream preserves partial Google text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"responseId\":\"google-abort\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial google\"}]}}]}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try GoogleProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial google", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial google", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("google-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial google", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "VAL-MISC-004 buildGenerationConfigValue disabled thinking emits thinkingBudget 0 for reasoning model" {

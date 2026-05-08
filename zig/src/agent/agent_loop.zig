@@ -4,12 +4,15 @@ const types = @import("types.zig");
 
 pub const AgentLoopError = error{
     MissingAssistantResult,
+    PartialContentIndexReused,
+    ToolCallAlreadyFinalized,
 };
 
 const PreparedToolCall = struct {
     tool_call: ai.ToolCall,
     tool: types.AgentTool,
     args: std.json.Value,
+    finalized: bool = false,
 
     fn deinit(self: *PreparedToolCall, allocator: std.mem.Allocator) void {
         deinitJsonValue(allocator, self.args);
@@ -26,6 +29,21 @@ const ExecutedToolCallOutcome = struct {
     is_error: bool,
 };
 
+const FinalizedToolCallOutcome = struct {
+    result: types.AgentToolResult,
+    is_error: bool,
+};
+
+/// Partial tool-call UX policy:
+/// - Every toolcall_start/toolcall_delta/toolcall_end still emits a
+///   message_update so RPC/streaming clients can observe argument
+///   accumulation and finalization order.
+/// - Partial arguments are exposed in the callback-scoped partial assistant
+///   message only when another assistant block anchors the transcript row.
+///   A standalone leading tool call is hidden from message.content until the
+///   final message_end so the TUI does not render a blank id/name tool row.
+/// - Tool execution and session persistence use only the final assistant
+///   message after done/error; partial tool-call snapshots are display-only.
 const PartialToolCallBlock = struct {
     arguments: std.ArrayList(u8) = .empty,
     final_tool_call: ?ai.ToolCall = null,
@@ -65,6 +83,7 @@ const PartialAssistantAccumulator = struct {
     allocator: std.mem.Allocator,
     blocks: std.ArrayList(PartialContentBlock) = .empty,
     index_map: std.ArrayList(?usize) = .empty,
+    ended_blocks: std.ArrayList(bool) = .empty,
 
     fn init(allocator: std.mem.Allocator) PartialAssistantAccumulator {
         return .{ .allocator = allocator };
@@ -74,13 +93,17 @@ const PartialAssistantAccumulator = struct {
         for (self.blocks.items) |*block| block.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
         self.index_map.deinit(self.allocator);
+        self.ended_blocks.deinit(self.allocator);
     }
 
     fn indexFor(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !usize {
         if (event.content_index) |content_index| {
             const requested: usize = @intCast(content_index);
             if (requested < self.index_map.items.len) {
-                if (self.index_map.items[requested]) |mapped| return mapped;
+                if (self.index_map.items[requested]) |mapped| {
+                    if (self.isEnded(mapped)) return AgentLoopError.PartialContentIndexReused;
+                    return mapped;
+                }
             }
             while (self.index_map.items.len <= requested) {
                 try self.index_map.append(self.allocator, null);
@@ -92,9 +115,24 @@ const PartialAssistantAccumulator = struct {
         return if (self.blocks.items.len == 0) 0 else self.blocks.items.len - 1;
     }
 
+    fn isEnded(self: *PartialAssistantAccumulator, index: usize) bool {
+        return index < self.ended_blocks.items.len and self.ended_blocks.items[index];
+    }
+
+    fn markEnded(self: *PartialAssistantAccumulator, index: usize) void {
+        std.debug.assert(index < self.ended_blocks.items.len);
+        self.ended_blocks.items[index] = true;
+    }
+
     fn ensureIndex(self: *PartialAssistantAccumulator, index: usize) !void {
         while (self.blocks.items.len <= index) {
-            try self.blocks.append(self.allocator, .{ .text = .empty });
+            try self.blocks.ensureUnusedCapacity(self.allocator, 1);
+            try self.ended_blocks.ensureUnusedCapacity(self.allocator, 1);
+            const next_index = self.blocks.items.len;
+            self.blocks.items.len = next_index + 1;
+            self.blocks.items[next_index] = .{ .text = .empty };
+            self.ended_blocks.items.len = next_index + 1;
+            self.ended_blocks.items[next_index] = false;
         }
     }
 
@@ -151,6 +189,7 @@ const PartialAssistantAccumulator = struct {
                 const text = try self.ensureText(index);
                 text.clearRetainingCapacity();
                 if (event.content) |content| try text.appendSlice(self.allocator, content);
+                self.markEnded(index);
             },
             .thinking_start => {
                 const index = try self.indexFor(event);
@@ -167,6 +206,7 @@ const PartialAssistantAccumulator = struct {
                 const thinking = try self.ensureThinking(index);
                 thinking.clearRetainingCapacity();
                 if (event.content) |content| try thinking.appendSlice(self.allocator, content);
+                self.markEnded(index);
             },
             .toolcall_start => {
                 const index = try self.indexFor(event);
@@ -181,6 +221,7 @@ const PartialAssistantAccumulator = struct {
                 const index = try self.indexFor(event);
                 const tool_call = try self.ensureToolCall(index);
                 if (event.tool_call) |final_tool_call| try tool_call.setFinal(self.allocator, final_tool_call);
+                self.markEnded(index);
             },
             else => {},
         }
@@ -260,6 +301,9 @@ const ParallelToolEmitter = struct {
 const ParallelToolTask = struct {
     arena: std.heap.ArenaAllocator,
     prepared: PreparedToolCall,
+    source_index: usize,
+    completion_counter: *std.atomic.Value(usize),
+    completion_order: usize = std.math.maxInt(usize),
     signal: ?*const std.atomic.Value(bool),
     emitter: *ParallelToolEmitter,
     result: ?types.AgentToolResult = null,
@@ -268,12 +312,16 @@ const ParallelToolTask = struct {
     fn init(
         parent_allocator: std.mem.Allocator,
         prepared: PreparedToolCall,
+        source_index: usize,
+        completion_counter: *std.atomic.Value(usize),
         signal: ?*const std.atomic.Value(bool),
         emitter: *ParallelToolEmitter,
     ) ParallelToolTask {
         return .{
             .arena = std.heap.ArenaAllocator.init(parent_allocator),
             .prepared = prepared,
+            .source_index = source_index,
+            .completion_counter = completion_counter,
             .signal = signal,
             .emitter = emitter,
         };
@@ -282,6 +330,11 @@ const ParallelToolTask = struct {
     fn deinit(self: *ParallelToolTask) void {
         self.arena.deinit();
     }
+};
+
+const PreparedToolCallEntry = struct {
+    prepared: PreparedToolCall,
+    source_index: usize,
 };
 
 pub fn runAgentLoop(
@@ -764,17 +817,24 @@ fn executeToolCallsSequential(
                     emit,
                     signal,
                 );
-                break :blk try finalizeExecutedToolCall(
+                const finalized = try finalizeExecutedToolCall(
                     allocator,
                     current_context,
                     assistant_message,
-                    owned_prepared_tool,
+                    &owned_prepared_tool,
                     executed,
                     false,
                     config,
                     emit_context,
                     emit,
                     signal,
+                );
+                break :blk try emitToolResultMessageForToolCall(
+                    owned_prepared_tool.tool_call,
+                    finalized.result,
+                    finalized.is_error,
+                    emit_context,
+                    emit,
                 );
             },
             .immediate => |immediate| try emitToolCallOutcome(
@@ -804,18 +864,19 @@ fn executeToolCallsParallel(
     emit: types.AgentEventCallback,
     signal: ?*const std.atomic.Value(bool),
 ) ![]const types.ToolResultMessage {
-    var results = std.ArrayList(types.ToolResultMessage).empty;
-    errdefer results.deinit(allocator);
+    const result_slots = try allocator.alloc(?types.ToolResultMessage, tool_calls.len);
+    @memset(result_slots, null);
+    defer allocator.free(result_slots);
 
-    var prepared_calls = std.ArrayList(PreparedToolCall).empty;
+    var prepared_calls = std.ArrayList(PreparedToolCallEntry).empty;
     defer {
-        for (prepared_calls.items) |*prepared_call| {
-            prepared_call.deinit(allocator);
+        for (prepared_calls.items) |*entry| {
+            entry.prepared.deinit(allocator);
         }
         prepared_calls.deinit(allocator);
     }
 
-    for (tool_calls) |tool_call| {
+    for (tool_calls, 0..) |tool_call, source_index| {
         try emit(emit_context, .{
             .event_type = .tool_execution_start,
             .tool_call_id = tool_call.id,
@@ -833,23 +894,26 @@ fn executeToolCallsParallel(
         );
 
         switch (prepared) {
-            .prepared => |prepared_tool| try prepared_calls.append(allocator, prepared_tool),
+            .prepared => |prepared_tool| try prepared_calls.append(allocator, .{
+                .prepared = prepared_tool,
+                .source_index = source_index,
+            }),
             .immediate => |immediate| {
-                const tool_result = try emitToolCallOutcome(
-                    allocator,
+                const tool_result = try finalizeImmediateToolCall(
                     tool_call,
                     immediate.result,
                     immediate.is_error,
                     emit_context,
                     emit,
                 );
-                try results.append(allocator, tool_result);
+                result_slots[source_index] = tool_result;
             },
         }
     }
 
     if (prepared_calls.items.len == 0) {
-        return try results.toOwnedSlice(allocator);
+        try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
+        return try collectParallelToolResultsInSourceOrder(allocator, result_slots);
     }
 
     const task_count = prepared_calls.items.len;
@@ -863,9 +927,17 @@ fn executeToolCallsParallel(
         .emit_context = emit_context,
         .emit = emit,
     };
+    var completion_counter = std.atomic.Value(usize).init(0);
 
-    for (prepared_calls.items, 0..) |prepared_tool, index| {
-        tasks[index] = ParallelToolTask.init(allocator, prepared_tool, signal, &parallel_emitter);
+    for (prepared_calls.items, 0..) |entry, index| {
+        tasks[index] = ParallelToolTask.init(
+            allocator,
+            entry.prepared,
+            entry.source_index,
+            &completion_counter,
+            signal,
+            &parallel_emitter,
+        );
         threads[index] = try std.Thread.spawn(.{}, runParallelToolTask, .{&tasks[index]});
     }
 
@@ -876,7 +948,12 @@ fn executeToolCallsParallel(
         for (tasks) |*task| task.deinit();
     }
 
-    for (tasks) |*task| {
+    const completion_order = try allocator.alloc(usize, task_count);
+    defer allocator.free(completion_order);
+    fillTaskCompletionOrder(completion_order, tasks);
+
+    for (completion_order) |task_index| {
+        const task = &tasks[task_index];
         const executed = ExecutedToolCallOutcome{
             .result = if (task.result) |result|
                 try cloneToolResult(result, allocator)
@@ -884,11 +961,11 @@ fn executeToolCallsParallel(
                 try createErrorToolResult(allocator, "Parallel tool execution failed"),
             .is_error = task.is_error,
         };
-        const tool_result = try finalizeExecutedToolCall(
+        const finalized = try finalizeExecutedToolCall(
             allocator,
             current_context,
             assistant_message,
-            task.prepared,
+            &task.prepared,
             executed,
             true,
             config,
@@ -896,10 +973,15 @@ fn executeToolCallsParallel(
             emit,
             signal,
         );
-        try results.append(allocator, tool_result);
+        result_slots[task.source_index] = createToolResultMessage(
+            task.prepared.tool_call,
+            finalized.result,
+            finalized.is_error,
+        );
     }
 
-    return try results.toOwnedSlice(allocator);
+    try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
+    return try collectParallelToolResultsInSourceOrder(allocator, result_slots);
 }
 
 const PreparedToolCallOrImmediate = union(enum) {
@@ -1054,11 +1136,13 @@ fn runParallelToolTask(task: *ParallelToolTask) void {
     ) catch {
         task.result = createErrorToolResult(task.arena.allocator(), "Parallel tool execution failed") catch unreachable;
         task.is_error = true;
+        task.completion_order = task.completion_counter.fetchAdd(1, .seq_cst);
         return;
     };
 
     task.result = outcome.result;
     task.is_error = outcome.is_error;
+    task.completion_order = task.completion_counter.fetchAdd(1, .seq_cst);
 }
 
 fn emitParallelToolUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
@@ -1076,14 +1160,17 @@ fn finalizeExecutedToolCall(
     allocator: std.mem.Allocator,
     current_context: types.AgentContext,
     assistant_message: ai.AssistantMessage,
-    prepared: PreparedToolCall,
+    prepared: *PreparedToolCall,
     executed: ExecutedToolCallOutcome,
     owns_result_content: bool,
     config: types.AgentLoopConfig,
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
     signal: ?*const std.atomic.Value(bool),
-) !types.ToolResultMessage {
+) !FinalizedToolCallOutcome {
+    if (prepared.finalized) return AgentLoopError.ToolCallAlreadyFinalized;
+    prepared.finalized = true;
+
     var result = executed.result;
     var is_error = executed.is_error;
     var result_content_owned = owns_result_content;
@@ -1100,14 +1187,14 @@ fn finalizeExecutedToolCall(
             if (result_content_owned) deinitContentBlocks(allocator, result.content);
             result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}));
             is_error = true;
-            return try emitToolCallOutcome(
-                allocator,
+            try emitToolExecutionEnd(
                 prepared.tool_call,
                 result,
                 is_error,
                 emit_context,
                 emit,
             );
+            return .{ .result = result, .is_error = is_error };
         };
 
         if (after_result) |override| {
@@ -1124,14 +1211,14 @@ fn finalizeExecutedToolCall(
         }
     }
 
-    return try emitToolCallOutcome(
-        allocator,
+    try emitToolExecutionEnd(
         prepared.tool_call,
         result,
         is_error,
         emit_context,
         emit,
     );
+    return .{ .result = result, .is_error = is_error };
 }
 
 fn createErrorToolResult(allocator: std.mem.Allocator, message: []const u8) !types.AgentToolResult {
@@ -1155,6 +1242,36 @@ fn emitToolCallOutcome(
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
 ) !types.ToolResultMessage {
+    _ = allocator;
+    const tool_result = try finalizeImmediateToolCall(
+        tool_call,
+        result,
+        is_error,
+        emit_context,
+        emit,
+    );
+    try emitToolResultMessage(tool_result, emit_context, emit);
+    return tool_result;
+}
+
+fn finalizeImmediateToolCall(
+    tool_call: ai.ToolCall,
+    result: types.AgentToolResult,
+    is_error: bool,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !types.ToolResultMessage {
+    try emitToolExecutionEnd(tool_call, result, is_error, emit_context, emit);
+    return createToolResultMessage(tool_call, result, is_error);
+}
+
+fn emitToolExecutionEnd(
+    tool_call: ai.ToolCall,
+    result: types.AgentToolResult,
+    is_error: bool,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !void {
     try emit(emit_context, .{
         .event_type = .tool_execution_end,
         .tool_call_id = tool_call.id,
@@ -1163,8 +1280,14 @@ fn emitToolCallOutcome(
         .result = result,
         .is_error = is_error,
     });
+}
 
-    const tool_result = types.ToolResultMessage{
+fn createToolResultMessage(
+    tool_call: ai.ToolCall,
+    result: types.AgentToolResult,
+    is_error: bool,
+) types.ToolResultMessage {
+    return .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .content = result.content,
@@ -1172,7 +1295,13 @@ fn emitToolCallOutcome(
         .is_error = is_error,
         .timestamp = types.nowMilliseconds(),
     };
+}
 
+fn emitToolResultMessage(
+    tool_result: types.ToolResultMessage,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !void {
     try emit(emit_context, .{
         .event_type = .message_start,
         .message = .{ .tool_result = tool_result },
@@ -1181,9 +1310,59 @@ fn emitToolCallOutcome(
         .event_type = .message_end,
         .message = .{ .tool_result = tool_result },
     });
+}
 
-    _ = allocator;
+fn emitToolResultMessageForToolCall(
+    tool_call: ai.ToolCall,
+    result: types.AgentToolResult,
+    is_error: bool,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !types.ToolResultMessage {
+    const tool_result = createToolResultMessage(tool_call, result, is_error);
+    try emitToolResultMessage(tool_result, emit_context, emit);
     return tool_result;
+}
+
+fn collectParallelToolResultsInSourceOrder(
+    allocator: std.mem.Allocator,
+    result_slots: []const ?types.ToolResultMessage,
+) ![]const types.ToolResultMessage {
+    var results = try std.ArrayList(types.ToolResultMessage).initCapacity(allocator, result_slots.len);
+    errdefer results.deinit(allocator);
+
+    for (result_slots) |slot| {
+        const tool_result = slot orelse return error.MissingToolResult;
+        try results.append(allocator, tool_result);
+    }
+
+    return try results.toOwnedSlice(allocator);
+}
+
+fn emitParallelToolResultMessagesInSourceOrder(
+    result_slots: []const ?types.ToolResultMessage,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !void {
+    for (result_slots) |slot| {
+        const tool_result = slot orelse return error.MissingToolResult;
+        try emitToolResultMessage(tool_result, emit_context, emit);
+    }
+}
+
+fn fillTaskCompletionOrder(order: []usize, tasks: []const ParallelToolTask) void {
+    for (order, 0..) |*slot, index| slot.* = index;
+
+    var index: usize = 1;
+    while (index < order.len) : (index += 1) {
+        const task_index = order[index];
+        const task_completion = tasks[task_index].completion_order;
+        var cursor = index;
+        while (cursor > 0 and tasks[order[cursor - 1]].completion_order > task_completion) : (cursor -= 1) {
+            order[cursor] = order[cursor - 1];
+        }
+        order[cursor] = task_index;
+    }
 }
 
 fn emitPartialMessageUpdate(
@@ -1197,6 +1376,11 @@ fn emitPartialMessageUpdate(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
+    // `partial_accumulator` owns long-lived partial bytes with the parent
+    // allocator, while this arena owns the callback-scoped message shape
+    // (`content` slices and temporary parsed JSON). Every pointer in the
+    // emitted update is borrowed for this callback only; subscribers that keep
+    // any update data must clone it before returning.
     const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
     try emit(emit_context, .{
         .event_type = .message_update,
@@ -1540,9 +1724,45 @@ const ParallelStreamingCapture = struct {
     in_callback: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
+const ParallelHookOrderingCapture = struct {
+    allocator: std.mem.Allocator,
+    first_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    second_observed_before_first_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    after_hook_order: std.ArrayList([]const u8) = .empty,
+    tool_end_order: std.ArrayList([]const u8) = .empty,
+    tool_message_order: std.ArrayList([]const u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) ParallelHookOrderingCapture {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *ParallelHookOrderingCapture) void {
+        self.after_hook_order.deinit(self.allocator);
+        self.tool_end_order.deinit(self.allocator);
+        self.tool_message_order.deinit(self.allocator);
+    }
+};
+
 fn captureToolEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const capture: *ToolExecutionCapture = @ptrCast(@alignCast(context.?));
     try capture.events.append(capture.allocator, event);
+}
+
+fn captureParallelHookOrderingEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *ParallelHookOrderingCapture = @ptrCast(@alignCast(context.?));
+    switch (event.event_type) {
+        .tool_execution_end => {
+            try capture.tool_end_order.append(capture.allocator, event.tool_call_id orelse return error.MissingToolCallId);
+        },
+        .message_end => {
+            const message = event.message orelse return;
+            switch (message) {
+                .tool_result => |tool_result| try capture.tool_message_order.append(capture.allocator, tool_result.tool_call_id),
+                else => {},
+            }
+        },
+        else => {},
+    }
 }
 
 fn captureParallelStreamingEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
@@ -1759,6 +1979,20 @@ const PartialUpdateCrossCapture = struct {
     saw_toolcall_end: bool = false,
 };
 
+const StreamingUpdateSnapshotCapture = struct {
+    allocator: std.mem.Allocator,
+    snapshots: std.ArrayList([]const u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) StreamingUpdateSnapshotCapture {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *StreamingUpdateSnapshotCapture) void {
+        for (self.snapshots.items) |snapshot| self.allocator.free(snapshot);
+        self.snapshots.deinit(self.allocator);
+    }
+};
+
 fn capturePartialUpdateCrossEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const capture: *PartialUpdateCrossCapture = @ptrCast(@alignCast(context.?));
     if (event.event_type != .message_update) return;
@@ -1815,6 +2049,77 @@ fn capturePartialUpdateCrossEvent(context: ?*anyopaque, event: types.AgentEvent)
         },
         else => {},
     }
+}
+
+fn captureStreamingUpdateSnapshotEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *StreamingUpdateSnapshotCapture = @ptrCast(@alignCast(context.?));
+    if (event.event_type != .message_update) return;
+
+    const snapshot = try streamingUpdateSnapshot(capture.allocator, event);
+    errdefer capture.allocator.free(snapshot);
+    try capture.snapshots.append(capture.allocator, snapshot);
+}
+
+fn streamingUpdateSnapshot(allocator: std.mem.Allocator, event: types.AgentEvent) ![]const u8 {
+    const assistant_event = event.assistant_message_event orelse return error.MissingAssistantMessageEvent;
+    const message = event.message orelse return error.MissingPartialMessage;
+    const assistant = switch (message) {
+        .assistant => |assistant_message| assistant_message,
+        else => return error.UnexpectedMessageRole,
+    };
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try out.writer.print("event={s}", .{@tagName(assistant_event.event_type)});
+    if (assistant_event.content_index) |content_index| {
+        try out.writer.print("|index={d}", .{content_index});
+    }
+    if (assistant_event.delta) |delta| {
+        try out.writer.print("|delta={s}", .{delta});
+    }
+    if (assistant_event.content) |content| {
+        try out.writer.print("|content={s}", .{content});
+    }
+    if (assistant_event.tool_call) |tool_call| {
+        try out.writer.writeAll("|eventToolCall=");
+        try writeToolCallSnapshot(allocator, &out.writer, tool_call);
+    }
+
+    try out.writer.writeAll("|message=");
+    try writeContentSnapshot(allocator, &out.writer, assistant.content);
+    return allocator.dupe(u8, out.written());
+}
+
+fn writeContentSnapshot(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    content: []const ai.ContentBlock,
+) !void {
+    try writer.writeAll("[");
+    for (content, 0..) |block, index| {
+        if (index > 0) try writer.writeAll(",");
+        switch (block) {
+            .text => |text| try writer.print("text:{s}", .{text.text}),
+            .thinking => |thinking| try writer.print("thinking:{s}", .{thinking.thinking}),
+            .tool_call => |tool_call| {
+                try writer.writeAll("toolCall:");
+                try writeToolCallSnapshot(allocator, writer, tool_call);
+            },
+            .image => try writer.writeAll("image"),
+        }
+    }
+    try writer.writeAll("]");
+}
+
+fn writeToolCallSnapshot(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    tool_call: ai.ToolCall,
+) !void {
+    const args_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
+    defer allocator.free(args_json);
+    try writer.print("id={s},name={s},args={s}", .{ tool_call.id, tool_call.name, args_json });
 }
 
 fn malformedPartialToolCallStreamForAgentLoopTest(
@@ -1980,6 +2285,29 @@ fn parallelAwareEchoToolExecute(
     );
 }
 
+fn hookOrderingToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const capture: *ParallelHookOrderingCapture = @ptrCast(@alignCast(tool_context orelse return error.MissingParallelHookOrderingCapture));
+    const value = try getStringArg(params, "value");
+    if (std.mem.eql(u8, value, "first")) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+        capture.first_finished.store(true, .seq_cst);
+    } else if (!capture.first_finished.load(.seq_cst)) {
+        capture.second_observed_before_first_finished.store(true, .seq_cst);
+    }
+    return try textToolResult(
+        allocator,
+        try std.fmt.allocPrint(allocator, "echoed: {s}", .{value}),
+    );
+}
+
 fn streamingParallelToolExecute(
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
@@ -2039,6 +2367,17 @@ fn blockBeforeToolCall(
         .block = true,
         .reason = "blocked by hook",
     };
+}
+
+fn recordAfterToolCallOrder(
+    _: std.mem.Allocator,
+    context: types.AfterToolCallContext,
+    _: ?*const std.atomic.Value(bool),
+) !?types.AfterToolCallResult {
+    const tool = findTool(context.context.tools, context.tool_call.name) orelse return error.MissingParallelHookOrderingTool;
+    const capture: *ParallelHookOrderingCapture = @ptrCast(@alignCast(tool.execute_context orelse return error.MissingParallelHookOrderingCapture));
+    try capture.after_hook_order.append(capture.allocator, context.tool_call.id);
+    return null;
 }
 
 fn overrideAfterToolCall(
@@ -2524,6 +2863,62 @@ test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content 
     try std.testing.expectEqualStrings("partial", assistant.content[2].tool_call.arguments.object.get("query").?.string);
 }
 
+test "VAL-REVIEW-M8-001 streaming message_update snapshots cover partial tool-call UX policy" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:partial-tool-ux-snapshots",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var capture = StreamingUpdateSnapshotCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        &capture,
+        captureStreamingUpdateSnapshotEvent,
+        null,
+        crossPartialUpdateStreamForAgentLoopTest,
+    );
+
+    const expected = [_][]const u8{
+        "event=thinking_start|index=0|message=[thinking:]",
+        "event=thinking_delta|index=0|delta=plan |message=[thinking:plan ]",
+        "event=thinking_delta|index=0|delta=first|message=[thinking:plan first]",
+        "event=thinking_end|index=0|content=plan first|message=[thinking:plan first]",
+        "event=text_start|index=1|message=[thinking:plan first,text:]",
+        "event=text_delta|index=1|delta=prior |message=[thinking:plan first,text:prior ]",
+        "event=text_delta|index=1|delta=text|message=[thinking:plan first,text:prior text]",
+        "event=text_end|index=1|content=prior text|message=[thinking:plan first,text:prior text]",
+        "event=toolcall_start|index=2|message=[thinking:plan first,text:prior text,toolCall:id=,name=,args={}]",
+        "event=toolcall_delta|index=2|delta={\"query\":\"par|message=[thinking:plan first,text:prior text,toolCall:id=,name=,args={\"query\":\"par\"}]",
+        "event=toolcall_end|index=2|eventToolCall=id=call_1,name=lookup,args={\"query\":\"partial\"}|message=[thinking:plan first,text:prior text,toolCall:id=call_1,name=lookup,args={\"query\":\"partial\"}]",
+    };
+
+    try std.testing.expectEqual(expected.len, capture.snapshots.items.len);
+    for (expected, capture.snapshots.items) |expected_snapshot, actual_snapshot| {
+        try std.testing.expectEqualStrings(expected_snapshot, actual_snapshot);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), assistant.content.len);
+    try std.testing.expectEqualStrings("partial", assistant.content[2].tool_call.arguments.object.get("query").?.string);
+}
+
 test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty object" {
     const model = ai.Model{
         .id = "recording-model",
@@ -2559,6 +2954,210 @@ test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty obj
     try std.testing.expectEqual(@as(usize, 2), assistant.content.len);
     try std.testing.expectEqualStrings("call_bad_args", assistant.content[1].tool_call.id);
     try std.testing.expectEqual(@as(usize, 0), assistant.content[1].tool_call.arguments.object.count());
+}
+
+test "ISS-406 partial accumulator rejects stale explicit content_index reuse after end" {
+    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
+    defer accumulator.deinit();
+
+    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try accumulator.applyEvent(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "draft",
+    });
+    try accumulator.applyEvent(.{
+        .event_type = .text_end,
+        .content_index = 0,
+        .content = "final text",
+    });
+
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        accumulator.applyEvent(.{
+            .event_type = .text_delta,
+            .content_index = 0,
+            .delta = " stale delta",
+        }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 }),
+    );
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-index-reuse",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const partial_message = try accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
+    try std.testing.expect(partial_message.content[0] == .text);
+    try std.testing.expectEqualStrings("final text", partial_message.content[0].text.text);
+}
+
+test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
+    const args = try jsonStringObject(std.testing.allocator, "value", "once");
+    var prepared = PreparedToolCall{
+        .tool_call = .{
+            .id = "tool-double-finalize",
+            .name = "echo",
+            .arguments = .null,
+        },
+        .tool = .{
+            .name = "echo",
+            .description = "Echo input",
+            .label = "Echo",
+            .parameters = .null,
+        },
+        .args = args,
+    };
+    defer prepared.deinit(std.testing.allocator);
+
+    const content = try std.testing.allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "already executed") } };
+    const executed = ExecutedToolCallOutcome{
+        .result = .{
+            .content = content,
+            .details = null,
+        },
+        .is_error = false,
+    };
+    defer {
+        std.testing.allocator.free(content[0].text.text);
+        std.testing.allocator.free(content);
+    }
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const assistant_message = ai.AssistantMessage{
+        .content = &.{},
+        .api = "faux",
+        .provider = "faux",
+        .model = "faux-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    };
+    const context = types.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &.{prepared.tool},
+    };
+    const config = types.AgentLoopConfig{
+        .model = .{
+            .id = "faux-model",
+            .name = "Faux Model",
+            .api = "faux",
+            .provider = "faux",
+            .base_url = "http://localhost",
+            .input_types = &[_][]const u8{"text"},
+            .context_window = 1024,
+            .max_tokens = 256,
+        },
+        .convert_to_llm = defaultConvertToLlmForTest,
+    };
+
+    const finalized = try finalizeExecutedToolCall(
+        std.testing.allocator,
+        context,
+        assistant_message,
+        &prepared,
+        executed,
+        false,
+        config,
+        &capture,
+        captureToolEvent,
+        null,
+    );
+    try std.testing.expectEqualStrings("already executed", finalized.result.content[0].text.text);
+    try std.testing.expect(!finalized.is_error);
+    try std.testing.expect(prepared.finalized);
+
+    try std.testing.expectError(
+        AgentLoopError.ToolCallAlreadyFinalized,
+        finalizeExecutedToolCall(
+            std.testing.allocator,
+            context,
+            assistant_message,
+            &prepared,
+            executed,
+            false,
+            config,
+            &capture,
+            captureToolEvent,
+            null,
+        ),
+    );
+
+    var end_count: usize = 0;
+    for (capture.events.items) |event| {
+        if (event.event_type == .tool_execution_end) {
+            end_count += 1;
+            try std.testing.expectEqualStrings("tool-double-finalize", event.tool_call_id.?);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), end_count);
+}
+
+test "ISS-407 message_update payload is callback-scoped and retained consumers clone" {
+    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
+    defer accumulator.deinit();
+
+    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try accumulator.applyEvent(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "borrowed update",
+    });
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:update-lifetime",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    var temp_buffer: [4096]u8 = undefined;
+    var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_buffer);
+    const partial_message = try accumulator.buildMessage(temp_allocator.allocator(), template);
+
+    try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
+    try std.testing.expect(partial_message.content[0] == .text);
+    try std.testing.expectEqualStrings("borrowed update", partial_message.content[0].text.text);
+
+    const temp_start = @intFromPtr(&temp_buffer[0]);
+    const temp_end = temp_start + temp_buffer.len;
+    const content_ptr = @intFromPtr(partial_message.content.ptr);
+    try std.testing.expect(content_ptr >= temp_start);
+    try std.testing.expect(content_ptr < temp_end);
+
+    const borrowed_text_ptr = partial_message.content[0].text.text.ptr;
+    const retained_content = try cloneContentBlocks(std.testing.allocator, partial_message.content);
+    defer {
+        deinitContentBlocks(std.testing.allocator, retained_content);
+        std.testing.allocator.free(retained_content);
+    }
+
+    try std.testing.expect(retained_content.ptr != partial_message.content.ptr);
+    try std.testing.expect(retained_content[0] == .text);
+    try std.testing.expect(retained_content[0].text.text.ptr != borrowed_text_ptr);
+
+    @memset(temp_buffer[0..], 0xa5);
+
+    try std.testing.expectEqualStrings("borrowed update", retained_content[0].text.text);
 }
 
 test "VAL-CROSS-002 terminal error with partial tool call suppresses tool execution" {
@@ -2840,6 +3439,87 @@ test "runAgentLoop executes multiple tool calls in parallel and emits tool resul
             return error.UnexpectedToolExecutionEndOrder;
         }
     }
+}
+
+test "ISS-404 parallel after_tool_call finalizes in completion order and emits messages in source order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first_args = try jsonStringObject(arena.allocator(), "value", "first");
+    const second_args = try jsonStringObject(arena.allocator(), "value", "second");
+    const tool_calls = try arena.allocator().alloc(ai.ToolCall, 2);
+    tool_calls[0] = .{ .id = "tool-1", .name = "echo", .arguments = first_args };
+    tool_calls[1] = .{ .id = "tool-2", .name = "echo", .arguments = second_args };
+
+    var capture = ParallelHookOrderingCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = &capture,
+        .execute = hookOrderingToolExecute,
+    };
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-model",
+            .usage = ai.Usage.init(),
+            .stop_reason = .tool_use,
+            .timestamp = 1,
+        },
+        tool_calls,
+        .{
+            .model = .{
+                .id = "faux-model",
+                .name = "Faux Model",
+                .api = "faux",
+                .provider = "faux",
+                .base_url = "http://localhost",
+                .input_types = &[_][]const u8{"text"},
+                .context_window = 1024,
+                .max_tokens = 256,
+            },
+            .tool_execution = .parallel,
+            .after_tool_call = recordAfterToolCallOrder,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureParallelHookOrderingEvent,
+        null,
+    );
+    defer {
+        for (results) |result| {
+            deinitContentBlocks(std.testing.allocator, result.content);
+            std.testing.allocator.free(result.content);
+        }
+        std.testing.allocator.free(results);
+    }
+
+    try std.testing.expect(capture.second_observed_before_first_finished.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), capture.after_hook_order.items.len);
+    try std.testing.expectEqualStrings("tool-2", capture.after_hook_order.items[0]);
+    try std.testing.expectEqualStrings("tool-1", capture.after_hook_order.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_end_order.items.len);
+    try std.testing.expectEqualStrings("tool-2", capture.tool_end_order.items[0]);
+    try std.testing.expectEqualStrings("tool-1", capture.tool_end_order.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), capture.tool_message_order.items.len);
+    try std.testing.expectEqualStrings("tool-1", capture.tool_message_order.items[0]);
+    try std.testing.expectEqualStrings("tool-2", capture.tool_message_order.items[1]);
+    try std.testing.expectEqualStrings("tool-1", results[0].tool_call_id);
+    try std.testing.expectEqualStrings("tool-2", results[1].tool_call_id);
 }
 
 test "executeToolCallsParallel returns tool result content that survives task arena cleanup" {

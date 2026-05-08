@@ -4,12 +4,13 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
-const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const AnthropicError = error{
     UnknownStopReason,
@@ -700,6 +701,74 @@ test "parse anthropic stream handles compact data fields and provider errors" {
     try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
 }
 
+test "parse anthropic stream preserves frame-aware multiline data under shared SSE loop" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        ": keepalive\n" ++
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_multiline\",\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: ignored_vendor_event\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ignored\"}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\n" ++
+        "data: \"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Frame\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("Frame", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("msg_multiline", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("Frame", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 4), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 2), done.message.?.usage.output);
+}
+
 test "parse anthropic stream returns error for empty successful stream" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -934,6 +1003,72 @@ test "ISS-002 Anthropic content_index remains stable after block removal" {
     try std.testing.expectEqualStrings("toolu_content_index", done.message.?.content[1].tool_call.id);
     try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
     try std.testing.expectEqualStrings("stable", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(done.message.?.tool_calls == null);
+    try std.testing.expect(stream_instance.next() == null);
+}
+
+test "parse anthropic stream coerces end_turn to tool_use when tool calls are present" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stop_tool\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_stop_coerce\",\"name\":\"lookup\",\"input\":{}}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"coerce\\\"}\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, stream_instance.next().?.event_type);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("coerce", tool_end.tool_call.?.arguments.object.get("query").?.string);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[0] == .tool_call);
     try std.testing.expect(done.message.?.tool_calls == null);
     try std.testing.expect(stream_instance.next() == null);
 }
@@ -1843,79 +1978,28 @@ fn parseSseStreamLines(
         active_blocks.deinit(allocator);
     }
 
-    var sse_event = std.ArrayList(u8).empty;
-    defer sse_event.deinit(allocator);
-    var sse_data = std.ArrayList(u8).empty;
-    defer sse_data.deinit(allocator);
-
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
+    var handler = AnthropicSseFrameHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .active_blocks = &active_blocks,
+        .model = model,
+        .context = context,
+        .options = options,
+    };
+    const loop_result = sse_loop.runFrames(allocator, AnthropicSseFrameHandler, &handler, streaming, options) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
             return;
-        }
-
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len == 0) {
-            const event_finished = processAnthropicSseEvent(
-                allocator,
-                stream_ptr,
-                sse_event.items,
-                sse_data.items,
-                &output,
-                &content_blocks,
-                &tool_calls,
-                &active_blocks,
-                model,
-                context,
-                options,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                    return;
-                },
-            };
-            if (event_finished) return;
-            sse_event.clearRetainingCapacity();
-            sse_data.clearRetainingCapacity();
-            continue;
-        }
-
-        if (trimmed[0] == ':') continue;
-        try appendSseField(allocator, trimmed, &sse_event, &sse_data);
-    }
-
-    if (sse_data.items.len > 0) {
-        const event_finished = processAnthropicSseEvent(
-            allocator,
-            stream_ptr,
-            sse_event.items,
-            sse_data.items,
-            &output,
-            &content_blocks,
-            &tool_calls,
-            &active_blocks,
-            model,
-            context,
-            options,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                return;
-            },
-        };
-        if (event_finished) return;
+        },
+    };
+    if (loop_result == .stopped) {
+        return;
     }
 
     if (active_blocks.items.len > 0) {
@@ -1969,6 +2053,48 @@ fn parseSseStreamLines(
     });
     stream_ptr.end(output);
 }
+
+const AnthropicSseFrameHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+
+    pub fn handleFrame(self: *AnthropicSseFrameHandler, sse_event: []const u8, data: []const u8) !bool {
+        const event_finished = try processAnthropicSseEvent(
+            self.allocator,
+            self.stream_ptr,
+            sse_event,
+            data,
+            self.output,
+            self.content_blocks,
+            self.tool_calls,
+            self.active_blocks,
+            self.model,
+            self.context,
+            self.options,
+        );
+        return !event_finished;
+    }
+
+    pub fn handleRuntimeFailure(self: *AnthropicSseFrameHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.content_blocks,
+            self.tool_calls,
+            self.active_blocks,
+            self.model,
+            err,
+        );
+    }
+};
 
 fn finalizeOutputFromPartials(
     allocator: std.mem.Allocator,
@@ -2054,26 +2180,6 @@ fn emitRuntimeFailure(
     output.stop_reason = provider_error.runtimeStopReason(err);
     output.error_message = provider_error.runtimeErrorMessage(err);
     provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
-}
-
-fn appendSseField(
-    allocator: std.mem.Allocator,
-    line: []const u8,
-    event_name: *std.ArrayList(u8),
-    data: *std.ArrayList(u8),
-) !void {
-    const delimiter_index = std.mem.indexOfScalar(u8, line, ':') orelse line.len;
-    const field = line[0..delimiter_index];
-    var value = if (delimiter_index < line.len) line[delimiter_index + 1 ..] else "";
-    if (value.len > 0 and value[0] == ' ') value = value[1..];
-
-    if (std.mem.eql(u8, field, "event")) {
-        event_name.clearRetainingCapacity();
-        try event_name.appendSlice(allocator, value);
-    } else if (std.mem.eql(u8, field, "data")) {
-        if (data.items.len > 0) try data.append(allocator, '\n');
-        try data.appendSlice(allocator, value);
-    }
 }
 
 fn isAnthropicMessageSseEvent(event_name: []const u8) bool {
@@ -3379,10 +3485,6 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
     return provider_json.cloneValue(allocator, value);
 }
 
-fn isAbortRequested(options: ?types.StreamOptions) bool {
-    return abort_helper.isRequestedFromOptions(options);
-}
-
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     provider_json.freeValue(allocator, value);
 }
@@ -3438,6 +3540,66 @@ test "parseSseStreamLines preserves partial Anthropic text before malformed term
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "stream preserves partial Anthropic text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "event: message_start\n" ++
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"anthropic-abort\"}}\n\n" ++
+                "event: content_block_start\n" ++
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+                "event: content_block_delta\n" ++
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial anthropic\"}}\n\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try AnthropicProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial anthropic", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial anthropic", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("anthropic-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial anthropic", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "parseSseStreamLines finalizes partial Anthropic blocks before provider error" {

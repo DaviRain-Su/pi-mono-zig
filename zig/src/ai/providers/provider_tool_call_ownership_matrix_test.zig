@@ -270,8 +270,71 @@ fn expectToolCallMessage(case: ToolCallOwnershipCase, message: types.AssistantMe
     try std.testing.expectEqualStrings("Berlin", message.content[0].tool_call.arguments.object.get("city").?.string);
 }
 
+fn expectToolCallOwnershipCase(allocator: std.mem.Allocator, case: ToolCallOwnershipCase) !void {
+    var stream_instance = try stream_ops.stream(
+        allocator,
+        std.Io.failing,
+        contractModel(case),
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+    defer stream_instance.deinit();
+
+    var saw_done = false;
+    while (stream_instance.next()) |event| {
+        switch (event.event_type) {
+            .start => {},
+            .toolcall_start => {
+                try std.testing.expectEqual(@as(?u32, 0), event.content_index);
+            },
+            .toolcall_delta => {
+                defer freeEventOwned(allocator, event);
+                try std.testing.expectEqual(@as(?u32, 0), event.content_index);
+                try std.testing.expectEqualStrings("{\"city\":\"Berlin\"}", event.delta.?);
+            },
+            .toolcall_end => {
+                defer freeEventOwned(allocator, event);
+                try std.testing.expectEqual(@as(?u32, 0), event.content_index);
+                try std.testing.expectEqualStrings("get_weather", event.tool_call.?.name);
+            },
+            .done => {
+                defer freeAssistantMessageOwned(allocator, event.message.?);
+                try expectToolCallMessage(case, event.message.?);
+                switch (case.contract) {
+                    .normalized_inline => try std.testing.expect(event.message.?.tool_calls == null),
+                    .legacy_dual_allocated => {
+                        try std.testing.expect(event.message.?.tool_calls != null);
+                        try std.testing.expectEqual(@as(usize, 1), event.message.?.tool_calls.?.len);
+                        try std.testing.expect(event.message.?.tool_calls.?[0].id.ptr != event.message.?.content[0].tool_call.id.ptr);
+                        try std.testing.expect(event.message.?.tool_calls.?[0].name.ptr != event.message.?.content[0].tool_call.name.ptr);
+                    },
+                }
+                saw_done = true;
+            },
+            else => {
+                freeEventOwned(allocator, event);
+                try std.testing.expect(false);
+            },
+        }
+    }
+
+    try std.testing.expect(saw_done);
+}
+
 test "ISS-200 provider stream matrix covers every built-in API for tool-call ownership" {
     try expectMatrixCoversBuiltIns();
+}
+
+test "ISS-201 debug allocator covers provider tool-call ownership matrix without leaks" {
+    try expectMatrixCoversBuiltIns();
+    try configureProviderMatrix();
+    defer api_registry.resetForTesting();
+
+    for (tool_call_ownership_matrix) |case| {
+        var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+        try expectToolCallOwnershipCase(debug_allocator.allocator(), case);
+        try std.testing.expectEqual(.ok, debug_allocator.deinit());
+    }
 }
 
 test "ISS-200 ISS-201 normalized provider tool-call streams use inline-only ownership without leaks" {

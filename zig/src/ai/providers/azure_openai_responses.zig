@@ -11,6 +11,7 @@ const responses_api = @import("../shared/responses_api.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const DEFAULT_AZURE_API_VERSION = "v1";
 const AZURE_BASE_URL_ENV = "AZURE_OPENAI_BASE_URL";
@@ -1589,6 +1590,86 @@ test "parseSseStreamLines emits Azure reasoning_text deltas with final content f
     freeAssistantMessageOwned(allocator, done.message.?);
 }
 
+test "parseSseStreamLines preserves Azure content indexes across text tool text blocks" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_azure_content_index\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_before\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Before\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_before\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Before\"}]}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.done\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_after\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"After\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_after\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"After\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure_content_index\",\"status\":\"completed\"}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://example.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+
+    const after_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, after_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), after_start.content_index.?);
+    const after_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, after_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), after_delta.content_index.?);
+    const after_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, after_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), after_end.content_index.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqualStrings("Before", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("get_weather", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("After", done.message.?.content[2].text.text);
+}
+
 test "finalizeCollectedOutput preserves Azure finalization semantics" {
     const allocator = std.testing.allocator;
 
@@ -1713,6 +1794,117 @@ test "stream returns error_event on setup failure instead of throwing" {
     try std.testing.expectEqualStrings("gpt-4.1", event.message.?.model);
     try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
     try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial Azure Responses text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_azure_abort\"}}\n" ++
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+                "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial azure\"}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "Azure GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 32768,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try AzureOpenAIResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial azure", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial azure", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("resp_azure_abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial azure", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "parseSseStreamLines finalizes Azure Responses tool call on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_azure_eof_tool\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_eof\",\"call_id\":\"call_eof\",\"name\":\"lookup\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_eof\",\"delta\":\"{\\\"query\\\":\\\"local\\\"}\"}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "Azure GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://example.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_delta.content_index.?);
+    try std.testing.expectEqualStrings("{\"query\":\"local\"}", tool_delta.delta.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_eof|fc_eof", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), done.message.?.content.len);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("local", done.message.?.content[0].tool_call.arguments.object.get("query").?.string);
     try std.testing.expect(stream.next() == null);
 }
 

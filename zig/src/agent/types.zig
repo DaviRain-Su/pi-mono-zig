@@ -25,6 +25,15 @@ pub const ThinkingLevel = enum {
     xhigh,
 };
 
+/// Configuration for how tool calls from a single assistant message are
+/// executed.
+///
+/// - `sequential`: each tool call is prepared, executed, finalized, and
+///   emitted before the next tool starts.
+/// - `parallel`: tool calls are prepared sequentially, then allowed tools
+///   execute concurrently. Prepared calls run `after_tool_call` and emit
+///   `tool_execution_end` in completion order; tool-result message artifacts
+///   are emitted later in assistant source order.
 pub const ToolExecutionMode = enum {
     sequential,
     parallel,

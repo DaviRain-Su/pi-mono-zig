@@ -18,7 +18,7 @@ Rule: never start milestone N+1 if milestone N's quality gate is red.
 - [ ] ISS-002 add `content_index` stability regression test for Anthropic
 - [ ] ISS-200 verify `provider_stream_contract_matrix_test.zig` covers
   cross-provider invariants; extend if not
-- [ ] ISS-201 add leak-tracking test that drives every provider through a
+- [x] ISS-201 add leak-tracking test that drives every provider through a
   tool-call stream
 - [ ] ISS-500 document INV-1 in `types.zig`
 - [ ] ISS-501 debug-mode assert in `freeAssistantMessage`
@@ -31,7 +31,10 @@ Rule: never start milestone N+1 if milestone N's quality gate is red.
 
 **Quality gate**:
 - `zig build test` green
-- New leak-tracking test green for all providers
+- New leak-tracking test green for all providers (covered by
+  `provider_tool_call_ownership_matrix_test.zig` debug-allocator matrix; the
+  Cloudflare helper surface is N/A because it does not own an independent
+  assistant-message stream)
 - Anthropic content_index regression test green
 
 ---
@@ -164,8 +167,8 @@ small variations.
 
 **Tasks**:
 - [ ] ISS-412 write `zig/src/agent/MODULE.md` with state diagram
-- [ ] ISS-407 document arena-vs-gpa allocator policy + add canary
-- [ ] ISS-404 document hook ordering for parallel exec
+- [x] ISS-407 document arena-vs-gpa allocator policy + add canary
+- [x] ISS-404 document hook ordering for parallel exec
 - [ ] ISS-406 add reuse-guard in `PartialAssistantAccumulator.indexFor`
 - [ ] ISS-410 add `finalized: bool` flag + double-finalize assert
 

@@ -7,6 +7,7 @@ const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const simple_options = @import("../shared/simple_options.zig");
 const openai = @import("openai.zig");
@@ -1772,45 +1773,87 @@ fn parseTextStreamLines(
     }
     var state = StreamParseState{};
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
-            return;
-        }
-
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-        const payload = if (std.mem.startsWith(u8, trimmed, "data: ")) trimmed[6..] else trimmed;
-        if (payload.len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        handleEventValue(allocator, stream_ptr, parsed.value, &output, &content_blocks, &tool_calls, &active_blocks, &state, model) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
-                return;
-            },
-        };
-        if (stream_ptr.result() != null) return;
-    }
+    var handler = BedrockSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .active_blocks = &active_blocks,
+        .state = &state,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(BedrockSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) return;
 
     try finalizeOutputSafely(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, &state, model);
 }
+
+const BedrockSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_blocks: *std.ArrayList(BlockEntry),
+    state: *StreamParseState,
+    model: types.Model,
+
+    pub fn extractDataLine(_: *BedrockSseLoopHandler, line: []const u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, line, "data: ")) return line[6..];
+        return line;
+    }
+
+    pub fn isDoneData(_: *BedrockSseLoopHandler, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn handleData(self: *BedrockSseLoopHandler, data: []const u8) !bool {
+        if (data.len == 0) return true;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try self.handleRuntimeFailure(err);
+                return false;
+            },
+        };
+        defer parsed.deinit();
+
+        handleEventValue(
+            self.allocator,
+            self.stream_ptr,
+            parsed.value,
+            self.output,
+            self.content_blocks,
+            self.tool_calls,
+            self.active_blocks,
+            self.state,
+            self.model,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try self.handleRuntimeFailure(err);
+                return false;
+            },
+        };
+
+        return self.stream_ptr.result() == null;
+    }
+
+    pub fn handleRuntimeFailure(self: *BedrockSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.content_blocks,
+            self.tool_calls,
+            self.active_blocks,
+            self.model,
+            err,
+        );
+    }
+};
 
 fn handleEventValue(
     allocator: std.mem.Allocator,
@@ -3335,6 +3378,8 @@ test "parse bedrock stream emits text thinking and tool call events" {
         "data: {\"contentBlockStart\":{\"contentBlockIndex\":2,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-1\",\"name\":\"get_weather\"}}}}\n" ++
         "data: {\"contentBlockDelta\":{\"contentBlockIndex\":2,\"delta\":{\"toolUse\":{\"input\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}}}\n" ++
         "data: {\"contentBlockStop\":{\"contentBlockIndex\":2}}\n" ++
+        "data: {\"contentBlockDelta\":{\"contentBlockIndex\":3,\"delta\":{\"text\":\"After tool\"}}}\n" ++
+        "data: {\"contentBlockStop\":{\"contentBlockIndex\":3}}\n" ++
         "data: {\"messageStop\":{\"stopReason\":\"tool_use\"}}\n" ++
         "data: {\"metadata\":{\"usage\":{\"inputTokens\":21,\"outputTokens\":9,\"totalTokens\":30}}}\n";
 
@@ -3364,30 +3409,89 @@ test "parse bedrock stream emits text thinking and tool call events" {
     try parseTextStreamLines(allocator, &stream_instance, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
+    const thinking_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
     const thinking_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
     try std.testing.expectEqualStrings("Need weather.", thinking_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_start.content_index.?);
     const text_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_delta.content_index.?);
     try std.testing.expectEqualStrings("Checking now", text_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), text_end.content_index.?);
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_start.content_index.?);
     const tool_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_delta.content_index.?);
     try std.testing.expect(std.mem.indexOf(u8, tool_delta.delta.?, "Berlin") != null);
     const tool_end = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), tool_end.content_index.?);
     try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
     try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
+    const after_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, after_start.event_type);
+    try std.testing.expectEqual(@as(u32, 3), after_start.content_index.?);
+    const after_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, after_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 3), after_delta.content_index.?);
+    try std.testing.expectEqualStrings("After tool", after_delta.delta.?);
+    const after_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, after_end.event_type);
+    try std.testing.expectEqual(@as(u32, 3), after_end.content_index.?);
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 4), done.message.?.content.len);
+    try std.testing.expectEqualStrings("After tool", done.message.?.content[3].text.text);
     try std.testing.expectEqual(@as(u32, 21), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 9), done.message.?.usage.output);
     try std.testing.expectEqual(@as(u32, 30), done.message.?.usage.total_tokens);
+}
+
+test "parseTextStreamLines preserves raw JSON line tolerance with shared SSE loop" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "{\"messageStart\":{\"role\":\"assistant\"}}\n" ++
+            "{\"contentBlockDelta\":{\"contentBlockIndex\":0,\"delta\":{\"text\":\"raw text\"}}}\n" ++
+            "{\"contentBlockStop\":{\"contentBlockIndex\":0}}\n" ++
+            "{\"messageStop\":{\"stopReason\":\"end_turn\"}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseTextStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("raw text", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("raw text", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("raw text", done.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "parseEventStreamFrames joins split tool call input fragments" {
@@ -3435,6 +3539,48 @@ test "parseEventStreamFrames joins split tool call input fragments" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+}
+
+test "parseEventStreamFrames coerces end_turn to tool_use when tool calls are present" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude 3.7 Sonnet",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+    try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStart", "{\"contentBlockIndex\":0,\"start\":{\"toolUse\":{\"toolUseId\":\"tool-stop-coerce\",\"name\":\"lookup\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"toolUse\":{\"input\":\"{\\\"query\\\":\\\"coerce\\\"}\"}}}");
+    try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":0}");
+    try appendEventStreamFrame(allocator, &body, "messageStop", "{\"stopReason\":\"end_turn\"}");
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    try parseEventStreamFrames(allocator, &stream_instance, body.items, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, stream_instance.next().?.event_type);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("coerce", tool_end.tool_call.?.arguments.object.get("query").?.string);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[0] == .tool_call);
+    try std.testing.expect(done.message.?.tool_calls == null);
 }
 
 fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.Model {

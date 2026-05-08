@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("args.zig");
+const enforcement = @import("../coding_agent/extensions/enforcement.zig");
 const extension_flags = @import("../coding_agent/extensions/extension_flags.zig");
 const extension_registry = @import("../coding_agent/extensions/extension_registry.zig");
 const extension_runtime = @import("../coding_agent/extensions/extension_runtime.zig");
@@ -193,6 +194,7 @@ pub fn runExtensionRegistryDump(
             .fixture = fixture,
         },
         .shutdown_timeout_ms = shutdown_timeout_ms,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } }) catch |err| {
         try stderr.print("Error: failed to start extension host: {s}\n", .{@errorName(err)});
         return 1;

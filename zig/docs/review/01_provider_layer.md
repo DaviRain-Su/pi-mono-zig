@@ -343,14 +343,15 @@ double-free path remains
 
 ### ISS-201 Add a leak-tracking allocator test for tool_calls deinit
 - 严重度: P1
-- 位置: new test file
-- 现状: We changed ownership semantics; no test asserts no double-free / no
-  leak across all providers.
-- 建议: Use `std.testing.allocator` (which leak-tracks) in a test that
-  drives each provider through a tool-call stream and asserts zero leaks.
-- 验证: new test target.
-- 状态: open
-- 负责:
+- 位置: `zig/src/ai/providers/provider_tool_call_ownership_matrix_test.zig`
+- 现状: A local provider override matrix drives built-in production providers,
+  faux, and Kimi-compatible fixture entries through tool-call streams under a
+  debug allocator.
+- 建议: Keep new provider additions covered by the matrix or explicitly justify
+  N/A helper surfaces such as Cloudflare.
+- 验证: `cd zig && zig build test-ai`
+- 状态: closed
+- 负责: 43b9a826-f859-43e5-8fe7-57519aa10b1a
 - 提交:
 
 ### ISS-202 Documented unsupported-feature matrix

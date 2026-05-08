@@ -3,10 +3,11 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
-const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const DEFAULT_BASE_URL = "https://cloudcode-pa.googleapis.com";
 const GEMINI_CLI_CLIENT_METADATA =
@@ -300,176 +301,19 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, error.RequestAborted);
-            return;
-        }
-
-        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        const response_value = if (value.object.get("response")) |response|
-            if (response == .object) response else continue
-        else
-            value;
-
-        if (response_value.object.get("responseId")) |response_id| {
-            if (response_id == .string and output.response_id == null) {
-                output.response_id = try allocator.dupe(u8, response_id.string);
-            }
-        }
-
-        if (response_value.object.get("usageMetadata")) |usage_metadata| {
-            updateUsage(&output.usage, usage_metadata);
-            calculateCost(model, &output.usage);
-        }
-
-        const candidates_value = response_value.object.get("candidates") orelse continue;
-        if (candidates_value != .array or candidates_value.array.items.len == 0) continue;
-
-        const candidate = candidates_value.array.items[0];
-        if (candidate != .object) continue;
-
-        if (candidate.object.get("content")) |content_value| {
-            if (content_value == .object) {
-                if (content_value.object.get("parts")) |parts_value| {
-                    if (parts_value == .array) {
-                        for (parts_value.array.items) |part| {
-                            if (part != .object) continue;
-
-                            if (part.object.get("text")) |text_value| {
-                                if (text_value == .string and text_value.string.len > 0) {
-                                    const is_thinking = if (part.object.get("thought")) |thought_value|
-                                        thought_value == .bool and thought_value.bool
-                                    else
-                                        false;
-
-                                    if (current_block == null or !matchesCurrentBlock(current_block.?, is_thinking)) {
-                                        try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                        current_block = if (is_thinking)
-                                            .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
-                                        else
-                                            .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
-                                        stream_ptr.push(.{
-                                            .event_type = if (is_thinking) .thinking_start else .text_start,
-                                            .content_index = @intCast(content_blocks.items.len),
-                                        });
-                                    }
-
-                                    if (current_block) |*block| {
-                                        switch (block.*) {
-                                            .text => |*text| {
-                                                try text.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (text.signature) |existing| allocator.free(existing);
-                                                        text.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                            .thinking => |*thinking| {
-                                                try thinking.text.appendSlice(allocator, text_value.string);
-                                                if (part.object.get("thoughtSignature")) |signature_value| {
-                                                    if (signature_value == .string and signature_value.string.len > 0) {
-                                                        if (thinking.signature) |existing| allocator.free(existing);
-                                                        thinking.signature = try allocator.dupe(u8, signature_value.string);
-                                                    }
-                                                }
-                                            },
-                                        }
-                                    }
-
-                                    stream_ptr.push(.{
-                                        .event_type = if (is_thinking) .thinking_delta else .text_delta,
-                                        .content_index = @intCast(content_blocks.items.len),
-                                        .delta = try allocator.dupe(u8, text_value.string),
-                                        .owns_delta = true,
-                                    });
-                                }
-                            }
-
-                            if (part.object.get("functionCall")) |function_call_value| {
-                                if (function_call_value == .object) {
-                                    try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-                                    const name_value = function_call_value.object.get("name");
-                                    if (name_value == null or name_value.? != .string) continue;
-
-                                    const args = if (function_call_value.object.get("args")) |args_value|
-                                        try cloneJsonValue(allocator, args_value)
-                                    else
-                                        try emptyJsonObject(allocator);
-
-                                    const tool_call_id = if (function_call_value.object.get("id")) |id_value|
-                                        if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, &generated_tool_call_count)
-                                    else
-                                        try generateToolCallId(allocator, &generated_tool_call_count);
-
-                                    const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
-                                        if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
-                                    else
-                                        null;
-
-                                    const tool_call = types.ToolCall{
-                                        .id = tool_call_id,
-                                        .name = try allocator.dupe(u8, name_value.?.string),
-                                        .arguments = args,
-                                        .thought_signature = thought_signature,
-                                    };
-                                    try content_blocks.append(allocator, .{ .tool_call = tool_call });
-                                    const content_index = content_blocks.items.len - 1;
-                                    try tool_calls.append(allocator, content_blocks.items[content_index].tool_call);
-
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_start,
-                                        .content_index = @intCast(content_index),
-                                    });
-
-                                    const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
-                                    defer allocator.free(args_json);
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_delta,
-                                        .content_index = @intCast(content_index),
-                                        .delta = try allocator.dupe(u8, args_json),
-                                        .owns_delta = true,
-                                    });
-                                    stream_ptr.push(.{
-                                        .event_type = .toolcall_end,
-                                        .content_index = @intCast(content_index),
-                                        .tool_call = content_blocks.items[content_index].tool_call,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (candidate.object.get("finishReason")) |finish_reason| {
-            if (finish_reason == .string) {
-                output.stop_reason = if (tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
-            }
-        }
+    var handler = GeminiCliSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .generated_tool_call_count = &generated_tool_call_count,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(GeminiCliSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) {
+        return;
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
@@ -481,6 +325,237 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const GeminiCliSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    generated_tool_call_count: *usize,
+    model: types.Model,
+
+    pub fn extractDataLine(_: *GeminiCliSseLoopHandler, line: []const u8) ?[]const u8 {
+        return provider_stream.parseCanonicalSseDataLine(line);
+    }
+
+    pub fn isDoneData(_: *GeminiCliSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *GeminiCliSseLoopHandler, data: []const u8) !bool {
+        return try processGeminiCliSseData(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            self.generated_tool_call_count,
+            self.model,
+            data,
+        );
+    }
+
+    pub fn handleRuntimeFailure(self: *GeminiCliSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            self.model,
+            err,
+        );
+    }
+};
+
+fn processGeminiCliSseData(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    generated_tool_call_count: *usize,
+    model: types.Model,
+    data: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, stream_ptr, output, current_block, content_blocks, tool_calls, model, err);
+            return false;
+        },
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return true;
+
+    const response_value = if (value.object.get("response")) |response|
+        if (response == .object) response else return true
+    else
+        value;
+
+    if (response_value.object.get("responseId")) |response_id| {
+        if (response_id == .string and output.response_id == null) {
+            output.response_id = try allocator.dupe(u8, response_id.string);
+        }
+    }
+
+    if (response_value.object.get("usageMetadata")) |usage_metadata| {
+        updateUsage(&output.usage, usage_metadata);
+        calculateCost(model, &output.usage);
+    }
+
+    const candidates_value = response_value.object.get("candidates") orelse return true;
+    if (candidates_value != .array or candidates_value.array.items.len == 0) return true;
+
+    const candidate = candidates_value.array.items[0];
+    if (candidate != .object) return true;
+
+    try processGeminiCliCandidateContent(
+        allocator,
+        stream_ptr,
+        current_block,
+        content_blocks,
+        tool_calls,
+        generated_tool_call_count,
+        candidate.object,
+    );
+
+    if (candidate.object.get("finishReason")) |finish_reason| {
+        if (finish_reason == .string) {
+            output.stop_reason = if (tool_calls.items.len > 0) .tool_use else mapStopReason(finish_reason.string);
+        }
+    }
+
+    return true;
+}
+
+fn processGeminiCliCandidateContent(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    generated_tool_call_count: *usize,
+    candidate: std.json.ObjectMap,
+) !void {
+    const content_value = candidate.get("content") orelse return;
+    if (content_value != .object) return;
+    const parts_value = content_value.object.get("parts") orelse return;
+    if (parts_value != .array) return;
+
+    for (parts_value.array.items) |part| {
+        if (part != .object) continue;
+
+        if (part.object.get("text")) |text_value| {
+            if (text_value == .string and text_value.string.len > 0) {
+                const is_thinking = if (part.object.get("thought")) |thought_value|
+                    thought_value == .bool and thought_value.bool
+                else
+                    false;
+
+                if (current_block.* == null or !matchesCurrentBlock(current_block.*.?, is_thinking)) {
+                    try finishCurrentBlock(allocator, current_block, content_blocks, stream_ptr);
+                    current_block.* = if (is_thinking)
+                        .{ .thinking = .{ .text = std.ArrayList(u8).empty, .signature = null } }
+                    else
+                        .{ .text = .{ .text = std.ArrayList(u8).empty, .signature = null } };
+                    stream_ptr.push(.{
+                        .event_type = if (is_thinking) .thinking_start else .text_start,
+                        .content_index = @intCast(content_blocks.items.len),
+                    });
+                }
+
+                if (current_block.*) |*block| {
+                    switch (block.*) {
+                        .text => |*text| {
+                            try text.text.appendSlice(allocator, text_value.string);
+                            if (part.object.get("thoughtSignature")) |signature_value| {
+                                if (signature_value == .string and signature_value.string.len > 0) {
+                                    if (text.signature) |existing| allocator.free(existing);
+                                    text.signature = try allocator.dupe(u8, signature_value.string);
+                                }
+                            }
+                        },
+                        .thinking => |*thinking| {
+                            try thinking.text.appendSlice(allocator, text_value.string);
+                            if (part.object.get("thoughtSignature")) |signature_value| {
+                                if (signature_value == .string and signature_value.string.len > 0) {
+                                    if (thinking.signature) |existing| allocator.free(existing);
+                                    thinking.signature = try allocator.dupe(u8, signature_value.string);
+                                }
+                            }
+                        },
+                    }
+                }
+
+                stream_ptr.push(.{
+                    .event_type = if (is_thinking) .thinking_delta else .text_delta,
+                    .content_index = @intCast(content_blocks.items.len),
+                    .delta = try allocator.dupe(u8, text_value.string),
+                    .owns_delta = true,
+                });
+            }
+        }
+
+        if (part.object.get("functionCall")) |function_call_value| {
+            if (function_call_value == .object) {
+                try finishCurrentBlock(allocator, current_block, content_blocks, stream_ptr);
+                const name_value = function_call_value.object.get("name");
+                if (name_value == null or name_value.? != .string) continue;
+
+                const args = if (function_call_value.object.get("args")) |args_value|
+                    try cloneJsonValue(allocator, args_value)
+                else
+                    try emptyJsonObject(allocator);
+
+                const tool_call_id = if (function_call_value.object.get("id")) |id_value|
+                    if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, generated_tool_call_count)
+                else
+                    try generateToolCallId(allocator, generated_tool_call_count);
+
+                const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
+                    if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
+                else
+                    null;
+
+                const tool_call = types.ToolCall{
+                    .id = tool_call_id,
+                    .name = try allocator.dupe(u8, name_value.?.string),
+                    .arguments = args,
+                    .thought_signature = thought_signature,
+                };
+                try content_blocks.append(allocator, .{ .tool_call = tool_call });
+                const content_index = content_blocks.items.len - 1;
+                try tool_calls.append(allocator, content_blocks.items[content_index].tool_call);
+
+                stream_ptr.push(.{
+                    .event_type = .toolcall_start,
+                    .content_index = @intCast(content_index),
+                });
+
+                const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+                defer allocator.free(args_json);
+                stream_ptr.push(.{
+                    .event_type = .toolcall_delta,
+                    .content_index = @intCast(content_index),
+                    .delta = try allocator.dupe(u8, args_json),
+                    .owns_delta = true,
+                });
+                stream_ptr.push(.{
+                    .event_type = .toolcall_end,
+                    .content_index = @intCast(content_index),
+                    .tool_call = content_blocks.items[content_index].tool_call,
+                });
+            }
+        }
+    }
 }
 
 fn finalizeOutputFromPartials(
@@ -970,10 +1045,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn isAbortRequested(options: ?types.StreamOptions) bool {
-    return abort_helper.isRequestedFromOptions(options);
-}
-
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return provider_json.cloneValue(allocator, value);
 }
@@ -1104,20 +1175,40 @@ test "parse stream unwraps response envelope and emits Gemini CLI events" {
     try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_delta, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_delta, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const thinking_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
+    const thinking_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_start.content_index.?);
     const text_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
     try std.testing.expectEqualStrings("It is sunny.", text_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqualStrings("resp-123", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("It is sunny.", done.message.?.content[2].text.text);
     try std.testing.expectEqual(@as(u32, 18), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.output);
 }
@@ -1355,6 +1446,43 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
     };
 }
 
+test "parseSseStreamLines keeps Gemini CLI canonical-only SSE data tolerance" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        ": keepalive\n" ++
+            "event: content\n" ++
+            "data:{\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"compact-ignored\"}]}}]}}\n" ++
+            "\n" ++
+            " data: {\"response\":{\"responseId\":\"gemini-cli-canonical\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"canonical\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":8,\"candidatesTokenCount\":5,\"totalTokenCount\":13}}}\r\n" ++
+            "data: [DONE]\n" ++
+            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"after-done\"}]}}]}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-gemini-cli", "google-gemini-cli"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("gemini-cli-canonical", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 8), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "parseSseStreamLines preserves partial Gemini CLI text before malformed terminal error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -1388,6 +1516,97 @@ test "parseSseStreamLines preserves partial Gemini CLI text before malformed ter
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes partial Gemini CLI text on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"response\":{\"responseId\":\"gemini-cli-eof\",\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"gemini-cli-eof-sig\",\"text\":\"partial gemini cli eof\"}]}}]}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-gemini-cli", "google-gemini-cli"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), delta.content_index.?);
+    try std.testing.expectEqualStrings("partial gemini cli eof", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("partial gemini cli eof", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("gemini-cli-eof", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial gemini cli eof", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("gemini-cli-eof-sig", done.message.?.content[0].text.text_signature.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial Gemini CLI text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"response\":{\"responseId\":\"gemini-cli-abort\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial gemini cli\"}]}}]}}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+    const model = types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-gemini-cli",
+        .provider = "google-gemini-cli",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try GoogleGeminiCliProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "{\"token\":\"cli-token\",\"projectId\":\"test-project\"}",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial gemini cli", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial gemini cli", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("gemini-cli-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial gemini cli", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "stream returns error_event on non-auth setup failure instead of throwing" {

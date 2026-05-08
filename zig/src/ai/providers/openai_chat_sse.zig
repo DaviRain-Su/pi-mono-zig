@@ -1,3 +1,15 @@
+//! Legacy OpenAI Chat Completions SSE parser.
+//!
+//! This module intentionally remains custom while most migrated providers use
+//! `ai/shared/sse_loop.zig`: it owns Chat Completions-specific delta
+//! accumulation, mixed text/thinking/tool-call ordering, and the legacy
+//! `AssistantMessage.tool_calls` compatibility copy. Inline `.tool_call`
+//! content remains canonical, while `tool_calls` is separately allocated for
+//! consumers that still read the legacy field; see `types.freeAssistantMessage`
+//! for the freeing contract. Compact `data:{...}` SSE lines are accepted here
+//! as a provider-compatible Chat Completions tolerance without broadening the
+//! canonical data-line helper used by migrated generic SSE-loop providers.
+
 const std = @import("std");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
@@ -36,6 +48,7 @@ const StreamingBlockKind = enum {
 const StreamingBlockOrderEntry = struct {
     kind: StreamingBlockKind,
     tool_call_index: ?usize = null,
+    text_content: ?[]const u8 = null,
 };
 
 fn deinitActiveTextBlock(block: *ActiveTextBlock, allocator: std.mem.Allocator) void {
@@ -98,6 +111,11 @@ fn deinitSseParseState(state: *SseParseState) void {
     if (state.thinking_block) |*block| deinitActiveThinkingBlock(block, allocator);
     for (state.active_tool_calls.items) |*tool_call| deinitActiveToolCallBlock(allocator, tool_call);
     state.active_tool_calls.deinit(allocator);
+    if (state.output.content.len == 0) {
+        for (state.block_order.items) |entry| {
+            if (entry.text_content) |content| allocator.free(content);
+        }
+    }
     state.block_order.deinit(allocator);
     state.content_blocks.deinit(allocator);
     if (!state.tool_calls_transferred) {
@@ -335,6 +353,19 @@ fn processToolCallDelta(state: *SseParseState, delta: std.json.Value) !void {
 }
 
 fn processToolCallItem(state: *SseParseState, tool_call_item: std.json.Value) !void {
+    // Chat Completions has no explicit content-block lifecycle events, but in
+    // plain text/tool/text streams a tool-call delta is the clearest available
+    // boundary between adjacent text spans. Close the current text block before
+    // opening or updating a tool so later text deltas reopen at a new stable
+    // content_index instead of being coalesced into the pre-tool text block.
+    //
+    // Keep mixed reasoning streams on the legacy accumulator path: without
+    // protocol block-end events, closing text while a reasoning accumulator is
+    // also open changes established OpenAI-compatible parity ordering.
+    if (state.thinking_block == null) {
+        try finishActiveTextBlock(state.allocator, &state.text_block, &state.block_order, state.stream_ptr);
+    }
+
     const tc_id = if (tool_call_item.object.get("id")) |id_v|
         if (id_v == .string) id_v.string else null
     else
@@ -367,6 +398,27 @@ fn processToolCallItem(state: *SseParseState, tool_call_item: std.json.Value) !v
         .delta = delta_str,
         .owns_delta = delta_str != null,
     });
+}
+
+fn finishActiveTextBlock(
+    allocator: std.mem.Allocator,
+    text_block: *?ActiveTextBlock,
+    block_order: *std.ArrayList(StreamingBlockOrderEntry),
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    if (text_block.*) |*block| {
+        const content = try allocator.dupe(u8, block.text.items);
+        errdefer allocator.free(content);
+        if (block.content_index >= block_order.items.len) return error.InvalidContentIndex;
+        block_order.items[block.content_index].text_content = content;
+        stream_ptr.push(.{
+            .event_type = .text_end,
+            .content_index = @intCast(block.content_index),
+            .content = content,
+        });
+        deinitActiveTextBlock(block, allocator);
+        text_block.* = null;
+    }
 }
 
 fn extractToolCallName(tool_call_item: std.json.Value) ?[]const u8 {
@@ -587,7 +639,12 @@ fn finishStreamingBlocks(
     for (block_order.items, 0..) |entry, content_index| {
         switch (entry.kind) {
             .text => {
+                if (entry.text_content) |content| {
+                    try content_blocks.append(allocator, types.ContentBlock{ .text = .{ .text = content } });
+                    continue;
+                }
                 const block = text_block.* orelse continue;
+                if (block.content_index != content_index) continue;
                 const content = try allocator.dupe(u8, block.text.items);
                 try content_blocks.append(allocator, types.ContentBlock{ .text = .{ .text = content } });
                 stream_ptr.push(.{
@@ -808,10 +865,8 @@ pub fn parseSseAssistantMessageFromSlice(
 
 /// Parse SSE line and extract JSON data
 pub fn parseSseLine(line: []const u8) ?[]const u8 {
-    const prefix = "data: ";
-    if (std.mem.startsWith(u8, line, prefix)) {
-        return line[prefix.len..];
-    }
+    if (std.mem.startsWith(u8, line, "data: ")) return line[6..];
+    if (std.mem.startsWith(u8, line, "data:")) return std.mem.trim(u8, line[5..], " ");
     return null;
 }
 
@@ -841,6 +896,7 @@ test "openai_chat_sse parses data lines and chunks" {
     const allocator = std.testing.allocator;
 
     try std.testing.expectEqualStrings("{\"foo\": 123}", parseSseLine("data: {\"foo\": 123}").?);
+    try std.testing.expectEqualStrings("{\"foo\": 123}", parseSseLine("data:{\"foo\": 123}").?);
     try std.testing.expect(parseSseLine("event: start") == null);
 
     try std.testing.expect((try parseChunk(allocator, "[DONE]")) == null);
@@ -850,6 +906,38 @@ test "openai_chat_sse parses data lines and chunks" {
     defer if (valid) |*v| v.deinit();
     try std.testing.expect(valid != null);
     try std.testing.expect(valid.?.value == .object);
+}
+
+test "openai_chat_sse accepts compact data lines in chat completions stream" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const body =
+        "data:{\"id\":\"chatcmpl_compact\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"compact\"}}]}\n" ++
+        "data:{\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n" ++
+        "data:[DONE]\n";
+
+    const body_copy = try allocator.dupe(u8, body);
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body_copy,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+    while (stream.next()) |event| event.deinitTransient(allocator);
+
+    const message = stream.result() orelse return error.MissingAssistantMessage;
+    defer types.freeAssistantMessage(allocator, message);
+
+    try std.testing.expectEqual(@as(usize, 1), message.content.len);
+    try std.testing.expectEqualStrings("compact", message.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, message.stop_reason);
+    try std.testing.expectEqualStrings("chatcmpl_compact", message.response_id.?);
 }
 
 test "openai_chat_sse maps stop reasons" {
@@ -931,4 +1019,150 @@ test "openai_chat_sse keeps interleaved indexed tool arguments separated" {
     try std.testing.expectEqual(@as(usize, 2), done.message.?.tool_calls.?.len);
     try std.testing.expectEqualStrings("call_unit", done.message.?.content[0].tool_call.id);
     try std.testing.expectEqualStrings("call_city", done.message.?.content[1].tool_call.id);
+}
+
+test "openai_chat_sse keeps text content indexes stable around tool boundaries" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8,
+        "data: {\"choices\":[{\"delta\":{\"content\":\"before \"}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}]}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"after\"}}]}\n" ++
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+
+    const start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start.event_type);
+
+    const first_text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, first_text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), first_text_start.content_index.?);
+
+    const first_text_delta = stream.next().?;
+    defer first_text_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.text_delta, first_text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), first_text_delta.content_index.?);
+    try std.testing.expectEqualStrings("before ", first_text_delta.delta.?);
+
+    const first_text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, first_text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), first_text_end.content_index.?);
+    try std.testing.expectEqualStrings("before ", first_text_end.content.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+
+    const tool_delta = stream.next().?;
+    defer tool_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+
+    const second_text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, second_text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), second_text_start.content_index.?);
+
+    const second_text_delta = stream.next().?;
+    defer second_text_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.text_delta, second_text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), second_text_delta.content_index.?);
+    try std.testing.expectEqualStrings("after", second_text_delta.delta.?);
+
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_weather", tool_end.tool_call.?.id);
+
+    const second_text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, second_text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), second_text_end.content_index.?);
+    try std.testing.expectEqualStrings("after", second_text_end.content.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before ", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("call_weather", done.message.?.content[1].tool_call.id);
+    try std.testing.expectEqualStrings("Berlin", done.message.?.content[1].tool_call.arguments.object.get("city").?.string);
+    try std.testing.expectEqualStrings("after", done.message.?.content[2].text.text);
+
+    const message = stream.result() orelse return error.MissingAssistantMessage;
+    defer types.freeAssistantMessage(allocator, message);
+
+    try std.testing.expectEqual(null, stream.next());
+}
+
+test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(u8,
+        "data: {\"id\":\"chatcmpl_eof\",\"choices\":[{\"delta\":{\"content\":\"before tool\"}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_eof\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"local\\\"}\"}}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_end.content.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_eof", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("chatcmpl_eof", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before tool", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("local", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(stream.next() == null);
 }

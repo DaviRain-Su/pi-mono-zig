@@ -95,17 +95,17 @@ findings here are about **state transitions, ownership, and event ordering**.
 - 严重度: P1
 - 位置: `zig/src/agent/agent_loop.zig:677-723` (executeToolCalls dispatch),
   `~1075-1135` (finalizeExecutedToolCall)
-- 现状: `after_tool_call` fires inside `finalizeExecutedToolCall`.
-- 问题: In parallel mode, tool 2 may finalize before tool 1. The
-  `after_tool_call` hook can therefore see tool 2's outcome before tool 1's
-  outcome. Whether this is intended is undocumented.
-- 建议: Document the contract: hooks fire as soon as each tool completes,
-  not in submission order. If consumers expect submission order, add a
-  serialization layer.
-- 验证: doc + test that asserts the chosen contract.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: `after_tool_call` fires inside tool finalization, after the execute
+  callback returns and before `tool_execution_end`.
+- 决策: Parallel prepared tools run `after_tool_call` and emit
+  `tool_execution_end` in tool completion order, matching the TypeScript
+  contract. Tool-result message artifacts and `turn_end.tool_results` remain
+  in assistant source order so transcript/context order stays stable.
+- 验证: `ISS-404 parallel after_tool_call finalizes in completion order and
+  emits messages in source order`.
+- 状态: closed
+- 负责: cca91a6c-bcf4-4689-ae60-264642a250bd
+- 提交: pending (mission workers leave changes uncommitted)
 
 ### ISS-405 emitToolCallOutcome: ordering vs message_update
 - 严重度: P1
@@ -152,9 +152,9 @@ findings here are about **state transitions, ownership, and event ordering**.
   retain". Add a debug-build canary that scribbles the arena memory after
   the callback returns.
 - 验证: doc + debug-mode canary test.
-- 状态: open
-- 负责:
-- 提交:
+- 状态: closed
+- 负责: d4f30d42-47f1-4a82-8004-e76863700da0
+- 提交: pending (mission workers leave changes uncommitted)
 
 ### ISS-408 streamAssistantResponse: reentrancy / nested calls
 - 严重度: P2

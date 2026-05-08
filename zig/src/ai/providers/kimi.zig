@@ -10,6 +10,7 @@ const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 pub const KimiProvider = struct {
     pub const api = "kimi-completions";
@@ -1341,6 +1342,80 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     freeAssistantMessageOwned(allocator, event6.message.?);
 }
 
+test "parseSseStream preserves kimi content indexes across thinking tool text blocks" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"cmpl_kimi_index\",\"choices\":[{\"delta\":{\"reasoning_content\":\"Need tool\"},\"finish_reason\":null}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_kimi\",\"function\":{\"name\":\"run_terminal\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":null}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"After tool\"},\"finish_reason\":\"stop\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"cached_tokens\":2}}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const thinking_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
+    const thinking_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("After tool", text_delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqualStrings("Need tool", done.message.?.content[0].thinking.thinking);
+    try std.testing.expectEqualStrings("run_terminal", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("After tool", done.message.?.content[2].text.text);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "parseSseStream coerces stop reason when finalized output contains tool calls" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1516,6 +1591,114 @@ test "parseSseStreamLines preserves partial Kimi text before malformed terminal 
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes Kimi text and tool call on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"kimi-eof\",\"choices\":[{\"delta\":{\"content\":\"before tool\"}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_eof\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"local\\\"}\"}}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("kimi-completions", "kimi"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_end.content.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_eof", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("kimi-eof", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before tool", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("local", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial Kimi text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"id\":\"kimi-abort\",\"choices\":[{\"delta\":{\"content\":\"partial kimi\"},\"finish_reason\":null}]}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try KimiProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial kimi", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial kimi", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("kimi-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial kimi", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "stream returns error_event when API key is empty" {

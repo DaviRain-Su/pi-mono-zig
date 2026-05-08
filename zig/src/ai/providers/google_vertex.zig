@@ -4,10 +4,11 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const event_stream = @import("../event_stream.zig");
-const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
+const test_stream_server = @import("test_stream_server.zig");
 const asn1 = std.crypto.codecs.asn1;
 
 const DEFAULT_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
@@ -851,35 +852,15 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, error.RequestAborted);
-            return;
-        }
-
-        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, model, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        try processVertexSseObject(allocator, &state, stream_ptr, model, value.object);
+    var handler = VertexSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .state = &state,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(VertexSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) {
+        return;
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
@@ -891,6 +872,75 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const VertexSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    state: *VertexSseParseState,
+    model: types.Model,
+
+    pub fn extractDataLine(_: *VertexSseLoopHandler, line: []const u8) ?[]const u8 {
+        return provider_stream.parseCanonicalSseDataLine(line);
+    }
+
+    pub fn isDoneData(_: *VertexSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *VertexSseLoopHandler, data: []const u8) !bool {
+        return try processVertexSseData(
+            self.allocator,
+            self.stream_ptr,
+            self.state,
+            self.model,
+            data,
+        );
+    }
+
+    pub fn handleRuntimeFailure(self: *VertexSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.state.output,
+            self.state.current_block,
+            self.state.content_blocks,
+            self.state.tool_calls,
+            self.model,
+            err,
+        );
+    }
+};
+
+fn processVertexSseData(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    state: *VertexSseParseState,
+    model: types.Model,
+    data: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(
+                allocator,
+                stream_ptr,
+                state.output,
+                state.current_block,
+                state.content_blocks,
+                state.tool_calls,
+                model,
+                err,
+            );
+            return false;
+        },
+    };
+    defer parsed.deinit();
+
+    const value = parsed.value;
+    if (value != .object) return true;
+    try processVertexSseObject(allocator, state, stream_ptr, model, value.object);
+    return true;
 }
 
 fn processVertexSseObject(
@@ -1598,10 +1648,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn isAbortRequested(options: ?types.StreamOptions) bool {
-    return abort_helper.isRequestedFromOptions(options);
-}
-
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return provider_json.cloneValue(allocator, value);
 }
@@ -1813,21 +1859,40 @@ test "parse stream emits Vertex thinking, tool, and text events" {
     try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_delta, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_delta, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const thinking_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
+    const thinking_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_start.content_index.?);
     const text_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
     try std.testing.expectEqualStrings("It is sunny.", text_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
     try std.testing.expectEqualStrings("resp-vertex", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqualStrings("It is sunny.", done.message.?.content[2].text.text);
 }
 
 test "stream HTTP status error is terminal sanitized event" {
@@ -2034,6 +2099,45 @@ fn runtimePreservationTestModel(api: types.Api, provider: types.Provider) types.
     };
 }
 
+test "parseSseStreamLines keeps Vertex canonical-only SSE data tolerance" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        ": keepalive\n" ++
+            "event: content\n" ++
+            "data:{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"compact-ignored\"}]}}]}\n" ++
+            "\n" ++
+            " data: {\"responseId\":\"vertex-canonical\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"canonical\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":6,\"candidatesTokenCount\":5,\"totalTokenCount\":11}}\r\n" ++
+            "data: [DONE]\n" ++
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"after-done\"}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-vertex", "google-vertex"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("canonical", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("vertex-canonical", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(u32, 6), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
+    try std.testing.expect(stream.next() == null);
+}
+
 test "parseSseStreamLines preserves partial Vertex text before malformed terminal error" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -2067,6 +2171,100 @@ test "parseSseStreamLines preserves partial Vertex text before malformed termina
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes partial Vertex text on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"responseId\":\"vertex-eof\",\"candidates\":[{\"content\":{\"parts\":[{\"thoughtSignature\":\"vertex-eof-sig\",\"text\":\"partial vertex eof\"}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("google-vertex", "google-vertex"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), delta.content_index.?);
+    try std.testing.expectEqualStrings("partial vertex eof", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("partial vertex eof", text_end.content.?);
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("vertex-eof", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial vertex eof", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("vertex-eof-sig", done.message.?.content[0].text.text_signature.?);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial Vertex text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"responseId\":\"vertex-abort\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial vertex\"}]}}]}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const server_url = try server.url(allocator);
+    defer allocator.free(server_url);
+    const base_url = try std.fmt.allocPrint(allocator, "{s}/v1/projects/test-project/locations/us-central1/publishers/google", .{server_url});
+    defer allocator.free(base_url);
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .base_url = base_url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try GoogleVertexProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "vertex-smoke-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial vertex", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial vertex", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("vertex-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial vertex", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "stream returns error_event on non-auth setup failure instead of throwing" {

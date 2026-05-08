@@ -8,6 +8,8 @@ const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
 const IMAGE_OMITTED_TEXT = "(image omitted: model does not support images)";
@@ -308,155 +310,20 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, error.RequestAborted);
-            return;
-        }
-
-        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_slots, &tool_calls, &active_tool_calls, model, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        if (value.object.get("id")) |id_value| {
-            if (id_value == .string and output.response_id == null) {
-                output.response_id = try allocator.dupe(u8, id_value.string);
-            }
-        }
-
-        if (value.object.get("usage")) |usage_value| {
-            updateUsage(&output.usage, usage_value);
-        }
-
-        const choices_value = value.object.get("choices") orelse continue;
-        if (choices_value != .array or choices_value.array.items.len == 0) continue;
-
-        const choice = choices_value.array.items[0];
-        if (choice != .object) continue;
-
-        if (choice.object.get("finish_reason")) |finish_reason| {
-            if (finish_reason == .string) {
-                output.stop_reason = mapStopReason(finish_reason.string);
-            }
-        }
-
-        const delta_value = choice.object.get("delta") orelse continue;
-        if (delta_value != .object) continue;
-
-        if (delta_value.object.get("content")) |content_value| {
-            switch (content_value) {
-                .string => |text_delta| {
-                    if (text_delta.len > 0) {
-                        try appendTextDelta(allocator, &current_block, &content_slots, stream_ptr, &next_content_index, text_delta, false);
-                    }
-                },
-                .array => |content_array| {
-                    for (content_array.items) |item| {
-                        if (item != .object) continue;
-                        const chunk_type = item.object.get("type") orelse continue;
-                        if (chunk_type != .string) continue;
-
-                        if (std.mem.eql(u8, chunk_type.string, "text")) {
-                            if (item.object.get("text")) |text_value| {
-                                if (text_value == .string and text_value.string.len > 0) {
-                                    try appendTextDelta(allocator, &current_block, &content_slots, stream_ptr, &next_content_index, text_value.string, false);
-                                }
-                            }
-                            continue;
-                        }
-
-                        if (std.mem.eql(u8, chunk_type.string, "thinking")) {
-                            if (try extractThinkingText(allocator, item)) |thinking_delta| {
-                                defer allocator.free(thinking_delta);
-                                try appendTextDelta(allocator, &current_block, &content_slots, stream_ptr, &next_content_index, thinking_delta, true);
-                            }
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
-        if (delta_value.object.get("tool_calls")) |tool_calls_value| {
-            if (tool_calls_value == .array) {
-                try finishCurrentBlock(allocator, &current_block, &content_slots, stream_ptr);
-                for (tool_calls_value.array.items) |tool_call_value| {
-                    if (tool_call_value != .object) continue;
-                    const call_index = getJsonUsize(tool_call_value.object.get("index"));
-                    const raw_call_id = if (tool_call_value.object.get("id")) |id_value|
-                        if (id_value == .string and !std.mem.eql(u8, id_value.string, "null")) id_value.string else null
-                    else
-                        null;
-                    const normalized_call_id = if (raw_call_id) |call_id|
-                        try deriveMistralToolCallId(allocator, call_id, 0)
-                    else blk: {
-                        const generated_id = try std.fmt.allocPrint(allocator, "toolcall:{d}", .{call_index});
-                        defer allocator.free(generated_id);
-                        break :blk try deriveMistralToolCallId(allocator, generated_id, 0);
-                    };
-                    defer allocator.free(normalized_call_id);
-
-                    const tool_call = if (findStreamingToolCall(&active_tool_calls, normalized_call_id, call_index)) |existing|
-                        existing
-                    else blk: {
-                        try active_tool_calls.append(allocator, .{
-                            .event_index = next_content_index,
-                            .index = call_index,
-                            .id = std.ArrayList(u8).empty,
-                            .name = std.ArrayList(u8).empty,
-                            .partial_args = std.ArrayList(u8).empty,
-                        });
-                        try active_tool_calls.items[active_tool_calls.items.len - 1].id.appendSlice(allocator, normalized_call_id);
-                        stream_ptr.push(.{
-                            .event_type = .toolcall_start,
-                            .content_index = @intCast(next_content_index),
-                        });
-                        next_content_index += 1;
-                        break :blk &active_tool_calls.items[active_tool_calls.items.len - 1];
-                    };
-
-                    if (tool_call_value.object.get("function")) |function_value| {
-                        if (function_value == .object) {
-                            if (function_value.object.get("name")) |name_value| {
-                                if (name_value == .string and name_value.string.len > 0) {
-                                    tool_call.name.clearRetainingCapacity();
-                                    try tool_call.name.appendSlice(allocator, name_value.string);
-                                }
-                            }
-                            if (function_value.object.get("arguments")) |arguments_value| {
-                                const arguments_delta = try stringifyArgumentsDelta(allocator, arguments_value);
-                                defer allocator.free(arguments_delta);
-                                try tool_call.partial_args.appendSlice(allocator, arguments_delta);
-                                stream_ptr.push(.{
-                                    .event_type = .toolcall_delta,
-                                    .content_index = @intCast(tool_call.event_index),
-                                    .delta = try allocator.dupe(u8, arguments_delta),
-                                    .owns_delta = true,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    var handler = MistralSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_slots = &content_slots,
+        .tool_calls = &tool_calls,
+        .active_tool_calls = &active_tool_calls,
+        .next_content_index = &next_content_index,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(MistralSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) {
+        return;
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_slots, stream_ptr);
@@ -490,6 +357,203 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const MistralSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_slots: *std.ArrayList(?types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_tool_calls: *std.ArrayList(StreamingToolCall),
+    next_content_index: *usize,
+    model: types.Model,
+
+    pub fn extractDataLine(_: *MistralSseLoopHandler, line: []const u8) ?[]const u8 {
+        return provider_stream.parseCanonicalSseDataLine(line);
+    }
+
+    pub fn isDoneData(_: *MistralSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *MistralSseLoopHandler, data: []const u8) !bool {
+        return try processMistralSseData(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_slots,
+            self.tool_calls,
+            self.active_tool_calls,
+            self.next_content_index,
+            self.model,
+            data,
+        );
+    }
+
+    pub fn handleRuntimeFailure(self: *MistralSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_slots,
+            self.tool_calls,
+            self.active_tool_calls,
+            self.model,
+            err,
+        );
+    }
+};
+
+fn processMistralSseData(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_slots: *std.ArrayList(?types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    active_tool_calls: *std.ArrayList(StreamingToolCall),
+    next_content_index: *usize,
+    model: types.Model,
+    data: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, stream_ptr, output, current_block, content_slots, tool_calls, active_tool_calls, model, err);
+            return false;
+        },
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return true;
+
+    if (value.object.get("id")) |id_value| {
+        if (id_value == .string and output.response_id == null) {
+            output.response_id = try allocator.dupe(u8, id_value.string);
+        }
+    }
+
+    if (value.object.get("usage")) |usage_value| {
+        updateUsage(&output.usage, usage_value);
+    }
+
+    const choices_value = value.object.get("choices") orelse return true;
+    if (choices_value != .array or choices_value.array.items.len == 0) return true;
+
+    const choice = choices_value.array.items[0];
+    if (choice != .object) return true;
+
+    if (choice.object.get("finish_reason")) |finish_reason| {
+        if (finish_reason == .string) {
+            output.stop_reason = mapStopReason(finish_reason.string);
+        }
+    }
+
+    const delta_value = choice.object.get("delta") orelse return true;
+    if (delta_value != .object) return true;
+
+    if (delta_value.object.get("content")) |content_value| {
+        switch (content_value) {
+            .string => |text_delta| {
+                if (text_delta.len > 0) {
+                    try appendTextDelta(allocator, current_block, content_slots, stream_ptr, next_content_index, text_delta, false);
+                }
+            },
+            .array => |content_array| {
+                for (content_array.items) |item| {
+                    if (item != .object) continue;
+                    const chunk_type = item.object.get("type") orelse continue;
+                    if (chunk_type != .string) continue;
+
+                    if (std.mem.eql(u8, chunk_type.string, "text")) {
+                        if (item.object.get("text")) |text_value| {
+                            if (text_value == .string and text_value.string.len > 0) {
+                                try appendTextDelta(allocator, current_block, content_slots, stream_ptr, next_content_index, text_value.string, false);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (std.mem.eql(u8, chunk_type.string, "thinking")) {
+                        if (try extractThinkingText(allocator, item)) |thinking_delta| {
+                            defer allocator.free(thinking_delta);
+                            try appendTextDelta(allocator, current_block, content_slots, stream_ptr, next_content_index, thinking_delta, true);
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (delta_value.object.get("tool_calls")) |tool_calls_value| {
+        if (tool_calls_value == .array) {
+            try finishCurrentBlock(allocator, current_block, content_slots, stream_ptr);
+            for (tool_calls_value.array.items) |tool_call_value| {
+                if (tool_call_value != .object) continue;
+                const call_index = getJsonUsize(tool_call_value.object.get("index"));
+                const raw_call_id = if (tool_call_value.object.get("id")) |id_value|
+                    if (id_value == .string and !std.mem.eql(u8, id_value.string, "null")) id_value.string else null
+                else
+                    null;
+                const normalized_call_id = if (raw_call_id) |call_id|
+                    try deriveMistralToolCallId(allocator, call_id, 0)
+                else blk: {
+                    const generated_id = try std.fmt.allocPrint(allocator, "toolcall:{d}", .{call_index});
+                    defer allocator.free(generated_id);
+                    break :blk try deriveMistralToolCallId(allocator, generated_id, 0);
+                };
+                defer allocator.free(normalized_call_id);
+
+                const tool_call = if (findStreamingToolCall(active_tool_calls, normalized_call_id, call_index)) |existing|
+                    existing
+                else blk: {
+                    try active_tool_calls.append(allocator, .{
+                        .event_index = next_content_index.*,
+                        .index = call_index,
+                        .id = std.ArrayList(u8).empty,
+                        .name = std.ArrayList(u8).empty,
+                        .partial_args = std.ArrayList(u8).empty,
+                    });
+                    try active_tool_calls.items[active_tool_calls.items.len - 1].id.appendSlice(allocator, normalized_call_id);
+                    stream_ptr.push(.{
+                        .event_type = .toolcall_start,
+                        .content_index = @intCast(next_content_index.*),
+                    });
+                    next_content_index.* += 1;
+                    break :blk &active_tool_calls.items[active_tool_calls.items.len - 1];
+                };
+
+                if (tool_call_value.object.get("function")) |function_value| {
+                    if (function_value == .object) {
+                        if (function_value.object.get("name")) |name_value| {
+                            if (name_value == .string and name_value.string.len > 0) {
+                                tool_call.name.clearRetainingCapacity();
+                                try tool_call.name.appendSlice(allocator, name_value.string);
+                            }
+                        }
+                        if (function_value.object.get("arguments")) |arguments_value| {
+                            const arguments_delta = try stringifyArgumentsDelta(allocator, arguments_value);
+                            defer allocator.free(arguments_delta);
+                            try tool_call.partial_args.appendSlice(allocator, arguments_delta);
+                            stream_ptr.push(.{
+                                .event_type = .toolcall_delta,
+                                .content_index = @intCast(tool_call.event_index),
+                                .delta = try allocator.dupe(u8, arguments_delta),
+                                .owns_delta = true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 fn finalizeOutputFromPartials(
@@ -1383,6 +1447,55 @@ test "parse stream emits text events and usage" {
     try std.testing.expectEqualStrings("resp_1", done.message.?.response_id.?);
 }
 
+test "parse stream keeps Mistral canonical data-line strictness through shared SSE loop" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "event: message\n" ++
+            "data:{\"choices\":[{\"delta\":{\"content\":\"ignored compact\"}}]}\n" ++
+            "data: {\"id\":\"resp_canonical\",\"choices\":[{\"delta\":{\"content\":\"canonical\"},\"finish_reason\":\"stop\"}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "mistral-medium-latest",
+        .name = "Mistral Medium",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream_instance.next().?.event_type);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("resp_canonical", done.message.?.response_id.?);
+    try std.testing.expect(stream_instance.next() == null);
+}
+
 test "parse stream emits thinking and tool call events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
@@ -1391,7 +1504,8 @@ test "parse stream emits thinking and tool call events" {
         u8,
         "data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"Need tool\"}]}]},\"finish_reason\":null}]}\n" ++
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-tool-1\",\"index\":0,\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]},\"finish_reason\":null}]}\n" ++
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-tool-1\",\"index\":0,\"function\":{\"arguments\":\"\\\"Berlin\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":12,\"total_tokens\":32}}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-tool-1\",\"index\":0,\"function\":{\"arguments\":\"\\\"Berlin\\\"}\"}}]},\"finish_reason\":null}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"After tool\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":12,\"total_tokens\":32}}\n" ++
             "data: [DONE]\n",
     );
 
@@ -1421,21 +1535,45 @@ test "parse stream emits thinking and tool call events" {
     try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.thinking_start, stream_instance.next().?.event_type);
+    const thinking_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_start, thinking_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_start.content_index.?);
     const thinking_delta = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
     try std.testing.expectEqualStrings("Need tool", thinking_delta.delta.?);
-    try std.testing.expectEqual(types.EventType.thinking_end, stream_instance.next().?.event_type);
-    try std.testing.expectEqual(types.EventType.toolcall_start, stream_instance.next().?.event_type);
-    _ = stream_instance.next().?;
-    _ = stream_instance.next().?;
+    const thinking_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta_one = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_one.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta_one.content_index.?);
+    const tool_delta_two = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta_two.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta_two.content_index.?);
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_start.content_index.?);
+    const text_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("After tool", text_delta.delta.?);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
     const tool_end = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
     try std.testing.expectEqualStrings("get_weather", tool_end.tool_call.?.name);
     try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
+    try std.testing.expectEqualStrings("After tool", done.message.?.content[2].text.text);
     try std.testing.expectEqual(@as(u32, 20), done.message.?.usage.input);
     try std.testing.expectEqual(@as(u32, 12), done.message.?.usage.output);
 }
@@ -1679,6 +1817,113 @@ test "parseSseStreamLines preserves partial Mistral text before malformed termin
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+test "parseSseStreamLines finalizes Mistral text and tool call on EOF mid-block" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"mistral-eof\",\"choices\":[{\"delta\":{\"content\":\"before tool\"}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_eof\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"local\\\"}\"}}]}}]}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimePreservationTestModel("mistral-conversations", "mistral"), null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+    const text_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_end.content.?);
+
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+    const tool_delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqualStrings("mistral-eof", done.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before tool", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("local", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "stream preserves partial Mistral text before mid-stream abort terminal event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const chunks = [_]test_stream_server.DelayedChunk{
+        .{
+            .bytes = "data: {\"id\":\"mistral-abort\",\"choices\":[{\"delta\":{\"content\":\"partial mistral\"},\"finish_reason\":null}]}\n",
+            .delay_after_ms = 120,
+        },
+        .{ .bytes = "data: [DONE]\n" },
+    };
+    var server = try test_stream_server.DelayedChunkServer.init(io, &chunks);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+    const model = types.Model{
+        .id = "mistral-medium-latest",
+        .name = "Mistral Medium",
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 131072,
+        .max_tokens = 32768,
+    };
+
+    var abort_signal = std.atomic.Value(bool).init(false);
+    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
+    defer abort_thread.join();
+
+    var stream = try MistralProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = "test-key",
+        .signal = &abort_signal,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial mistral", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial mistral", text_end.content.?);
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Request was aborted", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.aborted, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("mistral-abort", terminal.message.?.response_id.?);
+    try std.testing.expectEqualStrings("partial mistral", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream.next() == null);
 }
 
 test "stream returns error_event when API key is empty" {
