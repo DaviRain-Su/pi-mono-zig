@@ -27,6 +27,30 @@ export interface ExtensionPolicy {
 
 export type ExtensionPolicyMap = Record<string, ExtensionPolicy>;
 
+export interface ExtensionPolicyDenialDetails {
+	category: "denied_capability";
+	capability: CanonicalExtensionGrant;
+	operation: string;
+	phase: "call";
+	runtimeKind: ExtensionPolicyRuntimeKind;
+	extensionIdentity: string;
+	principal: {
+		runtimeKind: ExtensionPolicyRuntimeKind;
+		extensionId: string;
+	};
+	target?: unknown;
+}
+
+export class ExtensionPolicyDeniedError extends Error {
+	readonly details: ExtensionPolicyDenialDetails;
+
+	constructor(details: ExtensionPolicyDenialDetails) {
+		super(formatExtensionPolicyDenialMessage(details));
+		this.name = "ExtensionPolicyDeniedError";
+		this.details = details;
+	}
+}
+
 export interface ExtensionPolicyMapValidationResult {
 	policies: ExtensionPolicyMap;
 	errors: Error[];
@@ -146,6 +170,46 @@ function relativePolicyPath(baseDir: string | undefined, filePath: string): stri
 
 export function isCanonicalExtensionGrant(value: string): value is CanonicalExtensionGrant {
 	return GRANTS.has(value);
+}
+
+export function hasExtensionGrant(policy: ExtensionPolicy | undefined, grant: CanonicalExtensionGrant): boolean {
+	return policy?.approvedGrants?.includes(grant) === true;
+}
+
+export function createExtensionPolicyDenialError(
+	identity: CanonicalExtensionIdentity,
+	capability: CanonicalExtensionGrant,
+	operation: string,
+	target?: unknown,
+): ExtensionPolicyDeniedError {
+	return new ExtensionPolicyDeniedError({
+		category: "denied_capability",
+		capability,
+		operation,
+		phase: "call",
+		runtimeKind: identity.runtimeKind,
+		extensionIdentity: identity.key,
+		principal: {
+			runtimeKind: identity.runtimeKind,
+			extensionId: identity.key,
+		},
+		target,
+	});
+}
+
+export function assertExtensionGrant(
+	identity: CanonicalExtensionIdentity,
+	policy: ExtensionPolicy | undefined,
+	capability: CanonicalExtensionGrant,
+	operation: string,
+	target?: unknown,
+): void {
+	if (hasExtensionGrant(policy, capability)) return;
+	throw createExtensionPolicyDenialError(identity, capability, operation, target);
+}
+
+function formatExtensionPolicyDenialMessage(details: ExtensionPolicyDenialDetails): string {
+	return `Extension policy denied: principal ${details.extensionIdentity} lacks capability ${details.capability} for ${details.operation}`;
 }
 
 export function createTypeScriptExtensionIdentity(options: {

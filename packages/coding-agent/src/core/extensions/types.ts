@@ -1735,4 +1735,10 @@ export interface ExtensionError {
 	stack?: string;
 	phase?: string;
 	runtimeKind?: "typescript" | "process_jsonl" | "wasm" | "native" | "remote";
+	category?: string;
+	capability?: string;
+	operation?: string;
+	target?: unknown;
+	principal?: unknown;
+	extensionIdentity?: string;
 }

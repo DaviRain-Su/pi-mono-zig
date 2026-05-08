@@ -2,12 +2,19 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import { basename } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
 import type { ResourceDiagnostic } from "../diagnostics.js";
+import {
+	type CanonicalExtensionGrant,
+	createExtensionPolicyDenialError,
+	ExtensionPolicyDeniedError,
+	hasExtensionGrant,
+} from "../extension-policy.js";
 import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { PathMetadata, ResolvedWasmExtensionPackage } from "../package-manager.js";
@@ -151,12 +158,23 @@ function cloneForExtensionHandler<T>(value: T, seen = new WeakMap<object, unknow
 	return clone as T;
 }
 
-function createRevocableFacade<T extends object>(getTarget: () => T, assertActive: () => void): T {
+function createRevocableFacade<T extends object>(
+	getTarget: () => T,
+	assertActive: () => void,
+	options: { readOnly?: boolean; deniedMethods?: readonly string[] } = {},
+): T {
 	const functionCache = new Map<PropertyKey, FacadeFunction>();
+	const deniedMethods = new Set<PropertyKey>(options.deniedMethods ?? []);
+	const denyMutation = (property: PropertyKey): never => {
+		throw new Error(`read-only extension facade denied method ${String(property)}`);
+	};
 
 	return new Proxy({} as T, {
 		get(_target, property) {
 			assertActive();
+			if (deniedMethods.has(property)) {
+				return () => denyMutation(property);
+			}
 			const target = getTarget();
 			const value = Reflect.get(target, property, target) as unknown;
 			if (typeof value !== "function") {
@@ -182,6 +200,9 @@ function createRevocableFacade<T extends object>(getTarget: () => T, assertActiv
 		},
 		set(_target, property, value) {
 			assertActive();
+			if (options.readOnly) {
+				denyMutation(property);
+			}
 			return Reflect.set(getTarget(), property, value);
 		},
 		has(_target, property) {
@@ -190,10 +211,11 @@ function createRevocableFacade<T extends object>(getTarget: () => T, assertActiv
 		},
 		ownKeys() {
 			assertActive();
-			return Reflect.ownKeys(getTarget());
+			return Reflect.ownKeys(getTarget()).filter((property) => !deniedMethods.has(property));
 		},
 		getOwnPropertyDescriptor(_target, property) {
 			assertActive();
+			if (deniedMethods.has(property)) return undefined;
 			const descriptor = Reflect.getOwnPropertyDescriptor(getTarget(), property);
 			if (!descriptor) return undefined;
 			return { ...descriptor, configurable: true };
@@ -428,6 +450,24 @@ const noOpUIContext: ExtensionUIContext = {
 	getToolsExpanded: () => false,
 	setToolsExpanded: () => {},
 };
+
+const SESSION_MANAGER_MUTATING_METHODS = [
+	"setSessionFile",
+	"newSession",
+	"_persist",
+	"appendMessage",
+	"appendThinkingLevelChange",
+	"appendModelChange",
+	"appendCustomEntry",
+	"appendSessionInfo",
+	"appendLabelChange",
+	"branch",
+	"resetLeaf",
+	"branchWithSummary",
+	"createBranchedSession",
+] as const;
+
+const MODEL_REGISTRY_MUTATING_METHODS = ["refresh", "registerProvider", "unregisterProvider"] as const;
 
 export class ExtensionRunner {
 	private extensions: Extension[];
@@ -829,8 +869,14 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const assertActive = () => runner.assertActive();
 		const uiFacade = createRevocableFacade(() => runner.uiContext, assertActive);
-		const sessionManagerFacade = createRevocableFacade(() => runner.sessionManager, assertActive);
-		const modelRegistryFacade = createRevocableFacade(() => runner.modelRegistry, assertActive);
+		const sessionManagerFacade = createRevocableFacade(() => runner.sessionManager, assertActive, {
+			readOnly: true,
+			deniedMethods: SESSION_MANAGER_MUTATING_METHODS,
+		});
+		const modelRegistryFacade = createRevocableFacade(() => runner.modelRegistry, assertActive, {
+			readOnly: true,
+			deniedMethods: MODEL_REGISTRY_MUTATING_METHODS,
+		});
 		return {
 			get ui() {
 				runner.assertActive();
@@ -1010,6 +1056,23 @@ export class ExtensionRunner {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			const stack = err instanceof Error ? err.stack : undefined;
+			if (err instanceof ExtensionPolicyDeniedError) {
+				this.emitError({
+					extensionPath: ext.path,
+					event: eventType,
+					error: message,
+					stack,
+					phase: err.details.phase,
+					runtimeKind: err.details.runtimeKind,
+					category: err.details.category,
+					capability: err.details.capability,
+					operation: err.details.operation,
+					target: err.details.target,
+					principal: err.details.principal,
+					extensionIdentity: err.details.extensionIdentity,
+				});
+				return undefined;
+			}
 			this.emitError({
 				extensionPath: ext.path,
 				event: eventType,
@@ -1224,6 +1287,51 @@ export class ExtensionRunner {
 			baseDir: ext.sourceInfo.baseDir,
 			provenance: ext.sourceInfo.provenance,
 		};
+	}
+
+	private isPathInsideBase(pathValue: string, baseDir: string): boolean {
+		const resolvedBase = existsSync(baseDir) ? realpathSync(baseDir) : resolve(baseDir);
+		const absolutePath = isAbsolute(pathValue) ? pathValue : resolve(resolvedBase, pathValue);
+		const resolvedPath = existsSync(absolutePath) ? realpathSync(absolutePath) : resolve(absolutePath);
+		const relativePath = relative(resolvedBase, resolvedPath);
+		return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+	}
+
+	private filterResourcePathsByPolicy(
+		ext: Extension,
+		paths: readonly string[],
+		capability: CanonicalExtensionGrant,
+		operation: string,
+	): string[] {
+		const baseDir = ext.sourceInfo.provenance?.packageRoot ?? ext.sourceInfo.baseDir;
+		if (!baseDir || hasExtensionGrant(ext.effectivePolicy, capability)) {
+			return [...paths];
+		}
+
+		const allowedPaths: string[] = [];
+		for (const pathValue of paths) {
+			const absolutePath = isAbsolute(pathValue) ? pathValue : resolve(baseDir, pathValue);
+			if (!existsSync(absolutePath) || this.isPathInsideBase(pathValue, baseDir)) {
+				allowedPaths.push(pathValue);
+				continue;
+			}
+
+			const denial = createExtensionPolicyDenialError(ext.identity, capability, operation, { path: pathValue });
+			this.emitError({
+				extensionPath: ext.path,
+				event: operation,
+				error: denial.message,
+				phase: denial.details.phase,
+				runtimeKind: denial.details.runtimeKind,
+				category: denial.details.category,
+				capability: denial.details.capability,
+				operation: denial.details.operation,
+				target: denial.details.target,
+				principal: denial.details.principal,
+				extensionIdentity: denial.details.extensionIdentity,
+			});
+		}
+		return allowedPaths;
 	}
 
 	private getExtensionSourceLabel(extensionPath: string): string {
@@ -1515,15 +1623,24 @@ export class ExtensionRunner {
 					await this.invokeHandler(ext, "resources_discover", handler, event, ctx),
 				);
 				const metadata = this.metadataForExtension(ext);
+				const allowedSkillPaths = result?.skillPaths
+					? this.filterResourcePathsByPolicy(ext, result.skillPaths, "file.read", "resources_discover")
+					: undefined;
+				const allowedPromptPaths = result?.promptPaths
+					? this.filterResourcePathsByPolicy(ext, result.promptPaths, "file.read", "resources_discover")
+					: undefined;
+				const allowedThemePaths = result?.themePaths
+					? this.filterResourcePathsByPolicy(ext, result.themePaths, "file.read", "resources_discover")
+					: undefined;
 
-				if (result?.skillPaths?.length) {
-					skillPaths.push(...result.skillPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
+				if (allowedSkillPaths?.length) {
+					skillPaths.push(...allowedSkillPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
 				}
-				if (result?.promptPaths?.length) {
-					promptPaths.push(...result.promptPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
+				if (allowedPromptPaths?.length) {
+					promptPaths.push(...allowedPromptPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
 				}
-				if (result?.themePaths?.length) {
-					themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
+				if (allowedThemePaths?.length) {
+					themePaths.push(...allowedThemePaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
 				}
 			}
 		}

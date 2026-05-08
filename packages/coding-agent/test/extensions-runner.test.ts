@@ -2655,6 +2655,45 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("context creation", () => {
+		it("exposes read-only session and model registry facades to extension handlers", async () => {
+			const runtime = createExtensionRuntime();
+			const mutations: string[] = [];
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_start", (_event, ctx) => {
+						try {
+							(
+								ctx.sessionManager as ReadonlySessionManager & {
+									appendCustomEntry(customType: string, data?: unknown): string;
+								}
+							).appendCustomEntry("forbidden", { mutated: true });
+						} catch (error) {
+							mutations.push(error instanceof Error ? error.message : String(error));
+						}
+						try {
+							ctx.modelRegistry.registerProvider("facade-bypass", providerModelConfig);
+						} catch (error) {
+							mutations.push(error instanceof Error ? error.message : String(error));
+						}
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<read-only-facades>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+
+			expect(mutations).toEqual([
+				expect.stringContaining("read-only extension facade denied method appendCustomEntry"),
+				expect.stringContaining("read-only extension facade denied method registerProvider"),
+			]);
+			expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(0);
+			expect(modelRegistry.find("facade-bypass", "instant-model")).toBeUndefined();
+		});
+
 		it("exposes the current abort signal on ExtensionContext", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
@@ -3094,6 +3133,54 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("result-bearing subscriber aggregation", () => {
+		it("constrains existing resource discovery paths to the extension base directory without file grants", async () => {
+			const extensionBase = path.join(tempDir, "extension-base");
+			const outsideBase = path.join(tempDir, "outside-base");
+			fs.mkdirSync(path.join(extensionBase, "skills", "inside"), { recursive: true });
+			fs.mkdirSync(path.join(outsideBase, "skills", "outside"), { recursive: true });
+			fs.writeFileSync(
+				path.join(extensionBase, "skills", "inside", "SKILL.md"),
+				"---\nname: inside\ndescription: inside\n---\nInside",
+			);
+			fs.writeFileSync(
+				path.join(outsideBase, "skills", "outside", "SKILL.md"),
+				"---\nname: outside\ndescription: outside\n---\nOutside",
+			);
+			const extensionEntry = path.join(extensionBase, "extension.ts");
+			fs.writeFileSync(
+				extensionEntry,
+				`
+					export default function(pi) {
+						pi.on("resources_discover", async () => ({
+							skillPaths: [
+								${JSON.stringify(path.join(extensionBase, "skills", "inside"))},
+								${JSON.stringify(path.join(outsideBase, "skills", "outside"))},
+							],
+						}));
+					}
+				`,
+			);
+
+			const result = await discoverAndLoadExtensions([extensionEntry], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const errors: Array<{ event: string; error: string; capability?: string; operation?: string }> = [];
+			runner.onError((error) => errors.push(error));
+
+			const resources = await runner.emitResourcesDiscover(tempDir, "startup");
+
+			expect(resources.skillPaths.map((resource) => resource.path)).toEqual([
+				path.join(extensionBase, "skills", "inside"),
+			]);
+			expect(errors).toEqual([
+				expect.objectContaining({
+					event: "resources_discover",
+					capability: "file.read",
+					operation: "resources_discover",
+					error: expect.stringContaining("capability file.read"),
+				}),
+			]);
+		});
+
 		it("aggregates resources with provenance and error isolation", async () => {
 			const extCode1 = `
 				export default function(pi) {
@@ -3565,6 +3652,156 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("provider registration", () => {
+		it("default-denies privileged TypeScript extension host APIs without exact grants", async () => {
+			const runtime = createExtensionRuntime();
+			const sideEffects = {
+				messages: [] as unknown[],
+				userMessages: [] as unknown[],
+				entries: [] as unknown[],
+				names: [] as string[],
+				labels: [] as Array<{ entryId: string; label: string | undefined }>,
+				activeTools: [] as string[][],
+				models: [] as unknown[],
+				thinkingLevels: [] as string[],
+			};
+			const denied: string[] = [];
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_start", async () => {
+						const attempts = [
+							() => pi.sendMessage({ customType: "denied.message", content: "message", display: true }),
+							() => pi.sendUserMessage("denied user"),
+							() => pi.appendEntry("denied.entry", { value: true }),
+							() => pi.setSessionName("denied-name"),
+							() => pi.setLabel("entry-1", "denied-label"),
+							() => pi.setActiveTools(["read"]),
+							() => pi.setThinkingLevel("high"),
+							() => pi.registerProvider("denied-provider", providerModelConfig),
+							() => pi.unregisterProvider("denied-provider"),
+							() => pi.exec(process.execPath, ["-e", "process.exit(0)"]),
+						];
+						for (const attempt of attempts) {
+							try {
+								await attempt();
+							} catch (error) {
+								denied.push(error instanceof Error ? error.message : String(error));
+							}
+						}
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<policy-denied-host-apis>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(
+				{
+					...extensionActions,
+					sendMessage: (message) => sideEffects.messages.push(message),
+					sendUserMessage: (content) => sideEffects.userMessages.push(content),
+					appendEntry: (customType, data) => sideEffects.entries.push({ customType, data }),
+					setSessionName: (name) => sideEffects.names.push(name),
+					setLabel: (entryId, label) => sideEffects.labels.push({ entryId, label }),
+					setActiveTools: (toolNames) => sideEffects.activeTools.push(toolNames),
+					setModel: async (model) => {
+						sideEffects.models.push(model);
+						return true;
+					},
+					setThinkingLevel: (level) => sideEffects.thinkingLevels.push(level),
+				},
+				extensionContextActions,
+			);
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+
+			expect(sideEffects).toEqual({
+				messages: [],
+				userMessages: [],
+				entries: [],
+				names: [],
+				labels: [],
+				activeTools: [],
+				models: [],
+				thinkingLevels: [],
+			});
+			expect(modelRegistry.find("denied-provider", "instant-model")).toBeUndefined();
+			expect(denied).toHaveLength(10);
+			expect(denied).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining("capability session.write"),
+					expect.stringContaining("capability tool.use"),
+					expect.stringContaining("capability model.call"),
+					expect.stringContaining("capability shell.run"),
+					expect.stringContaining(extension.identity.key),
+				]),
+			);
+		});
+
+		it("allows privileged TypeScript extension host APIs with exact grants", async () => {
+			const runtime = createExtensionRuntime();
+			const sideEffects = {
+				messages: [] as unknown[],
+				userMessages: [] as unknown[],
+				entries: [] as unknown[],
+				names: [] as string[],
+				labels: [] as Array<{ entryId: string; label: string | undefined }>,
+				activeTools: [] as string[][],
+				thinkingLevels: [] as string[],
+			};
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_start", async () => {
+						pi.sendMessage({ customType: "allowed.message", content: "message", display: true });
+						pi.sendUserMessage("allowed user");
+						pi.appendEntry("allowed.entry", { value: true });
+						pi.setSessionName("allowed-name");
+						pi.setLabel("entry-1", "allowed-label");
+						pi.setActiveTools(["read"]);
+						pi.setThinkingLevel("high");
+						pi.registerProvider("allowed-provider", providerModelConfig);
+						const execResult = await pi.exec(process.execPath, ["-e", "process.stdout.write('ok')"]);
+						pi.appendEntry("allowed.exec", execResult.stdout);
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<policy-allowed-host-apis>",
+				{ approvedGrants: ["session.write", "tool.use", "model.call", "shell.run"] },
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(
+				{
+					...extensionActions,
+					sendMessage: (message) => sideEffects.messages.push(message),
+					sendUserMessage: (content) => sideEffects.userMessages.push(content),
+					appendEntry: (customType, data) => sideEffects.entries.push({ customType, data }),
+					setSessionName: (name) => sideEffects.names.push(name),
+					setLabel: (entryId, label) => sideEffects.labels.push({ entryId, label }),
+					setActiveTools: (toolNames) => sideEffects.activeTools.push(toolNames),
+					setThinkingLevel: (level) => sideEffects.thinkingLevels.push(level),
+				},
+				extensionContextActions,
+			);
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+
+			expect(sideEffects).toMatchObject({
+				messages: [{ customType: "allowed.message", content: "message" }],
+				userMessages: ["allowed user"],
+				entries: [
+					{ customType: "allowed.entry", data: { value: true } },
+					{ customType: "allowed.exec", data: "ok" },
+				],
+				names: ["allowed-name"],
+				labels: [{ entryId: "entry-1", label: "allowed-label" }],
+				activeTools: [["read"]],
+				thinkingLevels: ["high"],
+			});
+			expect(modelRegistry.find("allowed-provider", "instant-model")).toBeDefined();
+		});
+
 		it("unregisters extension-owned providers when the runner is invalidated", async () => {
 			const runtime = createExtensionRuntime();
 			const extension = await loadExtensionFromFactory(
@@ -3575,6 +3812,7 @@ describe("ExtensionRunner", () => {
 				createEventBus(),
 				runtime,
 				"<provider-owner>",
+				{ approvedGrants: ["model.call"] },
 			);
 			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
 

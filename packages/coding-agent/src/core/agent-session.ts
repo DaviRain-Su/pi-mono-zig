@@ -31,6 +31,7 @@ import {
 	isContextOverflow,
 	modelsAreEqual,
 	resetApiProviders,
+	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
@@ -386,12 +387,22 @@ export class AgentSession {
 			await this._agentEventQueue;
 
 			try {
-				return await runner.emitToolCall({
+				const result = await runner.emitToolCall({
 					type: "tool_call",
 					toolName: toolCall.name,
 					toolCallId: toolCall.id,
 					input: args as Record<string, unknown>,
 				});
+				const tool = this.getToolDefinition(toolCall.name);
+				if (tool) {
+					validateToolArguments(tool as Parameters<typeof validateToolArguments>[0], {
+						type: "toolCall",
+						id: toolCall.id,
+						name: toolCall.name,
+						arguments: args as Record<string, never>,
+					});
+				}
+				return result;
 			} catch (err) {
 				if (err instanceof Error) {
 					throw err;

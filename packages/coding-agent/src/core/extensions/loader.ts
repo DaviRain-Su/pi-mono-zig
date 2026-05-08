@@ -28,6 +28,7 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import {
+	assertExtensionGrant,
 	createTypeScriptExtensionIdentity,
 	type ExtensionPolicy,
 	type TypeScriptExtensionIdentity,
@@ -255,6 +256,8 @@ function createExtensionAPI(
 	cwd: string,
 	eventBus: EventBus,
 ): ExtensionAPI {
+	const assertGrant = (capability: Parameters<typeof assertExtensionGrant>[2], operation: string, target?: unknown) =>
+		assertExtensionGrant(extension.identity, extension.effectivePolicy, capability, operation, target);
 	const api = {
 		getExtensionIdentity() {
 			runtime.assertActive();
@@ -332,21 +335,29 @@ function createExtensionAPI(
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			runtime.assertActive();
+			if (!String(message.customType).startsWith("sub_agent.")) {
+				assertGrant("session.write", "send_message");
+			}
 			runtime.sendMessage(message, options);
 		},
 
 		sendUserMessage(content, options): void {
 			runtime.assertActive();
+			assertGrant("session.write", "send_user_message");
 			runtime.sendUserMessage(content, options);
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
 			runtime.assertActive();
+			if (!customType.startsWith("sub_agent.")) {
+				assertGrant("session.write", "append_entry", { customType });
+			}
 			runtime.appendEntry(customType, data);
 		},
 
 		setSessionName(name: string): void {
 			runtime.assertActive();
+			assertGrant("session.write", "set_session_name");
 			runtime.setSessionName(name);
 		},
 
@@ -357,11 +368,19 @@ function createExtensionAPI(
 
 		setLabel(entryId: string, label: string | undefined): void {
 			runtime.assertActive();
+			assertGrant("session.write", "set_label", { entryId });
 			runtime.setLabel(entryId, label);
 		},
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			runtime.assertActive();
+			assertGrant("shell.run", "exec", { command });
+			if (typeof command !== "string" || command.length === 0) {
+				throw new Error("exec command must be a non-empty string");
+			}
+			if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
+				throw new Error("exec args must be a string array");
+			}
 			return execCommand(command, args, options?.cwd ?? cwd, options);
 		},
 
@@ -377,6 +396,7 @@ function createExtensionAPI(
 
 		setActiveTools(toolNames: string[]): void {
 			runtime.assertActive();
+			assertGrant("tool.use", "set_active_tools");
 			runtime.setActiveTools(toolNames);
 		},
 
@@ -387,6 +407,7 @@ function createExtensionAPI(
 
 		setModel(model) {
 			runtime.assertActive();
+			assertGrant("model.call", "set_model", { provider: model.provider, id: model.id });
 			return runtime.setModel(model);
 		},
 
@@ -397,16 +418,19 @@ function createExtensionAPI(
 
 		setThinkingLevel(level) {
 			runtime.assertActive();
+			assertGrant("model.call", "set_thinking_level");
 			runtime.setThinkingLevel(level);
 		},
 
 		registerProvider(name: string, config: ProviderConfig) {
 			runtime.assertActive();
+			assertGrant("model.call", "register_provider", { provider: name });
 			runtime.registerProvider(name, config, extension.path);
 		},
 
 		unregisterProvider(name: string) {
 			runtime.assertActive();
+			assertGrant("model.call", "unregister_provider", { provider: name });
 			runtime.unregisterProvider(name, extension.path);
 		},
 
@@ -497,8 +521,9 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	extensionPath = "<inline>",
+	effectivePolicy?: ExtensionPolicy,
 ): Promise<Extension> {
-	const extension = createExtension(extensionPath, extensionPath);
+	const extension = createExtension(extensionPath, extensionPath, { effectivePolicy });
 	const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 	await factory(api);
 	return extension;
