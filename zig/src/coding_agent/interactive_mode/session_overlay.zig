@@ -410,6 +410,9 @@ fn pathsEqualCanonical(allocator: std.mem.Allocator, lhs: []const u8, rhs: []con
 }
 
 fn realpathAllocOrNull(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (@import("builtin").os.tag == .windows) {
+        return std.fs.path.resolve(allocator, &.{path}) catch return null;
+    }
     const z_path = allocator.dupeZ(u8, path) catch return null;
     defer allocator.free(z_path);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;

@@ -220,6 +220,10 @@ pub fn findInitialDefaultModel(
 ) !?ai.Model {
     for (ai.model_registry.builtInProviderConfigs()) |provider| {
         if (std.mem.eql(u8, provider.provider, "faux")) continue;
+        if (try preferredInitialDefaultProvider(allocator, env_map, provider.provider, configured_credentials)) |preferred| {
+            const model_id = preferred.default_model_id orelse preferred.provider;
+            return ai.model_registry.find(preferred.provider, model_id) orelse fallbackModel(preferred, model_id);
+        }
         if (!try hasProviderCredentials(allocator, env_map, provider.provider, configured_credentials)) continue;
 
         const model_id = provider.default_model_id orelse provider.provider;
@@ -598,6 +602,20 @@ fn hasProviderCredentials(
     configured_credentials: ConfiguredCredentials,
 ) !bool {
     return (try resolveAvailableProviderAuthStatus(allocator, env_map, provider, configured_credentials)) != .missing;
+}
+
+fn preferredInitialDefaultProvider(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    configured_credentials: ConfiguredCredentials,
+) !?ai.model_registry.ProviderConfig {
+    if (std.mem.eql(u8, provider, "kimi-code-openai")) {
+        if (try hasProviderCredentials(allocator, env_map, "kimi-coding", configured_credentials)) {
+            return ai.model_registry.getProviderConfig("kimi-coding");
+        }
+    }
+    return null;
 }
 
 fn isLocalBaseUrl(value: []const u8) bool {

@@ -35,7 +35,8 @@ pub fn main(init: std.process.Init) !void {
 
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(init.gpa);
-    var it = init.minimal.args.iterate();
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer it.deinit();
     _ = it.next();
     while (it.next()) |arg| {
         try argv.append(init.gpa, arg);
@@ -1835,7 +1836,7 @@ test "runCli preserves context when continuing with a different provider" {
     defer ai.api_registry.resetToBuiltIns();
 
     const openai_registration = try faux.registerFauxProvider(allocator, .{
-        .api = "openai-completions",
+        .api = "openai-responses",
         .provider = "openai",
         .models = &[_]faux.FauxModelDefinition{.{
             .id = "gpt-5.4",

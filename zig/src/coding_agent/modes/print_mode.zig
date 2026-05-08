@@ -26,7 +26,7 @@ const SignalGuard = struct {
     installed: bool = false,
 
     fn install(signal: *std.atomic.Value(bool)) SignalGuard {
-        if (!supportsPosixSignals()) return .{};
+        if (comptime !supportsPosixSignals()) return .{};
 
         active_abort_signal = signal;
         const action: std.posix.Sigaction = .{
@@ -44,7 +44,8 @@ const SignalGuard = struct {
     }
 
     fn deinit(self: *SignalGuard) void {
-        if (!self.installed or !supportsPosixSignals()) return;
+        if (comptime !supportsPosixSignals()) return;
+        if (!self.installed) return;
         if (self.previous_sigint) |previous| {
             std.posix.sigaction(.INT, &previous, null);
         }
@@ -68,6 +69,7 @@ fn supportsPosixSignals() bool {
 }
 
 fn handleSigint(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
+    if (comptime builtin.os.tag == .windows) return;
     _ = info;
     _ = ctx_ptr;
     if (sig != .INT) return;

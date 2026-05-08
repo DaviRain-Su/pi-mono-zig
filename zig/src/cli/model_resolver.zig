@@ -165,22 +165,16 @@ fn tryMatchModel(
 ) ?ai.model_registry.ModelSummary {
     if (findExactReferenceMatch(summaries, pattern, provider)) |exact| return exact;
 
-    var best_alias: ?ai.model_registry.ModelSummary = null;
-    var best_dated: ?ai.model_registry.ModelSummary = null;
+    var best: ?ai.model_registry.ModelSummary = null;
     for (summaries) |summary| {
         if (provider) |provider_name| {
             if (!std.ascii.eqlIgnoreCase(summary.provider, provider_name)) continue;
         }
         if (!containsIgnoreCase(summary.id, pattern) and !containsIgnoreCase(summary.name, pattern)) continue;
-
-        if (isAlias(summary.id)) {
-            if (best_alias == null or stringGreater(summary.id, best_alias.?.id)) best_alias = summary;
-        } else {
-            if (best_dated == null or stringGreater(summary.id, best_dated.?.id)) best_dated = summary;
-        }
+        if (isBetterFuzzyCandidate(summary, best, provider == null)) best = summary;
     }
 
-    return best_alias orelse best_dated;
+    return best;
 }
 
 fn findExactReferenceMatch(
@@ -274,6 +268,43 @@ fn isAlias(id: []const u8) bool {
     return false;
 }
 
+fn isBetterFuzzyCandidate(
+    candidate: ai.model_registry.ModelSummary,
+    current: ?ai.model_registry.ModelSummary,
+    prefer_direct_providers: bool,
+) bool {
+    const existing = current orelse return true;
+
+    if (prefer_direct_providers) {
+        const candidate_rank = fuzzyProviderRank(candidate.provider);
+        const existing_rank = fuzzyProviderRank(existing.provider);
+        if (candidate_rank != existing_rank) return candidate_rank < existing_rank;
+    }
+
+    const candidate_alias = isAlias(candidate.id);
+    const existing_alias = isAlias(existing.id);
+    if (candidate_alias != existing_alias) return candidate_alias;
+
+    return stringGreater(candidate.id, existing.id);
+}
+
+fn fuzzyProviderRank(provider: []const u8) u8 {
+    return if (isAggregatorProvider(provider)) 1 else 0;
+}
+
+fn isAggregatorProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "amazon-bedrock") or
+        std.mem.eql(u8, provider, "cloudflare-ai-gateway") or
+        std.mem.eql(u8, provider, "cloudflare-workers-ai") or
+        std.mem.eql(u8, provider, "fireworks") or
+        std.mem.eql(u8, provider, "github-copilot") or
+        std.mem.eql(u8, provider, "huggingface") or
+        std.mem.eql(u8, provider, "opencode") or
+        std.mem.eql(u8, provider, "opencode-go") or
+        std.mem.eql(u8, provider, "openrouter") or
+        std.mem.eql(u8, provider, "vercel-ai-gateway");
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
@@ -309,7 +340,7 @@ test "resolveCliModel supports fuzzy matching and thinking suffix" {
 
     try std.testing.expect(result.error_message == null);
     try std.testing.expectEqualStrings("anthropic", result.provider_name.?);
-    try std.testing.expectEqualStrings("claude-sonnet-4-5", result.model_name.?);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", result.model_name.?);
     try std.testing.expectEqual(cli.ThinkingLevel.high, result.thinking.?);
 }
 
@@ -323,14 +354,14 @@ test "resolveCliModel prefers provider split over gateway raw id when provider m
     try std.testing.expectEqualStrings("glm-5.1", result.model_name.?);
 }
 
-test "resolveCliModel falls back to raw slash model id when inferred provider has no match" {
+test "resolveCliModel falls back to exact raw slash model id when inferred provider has no match" {
     const allocator = std.testing.allocator;
-    var result = try resolveCliModel(allocator, null, "openai/gpt-4o:extended");
+    var result = try resolveCliModel(allocator, null, "openai/gpt-oss-120b:free");
     defer result.deinit(allocator);
 
     try std.testing.expect(result.error_message == null);
     try std.testing.expectEqualStrings("openrouter", result.provider_name.?);
-    try std.testing.expectEqualStrings("openai/gpt-4o:extended", result.model_name.?);
+    try std.testing.expectEqualStrings("openai/gpt-oss-120b:free", result.model_name.?);
 }
 
 test "resolveCliModel preserves explicit provider custom model ids" {

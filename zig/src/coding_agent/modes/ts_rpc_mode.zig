@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = @import("ai");
 const agent = @import("agent");
 const ts_rpc_wire = @import("ts_rpc_wire.zig");
@@ -2302,14 +2303,21 @@ pub fn runTsRpcMode(
 }
 
 fn pollTsRpcStdin(timeout_ms: i32) !bool {
-    var fds = [_]std.posix.pollfd{
-        .{
-            .fd = 0,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    return (try std.posix.poll(fds[0..], timeout_ms)) > 0;
+    if (builtin.os.tag == .windows) {
+        const stdin_handle = std.Io.File.stdin().handle;
+        const timeout: std.os.windows.LARGE_INTEGER = -@as(i64, @intCast(timeout_ms)) * 10000;
+        const status = std.os.windows.ntdll.NtWaitForSingleObject(stdin_handle, .FALSE, &timeout);
+        return status == .SUCCESS;
+    } else {
+        var fds = [_]std.posix.pollfd{
+            .{
+                .fd = 0,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        return (try std.posix.poll(fds[0..], timeout_ms)) > 0;
+    }
 }
 
 fn handleTsRpcAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {

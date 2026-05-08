@@ -732,7 +732,9 @@ fn executeShellCommand(allocator: std.mem.Allocator, io: std.Io, command: []cons
     }
 
     // Execute command using std.process.spawn
-    const argv = [_][]const u8{ "/bin/sh", "-c", command };
+    const builtin = @import("builtin");
+    const shell: []const u8 = if (builtin.os.tag == .windows) "bash" else "/bin/sh";
+    const argv = [_][]const u8{ shell, "-c", command };
     var child = std.process.spawn(io, .{
         .argv = argv[0..],
         .stdin = .ignore,
@@ -748,11 +750,11 @@ fn executeShellCommand(allocator: std.mem.Allocator, io: std.Io, command: []cons
     if (term == .exited and term.exited == 0) {
         if (child.stdout) |stdout_file| {
             // Read output in fixed buffer and trim
-            var buffer: [8192]u8 = undefined;
-            const bytes_read = std.posix.read(stdout_file.handle, &buffer) catch 0;
+            var read_buf: [8192]u8 = undefined;
+            const bytes_read = stdout_file.readStreaming(io, &.{&read_buf}) catch 0;
             if (bytes_read > 0) {
                 // Trim whitespace
-                const trimmed = std.mem.trim(u8, buffer[0..bytes_read], &std.ascii.whitespace);
+                const trimmed = std.mem.trim(u8, read_buf[0..bytes_read], &std.ascii.whitespace);
                 if (trimmed.len > 0) {
                     result = allocator.dupe(u8, trimmed) catch return null;
                 }
