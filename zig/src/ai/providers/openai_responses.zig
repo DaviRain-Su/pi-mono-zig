@@ -3791,7 +3791,7 @@ test "stream preserves partial Responses text before mid-stream abort terminal e
                 "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
                 "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n",
-            .delay_after_ms = 120,
+            .delay_after_ms = 1000,
         },
         .{ .bytes = "data: [DONE]\n" },
     };
@@ -3803,15 +3803,28 @@ test "stream preserves partial Responses text before mid-stream abort terminal e
     defer allocator.free(url);
 
     var abort_signal = std.atomic.Value(bool).init(false);
-    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
-    defer abort_thread.join();
+    const AbortAfterResponse = struct {
+        var signal: ?*std.atomic.Value(bool) = null;
+        var thread: ?std.Thread = null;
+
+        fn callback(_: u16, _: std.StringHashMap([]const u8), _: types.Model) !void {
+            thread = try test_stream_server.startAbortThread(std.testing.io, signal.?, 250);
+        }
+    };
+    AbortAfterResponse.signal = &abort_signal;
+    AbortAfterResponse.thread = null;
+    defer if (AbortAfterResponse.thread) |thread| thread.join();
 
     var stream = try OpenAIResponsesProvider.stream(
         allocator,
         io,
         streamErrorContractTestModel(url),
         streamErrorContractTestContext(),
-        .{ .api_key = "test-key", .signal = &abort_signal },
+        .{
+            .api_key = "test-key",
+            .signal = &abort_signal,
+            .on_response = &AbortAfterResponse.callback,
+        },
     );
     defer stream.deinit();
 
