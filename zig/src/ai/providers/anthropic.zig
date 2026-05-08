@@ -825,6 +825,111 @@ test "parse anthropic stream emits tool call and thinking events" {
     try std.testing.expect(done.message.?.tool_calls == null);
 }
 
+test "ISS-002 Anthropic content_index remains stable after block removal" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_content_index\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"intro\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_content_index\",\"name\":\"lookup\",\"input\":{}}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"stable\\\"}\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":8}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{
+        .messages = &[_]types.Message{},
+    }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+
+    const text_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), text_start.content_index);
+
+    const text_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), text_delta.content_index);
+    try std.testing.expectEqualStrings("intro", text_delta.delta.?);
+
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), text_end.content_index);
+    try std.testing.expectEqualStrings("intro", text_end.content.?);
+
+    const tool_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), tool_start.content_index);
+
+    const tool_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), tool_delta.content_index);
+    try std.testing.expectEqualStrings("{\"query\":\"stable\"}", tool_delta.delta.?);
+
+    const tool_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), tool_end.content_index);
+    try std.testing.expectEqualStrings("toolu_content_index", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
+    try std.testing.expectEqualStrings("stable", tool_end.tool_call.?.arguments.object.get("query").?.string);
+
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[0] == .text);
+    try std.testing.expectEqualStrings("intro", done.message.?.content[0].text.text);
+    try std.testing.expect(done.message.?.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("toolu_content_index", done.message.?.content[1].tool_call.id);
+    try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("stable", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(done.message.?.tool_calls == null);
+    try std.testing.expect(stream_instance.next() == null);
+}
+
 test "parse kimi anthropic-compatible stream repairs malformed json and ignores unknown events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;

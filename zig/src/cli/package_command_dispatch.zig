@@ -63,6 +63,34 @@ fn resolveCwd(
     return allocator.dupe(u8, real_cwd);
 }
 
+fn expectedPersistedLocalSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    is_project: bool,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    const base_dir = if (is_project)
+        try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" })
+    else
+        try allocator.dupe(u8, agent_dir);
+    defer allocator.free(base_dir);
+
+    const trimmed = std.mem.trim(u8, source, " \t\r\n");
+    const resolved = if (std.fs.path.isAbsolute(trimmed))
+        try allocator.dupe(u8, trimmed)
+    else
+        try std.fs.path.resolve(allocator, &[_][]const u8{ cwd, trimmed });
+    defer allocator.free(resolved);
+
+    const relative = try std.fs.path.relative(allocator, cwd, null, base_dir, resolved);
+    if (relative.len == 0) {
+        allocator.free(relative);
+        return allocator.dupe(u8, ".");
+    }
+    return relative;
+}
+
 test "dispatchPackageCommand returns null for non-package argv" {
     const allocator = std.testing.allocator;
 
@@ -142,11 +170,19 @@ test "dispatchPackageCommand preserves cwd override and agent-dir package scopes
     defer allocator.free(local_settings_path);
     const local_settings = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, local_settings_path, allocator, .unlimited);
     defer allocator.free(local_settings);
-    try std.testing.expect(std.mem.indexOf(u8, local_settings, "\"source\": \"./local-fixture\"") != null);
+    const expected_local_source = try expectedPersistedLocalSource(allocator, "./local-fixture", true, project_dir, agent_dir);
+    defer allocator.free(expected_local_source);
+    const expected_local_json = try std.fmt.allocPrint(allocator, "\"source\": \"{s}\"", .{expected_local_source});
+    defer allocator.free(expected_local_json);
+    try std.testing.expect(std.mem.indexOf(u8, local_settings, expected_local_json) != null);
 
     const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(user_settings_path);
     const user_settings = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, user_settings_path, allocator, .unlimited);
     defer allocator.free(user_settings);
-    try std.testing.expect(std.mem.indexOf(u8, user_settings, "\"source\": \"./user-fixture\"") != null);
+    const expected_user_source = try expectedPersistedLocalSource(allocator, "./user-fixture", false, project_dir, agent_dir);
+    defer allocator.free(expected_user_source);
+    const expected_user_json = try std.fmt.allocPrint(allocator, "\"source\": \"{s}\"", .{expected_user_source});
+    defer allocator.free(expected_user_json);
+    try std.testing.expect(std.mem.indexOf(u8, user_settings, expected_user_json) != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Canonical ordering for caller abort-signal classification across AI
 /// stream entry points, provider setup paths, and HTTP streaming setup.
@@ -238,11 +239,9 @@ pub const UserMessage = struct {
 pub const AssistantMessage = struct {
     role: []const u8 = "assistant",
     content: []const ContentBlock,
-    /// TypeScript stores tool-call blocks inline in `content`.
-    /// Zig keeps finalized tool calls here as an owned cache because provider and
-    /// transform layers frequently need direct access after streaming assembly.
-    /// This is an intentional representation deviation; helper code is responsible
-    /// for preserving TypeScript-equivalent behavior at API boundaries.
+    /// ISS-500 / INV-1: inline `.tool_call` blocks in `content` are canonical.
+    /// Normalized providers must leave this legacy cache null; `openai_chat_sse`
+    /// may populate it with separately owned compatibility copies.
     tool_calls: ?[]const ToolCall = null,
     api: Api,
     provider: Provider,
@@ -298,6 +297,124 @@ pub fn collectAssistantToolCalls(
     const calls = try allocator.alloc(ToolCall, legacy.len);
     @memcpy(calls, legacy);
     return calls;
+}
+
+/// Frees owned assistant-message payload fields from provider stream results.
+/// `api`, `provider`, and `model` are borrowed model metadata.
+pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: AssistantMessage) void {
+    assertNoInvalidDualOwnedToolCalls(message);
+    freeContentBlocks(allocator, message.content);
+    if (message.tool_calls) |tool_calls| freeToolCalls(allocator, tool_calls);
+    if (message.response_id) |response_id| allocator.free(response_id);
+    if (message.response_model) |response_model| allocator.free(response_model);
+    if (message.error_message) |error_message| allocator.free(error_message);
+}
+
+fn assertNoInvalidDualOwnedToolCalls(message: AssistantMessage) void {
+    if (builtin.mode != .Debug) return;
+    const legacy_tool_calls = message.tool_calls orelse return;
+
+    for (message.content) |block| {
+        if (block != .tool_call) continue;
+        for (legacy_tool_calls) |legacy_tool_call| {
+            if (!toolCallStorageAliases(block.tool_call, legacy_tool_call)) continue;
+            std.log.warn(
+                "ISS-501 / INV-1: AssistantMessage has aliased inline and legacy tool_calls; normalized providers must keep tool_calls null",
+                .{},
+            );
+            std.debug.assert(false);
+        }
+    }
+}
+
+fn toolCallStorageAliases(a: ToolCall, b: ToolCall) bool {
+    if (a.id.ptr == b.id.ptr or a.name.ptr == b.name.ptr) return true;
+    if (a.thought_signature != null and b.thought_signature != null and
+        a.thought_signature.?.ptr == b.thought_signature.?.ptr)
+    {
+        return true;
+    }
+    return jsonValueStorageAliases(a.arguments, b.arguments);
+}
+
+fn jsonValueStorageAliases(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .string => |a_string| b == .string and a_string.ptr == b.string.ptr,
+        .number_string => |a_number| b == .number_string and a_number.ptr == b.number_string.ptr,
+        .array => |a_array| b == .array and a_array.items.ptr == b.array.items.ptr,
+        .object => |a_object| b == .object and a_object.count() > 0 and a_object.count() == b.object.count() and
+            jsonObjectMayShareStorage(a_object, b.object),
+        else => false,
+    };
+}
+
+fn jsonObjectMayShareStorage(a: std.json.ObjectMap, b: std.json.ObjectMap) bool {
+    var iterator = a.iterator();
+    while (iterator.next()) |entry| {
+        if (b.getEntry(entry.key_ptr.*)) |other| {
+            if (entry.key_ptr.*.ptr == other.key_ptr.*.ptr) return true;
+            if (jsonValueStorageAliases(entry.value_ptr.*, other.value_ptr.*)) return true;
+        }
+    }
+    return false;
+}
+
+fn freeContentBlocks(allocator: std.mem.Allocator, blocks: []const ContentBlock) void {
+    for (blocks) |block| freeContentBlock(allocator, block);
+    allocator.free(blocks);
+}
+
+fn freeContentBlock(allocator: std.mem.Allocator, block: ContentBlock) void {
+    switch (block) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |signature| allocator.free(signature);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+        .thinking => |thinking| {
+            allocator.free(thinking.thinking);
+            if (thinking.thinking_signature) |signature| allocator.free(signature);
+            if (thinking.signature) |signature| allocator.free(signature);
+        },
+        .tool_call => |tool_call| freeToolCall(allocator, tool_call),
+    }
+}
+
+fn freeToolCalls(allocator: std.mem.Allocator, tool_calls: []const ToolCall) void {
+    for (tool_calls) |tool_call| freeToolCall(allocator, tool_call);
+    allocator.free(tool_calls);
+}
+
+fn freeToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    if (tool_call.thought_signature) |signature| allocator.free(signature);
+    freeJsonValue(allocator, tool_call.arguments);
+}
+
+fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
+    switch (value) {
+        .string => |string| allocator.free(string),
+        .number_string => |number_string| allocator.free(number_string),
+        .array => |array| {
+            for (array.items) |item| freeJsonValue(allocator, item);
+            var mutable = array;
+            mutable.deinit();
+        },
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(allocator, entry.value_ptr.*);
+            }
+            var mutable = object;
+            mutable.deinit(allocator);
+        },
+        else => {},
+    }
 }
 
 pub const ToolResultMessage = struct {
@@ -556,6 +673,7 @@ pub const SimpleStreamOptions = struct {
     }
 };
 
+/// Event ordering follows ISS-502 / INV-2..INV-5; see event_stream.zig.
 pub const EventType = enum {
     start,
     text_start,
@@ -573,6 +691,7 @@ pub const EventType = enum {
 
 pub const AssistantMessageEvent = struct {
     event_type: EventType,
+    /// Stable block id for text/thinking/tool-call start, delta, and end events.
     content_index: ?u32 = null,
     delta: ?[]const u8 = null,
     owns_delta: bool = false,
@@ -705,6 +824,70 @@ test "AssistantMessage with responseId" {
         .timestamp = 1234567890,
     };
     try std.testing.expectEqualStrings("assistant", msg.role);
+}
+
+fn makeOwnedToolCallForTest(
+    allocator: std.mem.Allocator,
+    id_value: []const u8,
+    name_value: []const u8,
+    city_value: []const u8,
+) !ToolCall {
+    const id = try allocator.dupe(u8, id_value);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, name_value);
+    errdefer allocator.free(name);
+
+    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    errdefer freeJsonValue(allocator, .{ .object = object });
+    const key = try allocator.dupe(u8, "city");
+    errdefer allocator.free(key);
+    const city = try allocator.dupe(u8, city_value);
+    errdefer allocator.free(city);
+    try object.put(allocator, key, .{ .string = city });
+
+    return .{
+        .id = id,
+        .name = name,
+        .arguments = .{ .object = object },
+    };
+}
+
+test "freeAssistantMessage releases normalized inline tool calls" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(ContentBlock, 1);
+    content[0] = .{ .tool_call = try makeOwnedToolCallForTest(allocator, "call_1", "get_weather", "Berlin") };
+
+    freeAssistantMessage(allocator, .{
+        .content = content,
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-5",
+        .usage = Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    });
+}
+
+test "freeAssistantMessage preserves openai_chat_sse legacy dual copies" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(ContentBlock, 1);
+    content[0] = .{ .tool_call = try makeOwnedToolCallForTest(allocator, "call_1", "get_weather", "Berlin") };
+
+    const legacy_tool_calls = try allocator.alloc(ToolCall, 1);
+    legacy_tool_calls[0] = try makeOwnedToolCallForTest(allocator, "call_1", "get_weather", "Paris");
+
+    freeAssistantMessage(allocator, .{
+        .content = content,
+        .tool_calls = legacy_tool_calls,
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4",
+        .usage = Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 2,
+    });
 }
 
 test "OpenAICompletionsCompat parity fields" {

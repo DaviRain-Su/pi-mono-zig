@@ -1,6 +1,11 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// ISS-502 stream invariants for `types.AssistantMessageEvent`:
+/// - INV-2: each `content_index` is stable and never reused within a stream.
+/// - INV-3: per-block ordering is `_start -> _delta* -> _end`.
+/// - INV-4: `done` is the final event for a successful stream.
+/// - INV-5: `error_event` terminates the stream with error stop metadata.
 /// Generic event stream for async iteration.
 /// T is the event type, R is the result type.
 pub fn EventStream(comptime T: type, comptime R: type) type {
