@@ -274,7 +274,7 @@ fn shouldUseMouseReporting() bool {
 }
 
 fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
-    const raw = value orelse return true;
+    const raw = value orelse return false;
     if (std.mem.eql(u8, raw, "0") or
         std.ascii.eqlIgnoreCase(raw, "false") or
         std.ascii.eqlIgnoreCase(raw, "no") or
@@ -282,8 +282,7 @@ fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
     {
         return false;
     }
-    return raw.len == 0 or
-        std.mem.eql(u8, raw, "1") or
+    return std.mem.eql(u8, raw, "1") or
         std.ascii.eqlIgnoreCase(raw, "true") or
         std.ascii.eqlIgnoreCase(raw, "yes") or
         std.ascii.eqlIgnoreCase(raw, "on");
@@ -479,6 +478,11 @@ fn appendPasteKeyText(
         return;
     }
 
+    if (pasteControlByteFromKey(key)) |byte| {
+        try paste_buffer.append(allocator, byte);
+        return;
+    }
+
     switch (key.codepoint) {
         vaxis.Key.enter, vaxis.Key.kp_enter => try paste_buffer.append(allocator, '\r'),
         vaxis.Key.tab => try paste_buffer.append(allocator, '\t'),
@@ -489,6 +493,22 @@ fn appendPasteKeyText(
             try paste_buffer.appendSlice(allocator, encoded[0..length]);
         },
     }
+}
+
+fn pasteControlByteFromKey(key: vaxis.Key) ?u8 {
+    if (!key.mods.ctrl or key.mods.alt or key.mods.shift or key.mods.super) return null;
+
+    return switch (key.codepoint) {
+        '@' => 0x00,
+        'a'...'z' => @intCast(key.codepoint - 'a' + 1),
+        'A'...'Z' => @intCast(key.codepoint - 'A' + 1),
+        '[' => 0x1B,
+        '\\' => 0x1C,
+        ']' => 0x1D,
+        '^' => 0x1E,
+        '_' => 0x1F,
+        else => null,
+    };
 }
 
 pub fn readSizeWithVaxis(_: ?*anyopaque, tty: *vaxis.Tty) ?Size {
@@ -630,6 +650,46 @@ test "processLoopEvent aggregates bracketed paste content from libvaxis events" 
 
     try std.testing.expect(!paste_active);
     try std.testing.expectEqualStrings("h\ri", result.owned_paste.?);
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .paste = result.owned_paste.? },
+        .consumed = 0,
+    }, result.parsed);
+}
+
+test "processLoopEvent preserves line feeds from bracketed paste parser sequence" {
+    const input = ESC ++ "[200~alpha\nbeta" ++ ESC ++ "[201~";
+
+    var parser: vaxis.Parser = .{};
+    var paste_buffer = std.ArrayList(u8).empty;
+    defer paste_buffer.deinit(std.testing.allocator);
+    var paste_active = false;
+    var index: usize = 0;
+    var maybe_result: ?InputLoopResult = null;
+    defer if (maybe_result) |result| result.deinit(std.testing.allocator);
+
+    while (index < input.len) {
+        const parsed = try parser.parse(input[index..], std.testing.allocator);
+        try std.testing.expect(parsed.n > 0);
+        index += parsed.n;
+
+        const event = parsed.event orelse continue;
+        const loop_event: ?LoopEvent = switch (event) {
+            .key_press => |key| .{ .key_press = key },
+            .paste_start => .paste_start,
+            .paste_end => .paste_end,
+            else => null,
+        };
+        if (loop_event) |value| {
+            if (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, value)) |result| {
+                try std.testing.expect(maybe_result == null);
+                maybe_result = result;
+            }
+        }
+    }
+
+    const result = maybe_result orelse return error.ExpectedPasteResult;
+    try std.testing.expect(!paste_active);
+    try std.testing.expectEqualStrings("alpha\nbeta", result.owned_paste.?);
     try std.testing.expectEqualDeep(keys.ParsedInput{
         .event = .{ .paste = result.owned_paste.? },
         .consumed = 0,
@@ -783,14 +843,18 @@ test "terminal startup and stop sequences include requested mouse reporting" {
     try std.testing.expect(std.mem.indexOf(u8, stopSequence(true, true), Terminal.MOUSE_DISABLE) != null);
 }
 
-test "terminal mouse reporting defaults on and supports explicit opt-out" {
-    try std.testing.expect(shouldUseMouseReportingForEnv(null));
-    try std.testing.expect(shouldUseMouseReportingForEnv(""));
+test "terminal mouse reporting is opt-in and supports explicit opt-out" {
+    try std.testing.expect(!shouldUseMouseReportingForEnv(null));
+    try std.testing.expect(!shouldUseMouseReportingForEnv(""));
     try std.testing.expect(shouldUseMouseReportingForEnv("1"));
     try std.testing.expect(shouldUseMouseReportingForEnv("true"));
+    try std.testing.expect(shouldUseMouseReportingForEnv("yes"));
+    try std.testing.expect(shouldUseMouseReportingForEnv("on"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("0"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("false"));
+    try std.testing.expect(!shouldUseMouseReportingForEnv("no"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("off"));
+    try std.testing.expect(!shouldUseMouseReportingForEnv("unexpected"));
 }
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {

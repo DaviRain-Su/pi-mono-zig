@@ -2631,7 +2631,7 @@ test "empty prompt page bindings scroll chat history instead of editor" {
 
     harness.state.updateChatScrollLayout(40, 10, 0, 80);
     try harness.press(.page_up, .{});
-    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 9), harness.state.chat_scroll_offset);
     try harness.press(.page_down, .{});
     try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
 
@@ -2670,7 +2670,7 @@ test "chat history page scroll uses configured page bindings" {
     try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
 
     try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("u") }, .{ .alt = true });
-    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 9), harness.state.chat_scroll_offset);
     try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("d") }, .{ .alt = true });
     try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
 }

@@ -165,6 +165,7 @@ pub const AppState = struct {
     visible_start_index: usize = 0,
     chat_scroll_offset: usize = 0,
     chat_scroll_max_offset: usize = 0,
+    chat_total_rows: usize = 0,
     chat_visible_rows: usize = 0,
     chat_width: usize = 1,
     chat_region: ChatRegion = .{},
@@ -484,6 +485,7 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
         self.visible_start_index = self.items.items.len;
         self.chat_scroll_offset = 0;
+        self.chat_total_rows = 0;
         self.replaceLabelLocked(&self.status, "display cleared") catch {};
     }
 
@@ -492,10 +494,17 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
         if (!self.chat_region.contains(wheel.row, wheel.col)) return;
         switch (wheel.direction) {
-            .up => self.chat_scroll_offset = @min(
-                self.chat_scroll_offset +| WHEEL_LINES_PER_NOTCH,
-                self.chat_scroll_max_offset,
-            ),
+            .up => {
+                if (self.chat_scroll_offset >= self.chat_scroll_max_offset and
+                    self.revealOlderChatItemsLocked(WHEEL_LINES_PER_NOTCH))
+                {
+                    return;
+                }
+                self.chat_scroll_offset = @min(
+                    self.chat_scroll_offset +| WHEEL_LINES_PER_NOTCH,
+                    self.chat_scroll_max_offset,
+                );
+            },
             .down => self.chat_scroll_offset = self.chat_scroll_offset -| WHEEL_LINES_PER_NOTCH,
         }
     }
@@ -503,8 +512,14 @@ pub const AppState = struct {
     pub fn chatScrollPageUp(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const page_size = self.chatScrollPageSizeLocked();
+        if (self.chat_scroll_offset >= self.chat_scroll_max_offset and
+            self.revealOlderChatItemsLocked(page_size))
+        {
+            return;
+        }
         self.chat_scroll_offset = @min(
-            self.chat_scroll_offset +| self.chatScrollPageSizeLocked(),
+            self.chat_scroll_offset +| page_size,
             self.chat_scroll_max_offset,
         );
     }
@@ -516,7 +531,36 @@ pub const AppState = struct {
     }
 
     fn chatScrollPageSizeLocked(self: *const AppState) usize {
-        return @max(self.chat_visible_rows, 1);
+        return @max(self.chat_visible_rows -| 1, 1);
+    }
+
+    fn revealOlderChatItemsLocked(self: *AppState, min_rows: usize) bool {
+        const item_count = self.items.items.len;
+        const old_start = @min(self.visible_start_index, item_count);
+        if (old_start == 0) {
+            self.visible_start_index = 0;
+            return false;
+        }
+
+        const width = @max(self.chat_width, 1);
+        const target_rows = @max(min_rows, 1);
+        const old_total_rows = estimateChatRows(self.items.items[old_start..], width, self.all_expanded);
+
+        var new_start = old_start;
+        var revealed_item_rows: usize = 0;
+        while (new_start > 0 and revealed_item_rows < target_rows) {
+            new_start -= 1;
+            revealed_item_rows +|= estimateChatItemRowsVisible(self.items.items[new_start], width, self.all_expanded);
+        }
+        if (new_start == old_start) return false;
+
+        const new_total_rows = estimateChatRows(self.items.items[new_start..], width, self.all_expanded);
+        const revealed_rows = new_total_rows -| old_total_rows;
+        self.visible_start_index = new_start;
+        self.chat_total_rows = new_total_rows;
+        self.chat_scroll_max_offset = self.chat_total_rows -| self.chat_visible_rows;
+        self.chat_scroll_offset = @min(self.chat_scroll_offset +| revealed_rows, self.chat_scroll_max_offset);
+        return true;
     }
 
     pub fn chatScrollToTail(self: *AppState) void {
@@ -542,6 +586,7 @@ pub const AppState = struct {
         const start_index = @min(self.visible_start_index, self.items.items.len);
         const total_rows = estimateChatRows(self.items.items[start_index..], @max(self.chat_width, 1), self.all_expanded);
         const max_offset = total_rows -| self.chat_visible_rows;
+        self.chat_total_rows = total_rows;
         self.chat_scroll_max_offset = max_offset;
         self.chat_scroll_offset = if (was_at_tail) 0 else @min(self.chat_scroll_offset, max_offset);
     }
@@ -556,6 +601,11 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const max_offset = total_chat_rows -| visible_rows;
+        const was_at_tail = self.chat_scroll_offset == 0;
+        if (!was_at_tail and total_chat_rows > self.chat_total_rows) {
+            self.chat_scroll_offset +|= total_chat_rows - self.chat_total_rows;
+        }
+        self.chat_total_rows = total_chat_rows;
         self.chat_scroll_max_offset = max_offset;
         self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
         self.chat_visible_rows = visible_rows;
@@ -1015,6 +1065,7 @@ pub const AppState = struct {
         self.visible_start_index = 0;
         self.chat_scroll_offset = 0;
         self.chat_scroll_max_offset = 0;
+        self.chat_total_rows = 0;
         self.chat_visible_rows = 0;
         self.chat_width = 1;
         self.chat_region = .{};
@@ -3892,18 +3943,18 @@ test "chat scroll wheel updates offset only inside chat region and clamps" {
     try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
 
     state.chatScrollPageUp();
-    try std.testing.expectEqual(@as(usize, 10), state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 9), state.chat_scroll_offset);
     state.chatScrollPageUp();
     state.chatScrollPageUp();
     try std.testing.expectEqual(@as(usize, 20), state.chat_scroll_offset);
     state.chatScrollPageDown();
-    try std.testing.expectEqual(@as(usize, 10), state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 11), state.chat_scroll_offset);
     state.chatScrollPageDown();
     state.chatScrollPageDown();
     try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
 }
 
-test "chat scroll tail clear auto-follow and resize clamp state" {
+test "chat scroll tail clear auto-follow append preservation and resize clamp state" {
     const allocator = std.testing.allocator;
     var state = try AppState.init(allocator, std.testing.io);
     defer state.deinit();
@@ -3920,8 +3971,15 @@ test "chat scroll tail clear auto-follow and resize clamp state" {
     try state.appendItemLocked(.info, "preserve reader position");
     try std.testing.expectEqual(@as(usize, 8), state.chat_scroll_offset);
 
+    state.updateChatScrollLayout(35, 10, 3, 80);
+    try std.testing.expectEqual(@as(usize, 13), state.chat_scroll_offset);
+
     state.updateChatScrollLayout(30, 25, 3, 80);
     try std.testing.expectEqual(@as(usize, 5), state.chat_scroll_offset);
+
+    state.chat_scroll_offset = 0;
+    state.updateChatScrollLayout(40, 25, 3, 80);
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
 
     state.clearDisplay();
     try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
@@ -3929,6 +3987,78 @@ test "chat scroll tail clear auto-follow and resize clamp state" {
     state.updateChatScrollLayout(5, 10, 3, 80);
     state.handleChatMouseWheel(.{ .direction = .up, .row = 5, .col = 10 });
     try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+}
+
+test "chat scroll page up at top reveals older hidden items and preserves anchor" {
+    const allocator = std.testing.allocator;
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    for (0..10) |index| {
+        const text = try std.fmt.allocPrint(allocator, "item {d}", .{index});
+        defer allocator.free(text);
+        try state.appendItemLocked(.info, text);
+    }
+
+    state.visible_start_index = 5;
+    const old_total_rows = estimateChatRows(state.items.items[state.visible_start_index..], 80, state.all_expanded);
+    state.updateChatScrollLayout(old_total_rows, 4, 3, 80);
+    state.chat_scroll_offset = state.chat_scroll_max_offset;
+    const old_offset = state.chat_scroll_offset;
+
+    state.chatScrollPageUp();
+
+    try std.testing.expectEqual(@as(usize, 2), state.visible_start_index);
+    try std.testing.expectEqual(old_offset + 3, state.chat_scroll_offset);
+    try std.testing.expectEqual(state.chat_scroll_max_offset, state.chat_scroll_offset);
+}
+
+test "chat scroll wheel at top reveals one notch of older hidden items and preserves anchor" {
+    const allocator = std.testing.allocator;
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    for (0..5) |index| {
+        const text = try std.fmt.allocPrint(allocator, "item {d}", .{index});
+        defer allocator.free(text);
+        try state.appendItemLocked(.info, text);
+    }
+
+    state.visible_start_index = 4;
+    const old_total_rows = estimateChatRows(state.items.items[state.visible_start_index..], 80, state.all_expanded);
+    state.updateChatScrollLayout(old_total_rows, 2, 3, 80);
+    state.chat_scroll_offset = state.chat_scroll_max_offset;
+    const old_offset = state.chat_scroll_offset;
+
+    state.handleChatMouseWheel(.{ .direction = .up, .row = 3, .col = 10 });
+
+    try std.testing.expectEqual(@as(usize, 1), state.visible_start_index);
+    try std.testing.expectEqual(old_offset + WHEEL_LINES_PER_NOTCH, state.chat_scroll_offset);
+    try std.testing.expectEqual(state.chat_scroll_max_offset, state.chat_scroll_offset);
+}
+
+test "chat scroll page up at oldest history is a no-op at top" {
+    const allocator = std.testing.allocator;
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    for (0..5) |index| {
+        const text = try std.fmt.allocPrint(allocator, "item {d}", .{index});
+        defer allocator.free(text);
+        try state.appendItemLocked(.info, text);
+    }
+
+    state.visible_start_index = 0;
+    const old_total_rows = estimateChatRows(state.items.items, 80, state.all_expanded);
+    state.updateChatScrollLayout(old_total_rows, 2, 3, 80);
+    state.chat_scroll_offset = state.chat_scroll_max_offset;
+    const old_offset = state.chat_scroll_offset;
+
+    state.chatScrollPageUp();
+
+    try std.testing.expectEqual(@as(usize, 0), state.visible_start_index);
+    try std.testing.expectEqual(old_offset, state.chat_scroll_offset);
+    try std.testing.expectEqual(old_total_rows -| @as(usize, 2), state.chat_scroll_max_offset);
 }
 
 test "drawChatViewport honors scroll offset and overlays overflow indicators" {
