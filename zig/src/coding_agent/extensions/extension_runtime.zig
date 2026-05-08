@@ -337,6 +337,7 @@ pub const WasmManifestHandoff = struct {
     artifact_path: []const u8,
     artifact_absolute_path: []const u8,
     artifact_sha256: ?[]const u8 = null,
+    package_root_sha256: ?[]const u8 = null,
     tool_id: []const u8,
     tool_description: []const u8,
     input_schema_json: []const u8,
@@ -359,6 +360,7 @@ pub const WasmManifestHandoff = struct {
             .artifact_path = manifest.artifact_path,
             .artifact_absolute_path = manifest.artifact_absolute_path,
             .artifact_sha256 = manifest.artifact_sha256,
+            .package_root_sha256 = manifest.package_root_sha256,
             .tool_id = manifest.tool_id,
             .tool_description = manifest.tool_description,
             .input_schema_json = manifest.input_schema_json,
@@ -570,6 +572,157 @@ pub fn startRuntime(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOp
     };
 }
 
+pub const LockedWasmRuntimeEntry = struct {
+    package_root: []u8,
+    manifest_path: []u8,
+    tool_id: []u8,
+    policy_lookup_key: []u8,
+    adapter: RuntimeAdapter,
+
+    fn deinit(self: *LockedWasmRuntimeEntry, allocator: std.mem.Allocator) void {
+        self.adapter.shutdown() catch {};
+        self.adapter.deinit();
+        allocator.free(self.package_root);
+        allocator.free(self.manifest_path);
+        allocator.free(self.tool_id);
+        allocator.free(self.policy_lookup_key);
+        self.* = undefined;
+    }
+};
+
+pub const LockedWasmRuntimeSet = struct {
+    allocator: std.mem.Allocator,
+    entries: []LockedWasmRuntimeEntry,
+    diagnostics: []resources_mod.Diagnostic,
+
+    pub fn deinit(self: *LockedWasmRuntimeSet) void {
+        for (self.entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.entries);
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(self.allocator);
+        self.allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+
+    pub fn agentTool(self: *LockedWasmRuntimeSet, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+        for (self.entries) |entry| {
+            if (try entry.adapter.agentTool(allocator, name)) |tool| return tool;
+        }
+        return null;
+    }
+
+    pub fn unloadPackage(self: *LockedWasmRuntimeSet, package_root: []const u8) !bool {
+        var list = std.ArrayList(LockedWasmRuntimeEntry).fromOwnedSlice(self.entries);
+        self.entries = &.{};
+        var removed = false;
+        var index: usize = 0;
+        while (index < list.items.len) {
+            if (!std.mem.eql(u8, list.items[index].package_root, package_root)) {
+                index += 1;
+                continue;
+            }
+            var entry = list.orderedRemove(index);
+            entry.deinit(self.allocator);
+            removed = true;
+        }
+        self.entries = try list.toOwnedSlice(self.allocator);
+        return removed;
+    }
+};
+
+pub fn startLockedWasmPackageRuntimes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *const config_mod.RuntimeConfig,
+    options: resources_mod.ResolveResourcesOptions,
+) !LockedWasmRuntimeSet {
+    var resolved = try resources_mod.resolveConfiguredLockedWasmPackages(allocator, io, options);
+    defer resolved.deinit(allocator);
+
+    var diagnostics = std.ArrayList(resources_mod.Diagnostic).empty;
+    errdefer deinitResourceDiagnosticsList(allocator, &diagnostics);
+    for (resolved.diagnostics) |diagnostic| {
+        try diagnostics.append(allocator, try cloneResourceDiagnostic(allocator, diagnostic));
+    }
+
+    var entries = std.ArrayList(LockedWasmRuntimeEntry).empty;
+    errdefer deinitLockedWasmRuntimeEntryList(allocator, &entries);
+    var seen_tools = std.StringHashMap(void).init(allocator);
+    defer seen_tools.deinit();
+
+    for (resolved.packages) |package| {
+        var handoff = WasmManifestHandoff.fromManifest(&package.manifest);
+        const policy_key = try wasmPolicyLookupKey(allocator, handoff);
+        defer allocator.free(policy_key);
+        handoff.policy_lookup_key = policy_key;
+
+        const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", "missing digest-bound wasm extension policy", package.manifest.manifest_path));
+            continue;
+        };
+        const approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
+        defer allocator.free(approved_capabilities);
+        handoff.approved_capabilities = approved_capabilities;
+        handoff.resource_limits = enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits);
+
+        const seen = try seen_tools.getOrPut(package.manifest.tool_id);
+        if (seen.found_existing) {
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_wasm_tool", "duplicate locked wasm tool id", package.manifest.manifest_path));
+            continue;
+        }
+
+        const adapter = startRuntime(allocator, io, .{ .wasm = .{ .manifest = handoff } }) catch |err| {
+            _ = seen_tools.remove(package.manifest.tool_id);
+            const message = try std.fmt.allocPrint(allocator, "wasm runtime handoff failed: {s}", .{@errorName(err)});
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "runtime_handoff_failed", message, package.manifest.manifest_path));
+            continue;
+        };
+        {
+            var entry = LockedWasmRuntimeEntry{
+                .package_root = try allocator.dupe(u8, package.manifest.package_root),
+                .manifest_path = try allocator.dupe(u8, package.manifest.manifest_path),
+                .tool_id = try allocator.dupe(u8, package.manifest.tool_id),
+                .policy_lookup_key = try allocator.dupe(u8, policy_key),
+                .adapter = adapter,
+            };
+            errdefer entry.deinit(allocator);
+            try entries.append(allocator, entry);
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .entries = try entries.toOwnedSlice(allocator),
+        .diagnostics = try diagnostics.toOwnedSlice(allocator),
+    };
+}
+
+fn deinitLockedWasmRuntimeEntryList(allocator: std.mem.Allocator, entries: *std.ArrayList(LockedWasmRuntimeEntry)) void {
+    for (entries.items) |*entry| entry.deinit(allocator);
+    entries.deinit(allocator);
+}
+
+fn cloneResourceDiagnostic(allocator: std.mem.Allocator, diagnostic: resources_mod.Diagnostic) !resources_mod.Diagnostic {
+    return .{
+        .kind = try allocator.dupe(u8, diagnostic.kind),
+        .message = try allocator.dupe(u8, diagnostic.message),
+        .path = if (diagnostic.path) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn makeResourceDiagnostic(allocator: std.mem.Allocator, kind: []const u8, message: []const u8, path: []const u8) !resources_mod.Diagnostic {
+    return .{
+        .kind = try allocator.dupe(u8, kind),
+        .message = try allocator.dupe(u8, message),
+        .path = try allocator.dupe(u8, path),
+    };
+}
+
+fn deinitResourceDiagnosticsList(allocator: std.mem.Allocator, diagnostics: *std.ArrayList(resources_mod.Diagnostic)) void {
+    for (diagnostics.items) |*diagnostic| diagnostic.deinit(allocator);
+    diagnostics.deinit(allocator);
+}
+
 pub fn startProcessJsonl(allocator: std.mem.Allocator, io: std.Io, options: ProcessJsonlOptions) !RuntimeAdapter {
     const host = try extension_host.HostProcess.start(allocator, io, options);
     return .{
@@ -680,6 +833,8 @@ const OwnedWasmManifest = struct {
     artifact_kind: wasm_manifest.ArtifactKind,
     artifact_path: []u8,
     artifact_absolute_path: []u8,
+    artifact_sha256: ?[]u8,
+    package_root_sha256: ?[]u8,
     tool_id: []u8,
     tool_description: []u8,
     input_schema_json: []u8,
@@ -707,6 +862,10 @@ const OwnedWasmManifest = struct {
         errdefer allocator.free(artifact_path);
         const artifact_absolute_path = try allocator.dupe(u8, handoff.artifact_absolute_path);
         errdefer allocator.free(artifact_absolute_path);
+        const artifact_sha256 = if (handoff.artifact_sha256) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (artifact_sha256) |value| allocator.free(value);
+        const package_root_sha256 = if (handoff.package_root_sha256) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (package_root_sha256) |value| allocator.free(value);
         const tool_id = try allocator.dupe(u8, handoff.tool_id);
         errdefer allocator.free(tool_id);
         const tool_description = try allocator.dupe(u8, handoff.tool_description);
@@ -732,6 +891,8 @@ const OwnedWasmManifest = struct {
             .artifact_kind = handoff.artifact_kind,
             .artifact_path = artifact_path,
             .artifact_absolute_path = artifact_absolute_path,
+            .artifact_sha256 = artifact_sha256,
+            .package_root_sha256 = package_root_sha256,
             .tool_id = tool_id,
             .tool_description = tool_description,
             .input_schema_json = input_schema_json,
@@ -752,6 +913,8 @@ const OwnedWasmManifest = struct {
         allocator.free(self.description);
         allocator.free(self.artifact_path);
         allocator.free(self.artifact_absolute_path);
+        if (self.artifact_sha256) |value| allocator.free(value);
+        if (self.package_root_sha256) |value| allocator.free(value);
         allocator.free(self.tool_id);
         allocator.free(self.tool_description);
         allocator.free(self.input_schema_json);
@@ -972,6 +1135,14 @@ const WasmRuntime = struct {
         if (wrote_source) try envelope.writer.writeAll(",");
         try envelope.writer.writeAll("\"artifactPath\":");
         try std.json.Stringify.value(self.manifest.artifact_path, .{}, &envelope.writer);
+        if (self.manifest.artifact_sha256) |artifact_sha256| {
+            try envelope.writer.writeAll(",\"artifactSha256\":");
+            try std.json.Stringify.value(artifact_sha256, .{}, &envelope.writer);
+        }
+        if (self.manifest.package_root_sha256) |package_root_sha256| {
+            try envelope.writer.writeAll(",\"packageRootSha256\":");
+            try std.json.Stringify.value(package_root_sha256, .{}, &envelope.writer);
+        }
         try envelope.writer.writeAll("}");
         try envelope.writer.writeAll(",\"message\":\"wasm tool execution denied by enforcement substrate\"}");
         try self.state.addDiagnostic(.host_error, .@"error", envelope.written());
@@ -2491,6 +2662,185 @@ test "persisted wasm extension policy resource limits reach tool enforcement dia
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"manifestPath\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"toolId\":\"builtin.truncateHead\"") != null);
+}
+
+test "locked wasm packages resolve to policy gated runtime set and unload cleanly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/pkg/wasm");
+
+    const fixture_manifest = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0/pi-extension.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(fixture_manifest);
+    const fixture_wasm = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0/wasm/plugin.wasm", allocator, .limited(1024 * 1024));
+    defer allocator.free(fixture_wasm);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/pkg/pi-extension.json", .data = fixture_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/pkg/wasm/plugin.wasm", .data = fixture_wasm });
+
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const package_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/pkg");
+    defer allocator.free(package_root);
+
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    var lock_entry = try @import("../packages/provenance_lockfile.zig").createWasmLockEntry(allocator, .user, manifest_result.valid.package_root, &manifest_result.valid);
+    defer lock_entry.deinit(allocator);
+    const lock_path = try @import("../packages/provenance_lockfile.zig").lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    try @import("../packages/provenance_lockfile.zig").writeEntry(allocator, std.testing.io, .user, lock_path, lock_entry);
+
+    const policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(policy_key);
+    const settings_json = try std.fmt.allocPrint(allocator,
+        \\{{"packages":["{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["builtin.truncateHead"]}}}}}}}}
+    , .{ package_root, policy_key });
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer @import("ai").model_registry.resetForTesting();
+
+    var runtime_set = try startLockedWasmPackageRuntimes(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = runtime_config.agent_dir,
+        .global = resources_mod.SettingsResources{ .packages = runtime_config.global_settings.packages },
+        .project = resources_mod.SettingsResources{ .packages = runtime_config.project_settings.packages },
+    });
+    defer runtime_set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), runtime_set.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime_set.diagnostics.len);
+    var agent_tool = (try runtime_set.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &agent_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\\nbravo\\ncharlie\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+    defer success_params.deinit();
+    const success = try agent_tool.execute.?(allocator, "locked-package-success", success_params.value, agent_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    try std.testing.expect(std.mem.indexOf(u8, success.content[0].text.text, "\"content\":\"alpha\\nbravo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasmRuntime(runtime_set.entries[0].adapter.ptr).manifest.policy_lookup_key.?, manifest_result.valid.artifact_sha256) != null);
+
+    try std.testing.expect(try runtime_set.unloadPackage(package_root));
+    try std.testing.expectEqual(@as(usize, 0), runtime_set.entries.len);
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "builtin.truncateHead"));
+}
+
+test "locked wasm runtime set omits missing policy and abi invalid packages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/no-policy/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "project/invalid-abi/wasm");
+
+    const manifest_template =
+        \\{{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "{s}",
+        \\  "name": "{s}",
+        \\  "version": "0.1.0",
+        \\  "description": "Runtime omission fixture.",
+        \\  "artifact": {{ "kind": "wasm-component", "path": "wasm/plugin.wasm" }},
+        \\  "tool": {{
+        \\    "id": "{s}",
+        \\    "description": "Runtime omission tool.",
+        \\    "inputSchema": {{}},
+        \\    "outputSchema": {{}}
+        \\  }},
+        \\  "capabilities": []
+        \\}}
+    ;
+    const no_policy_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.no-policy", "No Policy", "example.noPolicy" });
+    defer allocator.free(no_policy_manifest);
+    const invalid_abi_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.invalid-abi", "Invalid ABI", "example.invalidAbi" });
+    defer allocator.free(invalid_abi_manifest);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/no-policy/pi-extension.json", .data = no_policy_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/no-policy/wasm/plugin.wasm", .data = "\x00asm" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi/pi-extension.json", .data = invalid_abi_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi/wasm/plugin.wasm", .data = "\x00asm" });
+
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const no_policy_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/no-policy");
+    defer allocator.free(no_policy_root);
+    const invalid_abi_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/invalid-abi");
+    defer allocator.free(invalid_abi_root);
+
+    const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+
+    var no_policy_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, no_policy_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer no_policy_result.deinit(allocator);
+    try std.testing.expect(no_policy_result == .valid);
+    var no_policy_lock = try provenance_lockfile.createWasmLockEntry(allocator, .user, no_policy_result.valid.package_root, &no_policy_result.valid);
+    defer no_policy_lock.deinit(allocator);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, no_policy_lock);
+
+    var invalid_abi_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, invalid_abi_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer invalid_abi_result.deinit(allocator);
+    try std.testing.expect(invalid_abi_result == .valid);
+    var invalid_abi_lock = try provenance_lockfile.createWasmLockEntry(allocator, .user, invalid_abi_result.valid.package_root, &invalid_abi_result.valid);
+    defer invalid_abi_lock.deinit(allocator);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, invalid_abi_lock);
+
+    const invalid_policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&invalid_abi_result.valid));
+    defer allocator.free(invalid_policy_key);
+    const settings_json = try std.fmt.allocPrint(allocator,
+        \\{{"packages":["{s}","{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["example.invalidAbi"]}}}}}}}}
+    , .{ no_policy_root, invalid_abi_root, invalid_policy_key });
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer @import("ai").model_registry.resetForTesting();
+
+    var runtime_set = try startLockedWasmPackageRuntimes(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = runtime_config.agent_dir,
+        .global = resources_mod.SettingsResources{ .packages = runtime_config.global_settings.packages },
+        .project = resources_mod.SettingsResources{ .packages = runtime_config.project_settings.packages },
+    });
+    defer runtime_set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), runtime_set.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), runtime_set.diagnostics.len);
+    var missing_policy_seen = false;
+    var handoff_failure_seen = false;
+    for (runtime_set.diagnostics) |diagnostic| {
+        if (std.mem.eql(u8, diagnostic.kind, "missing_policy")) missing_policy_seen = true;
+        if (std.mem.eql(u8, diagnostic.kind, "runtime_handoff_failed")) handoff_failure_seen = true;
+    }
+    try std.testing.expect(missing_policy_seen);
+    try std.testing.expect(handoff_failure_seen);
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "example.noPolicy"));
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "example.invalidAbi"));
 }
 
 test "wasm manifest handoff owns and enforces tool scopes after source deinit" {

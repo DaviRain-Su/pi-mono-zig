@@ -118,6 +118,32 @@ pub const ResolvedPaths = struct {
     }
 };
 
+pub const LockedWasmPackage = struct {
+    source_info: SourceInfo,
+    manifest: wasm_manifest.Manifest,
+    lock_entry: provenance_lockfile.LockEntry,
+
+    pub fn deinit(self: *LockedWasmPackage, allocator: std.mem.Allocator) void {
+        self.source_info.deinit(allocator);
+        self.manifest.deinit(allocator);
+        self.lock_entry.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const LockedWasmPackageResolution = struct {
+    packages: []LockedWasmPackage,
+    diagnostics: []Diagnostic,
+
+    pub fn deinit(self: *LockedWasmPackageResolution, allocator: std.mem.Allocator) void {
+        for (self.packages) |*package| package.deinit(allocator);
+        allocator.free(self.packages);
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
 pub const PackageSourceConfig = struct {
     source: []u8,
     extensions: ?[]const []const u8 = null,
@@ -374,6 +400,34 @@ pub fn resolveConfiguredResources(
         .skills = try skills.toOwnedSlice(allocator),
         .prompts = try prompts.toOwnedSlice(allocator),
         .themes = try themes.toOwnedSlice(allocator),
+        .diagnostics = try diagnostics.toOwnedSlice(allocator),
+    };
+}
+
+pub fn resolveConfiguredLockedWasmPackages(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ResolveResourcesOptions,
+) !LockedWasmPackageResolution {
+    var diagnostics = std.ArrayList(Diagnostic).empty;
+    errdefer deinitDiagnosticsList(allocator, &diagnostics);
+    var packages = std.ArrayList(LockedWasmPackage).empty;
+    errdefer deinitLockedWasmPackageList(allocator, &packages);
+
+    try addLockedWasmPackageSources(allocator, io, &packages, &diagnostics, options.project.packages, .project, options.cwd, options.agent_dir);
+    try addLockedWasmPackageSources(allocator, io, &packages, &diagnostics, options.global.packages, .user, options.cwd, options.agent_dir);
+
+    std.mem.sort(LockedWasmPackage, packages.items, {}, struct {
+        fn lessThan(_: void, lhs: LockedWasmPackage, rhs: LockedWasmPackage) bool {
+            const left_scope = @intFromEnum(lhs.source_info.scope);
+            const right_scope = @intFromEnum(rhs.source_info.scope);
+            if (left_scope != right_scope) return left_scope < right_scope;
+            return std.mem.lessThan(u8, lhs.manifest.package_root, rhs.manifest.package_root);
+        }
+    }.lessThan);
+
+    return .{
+        .packages = try packages.toOwnedSlice(allocator),
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
 }
@@ -926,6 +980,76 @@ fn addPackageSources(
     }
 }
 
+fn addLockedWasmPackageSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: *std.ArrayList(LockedWasmPackage),
+    diagnostics: *std.ArrayList(Diagnostic),
+    configured_packages: ?[]const PackageSourceConfig,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !void {
+    const package_list = configured_packages orelse return;
+    for (package_list) |pkg| {
+        const parsed = parseSource(pkg.source);
+        switch (parsed) {
+            .local => |local| {
+                const base_dir = switch (scope) {
+                    .project => try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" }),
+                    .user => agent_dir,
+                    .temporary => cwd,
+                };
+                defer if (scope == .project) allocator.free(base_dir);
+                const resolved = try resolvePath(allocator, base_dir, local.path);
+                defer allocator.free(resolved);
+                try appendLockedWasmPackageIfValid(allocator, io, packages, diagnostics, resolved, pkg.source, scope, cwd, agent_dir);
+            },
+            .npm => |npm| {
+                const install_path = try npmInstallPath(allocator, scope, cwd, agent_dir, npm.name);
+                defer allocator.free(install_path);
+                if (!pathExists(io, install_path)) {
+                    try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "npm source is not installed", install_path));
+                    continue;
+                }
+                try appendLockedWasmPackageIfValid(allocator, io, packages, diagnostics, install_path, pkg.source, scope, cwd, agent_dir);
+            },
+            .git => |git| {
+                const install_path = try gitInstallPath(allocator, scope, cwd, agent_dir, git.normalized);
+                defer allocator.free(install_path);
+                if (!pathExists(io, install_path)) {
+                    try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "git source is not installed", install_path));
+                    continue;
+                }
+                try appendLockedWasmPackageIfValid(allocator, io, packages, diagnostics, install_path, pkg.source, scope, cwd, agent_dir);
+            },
+        }
+    }
+}
+
+fn appendLockedWasmPackageIfValid(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: *std.ArrayList(LockedWasmPackage),
+    diagnostics: *std.ArrayList(Diagnostic),
+    package_root: []const u8,
+    source: []const u8,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !void {
+    if (try verifyLockedWasmPackageDetailed(allocator, io, diagnostics, package_root, source, scope, cwd, agent_dir)) |package| {
+        for (packages.items) |existing| {
+            if (std.mem.eql(u8, existing.lock_entry.key, package.lock_entry.key)) {
+                var duplicate = package;
+                duplicate.deinit(allocator);
+                return;
+            }
+        }
+        try packages.append(allocator, package);
+    }
+}
+
 fn verifyLockedWasmPackageForResources(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -977,6 +1101,86 @@ fn verifyLockedWasmPackageForResources(
     _ = source;
     try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lock_entry", "missing extension provenance lock entry", lock_path));
     return false;
+}
+
+fn verifyLockedWasmPackageDetailed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    package_root: []const u8,
+    source: []const u8,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !?LockedWasmPackage {
+    if (scope == .temporary) return null;
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    if (!pathExists(io, manifest_path)) return null;
+
+    const provenance_scope: provenance_lockfile.Scope = if (scope == .project) .project else .user;
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
+    defer allocator.free(lock_path);
+
+    var current_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer current_result.deinit(allocator);
+    if (current_result != .valid) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_validation_failed", "wasm package validation failed", manifest_path));
+        return null;
+    }
+
+    var loaded = try provenance_lockfile.readLockfile(allocator, io, provenance_scope, lock_path, "resolve");
+    defer loaded.deinit(allocator);
+    if (loaded.diagnostic) |diagnostic| {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, diagnostic.category, diagnostic.message, lock_path));
+        return null;
+    }
+    if (!pathExists(io, lock_path)) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lockfile", "missing extension provenance lockfile", lock_path));
+        return null;
+    }
+
+    var current_entry = try provenance_lockfile.createWasmLockEntry(allocator, provenance_scope, current_result.valid.package_root, &current_result.valid);
+    defer current_entry.deinit(allocator);
+    var matched_entry: ?provenance_lockfile.LockEntry = null;
+    for (loaded.entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, current_entry.key)) continue;
+        if (provenance_lockfile.entriesEqual(entry, current_entry)) {
+            matched_entry = entry;
+            break;
+        }
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_root_digest_mismatch", "extension provenance drift", package_root));
+        return null;
+    }
+
+    if (matched_entry == null) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lock_entry", "missing extension provenance lock entry", lock_path));
+        return null;
+    }
+
+    const cloned_manifest = try cloneWasmManifest(allocator, current_result.valid);
+    errdefer {
+        var manifest = cloned_manifest;
+        manifest.deinit(allocator);
+    }
+    const cloned_entry = try matched_entry.?.clone(allocator);
+    errdefer {
+        var entry = cloned_entry;
+        entry.deinit(allocator);
+    }
+    return .{
+        .source_info = .{
+            .path = try allocator.dupe(u8, package_root),
+            .source = try allocator.dupe(u8, source),
+            .scope = scope,
+            .origin = .package,
+            .base_dir = try allocator.dupe(u8, package_root),
+        },
+        .manifest = cloned_manifest,
+        .lock_entry = cloned_entry,
+    };
 }
 
 fn collectPackageResourceRoot(
@@ -1959,6 +2163,82 @@ fn freeOwnedStringArrayList(allocator: std.mem.Allocator, list: *std.ArrayList([
     list.deinit(allocator);
 }
 
+fn cloneWasmManifest(allocator: std.mem.Allocator, manifest: wasm_manifest.Manifest) !wasm_manifest.Manifest {
+    const package_root = try allocator.dupe(u8, manifest.package_root);
+    errdefer allocator.free(package_root);
+    const manifest_path = try allocator.dupe(u8, manifest.manifest_path);
+    errdefer allocator.free(manifest_path);
+    const schema_version = try allocator.dupe(u8, manifest.schema_version);
+    errdefer allocator.free(schema_version);
+    const id = try allocator.dupe(u8, manifest.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, manifest.name);
+    errdefer allocator.free(name);
+    const version = try allocator.dupe(u8, manifest.version);
+    errdefer allocator.free(version);
+    const description = try allocator.dupe(u8, manifest.description);
+    errdefer allocator.free(description);
+    const artifact_path = try allocator.dupe(u8, manifest.artifact_path);
+    errdefer allocator.free(artifact_path);
+    const artifact_absolute_path = try allocator.dupe(u8, manifest.artifact_absolute_path);
+    errdefer allocator.free(artifact_absolute_path);
+    const artifact_sha256 = try allocator.dupe(u8, manifest.artifact_sha256);
+    errdefer allocator.free(artifact_sha256);
+    const package_root_sha256 = try allocator.dupe(u8, manifest.package_root_sha256);
+    errdefer allocator.free(package_root_sha256);
+    const tool_id = try allocator.dupe(u8, manifest.tool_id);
+    errdefer allocator.free(tool_id);
+    const tool_description = try allocator.dupe(u8, manifest.tool_description);
+    errdefer allocator.free(tool_description);
+    const input_schema_json = try allocator.dupe(u8, manifest.input_schema_json);
+    errdefer allocator.free(input_schema_json);
+    const output_schema_json = try allocator.dupe(u8, manifest.output_schema_json);
+    errdefer allocator.free(output_schema_json);
+    const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, manifest.requested_capabilities);
+    errdefer allocator.free(requested_capabilities);
+    var resource_limits = try cloneWasmResourceLimits(allocator, manifest.resource_limits);
+    errdefer resource_limits.deinit(allocator);
+
+    return .{
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .schema_version = schema_version,
+        .id = id,
+        .name = name,
+        .version = version,
+        .description = description,
+        .artifact_kind = manifest.artifact_kind,
+        .artifact_path = artifact_path,
+        .artifact_absolute_path = artifact_absolute_path,
+        .artifact_sha256 = artifact_sha256,
+        .package_root_sha256 = package_root_sha256,
+        .tool_id = tool_id,
+        .tool_description = tool_description,
+        .input_schema_json = input_schema_json,
+        .output_schema_json = output_schema_json,
+        .requested_capabilities = requested_capabilities,
+        .resource_limits = resource_limits,
+    };
+}
+
+fn cloneWasmResourceLimits(allocator: std.mem.Allocator, limits: wasm_manifest.ResourceLimits) !wasm_manifest.ResourceLimits {
+    const tool_scopes = try allocator.alloc([]u8, limits.tool_scopes.len);
+    errdefer allocator.free(tool_scopes);
+    for (limits.tool_scopes, 0..) |scope, index| {
+        tool_scopes[index] = try allocator.dupe(u8, scope);
+        errdefer allocator.free(tool_scopes[index]);
+    }
+    return .{
+        .max_children = limits.max_children,
+        .depth = limits.depth,
+        .turns = limits.turns,
+        .timeout_ms = limits.timeout_ms,
+        .output_bytes = limits.output_bytes,
+        .output_lines = limits.output_lines,
+        .tool_scopes = tool_scopes,
+    };
+}
+
 fn sliceConst(items: [][]u8) []const []const u8 {
     return @ptrCast(items);
 }
@@ -1969,6 +2249,11 @@ fn deinitResolvedSlice(allocator: std.mem.Allocator, items: []ResolvedResource) 
 }
 
 fn deinitResolvedList(allocator: std.mem.Allocator, items: *std.ArrayList(ResolvedResource)) void {
+    for (items.items) |*item| item.deinit(allocator);
+    items.deinit(allocator);
+}
+
+fn deinitLockedWasmPackageList(allocator: std.mem.Allocator, items: *std.ArrayList(LockedWasmPackage)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.deinit(allocator);
 }
@@ -2231,6 +2516,81 @@ test "resolveConfiguredResources denies wasm package resources without valid sco
     try std.testing.expectEqual(@as(usize, 0), malformed_lock.extensions.len);
     try std.testing.expectEqual(@as(usize, 1), malformed_lock.diagnostics.len);
     try std.testing.expectEqualStrings("malformed_lockfile", malformed_lock.diagnostics[0].kind);
+}
+
+test "resolveConfiguredLockedWasmPackages discovers only configured scope locked packages" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/locked/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/unlocked/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const manifest_json =
+        \\{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "com.example.locked-runtime",
+        \\  "name": "Locked Runtime",
+        \\  "version": "0.1.0",
+        \\  "description": "Locked runtime fixture.",
+        \\  "artifact": { "kind": "wasm-component", "path": "wasm/plugin.wasm" },
+        \\  "tool": {
+        \\    "id": "example.lockedRuntime",
+        \\    "description": "Locked runtime tool.",
+        \\    "inputSchema": {},
+        \\    "outputSchema": {}
+        \\  },
+        \\  "capabilities": []
+        \\}
+    ;
+    inline for (&.{ "locked", "unlocked" }) |name| {
+        const manifest_path = try std.fmt.allocPrint(allocator, "repo/fixtures/{s}/pi-extension.json", .{name});
+        defer allocator.free(manifest_path);
+        const artifact_path = try std.fmt.allocPrint(allocator, "repo/fixtures/{s}/wasm/plugin.wasm", .{name});
+        defer allocator.free(artifact_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest_json });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_path, .data = "\x00asm" });
+    }
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const locked_root = try makeTmpPath(allocator, tmp, "repo/fixtures/locked");
+    defer allocator.free(locked_root);
+    const unlocked_root = try makeTmpPath(allocator, tmp, "repo/fixtures/unlocked");
+    defer allocator.free(unlocked_root);
+
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, locked_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    var lock_entry = try provenance_lockfile.createWasmLockEntry(allocator, .user, manifest_result.valid.package_root, &manifest_result.valid);
+    defer lock_entry.deinit(allocator);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, cwd, agent_dir);
+    defer allocator.free(lock_path);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, lock_entry);
+
+    var locked_config = PackageSourceConfig{ .source = try allocator.dupe(u8, locked_root) };
+    defer locked_config.deinit(allocator);
+    var unlocked_config = PackageSourceConfig{ .source = try allocator.dupe(u8, unlocked_root) };
+    defer unlocked_config.deinit(allocator);
+
+    var resolved = try resolveConfiguredLockedWasmPackages(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{ locked_config, unlocked_config } },
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.packages.len);
+    try std.testing.expectEqualStrings("com.example.locked-runtime", resolved.packages[0].manifest.id);
+    try std.testing.expectEqualStrings("example.lockedRuntime", resolved.packages[0].manifest.tool_id);
+    try std.testing.expectEqual(provenance_lockfile.Scope.user, resolved.packages[0].lock_entry.scope);
+    try std.testing.expectEqualStrings(locked_root, resolved.packages[0].source_info.base_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), resolved.diagnostics.len);
+    try std.testing.expectEqualStrings("missing_lock_entry", resolved.diagnostics[0].kind);
 }
 
 test "loadResourceBundle loads skills templates and themes with selected theme" {
