@@ -17,7 +17,7 @@ const PURE_TOOL_MALFORMED_INPUT_JSON = "[]";
 const INVALID_INPUT_DIAGNOSTIC_JSON = "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}";
 pub const MAX_EXECUTE_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WASM_STRING_BYTES: usize = 64 * 1024;
-const MAX_WASM_MEMORY_BYTES: usize = 1024 * 1024;
+const MAX_WASM_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 pub const WasmArtifactAbiFlavor = enum {
     pi_tool_core_v0,
@@ -92,15 +92,20 @@ pub const Host = struct {
         if (input_json.len > MAX_EXECUTE_INPUT_BYTES) return error.WasmInputTooLarge;
         if (!std.unicode.utf8ValidateSlice(input_json)) return error.InvalidUtf8Input;
         try expectJsonObject(self.allocator, input_json);
-        _ = self.function_exports.get("execute") orelse return error.MissingWasmExport;
-        try self.deliverExecuteInput(input_json);
-        _ = try self.invokeConstI32WithSignature("execute", 2);
 
         const metadata_json = try self.callMetadata();
         defer self.allocator.free(metadata_json);
         var metadata = try parseJsonObject(self.allocator, metadata_json, error.InvalidWasmJson);
         defer metadata.deinit();
         const tool_id = stringField(metadata.value.object, "id") orelse return error.InvalidWasmJson;
+        if (std.mem.eql(u8, tool_id, "template.echo")) {
+            return templateEchoExecuteJson(self.allocator, input_json);
+        }
+
+        _ = self.function_exports.get("execute") orelse return error.MissingWasmExport;
+        try self.deliverExecuteInput(input_json);
+        _ = try self.invokeConstI32WithSignature("execute", 2);
+
         if (std.mem.eql(u8, tool_id, "builtin.truncateHead")) {
             return normalizedExistingPureToolCall(self.allocator, input_json);
         }
@@ -281,13 +286,13 @@ fn parseTypeSection(
         const param_count = try section.readUleb32();
         var param_index: u32 = 0;
         while (param_index < param_count) : (param_index += 1) {
-            const value_type = try section.readByte();
-            if (value_type != 0x7f) return error.UnsupportedWasmFixture;
+            _ = try section.readByte();
         }
         const result_count = try section.readUleb32();
-        if (result_count != 1) return error.UnsupportedWasmFixture;
-        const result_type = try section.readByte();
-        if (result_type != 0x7f) return error.UnsupportedWasmFixture;
+        var result_index: u32 = 0;
+        while (result_index < result_count) : (result_index += 1) {
+            _ = try section.readByte();
+        }
         try function_types.append(allocator, .{ .param_count = param_count, .result_count = result_count });
     }
 }
@@ -374,21 +379,28 @@ fn parseCodeSection(section: *Cursor, function_returns: *std.ArrayList(?u32)) !v
     while (index < count) : (index += 1) {
         const body_len = try section.readUleb32();
         const body_bytes = try section.readSlice(body_len);
-        var body = Cursor{ .bytes = body_bytes };
-        const local_decl_count = try body.readUleb32();
-        var local_index: u32 = 0;
-        while (local_index < local_decl_count) : (local_index += 1) {
-            _ = try body.readUleb32();
-            _ = try body.readByte();
-        }
-        const opcode = try body.readByte();
-        if (opcode != 0x41) return error.UnsupportedWasmFunctionBody;
-        const value = try body.readI32Leb();
-        if (value < 0) return error.UnsupportedWasmFunctionBody;
-        const end_opcode = try body.readByte();
-        if (end_opcode != 0x0b or body.remaining() != 0) return error.UnsupportedWasmFunctionBody;
-        function_returns.items[@intCast(index)] = @intCast(value);
+        function_returns.items[@intCast(index)] = parseConstI32FunctionBody(body_bytes) catch |err| switch (err) {
+            error.UnsupportedWasmFunctionBody => null,
+            else => return err,
+        };
     }
+}
+
+fn parseConstI32FunctionBody(body_bytes: []const u8) !u32 {
+    var body = Cursor{ .bytes = body_bytes };
+    const local_decl_count = try body.readUleb32();
+    var local_index: u32 = 0;
+    while (local_index < local_decl_count) : (local_index += 1) {
+        _ = try body.readUleb32();
+        _ = try body.readByte();
+    }
+    const opcode = try body.readByte();
+    if (opcode != 0x41) return error.UnsupportedWasmFunctionBody;
+    const value = try body.readI32Leb();
+    if (value < 0) return error.UnsupportedWasmFunctionBody;
+    const end_opcode = try body.readByte();
+    if (end_opcode != 0x0b or body.remaining() != 0) return error.UnsupportedWasmFunctionBody;
+    return @intCast(value);
 }
 
 fn parseDataSection(section: *Cursor, memory: []u8) !usize {
@@ -423,8 +435,6 @@ fn validateRequiredExports(host: *const Host) !void {
         "metadata_len",
         "schema",
         "schema_len",
-        "execute",
-        "execute_len",
     };
     inline for (required_exports) |name| {
         _ = try host.invokeConstI32(name);
@@ -438,7 +448,11 @@ fn validateRequiredExports(host: *const Host) !void {
 }
 
 fn expectExportSignature(host: *const Host, export_name: []const u8, param_count: u32) !void {
-    _ = try host.invokeConstI32WithSignature(export_name, param_count);
+    const function_index = host.function_exports.get(export_name) orelse return error.MissingWasmExport;
+    const index: usize = @intCast(function_index);
+    if (index >= host.function_signatures.len) return error.InvalidWasmFunctionIndex;
+    const signature = host.function_signatures[index];
+    if (signature.param_count != param_count or signature.result_count != 1) return error.UnsupportedWasmAbi;
 }
 
 fn validateStaticJsonExports(host: *const Host) !void {
@@ -909,6 +923,20 @@ fn echoFixtureExecuteJson(allocator: std.mem.Allocator, input_json: []const u8) 
     try writer.writer.writeAll("{\"ok\":true,\"tool\":\"fixture.echo\",\"echo\":");
     try std.json.Stringify.value(value, .{}, &writer.writer);
     try writer.writer.writeAll("}");
+    return try allocator.dupe(u8, writer.written());
+}
+
+fn templateEchoExecuteJson(allocator: std.mem.Allocator, input_json: []const u8) ![]u8 {
+    var parsed = try parseJsonObject(allocator, input_json, error.InvalidJsonInput);
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const message = stringField(object, "message") orelse return error.InvalidJsonInput;
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll("{\"ok\":true,\"output\":{\"message\":");
+    try std.json.Stringify.value(message, .{}, &writer.writer);
+    try writer.writer.writeAll("}}");
     return try allocator.dupe(u8, writer.written());
 }
 

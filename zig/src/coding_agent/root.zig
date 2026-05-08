@@ -23,6 +23,7 @@ pub const wasm_sdk = @import("extensions/wasm/pi_extension_sdk.zig");
 pub const wasm_wit_contract = @import("extensions/wasm/wasm_wit_contract.zig");
 pub const wasm_host_spike = @import("extensions/wasm/wasm_host_spike.zig");
 pub const wasm_sdk_template_tests = @import("extensions/wasm/sdk_template_tests.zig");
+pub const wasm_author_workflow_e2e_tests = @import("extensions/wasm/author_workflow_e2e_tests.zig");
 pub const package_manager = @import("packages/package_manager.zig");
 pub const provider_config = @import("providers/provider_config.zig");
 pub const oauth_callback_listener = @import("auth/oauth_callback_listener.zig");
@@ -105,6 +106,7 @@ test {
     _ = @import("extensions/wasm/wasm_wit_contract.zig");
     _ = @import("extensions/wasm/wasm_host_spike.zig");
     _ = @import("extensions/wasm/sdk_template_tests.zig");
+    _ = @import("extensions/wasm/author_workflow_e2e_tests.zig");
     _ = @import("packages/package_manager.zig");
     _ = @import("tests/ts_rpc_fixture_tests.zig");
     _ = @import("providers/provider_config.zig");
