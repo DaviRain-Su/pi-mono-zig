@@ -21,13 +21,19 @@ pub const RunPrintModeOptions = struct {
     messages: []const []const u8 = &.{},
 };
 
-const SignalGuard = struct {
+const SignalGuard = if (builtin.os.tag == .windows) struct {
+    installed: bool = false,
+
+    fn install(_: *std.atomic.Value(bool)) SignalGuard {
+        return .{};
+    }
+
+    fn deinit(_: *SignalGuard) void {}
+} else struct {
     previous_sigint: ?std.posix.Sigaction = null,
     installed: bool = false,
 
     fn install(signal: *std.atomic.Value(bool)) SignalGuard {
-        if (comptime builtin.os.tag == .windows) return .{};
-
         active_abort_signal = signal;
         const action: std.posix.Sigaction = .{
             .handler = .{ .sigaction = handleSigint },
@@ -44,7 +50,7 @@ const SignalGuard = struct {
     }
 
     fn deinit(self: *SignalGuard) void {
-        if (!self.installed or !supportsPosixSignals()) return;
+        if (!self.installed) return;
         if (self.previous_sigint) |previous| {
             std.posix.sigaction(.INT, &previous, null);
         }
@@ -60,15 +66,7 @@ const SignalGuard = struct {
 /// performs the actual abort outside signal-handler context.
 var active_abort_signal: ?*std.atomic.Value(bool) = null;
 
-fn supportsPosixSignals() bool {
-    return switch (builtin.os.tag) {
-        .windows, .wasi, .emscripten, .freestanding => false,
-        else => true,
-    };
-}
-
 fn handleSigint(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
-    if (comptime builtin.os.tag == .windows) return;
     _ = info;
     _ = ctx_ptr;
     if (sig != .INT) return;

@@ -364,6 +364,7 @@ pub fn runInteractiveMode(
         if (prompt_worker_active and !prompt_worker.running.load(.seq_cst)) {
             prompt_worker.join(allocator);
             prompt_worker_active = false;
+            app_state.setToolOutputExpanded(true);
             if (should_exit) break;
         }
         installSessionUiCallbacks(&bootstrap.session, &app_state);

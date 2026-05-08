@@ -218,7 +218,11 @@ pub const Terminal = struct {
                 self.current_size = try backend.getSize();
             },
             .native => |*native| {
-                if (native.resize_pending.swap(false, .seq_cst)) {
+                // On Windows, SIGWINCH is unavailable, so always poll the size.
+                // On POSIX, only re-read when the signal fires.
+                const should_read = builtin.os.tag == .windows or
+                    native.resize_pending.swap(false, .seq_cst);
+                if (should_read) {
                     self.current_size = native.readSize(self.current_size);
                 }
             },
