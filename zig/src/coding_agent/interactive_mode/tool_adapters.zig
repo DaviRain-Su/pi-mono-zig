@@ -4,6 +4,7 @@ const tools = @import("../tools/root.zig");
 const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
@@ -95,7 +96,16 @@ fn appendLockedWasmTools(
 ) !void {
     for (runtime_set.entries) |entry| {
         if (!toolNameIsEnabled(selected_tools, entry.tool_id)) continue;
-        if (hasToolName(items.items, entry.tool_id)) continue;
+        if (hasToolName(items.items, entry.tool_id)) {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=tool_construction; tool={s}; packageRoot={s}; installed wasm tool conflicts with existing provider tool",
+                .{ entry.tool_id, entry.package_root },
+            );
+            defer allocator.free(message);
+            try runtime_set.addDiagnostic("builtin_wasm_tool_conflict", message, entry.manifest_path);
+            continue;
+        }
         var tool = (try runtime_set.agentTool(allocator, entry.tool_id)) orelse continue;
         errdefer extension_runtime.deinitAgentTool(allocator, &tool);
         try items.append(allocator, tool);
@@ -379,6 +389,99 @@ test "buildAgentTools threads app context into execute callbacks" {
         try std.testing.expect(tool.execute_context == @as(?*anyopaque, @ptrCast(&app_context)));
     }
 }
+
+test "installed wasm tool conflicts with built-ins emit diagnostic and skip duplicate" {
+    const allocator = std.testing.allocator;
+
+    var items = std.ArrayList(agent.AgentTool).empty;
+    defer {
+        for (items.items) |*item| common.deinitJsonValue(allocator, item.parameters);
+        items.deinit(allocator);
+    }
+    try items.append(allocator, .{
+        .name = "read",
+        .description = "built-in read",
+        .label = "read",
+        .parameters = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
+        .execute = null,
+        .execute_context = null,
+    });
+
+    var runtime_set = extension_runtime.LockedWasmRuntimeSet{
+        .allocator = allocator,
+        .entries = try allocator.alloc(extension_runtime.LockedWasmRuntimeEntry, 1),
+        .diagnostics = &.{},
+    };
+    defer runtime_set.deinit();
+    runtime_set.entries[0] = .{
+        .package_root = try allocator.dupe(u8, "/tmp/conflicting-package"),
+        .manifest_path = try allocator.dupe(u8, "/tmp/conflicting-package/pi-extension.json"),
+        .tool_id = try allocator.dupe(u8, "read"),
+        .policy_lookup_key = try allocator.dupe(u8, "wasm:conflicting-package"),
+        .adapter = .{
+            .ptr = @ptrFromInt(1),
+            .vtable = &conflict_test_vtable,
+            .kind = .wasm,
+        },
+    };
+
+    try appendLockedWasmTools(allocator, &items, &runtime_set, &.{"read"});
+
+    try std.testing.expectEqual(@as(usize, 1), items.items.len);
+    try std.testing.expectEqualStrings("read", items.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), runtime_set.diagnostics.len);
+    try std.testing.expectEqualStrings("builtin_wasm_tool_conflict", runtime_set.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_set.diagnostics[0].message, "read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_set.diagnostics[0].message, "conflicting-package") != null);
+}
+
+const conflict_test_vtable: extension_runtime.RuntimeAdapter.VTable = .{
+    .wait_for_ready = conflictTestWaitForReady,
+    .pending_count = conflictTestPendingCount,
+    .diagnostic_count = conflictTestPendingCount,
+    .diagnostic_category_count = conflictTestDiagnosticCategoryCount,
+    .has_shutdown_complete = conflictTestHasShutdownComplete,
+    .registry_frames_applied = conflictTestPendingCount,
+    .has_registered_command = conflictTestHasRegisteredCommand,
+    .snapshot_registry_json = conflictTestSnapshotRegistryJson,
+    .with_registry = conflictTestWithRegistry,
+    .apply_cli_flag_values = conflictTestApplyCliFlagValues,
+    .agent_tool = conflictTestAgentTool,
+    .take_ui_requests = conflictTestTakeUiRequests,
+    .send_extension_ui_response = conflictTestSendExtensionUiResponse,
+    .send_extension_event_frame = conflictTestSendExtensionEventFrame,
+    .shutdown = conflictTestShutdown,
+    .deinit = conflictTestDeinit,
+};
+
+fn conflictTestWaitForReady(_: *anyopaque, _: u64) !void {}
+fn conflictTestPendingCount(_: *anyopaque) usize {
+    return 0;
+}
+fn conflictTestDiagnosticCategoryCount(_: *anyopaque, _: extension_runtime.DiagnosticCategory) usize {
+    return 0;
+}
+fn conflictTestHasShutdownComplete(_: *anyopaque) bool {
+    return true;
+}
+fn conflictTestHasRegisteredCommand(_: *anyopaque, _: []const u8) bool {
+    return false;
+}
+fn conflictTestSnapshotRegistryJson(_: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(u8, "{}");
+}
+fn conflictTestWithRegistry(_: *anyopaque, _: ?*anyopaque, _: extension_runtime.RegistryCallback) !void {}
+fn conflictTestApplyCliFlagValues(_: *anyopaque, _: []const extension_registry.ParsedCliFlag) !void {}
+fn conflictTestAgentTool(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !?agent.AgentTool {
+    return error.UnexpectedBuiltinConflictAgentToolConstruction;
+}
+fn conflictTestTakeUiRequests(_: *anyopaque, allocator: std.mem.Allocator) ![]extension_runtime.ExtensionUiRequest {
+    return allocator.alloc(extension_runtime.ExtensionUiRequest, 0);
+}
+fn conflictTestSendExtensionUiResponse(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn conflictTestSendExtensionEventFrame(_: *anyopaque, _: []const u8) void {}
+fn conflictTestShutdown(_: *anyopaque) !void {}
+fn conflictTestDeinit(_: *anyopaque) void {}
 
 test "forwardBashToolUpdate borrows streaming content without freeing it twice" {
     const allocator = std.testing.allocator;

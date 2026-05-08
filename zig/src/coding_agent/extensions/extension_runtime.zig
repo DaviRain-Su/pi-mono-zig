@@ -593,11 +593,14 @@ pub const LockedWasmRuntimeEntry = struct {
 pub const LockedWasmRuntimeSet = struct {
     allocator: std.mem.Allocator,
     entries: []LockedWasmRuntimeEntry,
+    retired_entries: []LockedWasmRuntimeEntry = &.{},
     diagnostics: []resources_mod.Diagnostic,
 
     pub fn deinit(self: *LockedWasmRuntimeSet) void {
         for (self.entries) |*entry| entry.deinit(self.allocator);
         self.allocator.free(self.entries);
+        for (self.retired_entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.retired_entries);
         for (self.diagnostics) |*diagnostic| diagnostic.deinit(self.allocator);
         self.allocator.free(self.diagnostics);
         self.* = undefined;
@@ -613,6 +616,8 @@ pub const LockedWasmRuntimeSet = struct {
     pub fn unloadPackage(self: *LockedWasmRuntimeSet, package_root: []const u8) !bool {
         var list = std.ArrayList(LockedWasmRuntimeEntry).fromOwnedSlice(self.entries);
         self.entries = &.{};
+        var retired = std.ArrayList(LockedWasmRuntimeEntry).fromOwnedSlice(self.retired_entries);
+        self.retired_entries = &.{};
         var removed = false;
         var index: usize = 0;
         while (index < list.items.len) {
@@ -620,12 +625,29 @@ pub const LockedWasmRuntimeSet = struct {
                 index += 1;
                 continue;
             }
+            try retired.ensureUnusedCapacity(self.allocator, 1);
             var entry = list.orderedRemove(index);
-            entry.deinit(self.allocator);
+            entry.adapter.shutdown() catch {};
+            retired.appendAssumeCapacity(entry);
             removed = true;
         }
         self.entries = try list.toOwnedSlice(self.allocator);
+        self.retired_entries = try retired.toOwnedSlice(self.allocator);
         return removed;
+    }
+
+    pub fn addDiagnostic(
+        self: *LockedWasmRuntimeSet,
+        kind: []const u8,
+        message: []const u8,
+        path: []const u8,
+    ) !void {
+        const expanded = try self.allocator.alloc(resources_mod.Diagnostic, self.diagnostics.len + 1);
+        errdefer self.allocator.free(expanded);
+        @memcpy(expanded[0..self.diagnostics.len], self.diagnostics);
+        expanded[self.diagnostics.len] = try makeResourceDiagnostic(self.allocator, kind, message, path);
+        self.allocator.free(self.diagnostics);
+        self.diagnostics = expanded;
     }
 };
 
@@ -656,7 +678,13 @@ pub fn startLockedWasmPackageRuntimes(
         handoff.policy_lookup_key = policy_key;
 
         const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", "missing digest-bound wasm extension policy", package.manifest.manifest_path));
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=registration; tool={s}; packageRoot={s}; policyLookupKey={s}; missing digest-bound wasm extension policy",
+                .{ package.manifest.tool_id, package.manifest.package_root, policy_key },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
             continue;
         };
         const approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
@@ -666,13 +694,23 @@ pub fn startLockedWasmPackageRuntimes(
 
         const seen = try seen_tools.getOrPut(package.manifest.tool_id);
         if (seen.found_existing) {
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_wasm_tool", "duplicate locked wasm tool id", package.manifest.manifest_path));
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=registration; tool={s}; packageRoot={s}; duplicate locked wasm tool id",
+                .{ package.manifest.tool_id, package.manifest.package_root },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_wasm_tool", message, package.manifest.manifest_path));
             continue;
         }
 
         const adapter = startRuntime(allocator, io, .{ .wasm = .{ .manifest = handoff } }) catch |err| {
             _ = seen_tools.remove(package.manifest.tool_id);
-            const message = try std.fmt.allocPrint(allocator, "wasm runtime handoff failed: {s}", .{@errorName(err)});
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=load; tool={s}; packageRoot={s}; wasm runtime handoff failed: {s}",
+                .{ package.manifest.tool_id, package.manifest.package_root, @errorName(err) },
+            );
             defer allocator.free(message);
             try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "runtime_handoff_failed", message, package.manifest.manifest_path));
             continue;
@@ -693,6 +731,7 @@ pub fn startLockedWasmPackageRuntimes(
     return .{
         .allocator = allocator,
         .entries = try entries.toOwnedSlice(allocator),
+        .retired_entries = &.{},
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
 }
@@ -2802,6 +2841,10 @@ test "locked wasm packages resolve to policy gated runtime set and unload cleanl
     try std.testing.expect(try runtime_set.unloadPackage(package_root));
     try std.testing.expectEqual(@as(usize, 0), runtime_set.entries.len);
     try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "builtin.truncateHead"));
+    try std.testing.expectError(
+        error.WasmToolNotRegistered,
+        agent_tool.execute.?(allocator, "locked-package-stale-after-unload", success_params.value, agent_tool.execute_context, null, null, null),
+    );
 }
 
 test "locked wasm runtime set omits missing policy and abi invalid packages" {

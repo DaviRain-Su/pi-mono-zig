@@ -172,6 +172,9 @@ fn dispatchNonInteractiveMode(
         },
     });
     defer built_tools.deinit();
+    if (built_tools.locked_wasm_runtimes) |*runtime_set| {
+        try output.writeResourceDiagnostics(stderr, runtime_set.diagnostics);
+    }
 
     var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
     defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
