@@ -68,47 +68,38 @@ changes can't silently break them.
 ### ISS-500 Document INV-1 in types.zig
 - 严重度: P1
 - 位置: `zig/src/ai/types.zig` (AssistantMessage definition)
-- 建议: Add a doc comment block above `tool_calls: ?[]ToolCall` listing:
-  "Inline `.tool_call` blocks in `content` are canonical. This field is null
-  for normalized providers; only `openai_chat_sse.zig` populates it (legacy
-  compat). See zig/docs/review/04_contracts.md INV-1."
+- 建议: Keep the doc comment above `tool_calls` synchronized with INV-1 and the legacy OpenAI Chat SSE exception.
 - 验证: docs only.
-- 状态: open
-- 负责:
-- 提交:
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 902720d3
 
 ### ISS-501 Add debug-mode assert for INV-1 in freeAssistantMessage
 - 严重度: P1
 - 位置: `zig/src/ai/types.zig` (freeAssistantMessage)
-- 建议: In `if (builtin.mode == .Debug)`, scan `content` for any
-  `.tool_call` block. If found AND `tool_calls != null`, log a warning so
-  regressions surface in tests.
+- 建议: Preserve `assertNoInvalidDualOwnedToolCalls` so normalized providers cannot alias inline and legacy tool-call storage in debug tests.
 - 验证: existing tests.
-- 状态: open
-- 负责:
-- 提交:
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 902720d3
 
 ### ISS-502 Document INV-2 / INV-3 / INV-4 / INV-5 in event_stream.zig
 - 严重度: P1
 - 位置: `zig/src/ai/event_stream.zig` (Event / EventType definitions)
-- 建议: Add a top-of-file doc block listing all four invariants. Use the
-  ISS numbers as anchors for grep.
+- 建议: Keep the top-of-file invariant block synchronized with event stream behavior.
 - 验证: docs only.
-- 状态: open
-- 负责:
-- 提交:
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 902720d3
 
 ### ISS-503 Extract `coerceStopReason` helper
 - 严重度: P1
-- 位置: new helper in `zig/src/ai/shared/` (e.g. provider_error.zig or a new
-  small file)
-- 建议: `pub fn coerceStopReasonForToolCalls(reason: StopReason,
-  had_tool_calls: bool) StopReason`. Use in every provider that emits tool
-  calls.
+- 位置: `zig/src/ai/shared/provider_error.zig::coerceStopReasonForToolCalls`
+- 建议: New providers that emit tool calls should use the shared helper instead of reintroducing inline coercion.
 - 验证: existing parity tests.
-- 状态: open
-- 负责:
-- 提交:
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: c3e7febc
 
 ### ISS-504 Add a debug-mode `EventOrderingGuard` for INV-3
 - 严重度: P2

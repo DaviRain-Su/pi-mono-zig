@@ -47,8 +47,10 @@ Sites:
 - `kimi.zig`
 - `anthropic.zig`
 
-Status after M4: the shared transfer/coercion logic lives in
-`zig/src/ai/shared/finalize.zig::finalizeOutput`. Cluster A providers retain
+Status after M4/M5/M6: the shared transfer/coercion logic lives in
+`zig/src/ai/shared/finalize.zig::finalizeOutput`, Responses-style block
+finalization lives in `zig/src/ai/shared/responses_api.zig`, and the generic
+SSE loop lives in `zig/src/ai/shared/sse_loop.zig`. Cluster A providers retain
 small provider-local adapters only for provider-specific current-block flushing,
 Bedrock event-index insertion, Responses pending/active tool-call queues, and
 runtime/error emission. Those adapters must delegate the final
@@ -333,24 +335,22 @@ Order matters. Each step must keep `zig build test` green.
 - 位置: every provider listed in Cluster A
 - 状态: done
 - 负责: bc5ff419-1758-411e-9a13-c25494e4ed9c verification
-- 提交: uncommitted shared-worktree verification
+- 提交: 3306500c
 
 ### ISS-308 Step 5: extract `finalizeCurrentBlock` for `*_responses.zig`
 - 严重度: P2
-- 位置: `openai_responses.zig`, `openai_codex_responses.zig`,
-  `azure_openai_responses.zig`
-- 状态: open
-- 负责:
-- 提交:
+- 位置: `openai_responses.zig`, `openai_codex_responses.zig`, `azure_openai_responses.zig`, `zig/src/ai/shared/responses_api.zig`
+- 状态: done
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 3306500c
 
 ### ISS-309 Step 6: extract generic `runSseLoop`
 - 严重度: P2
-- 位置: many — see plan
-- 建议: deliberately do this last. Add an `accept_compact_data_lines` flag
-  to absorb the Anthropic/OpenAI parsing difference (see ISS-051).
-- 状态: open
-- 负责:
-- 提交:
+- 位置: many — see plan and `zig/src/ai/shared/sse_loop.zig`
+- 建议: The M6 migration is complete for the review-roadmap scope. Preserve provider-local dispatch differences and keep compact-line handling explicit through `accept_compact_data_lines`.
+- 状态: done
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 3306500c, 902720d3
 
 ### ISS-310 Step 7: `emitTerminal` consolidation
 - 严重度: P2

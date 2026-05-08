@@ -57,17 +57,14 @@ assistant message. New code that violates these is a regression.
 
 #### ISS-002 Add regression test for `content_index` stability
 - 严重度: P1
-- 位置: `zig/src/ai/providers/anthropic.zig` (handleContentBlockStart ~2175,
-  createImplicitActiveBlock ~2390)
-- 现状: Recent fix changed `event_index = active_blocks.items.len` →
-  `event_index = anthropic_index`. No dedicated regression test exists.
-- 问题: A future refactor could silently regress this.
-- 建议: Add a test where text block 0 starts/stops, then tool_use block 1
-  starts; assert toolcall_start.content_index == 1, NOT 0.
-- 验证: append test to anthropic.zig; run `zig build test-ai`.
-- 状态: open
-- 负责:
-- 提交:
+- 位置: `zig/src/ai/providers/anthropic.zig` (`ISS-002 Anthropic content_index remains stable after block removal`)
+- 现状: Regression coverage exists for the text-stop/tool-start sequence that previously risked reusing `active_blocks.items.len` after removal.
+- 问题: Closed for this roadmap pass; future refactors must preserve provider incoming `index` as the event content index.
+- 建议: Keep the regression test with any Anthropic block-lifecycle refactor.
+- 验证: `cd zig && zig build test-ai`
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 902720d3
 
 #### ISS-003 Document `shouldTolerateNoncanonicalAnthropicChunk` policy
 - 严重度: P2
@@ -81,8 +78,6 @@ assistant message. New code that violates these is a regression.
 - 状态: open
 - 负责:
 - 提交:
-
----
 
 ### `openai_responses.zig` (3714 LOC)
 
@@ -332,32 +327,28 @@ double-free path remains
 
 ### ISS-200 Add provider-stream-contract matrix test
 - 严重度: P1
-- 位置: `zig/src/coding_agent/tests/provider_stream_contract_matrix_test.zig` (236 LOC, exists)
-- 现状: A matrix test exists but coverage is unclear.
-- 建议: Verify it asserts each provider's final output adheres to the
-  invariants in this doc's "Cross-provider invariants" section. Extend if not.
-- 验证: `zig build test-ai`.
-- 状态: open
-- 负责:
-- 提交:
+- 位置: `zig/src/coding_agent/tests/provider_stream_contract_matrix_test.zig`
+- 现状: The matrix covers every built-in API plus faux/Kimi-compatible fixtures and asserts setup/runtime failures become terminal `error_event` streams with API/provider/model metadata.
+- 建议: Keep new provider additions covered by the matrix or make any N/A routing/helper surface explicit.
+- 验证: `cd zig && zig build test-coding-agent`
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: daad6dbd
 
 ### ISS-201 Add a leak-tracking allocator test for tool_calls deinit
 - 严重度: P1
 - 位置: `zig/src/ai/providers/provider_tool_call_ownership_matrix_test.zig`
-- 现状: A local provider override matrix drives built-in production providers,
-  faux, and Kimi-compatible fixture entries through tool-call streams under a
-  debug allocator.
-- 建议: Keep new provider additions covered by the matrix or explicitly justify
-  N/A helper surfaces such as Cloudflare.
+- 现状: A local provider override matrix drives built-in production providers, faux, and Kimi-compatible fixture entries through tool-call streams under a debug allocator.
+- 建议: Keep new provider additions covered by the matrix or explicitly justify N/A helper surfaces such as Cloudflare.
 - 验证: `cd zig && zig build test-ai`
 - 状态: closed
 - 负责: 43b9a826-f859-43e5-8fe7-57519aa10b1a
-- 提交:
+- 提交: daad6dbd
 
 ### ISS-202 Documented unsupported-feature matrix
 - 严重度: P2
 - 位置: `zig/docs/review/05_test_matrix.md`
-- 建议: Build the matrix once and keep it updated.
-- 状态: open
-- 负责:
-- 提交:
+- 建议: Keep the provider/scenario matrix updated as provider features change; helper/routing surfaces must have explicit N/A notes.
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync
+- 提交: 902720d3

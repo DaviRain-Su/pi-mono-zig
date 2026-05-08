@@ -146,6 +146,10 @@ the test roots that justify confirmed coverage and N/A decisions.
   helper surface with no independent assistant-message stream ownership; the
   routed OpenAI/Anthropic provider rows carry the ownership coverage.
 
+## M9 closure
+
+M9 is complete for the review-roadmap scope: the matrix has zero unknown `?` cells, every N/A entry has a justification in the evidence notes, and the S13/S14/S12/S6/S15 priority sweep is closed. Remaining `❌` cells are known lower-priority missing coverage, not unclassified unknowns.
+
 ## Action items
 
 ### ISS-600 Confirm matrix entries by reading existing tests
@@ -157,7 +161,7 @@ the test roots that justify confirmed coverage and N/A decisions.
 - 验证: docs only.
 - 状态: closed
 - 负责: b3f3368b-a4b7-40f8-b53a-da67d0652925
-- 提交: pending (mission workers leave changes uncommitted)
+- 提交: 902720d3
 
 ### ISS-601 Fill ❌ cells in priority order
 - 严重度: P1
@@ -185,7 +189,7 @@ the test roots that justify confirmed coverage and N/A decisions.
 - 状态: closed for the M9 priority sweep; remaining ❌ cells are known missing
   coverage outside the priority gaps filled by this milestone.
 - 负责: 07fa7938-a12a-4f83-97d8-37faee17b89b
-- 提交: pending (mission workers leave changes uncommitted)
+- 提交: 902720d3
 
 ### ISS-602 Establish a test-add convention
 - 严重度: P2

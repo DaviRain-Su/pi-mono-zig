@@ -8,7 +8,7 @@ Other agents can claim work by:
 1. `grep -rn '状态: open' zig/docs/review/` to list all unclaimed issues.
 2. Pick an issue. Update its `状态:` to `in-progress` and add `负责: <agent-id>`.
 3. Implement the fix in a focused commit using the `验证:` hint to confirm.
-4. After the commit lands, update `状态:` to `done` with the commit hash.
+4. After the commit lands, update `状态:` to `done`/`closed` with the commit hash. Mission workers that are instructed not to commit should still backfill the commit hash once an implementation commit is available.
 
 ## Severity levels
 
@@ -61,13 +61,13 @@ next free number when adding a new finding (don't reuse).
 | Doc | Phase | Coverage |
 |---|---|---|
 | 00_module_map | scanned | full repo LOC, no TODO/FIXME found anywhere |
-| 01_provider_layer | seeded | issues seeded from recent normalize commit thread; needs full pass |
-| 02_provider_duplication | M4 verified | shared output finalization migration complete; M5+ still open |
-| 03_agent_layer | seeded | partial accumulator + tool exec known issues; needs full pass |
-| 04_contracts | seeded | types.zig + event_stream.zig need explicit invariants doc |
-| 05_test_matrix | empty | gather from existing tests |
-| 06_risk_register | seeded | top-10 picked from above; resequence as items close |
-| 07_refactor_roadmap | M4 verified | M4 checked off; continue with M5 Responses API common surface |
+| 01_provider_layer | M1/M9 synced | roadmap-linked provider invariant, ownership, and matrix items closed; remaining open issues are future/full-pass work |
+| 02_provider_duplication | M6 complete | M3–M6 shared finalize, Responses common surface, and generic SSE-loop work complete; ISS-310 remains follow-up |
+| 03_agent_layer | M7/M8 complete | state-machine doc, hook/allocator guards, reuse/double-finalize guards, and partial-UX policy closed |
+| 04_contracts | M1/M2 complete | INV-1/2/3/4/5 docs/assertions and stop-reason helper closed; EventOrderingGuard remains follow-up |
+| 05_test_matrix | M9 complete | zero unknown `?` cells; priority S13/S14/S12/S6/S15 sweep closed with evidence notes |
+| 06_risk_register | M1–M9 resequenced | top risks annotate completed roadmap items and retained future work |
+| 07_refactor_roadmap | M1–M9 complete | all M1–M9 roadmap checkboxes closed; M10 remains post-ai-agent/out of scope |
 
 ## Quality gates per commit
 

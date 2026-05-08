@@ -5,6 +5,8 @@ each milestone.
 
 ## Top 10
 
+Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/Responses/SSE shared-provider work, partial tool-call UX policy, and the priority test-matrix sweep are complete. Remaining risks below are retained for future review passes where their issue references are still open.
+
 ### R1 — Memory leaks on aborted / errored streams
 - 严重度: P0
 - 涉及: `agent_loop.zig` (PartialAssistantAccumulator),
@@ -22,7 +24,7 @@ each milestone.
   borrow-only) is correct only if `tool_calls.deinit` does not free strings.
   An accidental `freeToolCall` over a borrow-only entry would double-free.
 - 修法: ISS-040 (bedrock audit), ISS-403 (clone/deinit pairing audit),
-  ISS-501 (debug-mode assert).
+  ISS-501 (debug-mode assert, closed in `902720d3`).
 - 大小: S
 
 ### R3 — `content_index` reuse / instability
@@ -37,7 +39,7 @@ each milestone.
 - 涉及: every provider
 - 描述: 5 providers now have `had_tool_calls and stop == .stop -> .tool_use`
   inline; if a 6th provider gets added without it, behavior diverges.
-- 修法: ISS-503 (extract `coerceStopReasonForToolCalls` helper).
+- 修法: ISS-503 (extract `coerceStopReasonForToolCalls` helper, closed in `c3e7febc`).
 - 大小: S
 
 ### R5 — Provider duplication accumulating
@@ -47,14 +49,14 @@ each milestone.
   `parseSseStreamLines` outer loops, `mapStopReason`, and `emitRuntimeFailure`
   are duplicated. Every fix must be applied in N places. Recent normalization
   proved this — touched 5 files for one logical change.
-- 修法: ISS-300..310 (shared layer migration).
+- 修法: ISS-300..309 (M3–M6 shared layer migration complete); ISS-310 remains a lower-priority follow-up.
 - 大小: L (sequenced into 7 small steps)
 
 ### R6 — Partial UI: tool-call-only response shows nothing
 - 严重度: P1
 - 涉及: `agent_loop.zig` (buildMessage)
 - 描述: User sees no message_update during partial tool-call windows.
-- 修法: ISS-402.
+- 修法: ISS-402 (closed in `902720d3`).
 - 大小: S
 
 ### R7 — `openai_chat_sse.zig` legacy path landmines
@@ -82,12 +84,13 @@ each milestone.
 - 修法: separate review pass after `ai/` + `agent/` settle.
 - 大小: XL
 
-### R10 — Test matrix has many `?` cells
+### R10 — Test matrix classification drift
 - 严重度: P2
 - 涉及: test suite
-- 描述: We cannot confidently say "no regressions" until the matrix is
-  populated and the gaps closed.
-- 修法: ISS-600, ISS-601.
+- 描述: M9 removed all unknown `?` cells and closed the S13/S14/S12/S6/S15
+  priority sweep in `902720d3`. Remaining `❌` cells are known lower-priority
+  missing coverage and should not regress back to unknown/unjustified entries.
+- 修法: ISS-600 and ISS-601 are closed; ISS-602 remains open for a test-add convention.
 - 大小: M
 
 ---
