@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const enforcement = @import("enforcement.zig");
 const extension_events = @import("extension_events.zig");
 const extension_registry = @import("extension_registry.zig");
 
@@ -275,6 +276,12 @@ pub const ProtocolState = struct {
     /// can observe registered tools, commands, shortcuts, flags, and
     /// providers without depending on local sidecar manifests.
     registry: extension_registry.Registry,
+    registry_policy: enforcement.Policy = .{},
+    registry_principal: enforcement.Principal = .{
+        .runtime_kind = "process_jsonl",
+        .extension_id = "process_jsonl:unknown",
+    },
+    registry_accounting: enforcement.Accounting = .{},
     /// Total number of registry frames successfully applied. Useful for
     /// fixture tests that need to wait for the host to drain its
     /// register_* frames before snapshotting.
@@ -286,6 +293,17 @@ pub const ProtocolState = struct {
             .pending_request_ids = std.StringHashMap(void).init(allocator),
             .registry = extension_registry.Registry.init(allocator),
         };
+    }
+
+    pub fn initWithPolicy(
+        allocator: std.mem.Allocator,
+        policy: enforcement.Policy,
+        principal: enforcement.Principal,
+    ) ProtocolState {
+        var state = ProtocolState.init(allocator);
+        state.registry_policy = policy;
+        state.registry_principal = principal;
+        return state;
     }
 
     pub fn deinit(self: *ProtocolState) void {
@@ -331,10 +349,7 @@ pub const ProtocolState = struct {
             },
             .shutdown_complete => self.shutdown_complete_seen = true,
             .registry_frame => |frame| {
-                const outcome = extension_registry.applyHostFrame(&self.registry, frame.payload) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.WriteFailed => return err,
-                };
+                const outcome = try self.applyRegistryFrame(frame.payload);
                 switch (outcome) {
                     .registered_tool,
                     .registered_command,
@@ -364,6 +379,43 @@ pub const ProtocolState = struct {
                 }
             },
         }
+    }
+
+    fn applyRegistryFrame(self: *ProtocolState, frame: std.json.Value) !extension_registry.FrameOutcome {
+        const type_name = registryFrameType(frame);
+        if (type_name) |name| {
+            if (registryFrameOperation(name)) |operation| {
+                const target = enforcement.OperationTarget{ .id = registryFrameTargetId(frame, name) };
+                const decision = enforcement.decide(
+                    self.registry_principal,
+                    self.registry_policy,
+                    operation,
+                    target,
+                    .call,
+                    "process_jsonl/registry_frame",
+                    .{},
+                    &self.registry_accounting,
+                );
+                switch (decision) {
+                    .allow => {},
+                    .deny => |denial| {
+                        try self.addRegistryDenialDiagnostic(denial);
+                        return .none;
+                    },
+                }
+            }
+        }
+
+        const outcome = extension_registry.applyHostFrame(&self.registry, frame) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.WriteFailed => return err,
+        };
+        switch (outcome) {
+            .ignored_unsupported => try self.addUnsupportedRegistryFrameDiagnostic(type_name),
+            .ignored_malformed => try self.addMalformedRegistryFrameDiagnostic(type_name),
+            else => {},
+        }
+        return outcome;
     }
 
     pub fn onDiagnostic(self: *ProtocolState, diagnostic: Diagnostic) !void {
@@ -410,7 +462,125 @@ pub const ProtocolState = struct {
             .message = try self.allocator.dupe(u8, message),
         });
     }
+
+    fn addRegistryDenialDiagnostic(self: *ProtocolState, denial: enforcement.DenyDecision) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"category\":");
+        try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"capability\":");
+        try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"branch\":");
+        try std.json.Stringify.value(denial.branch.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"phase\":");
+        try std.json.Stringify.value(denial.phase.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"mode\":");
+        try std.json.Stringify.value(denial.mode, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":");
+        try std.json.Stringify.value(denial.principal.runtime_kind, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"extensionId\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        if (denial.principal.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("},\"operation\":");
+        try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"target\":{\"id\":");
+        if (denial.target.id) |target_id| {
+            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll("},\"reason\":");
+        try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"message\":\"process_jsonl registry frame denied by enforcement substrate\"}");
+        try self.addDiagnostic(.host_error, .@"error", envelope.written());
+    }
+
+    fn addUnsupportedRegistryFrameDiagnostic(self: *ProtocolState, type_name: ?[]const u8) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"category\":\"unsupported_message_type\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"message\":\"unsupported registry frame\"");
+        if (type_name) |name| {
+            try envelope.writer.writeAll(",\"actual\":");
+            try std.json.Stringify.value(name, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("}");
+        try self.addDiagnostic(.unsupported_message_type, .@"error", envelope.written());
+    }
+
+    fn addMalformedRegistryFrameDiagnostic(self: *ProtocolState, type_name: ?[]const u8) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"category\":\"malformed_registry_frame\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"message\":\"malformed registry frame\"");
+        if (type_name) |name| {
+            try envelope.writer.writeAll(",\"actual\":");
+            try std.json.Stringify.value(name, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("}");
+        try self.addDiagnostic(.host_error, .@"error", envelope.written());
+    }
 };
+
+fn registryFrameType(frame: std.json.Value) ?[]const u8 {
+    if (frame != .object) return null;
+    const type_value = frame.object.get("type") orelse return null;
+    return switch (type_value) {
+        .string => |value| value,
+        else => null,
+    };
+}
+
+fn registryFrameOperation(type_name: []const u8) ?enforcement.Operation {
+    if (std.mem.eql(u8, type_name, "register_provider") or
+        std.mem.eql(u8, type_name, "unregister_provider"))
+    {
+        return .model_call;
+    }
+    if (std.mem.eql(u8, type_name, "resources_discover")) return .file_read;
+    if (std.mem.eql(u8, type_name, "set_header") or
+        std.mem.eql(u8, type_name, "clear_header") or
+        std.mem.eql(u8, type_name, "set_footer") or
+        std.mem.eql(u8, type_name, "clear_footer") or
+        std.mem.eql(u8, type_name, "register_terminal_input") or
+        std.mem.eql(u8, type_name, "unregister_terminal_input") or
+        std.mem.eql(u8, type_name, "set_editor_component") or
+        std.mem.eql(u8, type_name, "clear_editor_component") or
+        std.mem.eql(u8, type_name, "set_widget") or
+        std.mem.eql(u8, type_name, "clear_widget") or
+        std.mem.eql(u8, type_name, "clear_ui_hooks_for_reload"))
+    {
+        return .ui_notify;
+    }
+    if (std.mem.eql(u8, type_name, "register_tool") or
+        std.mem.eql(u8, type_name, "register_command") or
+        std.mem.eql(u8, type_name, "register_shortcut") or
+        std.mem.eql(u8, type_name, "register_flag") or
+        std.mem.eql(u8, type_name, "register_capability") or
+        std.mem.eql(u8, type_name, "unregister_capability") or
+        std.mem.eql(u8, type_name, "clear_extension_registrations") or
+        std.mem.eql(u8, type_name, "register_message_renderer") or
+        std.mem.eql(u8, type_name, "unregister_message_renderer"))
+    {
+        return .tool_use;
+    }
+    return null;
+}
+
+fn registryFrameTargetId(frame: std.json.Value, type_name: []const u8) ?[]const u8 {
+    if (frame != .object) return null;
+    const object = frame.object;
+    if (std.mem.eql(u8, type_name, "register_capability") or std.mem.eql(u8, type_name, "unregister_capability")) {
+        return optionalString(object, "id");
+    }
+    if (std.mem.eql(u8, type_name, "register_shortcut")) return optionalString(object, "shortcut");
+    if (std.mem.eql(u8, type_name, "register_message_renderer") or std.mem.eql(u8, type_name, "unregister_message_renderer")) {
+        return optionalString(object, "customType");
+    }
+    if (std.mem.eql(u8, type_name, "set_widget") or std.mem.eql(u8, type_name, "clear_widget")) return optionalString(object, "key");
+    return optionalString(object, "name") orelse optionalString(object, "extensionPath");
+}
 
 pub fn startupFailureDiagnostic(allocator: std.mem.Allocator) !Diagnostic {
     return .{
@@ -558,6 +728,20 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
     try writer.writeAll(encoded);
 }
 
+const test_process_jsonl_principal: enforcement.Principal = .{
+    .runtime_kind = "process_jsonl",
+    .extension_id = "process_jsonl:test-fixture",
+    .policy_lookup_key = "process_jsonl:test-fixture-policy",
+};
+
+fn protocolStateWithAllRegistryGrants(allocator: std.mem.Allocator) ProtocolState {
+    return ProtocolState.initWithPolicy(
+        allocator,
+        .{ .approved_grants = enforcement.CANONICAL_GRANTS[0..] },
+        test_process_jsonl_principal,
+    );
+}
+
 test "M6 host protocol parses ordered JSONL frames" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
@@ -607,7 +791,7 @@ test "ProtocolState handles resources_discover only through registry frames" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const frames =
@@ -635,7 +819,7 @@ test "ProtocolState keeps UI request edge cases stable" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     try parser.feed(allocator, "{\"type\":\"extension_ui_request\",\"id\":\"pre-ready\",\"method\":\"input\",\"responseRequired\":true}\n", &state);
@@ -674,7 +858,7 @@ test "ProtocolState registry_frames_applied counts only accepted registry outcom
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     try parser.feed(allocator, "{\"type\":\"ready\"}\n", &state);
@@ -710,11 +894,80 @@ test "ProtocolState registry_frames_applied counts only accepted registry outcom
     try std.testing.expectEqualStrings("record-only", state.registry.ui_request_ids.items[0]);
 }
 
-test "process_jsonl protocol rejects invalid subscriber readiness frames without state mutation" {
+test "process_jsonl registry frames default-deny before mutation" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
     var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"denied-tool\",\"label\":\"Denied\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_provider\",\"name\":\"denied-provider\",\"displayName\":\"Denied\",\"models\":[{\"id\":\"denied-model\"}],\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"extensionPath\":\"fixture/denied.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 0), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 0), state.registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.registry.resource_discoveries.items.len);
+    try std.testing.expectEqual(@as(usize, 3), state.diagnosticCategoryCount(.host_error));
+    for (state.diagnostics.items) |diagnostic| {
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"category\":\"denied_capability\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"principal\":{\"runtimeKind\":\"process_jsonl\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"mode\":\"process_jsonl/registry_frame\"") != null);
+    }
+}
+
+test "process_jsonl registry frames mutate only with matching grants" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    const approved = [_]enforcement.Grant{ .tool_use, .model_call, .file_read };
+    var state = ProtocolState.initWithPolicy(
+        allocator,
+        .{ .approved_grants = approved[0..] },
+        test_process_jsonl_principal,
+    );
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"allowed-tool\",\"label\":\"Allowed\",\"extensionPath\":\"fixture/allowed.ts\"}\n" ++
+        "{\"type\":\"register_provider\",\"name\":\"allowed-provider\",\"displayName\":\"Allowed\",\"models\":[{\"id\":\"allowed-model\"}],\"extensionPath\":\"fixture/allowed.ts\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"extensionPath\":\"fixture/allowed.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expectEqual(@as(usize, 3), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.tools.items.len);
+    try std.testing.expectEqualStrings("allowed-tool", state.registry.tools.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.providers.items.len);
+    try std.testing.expectEqualStrings("allowed-provider", state.registry.providers.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.resource_discoveries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.diagnostics.items.len);
+}
+
+test "process_jsonl unsupported registry frames are diagnostics without mutation" {
+    const allocator = std.testing.allocator;
+    var state = protocolStateWithAllRegistryGrants(allocator);
+    defer state.deinit();
+
+    var unsupported = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"unsupported_registry_frame\",\"name\":\"noop\"}", .{});
+    defer unsupported.deinit();
+    try state.onMessage(.{ .registry_frame = .{ .payload = unsupported.value } });
+
+    try std.testing.expectEqual(@as(usize, 0), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 0), extension_registry.registrySurfaceCounts(&state.registry).tools);
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.unsupported_message_type));
+}
+
+test "process_jsonl protocol rejects invalid subscriber readiness frames without state mutation" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const baseline_frames =
@@ -811,7 +1064,7 @@ test "extension protocol ABI conformance helper covers diagnostics registry fram
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const frames =
@@ -862,7 +1115,7 @@ test "M11 host protocol applies live register_* JSONL frames into runtime regist
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const frames =
@@ -902,7 +1155,7 @@ test "extension_host ProtocolState accepts live register_capability frame" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const frames =
@@ -922,7 +1175,7 @@ test "extension_host ProtocolState applies clear_extension_registrations without
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
     defer parser.deinit(allocator);
-    var state = ProtocolState.init(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
     defer state.deinit();
 
     const frames =

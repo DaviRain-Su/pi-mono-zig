@@ -2800,6 +2800,7 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
             .fixture = "mixed-process-fixture",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer process_adapter.deinit();
     try std.testing.expectEqual(RuntimeKind.process_jsonl, process_adapter.kind);
@@ -2901,6 +2902,7 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
             .fixture = "display-metadata",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer process_adapter.deinit();
     try process_adapter.waitForReady(500);
@@ -3050,6 +3052,7 @@ test "runtime validation failures occur before registration while process_jsonl 
             .fixture = "validation-compat",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer adapter.deinit();
     try adapter.waitForReady(500);
@@ -3121,6 +3124,7 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
             .fixture = "adapter-fixture",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer adapter.deinit();
     try std.testing.expectEqual(RuntimeKind.process_jsonl, adapter.kind);
@@ -3166,6 +3170,7 @@ test "process_jsonl runtime adapter applies duplicate and unregister registry fr
             .fixture = "duplicate-registry",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer adapter.deinit();
     try adapter.waitForReady(500);
@@ -3209,6 +3214,7 @@ test "runtime-owned tool execution conformance preserves process wasm and native
             .fixture = "process-tool-contract",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     } });
     defer process_adapter.deinit();
     try process_adapter.waitForReady(500);

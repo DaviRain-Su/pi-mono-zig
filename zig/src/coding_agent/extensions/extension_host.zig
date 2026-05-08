@@ -1,4 +1,5 @@
 const std = @import("std");
+const enforcement = @import("enforcement.zig");
 const extension_registry = @import("extension_registry.zig");
 const extension_protocol = @import("extension_protocol.zig");
 
@@ -24,6 +25,9 @@ pub const HostProcessOptions = struct {
     extension_path: ?[]const u8 = null,
     initialize: InitializeFrame,
     shutdown_timeout_ms: u64 = 1000,
+    approved_capabilities: []const enforcement.Grant = &.{},
+    resource_limits: enforcement.ResourceLimits = .{},
+    policy_lookup_key: ?[]const u8 = null,
 };
 
 pub const HostProcess = struct {
@@ -72,7 +76,19 @@ pub const HostProcess = struct {
             .child = child,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
-            .state = ProtocolState.init(allocator),
+            .state = ProtocolState.initWithPolicy(
+                allocator,
+                .{
+                    .approved_grants = options.approved_capabilities,
+                    .resource_limits = options.resource_limits,
+                },
+                .{
+                    .runtime_kind = "process_jsonl",
+                    .extension_id = options.extension_path orelse options.argv[0],
+                    .policy_lookup_key = options.policy_lookup_key,
+                    .package_root = options.cwd,
+                },
+            ),
             .shutdown_timeout_ms = options.shutdown_timeout_ms,
         };
 
@@ -531,6 +547,7 @@ test "M11 host process drains live register_* frames into observable runtime reg
             .fixture = "registration-fixture",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     });
     defer host.deinit();
 
@@ -583,6 +600,7 @@ test "live host dynamic provider re-registration and unregister ordering has no 
             .fixture = "registration-reregister-fixture",
         },
         .shutdown_timeout_ms = 500,
+        .approved_capabilities = enforcement.CANONICAL_GRANTS[0..],
     });
     defer host.deinit();
 
