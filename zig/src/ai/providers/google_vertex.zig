@@ -2213,7 +2213,7 @@ test "stream preserves partial Vertex text before mid-stream abort terminal even
     const chunks = [_]test_stream_server.DelayedChunk{
         .{
             .bytes = "data: {\"responseId\":\"vertex-abort\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial vertex\"}]}}]}\n",
-            .delay_after_ms = 120,
+            .delay_after_ms = 1000,
         },
         .{ .bytes = "data: [DONE]\n" },
     };
@@ -2238,12 +2238,22 @@ test "stream preserves partial Vertex text before mid-stream abort terminal even
     };
 
     var abort_signal = std.atomic.Value(bool).init(false);
-    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
-    defer abort_thread.join();
+    const AbortAfterResponse = struct {
+        var signal: ?*std.atomic.Value(bool) = null;
+        var thread: ?std.Thread = null;
+
+        fn callback(_: u16, _: std.StringHashMap([]const u8), _: types.Model) !void {
+            thread = try test_stream_server.startAbortThread(std.testing.io, signal.?, 250);
+        }
+    };
+    AbortAfterResponse.signal = &abort_signal;
+    AbortAfterResponse.thread = null;
+    defer if (AbortAfterResponse.thread) |thread| thread.join();
 
     var stream = try GoogleVertexProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
         .api_key = "vertex-smoke-key",
         .signal = &abort_signal,
+        .on_response = &AbortAfterResponse.callback,
     });
     defer stream.deinit();
 
