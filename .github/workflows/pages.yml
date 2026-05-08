@@ -27,13 +27,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: zig/docs/book/package-lock.json
+
+      - name: Install book dependencies
+        working-directory: zig/docs/book
+        run: npm ci
+
+      - name: Build VitePress book
+        working-directory: zig/docs/book
+        run: npm run build
+
+      - name: Assemble Pages artifact
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # Copy the existing static landing site, but skip the book sources.
+          rsync -a --exclude='book' zig/docs/ _site/
+          # Mount the built book at /book/
+          mkdir -p _site/book
+          cp -r zig/docs/book/.vitepress/dist/. _site/book/
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: zig/docs
+          path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment

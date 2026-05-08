@@ -1,0 +1,37 @@
+/**
+ * 与 zig/docs/index.html 主页保持视觉一致：
+ * 主色 = 暖橙 #f7a41d，深色背景偏蓝黑。
+ */
+
+:root {
+  --vp-c-brand-1: #d97706;
+  --vp-c-brand-2: #f7a41d;
+  --vp-c-brand-3: #f7a41d;
+  --vp-c-brand-soft: #f7a41d22;
+  --vp-font-family-base:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --vp-font-family-mono:
+    "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+.dark {
+  --vp-c-brand-1: #f7a41d;
+  --vp-c-brand-2: #ffb84d;
+  --vp-c-brand-3: #ffb84d;
+  --vp-c-bg: #0b0d12;
+  --vp-c-bg-alt: #11141b;
+  --vp-c-bg-elv: #161a23;
+  --vp-c-divider: #232938;
+}
+
+.VPHero .name,
+.VPHero .text {
+  letter-spacing: -0.02em;
+}
+
+.mermaid {
+  display: flex;
+  justify-content: center;
+  margin: 1.5rem 0;
+}
