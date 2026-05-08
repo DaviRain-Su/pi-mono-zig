@@ -5,6 +5,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const cloudflare = @import("cloudflare.zig");
@@ -2005,18 +2006,7 @@ fn finalizeOutputFromPartials(
                         .arguments = arguments,
                     };
                 };
-                var final_tool_call_transferred = false;
-                errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
-                // Single allocation: content_blocks holds the canonical ToolCall
-                // value; tool_calls keeps a borrow-only copy (shared pointers)
-                // for length checks. ArrayList.deinit only frees its buffer, so
-                // the strings end up owned exclusively by output.content.
-                try tool_calls.append(allocator, final_tool_call);
-                errdefer if (!final_tool_call_transferred) {
-                    _ = tool_calls.pop();
-                };
-                try content_blocks.append(allocator, .{ .tool_call = final_tool_call });
-                final_tool_call_transferred = true;
+                try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, final_tool_call);
                 stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
             },
         }
@@ -2596,16 +2586,7 @@ fn handleContentBlockStop(
                     .arguments = arguments,
                 };
             };
-            var final_tool_call_transferred = false;
-            errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
-            // Single allocation: content_blocks owns the strings; tool_calls
-            // keeps a borrow-only copy for downstream length checks.
-            try tool_calls.append(allocator, final_tool_call);
-            errdefer if (!final_tool_call_transferred) {
-                _ = tool_calls.pop();
-            };
-            try content_blocks.append(allocator, .{ .tool_call = final_tool_call });
-            final_tool_call_transferred = true;
+            try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, final_tool_call);
             stream_ptr.push(.{
                 .event_type = .toolcall_end,
                 .content_index = @intCast(entry.event_index),
