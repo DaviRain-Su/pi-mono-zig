@@ -8,7 +8,7 @@ import * as path from "node:path";
 import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { createEventBus } from "../src/core/event-bus.js";
+import { createEventBus, type EventBus } from "../src/core/event-bus.js";
 import { executeBoundedSubAgentTask } from "../src/core/extensions/bounded-subagent-execution.js";
 import {
 	createExtensionRuntime,
@@ -32,6 +32,7 @@ import type {
 	ExtensionActions,
 	ExtensionContextActions,
 	ExtensionEventName,
+	ExtensionUIContext,
 	ProviderConfig,
 } from "../src/core/extensions/types.js";
 import {
@@ -42,7 +43,7 @@ import {
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { ResolvedWasmExtensionPackage } from "../src/core/package-manager.js";
-import { SessionManager } from "../src/core/session-manager.js";
+import { type ReadonlySessionManager, SessionManager } from "../src/core/session-manager.js";
 
 const SUB_AGENT_FORBIDDEN_PRODUCT_FIELDS = [
 	"ui",
@@ -2465,6 +2466,87 @@ describe("ExtensionRunner", () => {
 			controller.abort();
 			expect(ctx.signal?.aborted).toBe(true);
 		});
+
+		it("revokes extracted context host facades and ignores stale event-bus listeners", async () => {
+			const eventBus = createEventBus();
+			let capturedEvents: EventBus | undefined;
+			let capturedUi: ExtensionUIContext | undefined;
+			let capturedSessionManager: ReadonlySessionManager | undefined;
+			let capturedModelRegistry: ModelRegistry | undefined;
+			let observedBusEvents = 0;
+			let statusValue: string | undefined;
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					capturedEvents = pi.events;
+					pi.events.on("extension:test", () => {
+						observedBusEvents++;
+					});
+					pi.on("session_start", (_event, ctx) => {
+						capturedUi = ctx.ui;
+						capturedSessionManager = ctx.sessionManager;
+						capturedModelRegistry = ctx.modelRegistry;
+					});
+				},
+				tempDir,
+				eventBus,
+				runtime,
+				"<revocable-facades>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const uiContext: ExtensionUIContext = {
+				select: async () => undefined,
+				confirm: async () => false,
+				input: async () => undefined,
+				notify: () => {},
+				onTerminalInput: () => () => {},
+				setStatus: (_key, text) => {
+					statusValue = text;
+				},
+				setWorkingMessage: () => {},
+				setWorkingVisible: () => {},
+				setWorkingIndicator: () => {},
+				setHiddenThinkingLabel: () => {},
+				setWidget: () => {},
+				setFooter: () => {},
+				setHeader: () => {},
+				setTitle: () => {},
+				custom: async () => undefined as never,
+				pasteToEditor: () => {},
+				setEditorText: () => {},
+				getEditorText: () => "",
+				editor: async () => undefined,
+				addAutocompleteProvider: () => {},
+				setEditorComponent: () => {},
+				getEditorComponent: () => undefined,
+				get theme() {
+					return {} as ExtensionUIContext["theme"];
+				},
+				getAllThemes: () => [],
+				getTheme: () => undefined,
+				setTheme: () => ({ success: false, error: "not available" }),
+				getToolsExpanded: () => false,
+				setToolsExpanded: () => {},
+			};
+			runner.setUIContext(uiContext);
+			runner.bindCore(extensionActions, extensionContextActions);
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+			capturedUi?.setStatus("owned", "active");
+			capturedEvents?.emit("extension:test", {});
+			expect(statusValue).toBe("active");
+			expect(observedBusEvents).toBe(1);
+
+			runner.invalidate("stale runtime");
+
+			expect(() => capturedUi?.setStatus("owned", "stale")).toThrow("stale runtime");
+			expect(() => capturedSessionManager?.getSessionFile()).toThrow("stale runtime");
+			expect(() => capturedModelRegistry?.find("provider", "model")).toThrow("stale runtime");
+			expect(() => capturedEvents?.emit("extension:test", {})).toThrow("stale runtime");
+			eventBus.emit("extension:test", {});
+			expect(statusValue).toBe("active");
+			expect(observedBusEvents).toBe(1);
+		});
 	});
 
 	describe("error handling", () => {
@@ -2921,6 +3003,60 @@ describe("ExtensionRunner", () => {
 			expect(resources.skillPaths).toEqual([]);
 		});
 
+		it("isolates immutable lifecycle, context, provider, and input event payloads per handler", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("session_start", async (event) => {
+						event.reason = "mutated";
+					});
+					pi.on("context", async (event) => {
+						event.messages.push({ role: "user", content: "mutated", timestamp: 2 });
+					});
+					pi.on("before_provider_request", async (event) => {
+						event.payload.mutated = true;
+					});
+					pi.on("input", async (event) => {
+						event.text = "mutated";
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("session_start", async (event) => {
+						globalThis.observedLifecycleReason = event.reason;
+					});
+					pi.on("context", async (event) => ({
+						messages: [...event.messages, { role: "user", content: String(event.messages.length), timestamp: 3 }],
+					}));
+					pi.on("before_provider_request", async (event) => ({
+						...event.payload,
+						observedMutated: Boolean(event.payload.mutated),
+					}));
+					pi.on("input", async (event) => ({
+						action: "transform",
+						text: event.text + ":observed",
+					}));
+				}
+			`;
+			delete (globalThis as { observedLifecycleReason?: string }).observedLifecycleReason;
+			fs.writeFileSync(path.join(extensionsDir, "immutable-events-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "immutable-events-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const message: AgentMessage = { role: "user", content: "base", timestamp: 1 };
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+			const context = await runner.emitContext([message]);
+			const providerPayload = await runner.emitBeforeProviderRequest({ base: true });
+			const input = await runner.emitInput("base input", undefined, "interactive");
+
+			expect((globalThis as { observedLifecycleReason?: string }).observedLifecycleReason).toBe("startup");
+			expect(context.map((entry) => ("content" in entry ? entry.content : ""))).toEqual(["base", "1"]);
+			expect(providerPayload).toEqual({ base: true, observedMutated: false });
+			expect(input).toEqual({ action: "transform", text: "base input:observed", images: undefined });
+		});
+
 		it("short-circuits cancellable lifecycle events at the first cancellation", async () => {
 			const extCode1 = `
 				export default function(pi) {
@@ -3205,6 +3341,27 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("provider registration", () => {
+		it("unregisters extension-owned providers when the runner is invalidated", async () => {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.registerProvider("owned-provider", providerModelConfig);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<provider-owner>",
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+
+			runner.bindCore(extensionActions, extensionContextActions);
+			expect(modelRegistry.find("owned-provider", "instant-model")).toBeDefined();
+
+			runner.invalidate("provider owner unloaded");
+
+			expect(modelRegistry.find("owned-provider", "instant-model")).toBeUndefined();
+		});
+
 		it("bindCore ignores invalid queued registrations and reports extension error", () => {
 			const runtime = createExtensionRuntime();
 			runtime.registerProvider(

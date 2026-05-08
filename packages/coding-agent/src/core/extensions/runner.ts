@@ -82,6 +82,11 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 ] as const;
 
 type BuiltInKeyBindings = Partial<Record<KeyId, { keybinding: string; restrictOverride: boolean }>>;
+type ProviderActions = {
+	registerProvider?: (name: string, config: ProviderConfig) => void;
+	unregisterProvider?: (name: string) => void;
+};
+type FacadeFunction = (...args: unknown[]) => unknown;
 
 const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
 	const builtinKeybindings = {} as BuiltInKeyBindings;
@@ -103,6 +108,95 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 	}
 	return builtinKeybindings;
 };
+
+function cloneForExtensionHandler<T>(value: T, seen = new WeakMap<object, unknown>()): T {
+	if (value === null || typeof value !== "object") {
+		return value;
+	}
+
+	if (Array.isArray(value)) {
+		const existing = seen.get(value);
+		if (existing) return existing as T;
+		const clone: unknown[] = [];
+		seen.set(value, clone);
+		for (const item of value) {
+			clone.push(cloneForExtensionHandler(item, seen));
+		}
+		return clone as T;
+	}
+
+	const source = value as object;
+	const existing = seen.get(source);
+	if (existing) return existing as T;
+
+	const prototype = Object.getPrototypeOf(source);
+	if (prototype !== Object.prototype && prototype !== null) {
+		return value;
+	}
+
+	const clone = Object.create(prototype) as Record<PropertyKey, unknown>;
+	seen.set(source, clone);
+	for (const key of Reflect.ownKeys(source)) {
+		const descriptor = Object.getOwnPropertyDescriptor(source, key);
+		if (!descriptor) continue;
+		const clonedDescriptor = { ...descriptor };
+		if ("value" in clonedDescriptor) {
+			clonedDescriptor.value = cloneForExtensionHandler(clonedDescriptor.value, seen);
+		}
+		Object.defineProperty(clone, key, clonedDescriptor);
+	}
+	return clone as T;
+}
+
+function createRevocableFacade<T extends object>(getTarget: () => T, assertActive: () => void): T {
+	const functionCache = new Map<PropertyKey, FacadeFunction>();
+
+	return new Proxy({} as T, {
+		get(_target, property) {
+			assertActive();
+			const target = getTarget();
+			const value = Reflect.get(target, property, target) as unknown;
+			if (typeof value !== "function") {
+				return value;
+			}
+
+			const cached = functionCache.get(property);
+			if (cached) {
+				return cached;
+			}
+
+			const wrapper: FacadeFunction = (...args) => {
+				assertActive();
+				const activeTarget = getTarget();
+				const activeValue = Reflect.get(activeTarget, property, activeTarget) as unknown;
+				if (typeof activeValue !== "function") {
+					throw new TypeError(`Revoked extension facade property ${String(property)} is not callable`);
+				}
+				return Reflect.apply(activeValue as FacadeFunction, activeTarget, args);
+			};
+			functionCache.set(property, wrapper);
+			return wrapper;
+		},
+		set(_target, property, value) {
+			assertActive();
+			return Reflect.set(getTarget(), property, value);
+		},
+		has(_target, property) {
+			assertActive();
+			return property in getTarget();
+		},
+		ownKeys() {
+			assertActive();
+			return Reflect.ownKeys(getTarget());
+		},
+		getOwnPropertyDescriptor(_target, property) {
+			assertActive();
+			const descriptor = Reflect.getOwnPropertyDescriptor(getTarget(), property);
+			if (!descriptor) return undefined;
+			return { ...descriptor, configurable: true };
+		},
+	});
+}
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -262,6 +356,8 @@ export class ExtensionRunner {
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
 	private handlerTimeoutMs: number;
+	private providerActions: ProviderActions | undefined;
+	private registeredProviderNames: Set<string> = new Set();
 
 	constructor(
 		extensions: Extension[],
@@ -285,11 +381,10 @@ export class ExtensionRunner {
 	bindCore(
 		actions: ExtensionActions,
 		contextActions: ExtensionContextActions,
-		providerActions?: {
-			registerProvider?: (name: string, config: ProviderConfig) => void;
-			unregisterProvider?: (name: string) => void;
-		},
+		providerActions?: ProviderActions,
 	): void {
+		this.assertActive();
+		this.providerActions = providerActions;
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
@@ -320,11 +415,7 @@ export class ExtensionRunner {
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
 			try {
-				if (providerActions?.registerProvider) {
-					providerActions.registerProvider(name, config);
-				} else {
-					this.modelRegistry.registerProvider(name, config);
-				}
+				this.registerOwnedProvider(name, config);
 			} catch (err) {
 				this.emitError({
 					extensionPath,
@@ -339,19 +430,56 @@ export class ExtensionRunner {
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
 		this.runtime.registerProvider = (name, config) => {
-			if (providerActions?.registerProvider) {
-				providerActions.registerProvider(name, config);
-				return;
-			}
-			this.modelRegistry.registerProvider(name, config);
+			this.assertActive();
+			this.runtime.assertActive();
+			this.registerOwnedProvider(name, config);
 		};
 		this.runtime.unregisterProvider = (name) => {
-			if (providerActions?.unregisterProvider) {
-				providerActions.unregisterProvider(name);
-				return;
-			}
-			this.modelRegistry.unregisterProvider(name);
+			this.assertActive();
+			this.runtime.assertActive();
+			this.unregisterOwnedProvider(name);
 		};
+	}
+
+	private registerOwnedProvider(name: string, config: ProviderConfig): void {
+		if (this.providerActions?.registerProvider) {
+			this.providerActions.registerProvider(name, config);
+		} else {
+			this.modelRegistry.registerProvider(name, config);
+		}
+		this.registeredProviderNames.add(name);
+	}
+
+	private unregisterOwnedProvider(name: string): void {
+		if (this.providerActions?.unregisterProvider) {
+			this.providerActions.unregisterProvider(name);
+		} else {
+			this.modelRegistry.unregisterProvider(name);
+		}
+		this.registeredProviderNames.delete(name);
+	}
+
+	private cleanupOwnedProviders(): void {
+		const providerNames = [...this.registeredProviderNames];
+		this.registeredProviderNames.clear();
+		for (const name of providerNames) {
+			try {
+				if (this.providerActions?.unregisterProvider) {
+					this.providerActions.unregisterProvider(name);
+				} else {
+					this.modelRegistry.unregisterProvider(name);
+				}
+			} catch (err) {
+				this.emitError({
+					extensionPath: "<runtime>",
+					event: "unregister_provider",
+					error: err instanceof Error ? err.message : String(err),
+					stack: err instanceof Error ? err.stack : undefined,
+					phase: "unload",
+					runtimeKind: "typescript",
+				});
+			}
+		}
 	}
 
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
@@ -492,6 +620,8 @@ export class ExtensionRunner {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
+			this.runtime.pendingProviderRegistrations = [];
+			this.cleanupOwnedProviders();
 		}
 	}
 
@@ -596,10 +726,14 @@ export class ExtensionRunner {
 	createContext(): ExtensionContext {
 		const runner = this;
 		const getModel = this.getModel;
+		const assertActive = () => runner.assertActive();
+		const uiFacade = createRevocableFacade(() => runner.uiContext, assertActive);
+		const sessionManagerFacade = createRevocableFacade(() => runner.sessionManager, assertActive);
+		const modelRegistryFacade = createRevocableFacade(() => runner.modelRegistry, assertActive);
 		return {
 			get ui() {
 				runner.assertActive();
-				return runner.uiContext;
+				return uiFacade;
 			},
 			get hasUI() {
 				runner.assertActive();
@@ -611,11 +745,11 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return sessionManagerFacade;
 			},
 			get modelRegistry() {
 				runner.assertActive();
-				return runner.modelRegistry;
+				return modelRegistryFacade;
 			},
 			get model() {
 				runner.assertActive();
@@ -800,7 +934,8 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerResult = await this.invokeHandler(ext, event.type, handler, event, ctx);
+				const handlerEvent = cloneForExtensionHandler(event);
+				const handlerResult = await this.invokeHandler(ext, event.type, handler, handlerEvent, ctx);
 
 				if (this.isSessionBeforeEvent(event) && handlerResult) {
 					result = handlerResult as SessionBeforeEventResult;
@@ -824,7 +959,7 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
+				const currentEvent: MessageEndEvent = { ...event, message: cloneForExtensionHandler(currentMessage) };
 				const handlerResult = (await this.invokeHandler(ext, "message_end", handler, currentEvent, ctx)) as
 					| MessageEndEventResult
 					| undefined;
@@ -839,7 +974,7 @@ export class ExtensionRunner {
 					continue;
 				}
 
-				currentMessage = handlerResult.message;
+				currentMessage = cloneForExtensionHandler(handlerResult.message);
 				modified = true;
 			}
 		}
@@ -857,7 +992,8 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerResult = (await this.invokeHandler(ext, "tool_result", handler, currentEvent, ctx)) as
+				const handlerEvent = cloneForExtensionHandler(currentEvent);
+				const handlerResult = (await this.invokeHandler(ext, "tool_result", handler, handlerEvent, ctx)) as
 					| ToolResultEventResult
 					| undefined;
 				if (!handlerResult) continue;
@@ -919,7 +1055,8 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerResult = await this.invokeHandler(ext, "user_bash", handler, event, ctx);
+				const handlerEvent = cloneForExtensionHandler(event);
+				const handlerResult = await this.invokeHandler(ext, "user_bash", handler, handlerEvent, ctx);
 				if (handlerResult) {
 					return handlerResult as UserBashEventResult;
 				}
@@ -938,11 +1075,11 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const event: ContextEvent = { type: "context", messages: currentMessages };
+				const event: ContextEvent = { type: "context", messages: cloneForExtensionHandler(currentMessages) };
 				const handlerResult = await this.invokeHandler(ext, "context", handler, event, ctx);
 
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
-					currentMessages = (handlerResult as ContextEventResult).messages!;
+					currentMessages = cloneForExtensionHandler((handlerResult as ContextEventResult).messages!);
 				}
 			}
 		}
@@ -961,11 +1098,11 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				const event: BeforeProviderRequestEvent = {
 					type: "before_provider_request",
-					payload: currentPayload,
+					payload: cloneForExtensionHandler(currentPayload),
 				};
 				const handlerResult = await this.invokeHandler(ext, "before_provider_request", handler, event, ctx);
 				if (handlerResult !== undefined) {
-					currentPayload = handlerResult;
+					currentPayload = cloneForExtensionHandler(handlerResult);
 				}
 			}
 		}
@@ -999,16 +1136,16 @@ export class ExtensionRunner {
 				const event: BeforeAgentStartEvent = {
 					type: "before_agent_start",
 					prompt,
-					images,
+					images: cloneForExtensionHandler(images),
 					systemPrompt: currentSystemPrompt,
-					systemPromptOptions,
+					systemPromptOptions: cloneForExtensionHandler(systemPromptOptions),
 				};
 				const handlerResult = await this.invokeHandler(ext, "before_agent_start", handler, event, ctx);
 
 				if (handlerResult) {
 					const result = handlerResult as BeforeAgentStartEventResult;
 					if (result.message) {
-						messages.push(result.message);
+						messages.push(cloneForExtensionHandler(result.message));
 					}
 					if (result.systemPrompt !== undefined) {
 						currentSystemPrompt = result.systemPrompt;
@@ -1073,7 +1210,12 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+				const event: InputEvent = {
+					type: "input",
+					text: currentText,
+					images: cloneForExtensionHandler(currentImages),
+					source,
+				};
 				const result = (await this.invokeHandler(ext, "input", handler, event, ctx)) as
 					| InputEventResult
 					| undefined;

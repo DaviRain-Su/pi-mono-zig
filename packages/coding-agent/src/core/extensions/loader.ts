@@ -216,6 +216,33 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	return runtime;
 }
 
+function createRevocableEventBus(eventBus: EventBus, assertActive: () => void): EventBus {
+	return {
+		emit(channel, data) {
+			assertActive();
+			eventBus.emit(channel, data);
+		},
+		on(channel, handler) {
+			assertActive();
+			let subscribed = true;
+			const unsubscribe = eventBus.on(channel, (data) => {
+				if (!subscribed) return;
+				try {
+					assertActive();
+				} catch {
+					return;
+				}
+				return handler(data);
+			});
+			return () => {
+				assertActive();
+				subscribed = false;
+				unsubscribe();
+			};
+		},
+	};
+}
+
 /**
  * Create the ExtensionAPI for an extension.
  * Registration methods write to the extension object.
@@ -379,7 +406,7 @@ function createExtensionAPI(
 			runtime.unregisterProvider(name, extension.path);
 		},
 
-		events: eventBus,
+		events: createRevocableEventBus(eventBus, () => runtime.assertActive()),
 	} as ExtensionAPI;
 
 	return api;
