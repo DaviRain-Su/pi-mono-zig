@@ -218,8 +218,15 @@ pub const Markdown = struct {
 
             if (parseListItem(line)) |item| {
                 current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
-                current_row += try drawListItem(ctx.arena, active_theme, content_window, current_row, item);
-                line_index += 1;
+                current_row += try drawListItemBlock(
+                    ctx.arena,
+                    active_theme,
+                    content_window,
+                    current_row,
+                    item,
+                    source_lines.items,
+                    &line_index,
+                );
                 continue;
             }
 
@@ -279,9 +286,10 @@ const BlockquoteLine = struct {
 };
 
 const ListItem = struct {
-    indent: []const u8,
+    depth: usize,
     bullet: []const u8,
     text: []const u8,
+    content_indent_width: usize,
 };
 
 const LinkMatch = struct {
@@ -292,6 +300,49 @@ const LinkMatch = struct {
 const TableMatch = struct {
     end_index: usize,
 };
+
+fn drawListItemBlock(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    window: vaxis.Window,
+    start_row: usize,
+    item: ListItem,
+    source_lines: []const []const u8,
+    line_index: *usize,
+) std.mem.Allocator.Error!usize {
+    const item_text_trimmed = std.mem.trim(u8, item.text, " \t");
+    if (isCodeFence(item_text_trimmed)) {
+        var list_code_block_lines = std.ArrayList([]const u8).empty;
+        const language = std.mem.trim(u8, item_text_trimmed[3..], " \t");
+        line_index.* += 1;
+        while (line_index.* < source_lines.len) : (line_index.* += 1) {
+            const code_line = source_lines[line_index.*];
+            if (isCodeFence(std.mem.trim(u8, code_line, " \t"))) {
+                line_index.* += 1;
+                break;
+            }
+            try list_code_block_lines.append(
+                allocator,
+                stripListContinuationIndent(code_line, item.content_indent_width),
+            );
+        }
+        return drawListCodeBlock(
+            allocator,
+            theme,
+            window,
+            start_row,
+            item,
+            language,
+            list_code_block_lines.items,
+        );
+    }
+
+    line_index.* += 1;
+    if (parseBlockquoteLine(item.text)) |quote| {
+        return drawListQuoteLine(allocator, theme, window, start_row, item, quote);
+    }
+    return drawListItem(allocator, theme, window, start_row, item);
+}
 
 const TableBorderPosition = enum {
     top,
@@ -382,6 +433,48 @@ fn drawQuoteLine(
     );
 }
 
+fn drawListQuoteLine(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    window: vaxis.Window,
+    start_row: usize,
+    item: ListItem,
+    quote: BlockquoteLine,
+) std.mem.Allocator.Error!usize {
+    const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
+    const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
+    const prefix_style = resolvedStyle(theme, .markdown_quote_border, QUOTE_BORDER_FALLBACK_STYLE);
+    const body_style = resolvedStyle(theme, .markdown_quote, QUOTE_FALLBACK_STYLE);
+    const indent = try normalizedListIndentAlloc(allocator, item.depth);
+    const list_prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
+    const list_continuation_prefix = try spaceString(allocator, list_prefix_width);
+
+    var first_prefix = std.ArrayList(vaxis.Segment).empty;
+    if (indent.len > 0) {
+        try first_prefix.append(allocator, .{ .text = indent, .style = text_style });
+    }
+    try first_prefix.append(allocator, .{ .text = item.bullet, .style = bullet_style });
+    try first_prefix.append(allocator, .{ .text = "▍ ", .style = prefix_style });
+
+    var continuation_prefix = std.ArrayList(vaxis.Segment).empty;
+    if (list_continuation_prefix.len > 0) {
+        try continuation_prefix.append(allocator, .{ .text = list_continuation_prefix, .style = text_style });
+    }
+    try continuation_prefix.append(allocator, .{ .text = "▍ ", .style = prefix_style });
+
+    const body_segments = try buildInlineSegments(allocator, theme, body_style, quote.text, null);
+    return drawPrefixedSegments(
+        allocator,
+        window,
+        start_row,
+        first_prefix.items,
+        continuation_prefix.items,
+        list_prefix_width + 2,
+        body_segments,
+        null,
+    );
+}
+
 fn drawListItem(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,
@@ -391,11 +484,13 @@ fn drawListItem(
 ) std.mem.Allocator.Error!usize {
     const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
     const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
-    const continuation_prefix = try spaceString(allocator, ansi.visibleWidth(item.indent) + ansi.visibleWidth(item.bullet));
+    const indent = try normalizedListIndentAlloc(allocator, item.depth);
+    const prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
+    const continuation_prefix = try spaceString(allocator, prefix_width);
 
     var first_prefix = std.ArrayList(vaxis.Segment).empty;
-    if (item.indent.len > 0) {
-        try first_prefix.append(allocator, .{ .text = item.indent, .style = text_style });
+    if (indent.len > 0) {
+        try first_prefix.append(allocator, .{ .text = indent, .style = text_style });
     }
     try first_prefix.append(allocator, .{ .text = item.bullet, .style = bullet_style });
 
@@ -410,10 +505,60 @@ fn drawListItem(
         start_row,
         first_prefix.items,
         &continuation_segments,
-        ansi.visibleWidth(item.indent) + ansi.visibleWidth(item.bullet),
+        prefix_width,
         body_segments,
         null,
     );
+}
+
+fn drawListCodeBlock(
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    window: vaxis.Window,
+    start_row: usize,
+    item: ListItem,
+    language: []const u8,
+    code_lines: []const []const u8,
+) std.mem.Allocator.Error!usize {
+    if (window.width == 0 or start_row >= window.height) return 0;
+
+    const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
+    const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
+    const indent = try normalizedListIndentAlloc(allocator, item.depth);
+    const prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
+    const continuation_prefix_text = try spaceString(allocator, prefix_width);
+
+    var first_prefix = std.ArrayList(vaxis.Segment).empty;
+    if (indent.len > 0) {
+        try first_prefix.append(allocator, .{ .text = indent, .style = text_style });
+    }
+    try first_prefix.append(allocator, .{ .text = item.bullet, .style = bullet_style });
+
+    const continuation_prefix = [_]vaxis.Segment{.{
+        .text = continuation_prefix_text,
+        .style = text_style,
+    }};
+
+    const block_window = window.child(.{
+        .y_off = @intCast(start_row),
+        .height = window.height - @as(u16, @intCast(start_row)),
+    });
+    if (prefix_width >= block_window.width) {
+        drawSegmentsNoWrap(block_window, first_prefix.items);
+        return 1;
+    }
+
+    const prefix_window = block_window.child(.{ .width = @intCast(prefix_width) });
+    const content_window = block_window.child(.{
+        .x_off = @intCast(prefix_width),
+        .width = block_window.width - @as(u16, @intCast(prefix_width)),
+    });
+    const row_count = @max(
+        @as(usize, 1),
+        try drawCodeBlock(allocator, theme, content_window, 0, language, code_lines),
+    );
+    drawPrefixRows(prefix_window, row_count, first_prefix.items, &continuation_prefix);
+    return row_count;
 }
 
 fn drawCodeBlock(
@@ -1135,6 +1280,19 @@ fn spaceString(allocator: std.mem.Allocator, count: usize) std.mem.Allocator.Err
     return spaces;
 }
 
+fn normalizedListIndentAlloc(allocator: std.mem.Allocator, depth: usize) std.mem.Allocator.Error![]const u8 {
+    return spaceString(allocator, depth * 4);
+}
+
+fn normalizedListDepth(indent_len: usize) usize {
+    return indent_len / 2;
+}
+
+fn stripListContinuationIndent(line: []const u8, content_indent_width: usize) []const u8 {
+    const indent_len = leadingWhitespaceLength(line);
+    return line[@min(indent_len, content_indent_width)..];
+}
+
 fn normalizeTabsAlloc(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]const u8 {
     var builder = std.ArrayList(u8).empty;
     for (text) |byte| {
@@ -1184,7 +1342,12 @@ fn parseListItem(line: []const u8) ?ListItem {
     const indent_len = leadingWhitespaceLength(line);
     const remainder = line[indent_len..];
     if (remainder.len >= 2 and (remainder[0] == '-' or remainder[0] == '*' or remainder[0] == '+') and remainder[1] == ' ') {
-        return .{ .indent = line[0..indent_len], .bullet = "• ", .text = remainder[2..] };
+        return .{
+            .depth = normalizedListDepth(indent_len),
+            .bullet = "• ",
+            .text = remainder[2..],
+            .content_indent_width = indent_len + 2,
+        };
     }
 
     var digit_count: usize = 0;
@@ -1192,9 +1355,10 @@ fn parseListItem(line: []const u8) ?ListItem {
     if (digit_count == 0 or digit_count + 1 >= remainder.len) return null;
     if (remainder[digit_count] != '.' or remainder[digit_count + 1] != ' ') return null;
     return .{
-        .indent = line[0..indent_len],
+        .depth = normalizedListDepth(indent_len),
         .bullet = remainder[0 .. digit_count + 2],
         .text = remainder[digit_count + 2 ..],
+        .content_indent_width = indent_len + digit_count + 2,
     };
 }
 
@@ -1304,6 +1468,27 @@ fn findClosing(text: []const u8, start: usize, marker: []const u8) ?usize {
     return index;
 }
 
+fn expectMarkdownTrimmedRows(text: []const u8, width: usize, expected: []const []const u8) !void {
+    const markdown = Markdown{ .text = text };
+    var screen = try test_helpers.renderToScreen(markdown.drawComponent(), width, expected.len);
+    defer screen.deinit(std.testing.allocator);
+
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
+
+    var rows = std.mem.splitScalar(u8, rendered, '\n');
+    for (expected) |expected_row| {
+        const row = rows.next() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(expected_row, trimRightSpaces(row));
+    }
+}
+
+fn trimRightSpaces(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and text[end - 1] == ' ') : (end -= 1) {}
+    return text[0..end];
+}
+
 test "markdown renders inline styles as cell styles" {
     var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
     defer theme.deinit(std.testing.allocator);
@@ -1375,6 +1560,72 @@ test "markdown renders headings lists blockquotes rules and code blocks with cel
     try test_helpers.expectCell(&screen, 0, 4, "┌", style_mod.styleFor(&theme, .markdown_code_border));
     try test_helpers.expectCell(&screen, 2, 5, "c", style_mod.styleFor(&theme, .markdown_code));
     try test_helpers.expectCell(&screen, 0, 6, "└", style_mod.styleFor(&theme, .markdown_code_border));
+}
+
+test "markdown indents wrapped unordered list lines" {
+    try expectMarkdownTrimmedRows(
+        "- alpha beta gamma delta epsilon",
+        20,
+        &.{ "• alpha beta gamma", "  delta epsilon" },
+    );
+}
+
+test "markdown indents wrapped ordered list lines" {
+    try expectMarkdownTrimmedRows(
+        "1. alpha beta gamma delta epsilon",
+        20,
+        &.{ "1. alpha beta gamma", "   delta epsilon" },
+    );
+}
+
+test "markdown indents wrapped ordered list lines with multi-digit markers" {
+    try expectMarkdownTrimmedRows(
+        "10. alpha beta gamma delta epsilon",
+        21,
+        &.{ "10. alpha beta gamma", "    delta epsilon" },
+    );
+}
+
+test "markdown normalizes nested list indentation" {
+    try expectMarkdownTrimmedRows(
+        "- parent\n  - alpha beta gamma delta epsilon",
+        24,
+        &.{ "• parent", "    • alpha beta gamma", "      delta epsilon" },
+    );
+    try expectMarkdownTrimmedRows(
+        "1. parent\n   - alpha beta gamma delta epsilon",
+        24,
+        &.{ "1. parent", "    • alpha beta gamma", "      delta epsilon" },
+    );
+}
+
+test "markdown renders and wraps blockquotes inside list items" {
+    try expectMarkdownTrimmedRows(
+        "- > alpha beta gamma delta epsilon zeta",
+        24,
+        &.{ "• ▍ alpha beta gamma", "  ▍ delta epsilon zeta" },
+    );
+}
+
+test "markdown renders fenced code blocks inside list items with list indentation" {
+    const markdown = Markdown{
+        .text =
+        \\- ```ts
+        \\  alpha beta gamma delta epsilon zeta
+        \\  ```
+        ,
+    };
+
+    var screen = try test_helpers.renderToScreen(markdown.drawComponent(), 24, 4);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "•", LIST_BULLET_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 0, "┌", CODE_BORDER_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 1, " ", MARKDOWN_TEXT_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 1, "│", CODE_BORDER_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 4, 1, "a", CODE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 3, " ", MARKDOWN_TEXT_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 3, "└", CODE_BORDER_FALLBACK_STYLE);
 }
 
 test "markdown table snapshot preserves three column alignment" {

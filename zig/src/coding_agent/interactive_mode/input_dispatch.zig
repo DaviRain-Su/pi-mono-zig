@@ -1619,6 +1619,15 @@ fn handleEditorAction(
     should_exit: *bool,
     live_resources: *LiveResources,
 ) !void {
+    if (shouldRouteEditorActionToChatScroll(action, editor)) {
+        switch (action) {
+            .page_up => app_state.chatScrollPageUp(),
+            .page_down => app_state.chatScrollPageDown(),
+            else => unreachable,
+        }
+        return;
+    }
+
     switch (action) {
         .input_submit => try submitEditorIfNotEmpty(
             allocator,
@@ -1644,6 +1653,12 @@ fn handleEditorAction(
             _ = try editor.handleAction(editor_action);
         },
     }
+}
+
+fn shouldRouteEditorActionToChatScroll(action: keybindings_mod.EditorAction, editor: *const tui.Editor) bool {
+    if (editor.isShowingAutocomplete()) return false;
+    if (editor.text().len != 0) return false;
+    return action == .page_up or action == .page_down;
 }
 
 pub fn resolveAppAction(keybindings: ?*const keybindings_mod.Keybindings, key: tui.Key) ?keybindings_mod.Action {
@@ -2597,6 +2612,67 @@ test "configured editor keybindings drive movement and submit while old defaults
     try harness.press(.{ .ctrl = 'j' }, .{});
     try std.testing.expectEqualStrings("", harness.editor.text());
     try std.testing.expect(harness.state.items.items.len > 0);
+}
+
+test "empty prompt page bindings scroll chat history instead of editor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    harness.state.updateChatScrollLayout(40, 10, 0, 80);
+    try harness.press(.page_up, .{});
+    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    try harness.press(.page_down, .{});
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
+
+    _ = try harness.editor.handlePaste("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7");
+    harness.state.chat_scroll_offset = 10;
+    try harness.press(.page_up, .{});
+    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    const cursor = harness.editor.cursorPosition();
+    try std.testing.expectEqual(@as(usize, 2), cursor.line);
+    try std.testing.expectEqual(@as(usize, 2), cursor.column);
+}
+
+test "chat history page scroll uses configured page bindings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setEditorBinding(.page_up, &.{.{ .alt = 'u' }});
+    try custom_keybindings.setEditorBinding(.page_down, &.{.{ .alt = 'd' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    harness.state.updateChatScrollLayout(40, 10, 0, 80);
+    try harness.press(.page_up, .{});
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("u") }, .{ .alt = true });
+    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("d") }, .{ .alt = true });
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
 }
 
 test "dispatch input event resolves message actions from configured bindings only" {

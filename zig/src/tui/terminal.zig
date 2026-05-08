@@ -270,11 +270,23 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 fn shouldUseMouseReporting() bool {
-    const value = getenv("PI_ENABLE_MOUSE") orelse return false;
-    return std.mem.eql(u8, value, "1") or
-        std.ascii.eqlIgnoreCase(value, "true") or
-        std.ascii.eqlIgnoreCase(value, "yes") or
-        std.ascii.eqlIgnoreCase(value, "on");
+    return shouldUseMouseReportingForEnv(getenv("PI_ENABLE_MOUSE"));
+}
+
+fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
+    const raw = value orelse return true;
+    if (std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no") or
+        std.ascii.eqlIgnoreCase(raw, "off"))
+    {
+        return false;
+    }
+    return raw.len == 0 or
+        std.mem.eql(u8, raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes") or
+        std.ascii.eqlIgnoreCase(raw, "on");
 }
 
 fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resources_dir: ?[]const u8, term: ?[]const u8) bool {
@@ -290,7 +302,12 @@ fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resou
 }
 
 fn startupSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
-    _ = use_mouse_reporting;
+    if (use_mouse_reporting) {
+        if (use_kitty_keyboard_protocol) {
+            return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE;
+        }
+        return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.MOUSE_ENABLE;
+    }
     if (use_kitty_keyboard_protocol) {
         return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE;
     }
@@ -298,7 +315,12 @@ fn startupSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool)
 }
 
 fn stopSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
-    _ = use_mouse_reporting;
+    if (use_mouse_reporting) {
+        if (use_kitty_keyboard_protocol) {
+            return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR;
+        }
+        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.SHOW_CURSOR;
+    }
     if (use_kitty_keyboard_protocol) {
         return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR;
     }
@@ -697,8 +719,8 @@ test "terminal enters raw mode on startup and restores on exit" {
     );
     try std.testing.expectEqual(expected_use_kitty, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>7u") != null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>31u") == null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") == null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") == null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") != null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1003h") == null);
 
     terminal.stop();
@@ -709,8 +731,8 @@ test "terminal enters raw mode on startup and restores on exit" {
         stopSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[1],
     );
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") == null);
-    try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") == null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") != null);
 }
 
 test "terminal restores terminal modes when startup fails" {
@@ -748,17 +770,27 @@ test "terminal startup and stop sequences include Kitty keyboard protocol by def
     );
 }
 
-test "terminal startup and stop sequences leave mouse wheel for scrollback" {
+test "terminal startup and stop sequences include requested mouse reporting" {
     try std.testing.expectEqualStrings(
-        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
         startupSequence(true, true),
     );
     try std.testing.expectEqualStrings(
-        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         stopSequence(true, true),
     );
-    try std.testing.expect(std.mem.indexOf(u8, startupSequence(true, true), Terminal.MOUSE_ENABLE) == null);
-    try std.testing.expect(std.mem.indexOf(u8, stopSequence(true, true), Terminal.MOUSE_DISABLE) == null);
+    try std.testing.expect(std.mem.indexOf(u8, startupSequence(true, true), Terminal.MOUSE_ENABLE) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stopSequence(true, true), Terminal.MOUSE_DISABLE) != null);
+}
+
+test "terminal mouse reporting defaults on and supports explicit opt-out" {
+    try std.testing.expect(shouldUseMouseReportingForEnv(null));
+    try std.testing.expect(shouldUseMouseReportingForEnv(""));
+    try std.testing.expect(shouldUseMouseReportingForEnv("1"));
+    try std.testing.expect(shouldUseMouseReportingForEnv("true"));
+    try std.testing.expect(!shouldUseMouseReportingForEnv("0"));
+    try std.testing.expect(!shouldUseMouseReportingForEnv("false"));
+    try std.testing.expect(!shouldUseMouseReportingForEnv("off"));
 }
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {

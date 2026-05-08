@@ -500,6 +500,25 @@ pub const AppState = struct {
         }
     }
 
+    pub fn chatScrollPageUp(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = @min(
+            self.chat_scroll_offset +| self.chatScrollPageSizeLocked(),
+            self.chat_scroll_max_offset,
+        );
+    }
+
+    pub fn chatScrollPageDown(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = self.chat_scroll_offset -| self.chatScrollPageSizeLocked();
+    }
+
+    fn chatScrollPageSizeLocked(self: *const AppState) usize {
+        return @max(self.chat_visible_rows, 1);
+    }
+
     pub fn chatScrollToTail(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -3870,6 +3889,17 @@ test "chat scroll wheel updates offset only inside chat region and clamps" {
     state.handleChatMouseWheel(.{ .direction = .down, .row = 5, .col = 10 });
     try std.testing.expectEqual(@as(usize, 17), state.chat_scroll_offset);
     for (0..10) |_| state.handleChatMouseWheel(.{ .direction = .down, .row = 5, .col = 10 });
+    try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
+
+    state.chatScrollPageUp();
+    try std.testing.expectEqual(@as(usize, 10), state.chat_scroll_offset);
+    state.chatScrollPageUp();
+    state.chatScrollPageUp();
+    try std.testing.expectEqual(@as(usize, 20), state.chat_scroll_offset);
+    state.chatScrollPageDown();
+    try std.testing.expectEqual(@as(usize, 10), state.chat_scroll_offset);
+    state.chatScrollPageDown();
+    state.chatScrollPageDown();
     try std.testing.expectEqual(@as(usize, 0), state.chat_scroll_offset);
 }
 
