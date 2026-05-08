@@ -251,7 +251,6 @@ fn recordingStream(
     _: types.Context,
     options: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
-    _ = allocator;
     _ = io;
     recording_state.stream_calls += 1;
     recording_state.saw_model_api = model.api;
@@ -271,12 +270,11 @@ fn recordingStream(
         recording_state.saw_bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
     }
 
-    const result_allocator = std.heap.page_allocator;
-    const text = try result_allocator.dupe(u8, recording_state.response_text);
-    const content = try result_allocator.alloc(types.ContentBlock, 1);
+    const text = try allocator.dupe(u8, recording_state.response_text);
+    const content = try allocator.alloc(types.ContentBlock, 1);
     content[0] = .{ .text = .{ .text = text } };
 
-    var stream_instance = event_stream.createAssistantMessageEventStream(std.testing.allocator, std.Io.failing);
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, std.Io.failing);
     stream_instance.push(.{
         .event_type = .done,
         .message = .{
@@ -365,9 +363,8 @@ fn ownedDeltaStream(
     _: types.Context,
     _: ?types.StreamOptions,
 ) !event_stream.AssistantMessageEventStream {
-    const result_allocator = std.heap.page_allocator;
-    const text = try result_allocator.dupe(u8, "owned delta complete");
-    const content = try result_allocator.alloc(types.ContentBlock, 1);
+    const text = try allocator.dupe(u8, "owned delta complete");
+    const content = try allocator.alloc(types.ContentBlock, 1);
     content[0] = .{ .text = .{ .text = text } };
 
     var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
