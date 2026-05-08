@@ -57,13 +57,25 @@ test "zig sdk facade serializes deterministic author-facing metadata schema exec
         .tool_id = "template.echo",
         .phase = .execute,
         .category = "unsupported_host_api",
-        .message = "blocked Authorization Bearer sk-pi-template-secret",
-        .details = "payload contains sk-pi-template-secret",
+        .message = "blocked Authorization: Bearer pi-template-secret and x-api-key: pi-template-header-secret",
+        .details = "https://example.test/run?api_key=pi-template-query-secret&access_token=pi-template-access-secret payload sk-pi-template-secret",
     });
     defer allocator.free(diagnostic_json);
     try std.testing.expectEqualStrings(
-        "{\"runtime\":\"wasm\",\"extensionId\":\"com.example.echo\",\"toolId\":\"template.echo\",\"phase\":\"execute\",\"category\":\"unsupported_host_api\",\"message\":\"blocked Authorization Bearer [REDACTED]\",\"details\":\"payload contains [REDACTED]\"}",
+        "{\"runtime\":\"wasm\",\"severity\":\"error\",\"extensionId\":\"com.example.echo\",\"toolId\":\"template.echo\",\"phase\":\"execute\",\"category\":\"unsupported_host_api\",\"message\":\"blocked Authorization: Bearer [REDACTED] and x-api-key: [REDACTED]\",\"details\":\"https://example.test/run?api_key=[REDACTED]&access_token=[REDACTED] payload [REDACTED]\"}",
         diagnostic_json,
+    );
+
+    const unsupported_json = try sdk.unsupportedHostApiDiagnosticAlloc(
+        allocator,
+        "com.example.echo",
+        "template.echo",
+        "Workflow.RemoteWasm.load?token=pi-unsupported-secret",
+    );
+    defer allocator.free(unsupported_json);
+    try std.testing.expectEqualStrings(
+        "{\"runtime\":\"wasm\",\"severity\":\"error\",\"extensionId\":\"com.example.echo\",\"toolId\":\"template.echo\",\"phase\":\"execute\",\"category\":\"unsupported_host_api\",\"message\":\"unsupported host API denied: Workflow.RemoteWasm.load?token=[REDACTED]\",\"details\":\"\"}",
+        unsupported_json,
     );
 }
 

@@ -35,6 +35,7 @@ pub const Phase = enum {
 };
 
 pub const Diagnostic = struct {
+    severity: []const u8 = "error",
     extension_id: []const u8,
     tool_id: []const u8,
     phase: Phase,
@@ -147,7 +148,9 @@ pub fn diagnosticJsonAlloc(allocator: std.mem.Allocator, diagnostic: Diagnostic)
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
-    try writer.writer.writeAll("{\"runtime\":\"wasm\",\"extensionId\":");
+    try writer.writer.writeAll("{\"runtime\":\"wasm\",\"severity\":");
+    try std.json.Stringify.value(diagnostic.severity, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"extensionId\":");
     try std.json.Stringify.value(diagnostic.extension_id, .{}, &writer.writer);
     try writer.writer.writeAll(",\"toolId\":");
     try std.json.Stringify.value(diagnostic.tool_id, .{}, &writer.writer);
@@ -275,6 +278,24 @@ fn redactSecretsAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     defer writer.deinit();
     var index: usize = 0;
     while (index < text.len) {
+        if (sensitiveQueryParamPrefixLen(text[index..])) |prefix_len| {
+            try writer.writer.writeAll(text[index .. index + prefix_len]);
+            try writer.writer.writeAll("[REDACTED]");
+            index = skipSecretValue(text, index + prefix_len, .query);
+            continue;
+        }
+        if (startsWithIgnoreCase(text[index..], "Bearer ")) {
+            try writer.writer.writeAll(text[index .. index + "Bearer ".len]);
+            try writer.writer.writeAll("[REDACTED]");
+            index = skipSecretValue(text, index + "Bearer ".len, .token);
+            continue;
+        }
+        if (sensitiveHeaderPrefixLen(text[index..])) |prefix_len| {
+            try writer.writer.writeAll(text[index .. index + prefix_len]);
+            try writer.writer.writeAll("[REDACTED]");
+            index = skipSecretValue(text, index + prefix_len, .header);
+            continue;
+        }
         if (std.mem.startsWith(u8, text[index..], "sk-")) {
             try writer.writer.writeAll("[REDACTED]");
             index += 3;
@@ -285,6 +306,88 @@ fn redactSecretsAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         index += 1;
     }
     return allocator.dupe(u8, writer.written());
+}
+
+const SecretValueMode = enum {
+    token,
+    query,
+    header,
+};
+
+fn sensitiveQueryParamPrefixLen(text: []const u8) ?usize {
+    const keys = [_][]const u8{
+        "api_key=",
+        "apikey=",
+        "access_token=",
+        "refresh_token=",
+        "token=",
+        "key=",
+        "session_token=",
+    };
+    for (keys) |key| {
+        if (startsWithIgnoreCase(text, key)) return key.len;
+    }
+    return null;
+}
+
+fn sensitiveHeaderPrefixLen(text: []const u8) ?usize {
+    const headers = [_][]const u8{
+        "x-api-key",
+        "api-key",
+        "authorization",
+        "x-amz-security-token",
+        "cookie",
+        "set-cookie",
+    };
+    for (headers) |header| {
+        if (!startsWithIgnoreCase(text, header)) continue;
+        var index: usize = header.len;
+        while (index < text.len and text[index] == ' ') index += 1;
+        if (index >= text.len or text[index] != ':') continue;
+        index += 1;
+        while (index < text.len and text[index] == ' ') index += 1;
+        if (std.ascii.eqlIgnoreCase(header, "authorization") and startsWithIgnoreCase(text[index..], "Bearer ")) {
+            return null;
+        }
+        return index;
+    }
+    return null;
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix);
+}
+
+fn skipSecretValue(text: []const u8, start: usize, mode: SecretValueMode) usize {
+    var index = start;
+    while (index < text.len) : (index += 1) {
+        const byte = text[index];
+        switch (mode) {
+            .query => {
+                if (byte == '&' or byte == '#' or isSecretBoundary(byte)) return index;
+            },
+            .token => {
+                if (isSecretBoundary(byte) or byte == '&' or byte == '?' or byte == '#') return index;
+            },
+            .header => {
+                if (byte == '\n' or byte == '\r') return index;
+            },
+        }
+    }
+    return index;
+}
+
+fn isSecretBoundary(byte: u8) bool {
+    return byte == ' ' or
+        byte == '\t' or
+        byte == '"' or
+        byte == '\'' or
+        byte == '<' or
+        byte == '>' or
+        byte == ')' or
+        byte == ']' or
+        byte == '}' or
+        byte == ',';
 }
 
 fn isSecretChar(byte: u8) bool {
