@@ -5,10 +5,12 @@
 ### Added
 
 - Added `kimi-code-openai` as a built-in OpenAI-compatible Kimi Code provider using `KIMI_API_KEY` and the canonical `kimi-for-coding` model.
+- Added Together AI as a built-in OpenAI-compatible provider with generated model metadata and `TOGETHER_API_KEY` authentication ([#3624](https://github.com/earendil-works/pi-mono/pull/3624) by [@Nutlope](https://github.com/Nutlope)).
 
 ### Fixed
 
 - Fixed generated Kimi Code catalog entries to expose only the canonical `kimi-for-coding` model and stop spoofing the Kimi CLI User-Agent.
+- Fixed OpenAI Responses requests for models that support disabling reasoning to send `reasoning.effort: "none"` when thinking is off.
 
 ## [0.74.0] - 2026-05-07
 

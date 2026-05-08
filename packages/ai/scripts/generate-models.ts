@@ -65,6 +65,58 @@ const COPILOT_STATIC_HEADERS = {
 	"Copilot-Integration-Id": "vscode-chat",
 } as const;
 
+const TOGETHER_BASE_URL = "https://api.together.ai/v1";
+const TOGETHER_BASE_COMPAT: OpenAICompletionsCompat = {
+	supportsStore: false,
+	supportsDeveloperRole: false,
+	supportsReasoningEffort: false,
+	maxTokensField: "max_tokens",
+	supportsStrictMode: false,
+	supportsLongCacheRetention: false,
+};
+const TOGETHER_TOGGLE_REASONING_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_BASE_COMPAT,
+	thinkingFormat: "together",
+};
+const TOGETHER_REASONING_EFFORT_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_BASE_COMPAT,
+	supportsReasoningEffort: true,
+	thinkingFormat: "openai",
+};
+const TOGETHER_TOGGLE_REASONING_EFFORT_COMPAT: OpenAICompletionsCompat = {
+	...TOGETHER_TOGGLE_REASONING_COMPAT,
+	supportsReasoningEffort: true,
+};
+const TOGETHER_REASONING_ONLY_MODELS = new Set([
+	"deepseek-ai/DeepSeek-R1",
+	"MiniMaxAI/MiniMax-M2.5",
+	"MiniMaxAI/MiniMax-M2.7",
+]);
+const TOGETHER_REASONING_EFFORT_MODELS = new Set(["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
+const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro"]);
+const TOGETHER_FIXED_REASONING_LEVEL_MAP = {
+	off: null,
+	minimal: null,
+	low: null,
+	medium: null,
+} as const;
+const TOGETHER_REASONING_EFFORT_LEVEL_MAP = {
+	off: null,
+	minimal: null,
+} as const;
+const TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP = {
+	minimal: null,
+	low: null,
+	medium: null,
+	high: "high",
+	xhigh: null,
+} as const;
+const TOGETHER_TOGGLE_REASONING_LEVEL_MAP = {
+	minimal: null,
+	low: null,
+	medium: null,
+} as const;
+
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
@@ -105,6 +157,7 @@ const ZIG_DEFAULT_MODEL_PER_PROVIDER: Record<string, string> = {
 	"moonshotai-cn": "kimi-k2.6",
 	huggingface: "moonshotai/Kimi-K2.6",
 	fireworks: "accounts/fireworks/models/kimi-k2p6",
+	together: "moonshotai/Kimi-K2.6",
 	opencode: "kimi-k2.6",
 	"opencode-go": "kimi-k2.6",
 	"kimi-coding": "kimi-for-coding",
@@ -231,8 +284,37 @@ pub const models = [_]model_registry.ModelDefinition{
 	return output;
 }
 
+const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
+	"gpt-5.1",
+	"gpt-5.2",
+	"gpt-5.3-codex",
+	"gpt-5.4",
+	"gpt-5.4-mini",
+	"gpt-5.4-nano",
+	"gpt-5.5",
+]);
+
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
 	model.thinkingLevelMap = { ...model.thinkingLevelMap, ...map };
+}
+
+function getTogetherCompat(modelId: string, reasoning: boolean): OpenAICompletionsCompat {
+	if (!reasoning) return TOGETHER_BASE_COMPAT;
+	if (TOGETHER_REASONING_EFFORT_MODELS.has(modelId)) return TOGETHER_REASONING_EFFORT_COMPAT;
+	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) return TOGETHER_TOGGLE_REASONING_EFFORT_COMPAT;
+	if (TOGETHER_REASONING_ONLY_MODELS.has(modelId)) return TOGETHER_BASE_COMPAT;
+	return TOGETHER_TOGGLE_REASONING_COMPAT;
+}
+
+function getTogetherThinkingLevelMap(
+	modelId: string,
+	reasoning: boolean,
+): NonNullable<Model<any>["thinkingLevelMap"]> | undefined {
+	if (!reasoning) return undefined;
+	if (TOGETHER_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_REASONING_EFFORT_LEVEL_MAP };
+	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP };
+	if (TOGETHER_REASONING_ONLY_MODELS.has(modelId)) return { ...TOGETHER_FIXED_REASONING_LEVEL_MAP };
+	return { ...TOGETHER_TOGGLE_REASONING_LEVEL_MAP };
 }
 
 function supportsOpenAiXhigh(modelId: string): boolean {
@@ -266,6 +348,13 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.startsWith("gpt-5")
 	) {
 		mergeThinkingLevelMap(model, { off: null });
+	}
+	if (
+		model.api === "openai-responses" &&
+		model.provider === "openai" &&
+		OPENAI_RESPONSES_NONE_REASONING_MODELS.has(model.id)
+	) {
+		mergeThinkingLevelMap(model, { off: "none" });
 	}
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
@@ -819,6 +908,38 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						cacheRead: m.cost?.cache_read || 0,
 						cacheWrite: m.cost?.cache_write || 0,
 					},
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+				});
+			}
+		}
+
+		// Process Together AI models
+		const togetherProvider = data.together ?? data.togetherai ?? data["together-ai"];
+		if (togetherProvider?.models) {
+			for (const [modelId, model] of Object.entries(togetherProvider.models)) {
+				const m = model as ModelsDevModel & { status?: string };
+				if (m.tool_call !== true) continue;
+				if (m.status === "deprecated") continue;
+
+				const reasoning = m.reasoning === true;
+				const thinkingLevelMap = getTogetherThinkingLevelMap(modelId, reasoning);
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "openai-completions",
+					provider: "together",
+					baseUrl: TOGETHER_BASE_URL,
+					reasoning,
+					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					compat: getTogetherCompat(modelId, reasoning),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});

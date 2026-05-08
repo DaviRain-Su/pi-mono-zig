@@ -357,11 +357,13 @@ pub fn resolveConfiguredResources(
 
     if (options.include_default_extensions) try addAutoDiscovered(allocator, io, &extensions, &diagnostics, .extension, .project, project_base_dir);
     if (options.include_default_skills) try addAutoDiscovered(allocator, io, &skills, &diagnostics, .skill, .project, project_base_dir);
+    if (options.include_default_skills) try addAutoDiscoveredProjectAgentSkills(allocator, io, &skills, &diagnostics, options.cwd, options.env_map);
     if (options.include_default_prompts) try addAutoDiscovered(allocator, io, &prompts, &diagnostics, .prompt, .project, project_base_dir);
     if (options.include_default_themes) try addAutoDiscovered(allocator, io, &themes, &diagnostics, .theme, .project, project_base_dir);
 
     if (options.include_default_extensions) try addAutoDiscovered(allocator, io, &extensions, &diagnostics, .extension, .user, options.agent_dir);
     if (options.include_default_skills) try addAutoDiscovered(allocator, io, &skills, &diagnostics, .skill, .user, options.agent_dir);
+    if (options.include_default_skills) try addAutoDiscoveredUserAgentSkills(allocator, io, &skills, &diagnostics, options.env_map);
     if (options.include_default_prompts) try addAutoDiscovered(allocator, io, &prompts, &diagnostics, .prompt, .user, options.agent_dir);
     if (options.include_default_themes) try addAutoDiscovered(allocator, io, &themes, &diagnostics, .theme, .user, options.agent_dir);
 
@@ -1358,6 +1360,64 @@ fn addAutoDiscovered(
     );
 }
 
+fn addAutoDiscoveredProjectAgentSkills(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    cwd: []const u8,
+    env_map: ?*const std.process.Environ.Map,
+) !void {
+    const user_agents_skills_dir = try userAgentsSkillsDir(allocator, env_map);
+    defer if (user_agents_skills_dir) |path| allocator.free(path);
+
+    var skill_dirs = std.ArrayList([]u8).empty;
+    defer {
+        for (skill_dirs.items) |path| allocator.free(path);
+        skill_dirs.deinit(allocator);
+    }
+    try collectAncestorAgentSkillDirs(allocator, io, cwd, &skill_dirs);
+
+    for (skill_dirs.items) |agents_skills_dir| {
+        if (user_agents_skills_dir) |user_dir| {
+            if (std.mem.eql(u8, agents_skills_dir, user_dir)) continue;
+        }
+        const agents_base_dir = std.fs.path.dirname(agents_skills_dir) orelse continue;
+        try addAutoDiscoveredAgentSkillDir(allocator, io, target, diagnostics, agents_skills_dir, .project, agents_base_dir);
+    }
+}
+
+fn addAutoDiscoveredUserAgentSkills(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    env_map: ?*const std.process.Environ.Map,
+) !void {
+    const agents_skills_dir = try userAgentsSkillsDir(allocator, env_map) orelse return;
+    defer allocator.free(agents_skills_dir);
+    const agents_base_dir = std.fs.path.dirname(agents_skills_dir) orelse return;
+    try addAutoDiscoveredAgentSkillDir(allocator, io, target, diagnostics, agents_skills_dir, .user, agents_base_dir);
+}
+
+fn addAutoDiscoveredAgentSkillDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    agents_skills_dir: []const u8,
+    scope: SourceScope,
+    agents_base_dir: []const u8,
+) !void {
+    if (!pathExists(io, agents_skills_dir)) return;
+    try collectAgentSkillFiles(allocator, io, target, diagnostics, agents_skills_dir, true, .{
+        .source = "auto",
+        .scope = scope,
+        .origin = .top_level,
+        .base_dir = agents_base_dir,
+    });
+}
+
 fn addLocalEntries(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1466,6 +1526,40 @@ fn collectSkillFiles(
         const file_path = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
         defer allocator.free(file_path);
         try appendResolvedResource(allocator, target, file_path, enabled, seed);
+    }
+}
+
+fn collectAgentSkillFiles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    dir_path: []const u8,
+    enabled: bool,
+    seed: MetadataSeed,
+) !void {
+    const skill_marker = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, "SKILL.md" });
+    defer allocator.free(skill_marker);
+    if (pathExists(io, skill_marker)) {
+        try appendResolvedResource(allocator, target, skill_marker, enabled, seed);
+        return;
+    }
+
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "failed to open skills directory", dir_path));
+        return;
+    };
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        if (std.mem.eql(u8, entry.name, "node_modules")) continue;
+
+        const subdir = try std.fs.path.join(allocator, &[_][]const u8{ dir_path, entry.name });
+        defer allocator.free(subdir);
+        try collectAgentSkillFiles(allocator, io, target, diagnostics, subdir, enabled, seed);
     }
 }
 
@@ -1966,6 +2060,58 @@ fn readOptionalFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         error.FileNotFound => null,
         else => return err,
     };
+}
+
+fn userAgentsSkillsDir(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) !?[]u8 {
+    const home = resourceEnvValue(env_map, "HOME") orelse return null;
+    return @as(?[]u8, try std.fs.path.join(allocator, &[_][]const u8{ home, ".agents", "skills" }));
+}
+
+fn collectAncestorAgentSkillDirs(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start_dir: []const u8,
+    out: *std.ArrayList([]u8),
+) !void {
+    var current = if (std.fs.path.isAbsolute(start_dir))
+        try allocator.dupe(u8, start_dir)
+    else
+        try std.fs.path.resolve(allocator, &[_][]const u8{start_dir});
+    defer allocator.free(current);
+
+    const git_root = try findGitRepoRoot(allocator, io, current);
+    defer if (git_root) |path| allocator.free(path);
+
+    while (true) {
+        try out.append(allocator, try std.fs.path.join(allocator, &[_][]const u8{ current, ".agents", "skills" }));
+        if (git_root) |root| {
+            if (std.mem.eql(u8, current, root)) break;
+        }
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+}
+
+fn findGitRepoRoot(allocator: std.mem.Allocator, io: std.Io, start_dir: []const u8) !?[]u8 {
+    var current = try allocator.dupe(u8, start_dir);
+    defer allocator.free(current);
+
+    while (true) {
+        const git_path = try std.fs.path.join(allocator, &[_][]const u8{ current, ".git" });
+        defer allocator.free(git_path);
+        if (pathExists(io, git_path)) {
+            return try allocator.dupe(u8, current);
+        }
+        const parent = std.fs.path.dirname(current) orelse break;
+        if (std.mem.eql(u8, parent, current)) break;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
+    return null;
 }
 
 fn makeDiagnostic(allocator: std.mem.Allocator, kind: []const u8, message: []const u8, path: []const u8) !Diagnostic {
@@ -2473,12 +2619,20 @@ fn makeTmpPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]
     return makeAbsoluteTestPath(allocator, relative_path);
 }
 
+fn findResolvedResource(items: []const ResolvedResource, path: []const u8) ?ResolvedResource {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.path, path)) return item;
+    }
+    return null;
+}
+
 test "resolveConfiguredResources loads local, npm, and git resource sources" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "repo/.pi/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
     try tmp.dir.createDirPath(std.testing.io, "repo/.pi/prompts");
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent/packages/npm/node_modules/@demo/pkg/extensions");
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent/packages/npm/node_modules/@demo/pkg/skills/reviewer");
@@ -2576,6 +2730,7 @@ test "resolveConfiguredResources loads local, npm, and git resource sources" {
             .prompts = &.{"prompts"},
             .packages = &.{git_pkg},
         },
+        .include_default_skills = false,
     });
     defer resolved.deinit(allocator);
 
@@ -2587,6 +2742,116 @@ test "resolveConfiguredResources loads local, npm, and git resource sources" {
     try std.testing.expectEqual(@as(usize, 1), resolved.prompts.len);
     try std.testing.expect(std.mem.indexOf(u8, resolved.prompts[0].path, "summarize.md") != null);
     try std.testing.expectEqual(@as(usize, 2), resolved.themes.len);
+}
+
+test "resolveConfiguredResources discovers project .agents skills up to git root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.createDirPath(std.testing.io, "repo/packages/feature");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.agents/skills/repo");
+    try tmp.dir.createDirPath(std.testing.io, "repo/packages/.agents/skills/package");
+    try tmp.dir.createDirPath(std.testing.io, ".agents/skills/above-repo");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/.agents/skills/repo/SKILL.md",
+        .data = "---\nname: repo\ndescription: repo\n---\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/packages/.agents/skills/package/SKILL.md",
+        .data = "---\nname: package\ndescription: package\n---\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".agents/skills/above-repo/SKILL.md",
+        .data = "---\nname: above\ndescription: above\n---\n",
+    });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo/packages/feature");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const repo_skill = try makeTmpPath(allocator, tmp, "repo/.agents/skills/repo/SKILL.md");
+    defer allocator.free(repo_skill);
+    const package_skill = try makeTmpPath(allocator, tmp, "repo/packages/.agents/skills/package/SKILL.md");
+    defer allocator.free(package_skill);
+    const above_repo_skill = try makeTmpPath(allocator, tmp, ".agents/skills/above-repo/SKILL.md");
+    defer allocator.free(above_repo_skill);
+    const repo_agents_base = try makeTmpPath(allocator, tmp, "repo/.agents");
+    defer allocator.free(repo_agents_base);
+    const package_agents_base = try makeTmpPath(allocator, tmp, "repo/packages/.agents");
+    defer allocator.free(package_agents_base);
+
+    var resolved = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .include_default_extensions = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    const repo_resource = findResolvedResource(resolved.skills, repo_skill).?;
+    const package_resource = findResolvedResource(resolved.skills, package_skill).?;
+    try std.testing.expect(findResolvedResource(resolved.skills, above_repo_skill) == null);
+    try std.testing.expectEqual(.project, repo_resource.source_info.scope);
+    try std.testing.expectEqual(.project, package_resource.source_info.scope);
+    try std.testing.expectEqualStrings(repo_agents_base, repo_resource.source_info.base_dir.?);
+    try std.testing.expectEqualStrings(package_agents_base, package_resource.source_info.base_dir.?);
+}
+
+test "resolveConfiguredResources discovers user .agents skills with .agents base dir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/scratch/nested");
+    try tmp.dir.createDirPath(std.testing.io, "home/.agents/skills/home-skill");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.agents/skills/home-skill/SKILL.md",
+        .data = "---\nname: home-skill\ndescription: home\n---\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.agents/skills/root-file.md",
+        .data = "---\nname: root-file\ndescription: root file\n---\n",
+    });
+
+    const home = try makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home);
+    const cwd = try makeTmpPath(allocator, tmp, "home/scratch/nested");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const skill_path = try makeTmpPath(allocator, tmp, "home/.agents/skills/home-skill/SKILL.md");
+    defer allocator.free(skill_path);
+    const root_markdown = try makeTmpPath(allocator, tmp, "home/.agents/skills/root-file.md");
+    defer allocator.free(root_markdown);
+    const agents_base = try makeTmpPath(allocator, tmp, "home/.agents");
+    defer allocator.free(agents_base);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home);
+
+    var resolved = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .env_map = &env_map,
+        .include_default_extensions = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    const resource = findResolvedResource(resolved.skills, skill_path).?;
+    try std.testing.expect(findResolvedResource(resolved.skills, root_markdown) == null);
+    try std.testing.expectEqual(@as(usize, 1), resolved.skills.len);
+    try std.testing.expectEqual(.user, resource.source_info.scope);
+    try std.testing.expectEqualStrings("auto", resource.source_info.source);
+    try std.testing.expectEqualStrings(agents_base, resource.source_info.base_dir.?);
 }
 
 test "resolveConfiguredResources denies wasm package resources without valid scope lock" {

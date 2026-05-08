@@ -1,6 +1,6 @@
 import "@mariozechner/mini-lit/dist/ThemeToggle.js";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import { getModel, type TextContent } from "@earendil-works/pi-ai";
+import { getModel, type ImageContent, type TextContent } from "@earendil-works/pi-ai";
 import {
 	type AgentState,
 	ApiKeyPromptDialog,
@@ -79,8 +79,8 @@ const generateTitle = (messages: AgentMessage[]): string => {
 	if (typeof content === "string") {
 		text = content;
 	} else {
-		const textBlocks = content.filter((c): c is TextContent => c.type === "text");
-		text = textBlocks.map((c) => c.text || "").join(" ");
+		const textBlocks = content.filter((c: TextContent | ImageContent): c is TextContent => c.type === "text");
+		text = textBlocks.map((c: TextContent) => c.text || "").join(" ");
 	}
 
 	text = text.trim();

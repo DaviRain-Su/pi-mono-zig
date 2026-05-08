@@ -459,6 +459,7 @@ pub fn formatHintsText(
 fn hintKeyLabel(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
     if (std.mem.eql(u8, label, "Enter")) return allocator.dupe(u8, "⏎");
     if (std.mem.eql(u8, label, "Alt+Enter")) return allocator.dupe(u8, "Alt+⏎");
+    if (std.mem.eql(u8, label, "Option+Enter")) return allocator.dupe(u8, "Option+⏎");
     return allocator.dupe(u8, label);
 }
 

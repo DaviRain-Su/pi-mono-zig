@@ -107,6 +107,8 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "groq", model: "openai/gpt-oss-120b", label: "groq-gpt-oss-120b" },
 	// Hugging Face
 	{ provider: "huggingface", model: "moonshotai/Kimi-K2.5", label: "huggingface-kimi-k2.5" },
+	// Together AI
+	{ provider: "together", model: "moonshotai/Kimi-K2.6", label: "together-kimi-k2.6" },
 	// Kimi For Coding
 	{ provider: "kimi-coding", model: "kimi-for-coding", label: "kimi-coding-kimi-for-coding" },
 	// Mistral

@@ -66,6 +66,7 @@ pi
 | OpenCode Go | `OPENCODE_API_KEY` | `opencode-go` |
 | Hugging Face | `HF_TOKEN` | `huggingface` |
 | Fireworks | `FIREWORKS_API_KEY` | `fireworks` |
+| Together AI | `TOGETHER_API_KEY` | `together` |
 | Kimi For Coding | `KIMI_API_KEY` | `kimi-coding` |
 | MiniMax | `MINIMAX_API_KEY` | `minimax` |
 | MiniMax (China) | `MINIMAX_CN_API_KEY` | `minimax-cn` |
@@ -88,6 +89,7 @@ Store credentials in `~/.pi/agent/auth.json`:
   "google": { "type": "api_key", "key": "..." },
   "opencode": { "type": "api_key", "key": "..." },
   "opencode-go": { "type": "api_key", "key": "..." },
+  "together": { "type": "api_key", "key": "..." },
   "xiaomi": { "type": "api_key", "key": "..." },
   "xiaomi-token-plan-cn":  { "type": "api_key", "key": "..." },
   "xiaomi-token-plan-ams": { "type": "api_key", "key": "..." },

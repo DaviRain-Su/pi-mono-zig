@@ -341,12 +341,42 @@ fn appendReasoningPayloadFields(
             const value = effort orelse "none";
             try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, value) });
             try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
+        } else if (std.mem.eql(u8, compat.thinking_format, "together")) {
+            var reasoning = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+            errdefer reasoning.deinit(allocator);
+            try reasoning.put(allocator, try allocator.dupe(u8, "enabled"), .{ .bool = effort != null });
+            try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
+            if (effort) |value| {
+                if (compat.supports_reasoning_effort) {
+                    try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, mappedReasoningEffort(model, value)) });
+                }
+            }
         } else if (effort) |value| {
             if (compat.supports_reasoning_effort) {
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, value) });
             }
         }
     }
+}
+
+fn mappedReasoningEffort(model: types.Model, effort: []const u8) []const u8 {
+    const level = modelThinkingLevel(effort) orelse return effort;
+    const map = model.thinking_level_map orelse return effort;
+    const entry = map.get(level) orelse return effort;
+    return switch (entry) {
+        .mapped => |mapped| mapped,
+        .unsupported => effort,
+    };
+}
+
+fn modelThinkingLevel(effort: []const u8) ?types.ModelThinkingLevel {
+    if (std.mem.eql(u8, effort, "off")) return .off;
+    if (std.mem.eql(u8, effort, "minimal")) return .minimal;
+    if (std.mem.eql(u8, effort, "low")) return .low;
+    if (std.mem.eql(u8, effort, "medium")) return .medium;
+    if (std.mem.eql(u8, effort, "high")) return .high;
+    if (std.mem.eql(u8, effort, "xhigh")) return .xhigh;
+    return null;
 }
 
 fn appendRoutingPayloadFields(
@@ -555,12 +585,17 @@ pub fn getCompat(model: types.Model) OpenAICompat {
     const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null;
     const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
     const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
+    const is_together = std.mem.eql(u8, model.provider, "together") or
+        std.mem.indexOf(u8, model.base_url, "api.together.ai") != null or
+        std.mem.indexOf(u8, model.base_url, "api.together.xyz") != null;
     const is_cloudflare_workers_ai = std.mem.eql(u8, model.provider, "cloudflare-workers-ai") or std.mem.indexOf(u8, model.base_url, "api.cloudflare.com") != null;
     const is_cloudflare_ai_gateway = std.mem.eql(u8, model.provider, "cloudflare-ai-gateway") or std.mem.indexOf(u8, model.base_url, "gateway.ai.cloudflare.com") != null;
     const detected_thinking_format = if (is_deepseek)
         "deepseek"
     else if (is_zai)
         "zai"
+    else if (is_together)
+        "together"
     else if (std.mem.eql(u8, model.provider, "openrouter") or std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null)
         "openrouter"
     else
@@ -573,9 +608,9 @@ pub fn getCompat(model: types.Model) OpenAICompat {
     return .{
         .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
         .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
-        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai and !is_cloudflare_ai_gateway),
+        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai and !is_together and !is_cloudflare_ai_gateway),
         .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
-        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes or is_cloudflare_ai_gateway) "max_tokens" else "max_completion_tokens",
+        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes or is_together or is_cloudflare_ai_gateway) "max_tokens" else "max_completion_tokens",
         .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
         .requires_assistant_after_tool_result = compatBoolField(model.compat, "requiresAssistantAfterToolResult") orelse false,
         .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
@@ -584,10 +619,10 @@ pub fn getCompat(model: types.Model) OpenAICompat {
         .open_router_routing = compatObjectValueField(model.compat, "openRouterRouting") orelse null,
         .vercel_gateway_routing = compatObjectValueField(model.compat, "vercelGatewayRouting") orelse null,
         .zai_tool_stream = compatBoolField(model.compat, "zaiToolStream") orelse false,
-        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse !is_cloudflare_ai_gateway,
+        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse !(is_together or is_cloudflare_ai_gateway),
         .cache_control_format = compatStringField(model.compat, "cacheControlFormat") orelse detected_cache_control_format,
         .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse false,
-        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !(is_cloudflare_workers_ai or is_cloudflare_ai_gateway),
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !(is_together or is_cloudflare_workers_ai or is_cloudflare_ai_gateway),
     };
 }
 
@@ -622,6 +657,7 @@ fn isNonStandardProvider(model: types.Model) bool {
     if (std.mem.eql(u8, provider, "cerebras") or
         std.mem.eql(u8, provider, "xai") or
         std.mem.eql(u8, provider, "zai") or
+        std.mem.eql(u8, provider, "together") or
         std.mem.eql(u8, provider, "opencode") or
         std.mem.eql(u8, provider, "cloudflare-workers-ai") or
         std.mem.eql(u8, provider, "cloudflare-ai-gateway"))
@@ -634,6 +670,8 @@ fn isNonStandardProvider(model: types.Model) bool {
         std.mem.indexOf(u8, base_url, "chutes.ai") != null or
         std.mem.indexOf(u8, base_url, "deepseek.com") != null or
         std.mem.indexOf(u8, base_url, "api.z.ai") != null or
+        std.mem.indexOf(u8, base_url, "api.together.ai") != null or
+        std.mem.indexOf(u8, base_url, "api.together.xyz") != null or
         std.mem.indexOf(u8, base_url, "opencode.ai") != null or
         std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null or
         std.mem.indexOf(u8, base_url, "gateway.ai.cloudflare.com") != null)
@@ -1136,4 +1174,93 @@ fn buildMessageObject(allocator: std.mem.Allocator, role: []const u8, content: [
     try obj.put(allocator, try allocator.dupe(u8, "role"), std.json.Value{ .string = try allocator.dupe(u8, role) });
     try obj.put(allocator, try allocator.dupe(u8, "content"), std.json.Value{ .string = try allocator.dupe(u8, content) });
     return obj;
+}
+
+test "Together compat uses non-standard chat payload fields" {
+    const allocator = std.testing.allocator;
+
+    var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
+    defer freeJsonValue(allocator, tool_schema);
+    try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+
+    const model = types.Model{
+        .id = "moonshotai/Kimi-K2.6",
+        .name = "Kimi K2.6",
+        .api = "openai-completions",
+        .provider = "together",
+        .base_url = "https://api.together.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 262144,
+        .max_tokens = 131000,
+    };
+    const context = types.Context{
+        .system_prompt = "Follow instructions.",
+        .messages = &[_]types.Message{},
+        .tools = &[_]types.Tool{.{
+            .name = "lookup",
+            .description = "Look up data",
+            .parameters = tool_schema,
+        }},
+    };
+
+    const payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
+        .max_tokens = 256,
+        .openai_reasoning_effort = "high",
+        .session_id = "together-session",
+        .cache_retention = .long,
+    }, null);
+    defer freeJsonValue(allocator, payload);
+
+    try std.testing.expect(payload.object.get("store") == null);
+    try std.testing.expect(payload.object.get("prompt_cache_key") == null);
+    try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
+    try std.testing.expect(payload.object.get("max_completion_tokens") == null);
+    try std.testing.expectEqual(@as(i64, 256), payload.object.get("max_tokens").?.integer);
+    try std.testing.expect(payload.object.get("reasoning_effort") == null);
+    try std.testing.expectEqual(true, payload.object.get("reasoning").?.object.get("enabled").?.bool);
+
+    const messages = payload.object.get("messages").?.array.items;
+    try std.testing.expectEqualStrings("system", messages[0].object.get("role").?.string);
+
+    const tool = payload.object.get("tools").?.array.items[0].object;
+    const function = tool.get("function").?.object;
+    try std.testing.expect(function.get("strict") == null);
+}
+
+test "Together reasoning payload preserves supported mapped effort" {
+    const allocator = std.testing.allocator;
+
+    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try compat.put(allocator, try allocator.dupe(u8, "thinkingFormat"), .{ .string = try allocator.dupe(u8, "together") });
+    try compat.put(allocator, try allocator.dupe(u8, "supportsReasoningEffort"), .{ .bool = true });
+    const compat_value = std.json.Value{ .object = compat };
+    defer freeJsonValue(allocator, compat_value);
+
+    const model = types.Model{
+        .id = "deepseek-ai/DeepSeek-V4-Pro",
+        .name = "DeepSeek V4 Pro",
+        .api = "openai-completions",
+        .provider = "custom-provider",
+        .base_url = "https://api.together.xyz/v1",
+        .reasoning = true,
+        .thinking_level_map = .{ .high = .{ .mapped = "max" } },
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 512000,
+        .max_tokens = 384000,
+        .compat = compat_value,
+    };
+    const context = types.Context{ .messages = &[_]types.Message{} };
+
+    const enabled_payload = try buildRequestPayload(allocator, model, context, .{
+        .openai_reasoning_effort = "high",
+    });
+    defer freeJsonValue(allocator, enabled_payload);
+    try std.testing.expectEqual(true, enabled_payload.object.get("reasoning").?.object.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("max", enabled_payload.object.get("reasoning_effort").?.string);
+
+    const disabled_payload = try buildRequestPayload(allocator, model, context, null);
+    defer freeJsonValue(allocator, disabled_payload);
+    try std.testing.expectEqual(false, disabled_payload.object.get("reasoning").?.object.get("enabled").?.bool);
+    try std.testing.expect(disabled_payload.object.get("reasoning_effort") == null);
 }

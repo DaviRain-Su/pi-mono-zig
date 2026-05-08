@@ -2810,10 +2810,15 @@ fn buildSystemPromptValue(
 
     var array = std.json.Array.init(allocator);
     if (is_oauth) {
-        try array.append(try buildTextBlockObject(allocator, CLAUDE_CODE_IDENTITY, cache_control));
+        try array.append(try buildTextBlockObject(allocator, CLAUDE_CODE_IDENTITY, null));
     }
     if (system_prompt) |prompt| {
-        try array.append(try buildTextBlockObject(allocator, prompt, cache_control));
+        try array.append(try buildTextBlockObject(allocator, prompt, null));
+    }
+    if (cache_control) |value| {
+        if (array.items.len > 0) {
+            try applyCacheControlToBlock(allocator, &array.items[array.items.len - 1], value);
+        }
     }
     return .{ .array = array };
 }
@@ -2838,18 +2843,15 @@ fn buildMessagesValue(
                 }
             },
             .tool_result => {
-                const grouped = try buildToolResultUserMessageValue(allocator, messages[index..], cache_control);
+                const grouped = try buildToolResultUserMessageValue(allocator, messages[index..]);
                 try array.append(grouped.value);
                 index += grouped.consumed - 1;
             },
         }
     }
     _ = tools;
-    if (cache_control) |_| {
-        if (array.items.len > 0) {
-            const last = &array.items[array.items.len - 1];
-            try applyCacheControlToLastUserContent(allocator, last, cache_control.?);
-        }
+    if (cache_control) |value| {
+        try applyCacheControlToLastNUserMessages(allocator, &array, value, 2);
     }
     return .{ .array = array };
 }
@@ -2948,7 +2950,6 @@ fn buildAssistantMessageValue(
 fn buildToolResultUserMessageValue(
     allocator: std.mem.Allocator,
     messages: []const types.Message,
-    cache_control: ?std.json.Value,
 ) !struct { value: std.json.Value, consumed: usize } {
     var content = std.json.Array.init(allocator);
     errdefer content.deinit();
@@ -2967,12 +2968,6 @@ fn buildToolResultUserMessageValue(
                 try content.append(.{ .object = object });
             },
             else => break,
-        }
-    }
-
-    if (cache_control) |_| {
-        if (content.items.len > 0) {
-            try applyCacheControlToBlock(allocator, &content.items[content.items.len - 1], cache_control.?);
         }
     }
 
@@ -3078,6 +3073,25 @@ fn buildRoleMessageObject(allocator: std.mem.Allocator, role: []const u8, conten
     try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
     try object.put(allocator, try allocator.dupe(u8, "content"), content);
     return .{ .object = object };
+}
+
+fn applyCacheControlToLastNUserMessages(
+    allocator: std.mem.Allocator,
+    messages: *std.json.Array,
+    cache_control: std.json.Value,
+    count: usize,
+) !void {
+    var remaining = count;
+    var index = messages.items.len;
+    while (index > 0 and remaining > 0) {
+        index -= 1;
+        const message = &messages.items[index];
+        if (message.* != .object) continue;
+        const role_value = message.object.get("role") orelse continue;
+        if (role_value != .string or !std.mem.eql(u8, role_value.string, "user")) continue;
+        try applyCacheControlToLastUserContent(allocator, message, cache_control);
+        remaining -= 1;
+    }
 }
 
 fn applyCacheControlToLastUserContent(allocator: std.mem.Allocator, message: *std.json.Value, cache_control: std.json.Value) !void {

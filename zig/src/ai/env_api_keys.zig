@@ -143,6 +143,7 @@ fn resolveEnvVar(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "moonshotai-cn")) return "MOONSHOT_API_KEY";
     if (std.mem.eql(u8, provider, "huggingface")) return "HF_TOKEN";
     if (std.mem.eql(u8, provider, "fireworks")) return "FIREWORKS_API_KEY";
+    if (std.mem.eql(u8, provider, "together")) return "TOGETHER_API_KEY";
     if (std.mem.eql(u8, provider, "opencode")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "opencode-go")) return "OPENCODE_API_KEY";
     if (std.mem.eql(u8, provider, "kimi")) return "MOONSHOT_API_KEY";
@@ -184,6 +185,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
     try env_map.put("MINIMAX_CN_API_KEY", "minimax-cn-key");
     try env_map.put("HF_TOKEN", "hf-key");
     try env_map.put("FIREWORKS_API_KEY", "fireworks-key");
+    try env_map.put("TOGETHER_API_KEY", "together-key");
     try env_map.put("OPENCODE_API_KEY", "opencode-key");
     try env_map.put("MOONSHOT_API_KEY", "moonshot-key");
     try env_map.put("KIMI_API_KEY", "kimi-key");
@@ -225,6 +227,7 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
         .{ .provider = "moonshotai-cn", .expected = "moonshot-key" },
         .{ .provider = "huggingface", .expected = "hf-key" },
         .{ .provider = "fireworks", .expected = "fireworks-key" },
+        .{ .provider = "together", .expected = "together-key" },
         .{ .provider = "opencode", .expected = "opencode-key" },
         .{ .provider = "opencode-go", .expected = "opencode-key" },
         .{ .provider = "kimi", .expected = "moonshot-key" },
@@ -277,6 +280,7 @@ test "getEnvApiKey ignores blank credential values" {
     try env_map.put("OPENAI_API_KEY", "");
     try env_map.put("MOONSHOT_API_KEY", "\t ");
     try env_map.put("CLOUDFLARE_API_KEY", "\n");
+    try env_map.put("TOGETHER_API_KEY", "\n");
     try env_map.put("XIAOMI_API_KEY", " ");
     try env_map.put("XIAOMI_TOKEN_PLAN_CN_API_KEY", "\r\n");
     try env_map.put("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "\t");
@@ -306,6 +310,7 @@ test "getEnvApiKey ignores blank credential values" {
         "moonshotai-cn",
         "cloudflare-workers-ai",
         "cloudflare-ai-gateway",
+        "together",
         "xiaomi",
         "xiaomi-token-plan-cn",
         "xiaomi-token-plan-ams",

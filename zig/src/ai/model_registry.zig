@@ -951,6 +951,7 @@ test "built-in models are registered at startup" {
     try std.testing.expect(find("cerebras", "zai-glm-4.7") != null);
     try std.testing.expect(find("google", "gemini-3.1-pro-preview") != null);
     try std.testing.expect(find("huggingface", "moonshotai/Kimi-K2.6") != null);
+    try std.testing.expect(find("together", "moonshotai/Kimi-K2.6") != null);
     try std.testing.expect(find("opencode-go", "kimi-k2.6") != null);
     try std.testing.expect(find("kimi-coding", "kimi-for-coding") != null);
     try std.testing.expect(find("kimi-code-openai", "kimi-for-coding") != null);
@@ -990,6 +991,7 @@ test "generated catalog registers representative TypeScript models" {
     try std.testing.expect(find("deepseek", "deepseek-v4-pro") != null);
     try std.testing.expect(find("openrouter", "moonshotai/kimi-k2.6") != null);
     try std.testing.expect(find("vercel-ai-gateway", "zai/glm-5.1") != null);
+    try std.testing.expect(find("together", "moonshotai/Kimi-K2.6") != null);
     try std.testing.expect(find("opencode", "big-pickle") != null);
     try std.testing.expect(find("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6") != null);
 }
@@ -1023,6 +1025,7 @@ test "phase4 provider expansion registers configs and default models" {
         .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
         .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
         .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
+        .{ .provider = "together", .api = "openai-completions", .base_url = "https://api.together.ai/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
         .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "kimi-code-openai", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .default_model_id = "kimi-for-coding" },
         .{ .provider = "deepseek", .api = "openai-completions", .base_url = "https://api.deepseek.com", .default_model_id = "deepseek-v4-pro" },
@@ -1063,6 +1066,21 @@ test "phase4 provider expansion registers configs and default models" {
     try expectCompatBool(kimi_code_openai, "supportsReasoningEffort", false);
     try expectCompatString(kimi_code_openai, "maxTokensField", "max_tokens");
     try expectCompatBool(kimi_code_openai, "supportsStrictMode", false);
+
+    const together = find("together", "moonshotai/Kimi-K2.6").?;
+    try std.testing.expectEqualStrings("Kimi K2.6", together.name);
+    try std.testing.expect(together.reasoning);
+    try std.testing.expectEqual(@as(u32, 262144), together.context_window);
+    try std.testing.expectEqual(@as(u32, 131000), together.max_tokens);
+    try std.testing.expectEqual(@as(usize, 2), together.input_types.len);
+    try std.testing.expectEqualStrings("image", together.input_types[1]);
+    try expectCompatBool(together, "supportsStore", false);
+    try expectCompatBool(together, "supportsDeveloperRole", false);
+    try expectCompatBool(together, "supportsReasoningEffort", false);
+    try expectCompatString(together, "maxTokensField", "max_tokens");
+    try expectCompatString(together, "thinkingFormat", "together");
+    try expectCompatBool(together, "supportsStrictMode", false);
+    try expectCompatBool(together, "supportsLongCacheRetention", false);
 }
 
 test "zai CodePlan built-ins mirror TypeScript generated metadata" {

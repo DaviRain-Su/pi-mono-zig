@@ -3010,6 +3010,7 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		};
 
+		// Project extensions from .pi/
 		addResources(
 			"extensions",
 			collectAutoExtensionEntries(projectDirs.extensions),
@@ -3017,16 +3018,32 @@ export class DefaultPackageManager implements PackageManager {
 			projectOverrides.extensions,
 			projectBaseDir,
 		);
+
+		// Project skills from .pi/
 		addResources(
 			"skills",
-			[
-				...collectAutoSkillEntries(projectDirs.skills, "pi"),
-				...projectAgentsSkillDirs.flatMap((dir) => collectAutoSkillEntries(dir, "agents")),
-			],
+			collectAutoSkillEntries(projectDirs.skills, "pi"),
 			projectMetadata,
 			projectOverrides.skills,
 			projectBaseDir,
 		);
+
+		// Project skills from .agents/ (each with its own baseDir)
+		for (const agentsSkillsDir of projectAgentsSkillDirs) {
+			const agentsBaseDir = dirname(agentsSkillsDir); // the .agents directory
+			const agentsMetadata: PathMetadata = {
+				...projectMetadata,
+				baseDir: agentsBaseDir,
+			};
+			addResources(
+				"skills",
+				collectAutoSkillEntries(agentsSkillsDir, "agents"),
+				agentsMetadata,
+				projectOverrides.skills,
+				agentsBaseDir,
+			);
+		}
+
 		addResources(
 			"prompts",
 			collectAutoPromptEntries(projectDirs.prompts),
@@ -3042,6 +3059,7 @@ export class DefaultPackageManager implements PackageManager {
 			projectBaseDir,
 		);
 
+		// User extensions from ~/.pi/agent/
 		addResources(
 			"extensions",
 			collectAutoExtensionEntries(userDirs.extensions),
@@ -3049,13 +3067,30 @@ export class DefaultPackageManager implements PackageManager {
 			userOverrides.extensions,
 			globalBaseDir,
 		);
+
+		// User skills from ~/.pi/agent/
 		addResources(
 			"skills",
-			[...collectAutoSkillEntries(userDirs.skills, "pi"), ...collectAutoSkillEntries(userAgentsSkillsDir, "agents")],
+			collectAutoSkillEntries(userDirs.skills, "pi"),
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,
 		);
+
+		// User skills from ~/.agents/ (with its own baseDir)
+		const userAgentsBaseDir = dirname(userAgentsSkillsDir);
+		const userAgentsMetadata: PathMetadata = {
+			...userMetadata,
+			baseDir: userAgentsBaseDir,
+		};
+		addResources(
+			"skills",
+			collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			userAgentsMetadata,
+			userOverrides.skills,
+			userAgentsBaseDir,
+		);
+
 		addResources(
 			"prompts",
 			collectAutoPromptEntries(userDirs.prompts),

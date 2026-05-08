@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createEventBus, type EventBus } from "../src/core/event-bus.js";

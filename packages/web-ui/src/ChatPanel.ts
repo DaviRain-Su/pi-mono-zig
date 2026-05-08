@@ -97,7 +97,7 @@ export class ChatPanel extends LitElement {
 			const attachments: Attachment[] = [];
 			for (const message of this.agent!.state.messages) {
 				if (message.role === "user-with-attachments") {
-					message.attachments?.forEach((a) => {
+					message.attachments?.forEach((a: Attachment) => {
 						attachments.push(a);
 					});
 				}

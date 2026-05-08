@@ -365,7 +365,12 @@ test "provider smoke Cloudflare placeholders substitute and fail explicitly" {
 
     var missing_env_map = std.process.Environ.Map.init(allocator);
     defer missing_env_map.deinit();
-    try std.testing.expectError(error.EnvironmentVariableNotFound, cloudflare.resolveCloudflareBaseUrlFromMap(allocator, workers_model, &missing_env_map));
+    try std.testing.expectError(error.MissingCloudflareAccountId, cloudflare.resolveCloudflareBaseUrlFromMap(allocator, workers_model, &missing_env_map));
+
+    var missing_gateway_map = std.process.Environ.Map.init(allocator);
+    defer missing_gateway_map.deinit();
+    try missing_gateway_map.put("CLOUDFLARE_ACCOUNT_ID", "smoke-account");
+    try std.testing.expectError(error.MissingCloudflareGatewayId, cloudflare.resolveCloudflareBaseUrlFromMap(allocator, compat_model, &missing_gateway_map));
 }
 
 test "provider smoke Cloudflare Gateway OpenAI Responses capture routing auth metadata" {

@@ -16,6 +16,10 @@ export type KnownApi =
 
 export type Api = KnownApi | (string & {});
 
+export type KnownImagesApi = "openrouter-images";
+
+export type ImagesApi = KnownImagesApi | (string & {});
+
 export type KnownProvider =
 	| "amazon-bedrock"
 	| "anthropic"
@@ -39,6 +43,7 @@ export type KnownProvider =
 	| "moonshotai-cn"
 	| "huggingface"
 	| "fireworks"
+	| "together"
 	| "opencode"
 	| "opencode-go"
 	| "kimi-coding"
@@ -50,6 +55,10 @@ export type KnownProvider =
 	| "xiaomi-token-plan-ams"
 	| "xiaomi-token-plan-sgp";
 export type Provider = KnownProvider | string;
+
+export type KnownImagesProvider = "openrouter";
+
+export type ImagesProvider = KnownImagesProvider | string;
 
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 export type ModelThinkingLevel = "off" | ThinkingLevel;
@@ -138,6 +147,48 @@ export interface StreamOptions {
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
+export interface ImagesOptions {
+	signal?: AbortSignal;
+	apiKey?: string;
+	/**
+	 * Optional callback for inspecting or replacing provider payloads before sending.
+	 * Return undefined to keep the payload unchanged.
+	 */
+	onPayload?: (payload: unknown, model: ImagesModel<ImagesApi>) => unknown | undefined | Promise<unknown | undefined>;
+	/**
+	 * Optional callback invoked after an HTTP response is received.
+	 */
+	onResponse?: (response: ProviderResponse, model: ImagesModel<ImagesApi>) => void | Promise<void>;
+	/**
+	 * Optional custom HTTP headers to include in API requests.
+	 * Merged with provider defaults; can override default headers.
+	 */
+	headers?: Record<string, string>;
+	/**
+	 * HTTP request timeout in milliseconds for providers/SDKs that support it.
+	 */
+	timeoutMs?: number;
+	/**
+	 * Maximum retry attempts for providers/SDKs that support client-side retries.
+	 */
+	maxRetries?: number;
+	/**
+	 * Maximum delay in milliseconds to wait for a retry when the server requests a long wait.
+	 * If the server's requested delay exceeds this value, the request fails immediately
+	 * with an error containing the requested delay, allowing higher-level retry logic
+	 * to handle it with user visibility.
+	 * Default: 60000 (60 seconds). Set to 0 to disable the cap.
+	 */
+	maxRetryDelayMs?: number;
+	/**
+	 * Optional metadata to include in API requests.
+	 * Providers extract the fields they understand and ignore the rest.
+	 */
+	metadata?: Record<string, unknown>;
+}
+
+export type ProviderImagesOptions = ImagesOptions & Record<string, unknown>;
+
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -158,6 +209,12 @@ export type StreamFunction<TApi extends Api = Api, TOptions extends StreamOption
 	context: Context,
 	options?: TOptions,
 ) => AssistantMessageEventStream;
+
+export type ImagesFunction<TApi extends ImagesApi = ImagesApi, TOptions extends ImagesOptions = ImagesOptions> = (
+	model: ImagesModel<TApi>,
+	context: ImagesContext,
+	options?: TOptions,
+) => Promise<AssistantImages>;
 
 export interface TextSignatureV1 {
 	v: 1;
@@ -245,6 +302,27 @@ export interface ToolResultMessage<TDetails = any> {
 
 export type Message = UserMessage | AssistantMessage | ToolResultMessage;
 
+export type ImagesInputContent = TextContent | ImageContent;
+export type ImagesOutputContent = TextContent | ImageContent;
+
+export interface ImagesContext {
+	input: ImagesInputContent[];
+}
+
+export type ImagesStopReason = "stop" | "error" | "aborted";
+
+export interface AssistantImages {
+	api: ImagesApi;
+	provider: ImagesProvider;
+	model: string;
+	output: ImagesOutputContent[];
+	responseId?: string;
+	usage?: Usage;
+	stopReason: ImagesStopReason;
+	errorMessage?: string;
+	timestamp: number; // Unix timestamp in milliseconds
+}
+
 import type { TSchema } from "typebox";
 
 export interface Tool<TParameters extends TSchema = TSchema> {
@@ -304,8 +382,8 @@ export interface OpenAICompletionsCompat {
 	requiresThinkingAsText?: boolean;
 	/** Whether all replayed assistant messages must include an empty reasoning_content field when reasoning is enabled. Default: auto-detected from URL. */
 	requiresReasoningContentOnAssistantMessages?: boolean;
-	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "deepseek" uses thinking: { type } plus reasoning_effort, "zai" uses top-level enable_thinking: boolean, "qwen" uses top-level enable_thinking: boolean, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
-	thinkingFormat?: "openai" | "openrouter" | "deepseek" | "zai" | "qwen" | "qwen-chat-template";
+	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "deepseek" uses thinking: { type } plus reasoning_effort, "together" uses reasoning: { enabled } plus reasoning_effort when supported, "zai" uses top-level enable_thinking: boolean, "qwen" uses top-level enable_thinking: boolean, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
+	thinkingFormat?: "openai" | "openrouter" | "deepseek" | "together" | "zai" | "qwen" | "qwen-chat-template";
 	/** OpenRouter-specific routing preferences. Only used when baseUrl points to OpenRouter. */
 	openRouterRouting?: OpenRouterRouting;
 	/** Vercel AI Gateway routing preferences. Only used when baseUrl points to Vercel AI Gateway. */
@@ -462,4 +540,11 @@ export interface Model<TApi extends Api> {
 			: TApi extends "anthropic-messages"
 				? AnthropicMessagesCompat
 				: never;
+}
+
+export interface ImagesModel<TApi extends ImagesApi>
+	extends Omit<Model<Api>, "api" | "provider" | "reasoning" | "contextWindow" | "maxTokens" | "compat"> {
+	api: TApi;
+	provider: ImagesProvider;
+	output: ("text" | "image")[];
 }

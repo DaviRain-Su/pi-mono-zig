@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tui = @import("tui");
 
 pub const Action = enum(u8) {
@@ -179,20 +180,24 @@ pub const KeySpec = union(enum) {
     }
 
     pub fn format(self: KeySpec, allocator: std.mem.Allocator) ![]u8 {
+        return self.formatForOs(allocator, builtin.target.os.tag);
+    }
+
+    pub fn formatForOs(self: KeySpec, allocator: std.mem.Allocator, os_tag: std.Target.Os.Tag) ![]u8 {
         return switch (self) {
             .ctrl => |value| std.fmt.allocPrint(allocator, "Ctrl+{c}", .{std.ascii.toUpper(value)}),
-            .ctrl_alt => |value| std.fmt.allocPrint(allocator, "Ctrl+Alt+{c}", .{std.ascii.toUpper(value)}),
-            .alt => |value| std.fmt.allocPrint(allocator, "Alt+{c}", .{std.ascii.toUpper(value)}),
+            .ctrl_alt => |value| std.fmt.allocPrint(allocator, "Ctrl+{s}+{c}", .{ altModifierDisplayName(os_tag), std.ascii.toUpper(value) }),
+            .alt => |value| std.fmt.allocPrint(allocator, "{s}+{c}", .{ altModifierDisplayName(os_tag), std.ascii.toUpper(value) }),
             .escape => allocator.dupe(u8, "Esc"),
             .enter => allocator.dupe(u8, "Enter"),
             .shift_enter => allocator.dupe(u8, "Shift+Enter"),
             .tab => allocator.dupe(u8, "Tab"),
             .shift_tab => allocator.dupe(u8, "Shift+Tab"),
-            .alt_enter => allocator.dupe(u8, "Alt+Enter"),
-            .alt_up => allocator.dupe(u8, "Alt+Up"),
-            .alt_down => allocator.dupe(u8, "Alt+Down"),
-            .alt_left => allocator.dupe(u8, "Alt+Left"),
-            .alt_right => allocator.dupe(u8, "Alt+Right"),
+            .alt_enter => std.fmt.allocPrint(allocator, "{s}+Enter", .{altModifierDisplayName(os_tag)}),
+            .alt_up => std.fmt.allocPrint(allocator, "{s}+Up", .{altModifierDisplayName(os_tag)}),
+            .alt_down => std.fmt.allocPrint(allocator, "{s}+Down", .{altModifierDisplayName(os_tag)}),
+            .alt_left => std.fmt.allocPrint(allocator, "{s}+Left", .{altModifierDisplayName(os_tag)}),
+            .alt_right => std.fmt.allocPrint(allocator, "{s}+Right", .{altModifierDisplayName(os_tag)}),
             .ctrl_left => allocator.dupe(u8, "Ctrl+Left"),
             .ctrl_right => allocator.dupe(u8, "Ctrl+Right"),
             .ctrl_backspace => allocator.dupe(u8, "Ctrl+Backspace"),
@@ -208,11 +213,15 @@ pub const KeySpec = union(enum) {
             .page_down => allocator.dupe(u8, "PgDn"),
             .backspace => allocator.dupe(u8, "Backspace"),
             .delete => allocator.dupe(u8, "Delete"),
-            .alt_backspace => allocator.dupe(u8, "Alt+Backspace"),
-            .alt_delete => allocator.dupe(u8, "Alt+Delete"),
+            .alt_backspace => std.fmt.allocPrint(allocator, "{s}+Backspace", .{altModifierDisplayName(os_tag)}),
+            .alt_delete => std.fmt.allocPrint(allocator, "{s}+Delete", .{altModifierDisplayName(os_tag)}),
         };
     }
 };
+
+pub fn altModifierDisplayName(os_tag: std.Target.Os.Tag) []const u8 {
+    return if (os_tag == .macos) "Option" else "Alt";
+}
 
 const BindingDefinition = struct {
     action: Action,
@@ -827,6 +836,21 @@ test "keybinding parseKeySpec handles all new formats" {
     try std.testing.expectEqual(KeySpec.shift_tab, parseKeySpec("shift+tab").?);
     try std.testing.expectEqual(KeySpec.escape, parseKeySpec("escape").?);
     try std.testing.expectEqualDeep(KeySpec{ .ctrl = 'c' }, parseKeySpec("ctrl+c").?);
+}
+
+test "keybinding display labels use Option on macOS while matching Alt" {
+    const allocator = std.testing.allocator;
+    const alt_enter: KeySpec = .alt_enter;
+
+    const mac_label = try alt_enter.formatForOs(allocator, .macos);
+    defer allocator.free(mac_label);
+    try std.testing.expectEqualStrings("Option+Enter", mac_label);
+
+    const linux_label = try alt_enter.formatForOs(allocator, .linux);
+    defer allocator.free(linux_label);
+    try std.testing.expectEqualStrings("Alt+Enter", linux_label);
+
+    try std.testing.expect(alt_enter.matches(.enter, .{ .alt = true }));
 }
 
 test "keybinding shift_char matches uppercase printable key with shift modifier" {

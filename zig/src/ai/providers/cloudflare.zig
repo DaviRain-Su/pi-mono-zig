@@ -22,7 +22,8 @@ pub fn isCloudflareProvider(provider: []const u8) bool {
 
 /// Substitute `{VAR}` placeholders in a model's base_url using the provided env map.
 /// Always returns an owned slice that the caller must free.
-/// Returns error.EnvironmentVariableNotFound if a required env var is missing or empty.
+/// Returns a Cloudflare-specific error if a required Cloudflare env var is missing or empty.
+/// Unknown placeholders return error.EnvironmentVariableNotFound.
 pub fn resolveCloudflareBaseUrlFromMap(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -49,10 +50,10 @@ pub fn resolveCloudflareBaseUrlFromMap(
             i += 1; // skip '}'
 
             const env_value = env_map.get(var_name) orelse {
-                return error.EnvironmentVariableNotFound;
+                return missingCloudflarePlaceholderError(var_name);
             };
             if (env_value.len == 0) {
-                return error.EnvironmentVariableNotFound;
+                return missingCloudflarePlaceholderError(var_name);
             }
             try result.appendSlice(allocator, env_value);
         } else {
@@ -66,7 +67,8 @@ pub fn resolveCloudflareBaseUrlFromMap(
 
 /// Substitute `{VAR}` placeholders in a model's base_url from the process environment.
 /// Always returns an owned slice that the caller must free.
-/// Returns error.EnvironmentVariableNotFound if a required env var is missing or empty.
+/// Returns a Cloudflare-specific error if a required Cloudflare env var is missing or empty.
+/// Unknown placeholders return error.EnvironmentVariableNotFound.
 pub fn resolveCloudflareBaseUrl(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -75,6 +77,12 @@ pub fn resolveCloudflareBaseUrl(
     var env_map = try env.createMap(allocator);
     defer env_map.deinit();
     return resolveCloudflareBaseUrlFromMap(allocator, model, &env_map);
+}
+
+fn missingCloudflarePlaceholderError(var_name: []const u8) anyerror {
+    if (std.mem.eql(u8, var_name, "CLOUDFLARE_ACCOUNT_ID")) return error.MissingCloudflareAccountId;
+    if (std.mem.eql(u8, var_name, "CLOUDFLARE_GATEWAY_ID")) return error.MissingCloudflareGatewayId;
+    return error.EnvironmentVariableNotFound;
 }
 
 fn currentProcessEnviron() std.process.Environ {
@@ -187,7 +195,7 @@ test "cloudflare resolveCloudflareBaseUrl missing env var returns error" {
     };
 
     const result = resolveCloudflareBaseUrlFromMap(allocator, model, &env_map);
-    try std.testing.expectError(error.EnvironmentVariableNotFound, result);
+    try std.testing.expectError(error.MissingCloudflareAccountId, result);
 }
 
 test "cloudflare resolveCloudflareBaseUrl empty env var returns error" {
@@ -208,5 +216,27 @@ test "cloudflare resolveCloudflareBaseUrl empty env var returns error" {
     };
 
     const result = resolveCloudflareBaseUrlFromMap(allocator, model, &env_map);
-    try std.testing.expectError(error.EnvironmentVariableNotFound, result);
+    try std.testing.expectError(error.MissingCloudflareAccountId, result);
+}
+
+test "cloudflare resolveCloudflareBaseUrl missing gateway env var returns error" {
+    const allocator = std.testing.allocator;
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("CLOUDFLARE_ACCOUNT_ID", "abc123");
+    // CLOUDFLARE_GATEWAY_ID not set
+
+    const model = types.Model{
+        .id = "test",
+        .name = "Test",
+        .api = "openai-completions",
+        .provider = "cloudflare-ai-gateway",
+        .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/openai",
+        .input_types = &[_][]const u8{},
+        .context_window = 131072,
+        .max_tokens = 8192,
+    };
+
+    const result = resolveCloudflareBaseUrlFromMap(allocator, model, &env_map);
+    try std.testing.expectError(error.MissingCloudflareGatewayId, result);
 }

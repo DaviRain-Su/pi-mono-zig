@@ -1835,7 +1835,7 @@ test "runCli preserves context when continuing with a different provider" {
     defer ai.api_registry.resetToBuiltIns();
 
     const openai_registration = try faux.registerFauxProvider(allocator, .{
-        .api = "openai-completions",
+        .api = "openai-responses",
         .provider = "openai",
         .models = &[_]faux.FauxModelDefinition{.{
             .id = "gpt-5.4",

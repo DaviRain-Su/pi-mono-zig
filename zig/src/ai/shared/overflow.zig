@@ -10,6 +10,8 @@ const overflow_patterns = [_][]const u8{
     "maximum prompt length is",
     "reduce the length of the messages",
     "maximum context length is",
+    "is longer than the model's context length",
+    "is longer than the models context length",
     "exceeds the limit of",
     "exceeds the available context size",
     "greater than the context length",
@@ -89,6 +91,21 @@ test "isContextOverflow detects provider error patterns" {
     };
 
     try std.testing.expect(isContextOverflow(message, 32768));
+}
+
+test "isContextOverflow detects Together context length messages" {
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = "openai-completions",
+        .provider = "together",
+        .model = "moonshotai/Kimi-K2.6",
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "The input (300000 tokens) is longer than the model's context length (262144 tokens).",
+        .timestamp = 0,
+    };
+
+    try std.testing.expect(isContextOverflow(message, 262144));
 }
 
 test "isContextOverflow ignores rate limit style non overflow errors" {

@@ -165,22 +165,17 @@ fn tryMatchModel(
 ) ?ai.model_registry.ModelSummary {
     if (findExactReferenceMatch(summaries, pattern, provider)) |exact| return exact;
 
-    var best_alias: ?ai.model_registry.ModelSummary = null;
-    var best_dated: ?ai.model_registry.ModelSummary = null;
+    var best: ?ai.model_registry.ModelSummary = null;
     for (summaries) |summary| {
         if (provider) |provider_name| {
             if (!std.ascii.eqlIgnoreCase(summary.provider, provider_name)) continue;
         }
         if (!containsIgnoreCase(summary.id, pattern) and !containsIgnoreCase(summary.name, pattern)) continue;
 
-        if (isAlias(summary.id)) {
-            if (best_alias == null or stringGreater(summary.id, best_alias.?.id)) best_alias = summary;
-        } else {
-            if (best_dated == null or stringGreater(summary.id, best_dated.?.id)) best_dated = summary;
-        }
+        if (best == null or betterFuzzyMatch(summary, best.?, provider == null)) best = summary;
     }
 
-    return best_alias orelse best_dated;
+    return best;
 }
 
 fn findExactReferenceMatch(
@@ -292,6 +287,35 @@ fn stringGreater(lhs: []const u8, rhs: []const u8) bool {
     return std.mem.order(u8, lhs, rhs) == .gt;
 }
 
+fn betterFuzzyMatch(
+    candidate: ai.model_registry.ModelSummary,
+    current: ai.model_registry.ModelSummary,
+    across_providers: bool,
+) bool {
+    if (across_providers) {
+        const candidate_rank = fuzzyProviderRank(candidate.provider);
+        const current_rank = fuzzyProviderRank(current.provider);
+        if (candidate_rank != current_rank) return candidate_rank < current_rank;
+    }
+
+    const candidate_alias = isAlias(candidate.id);
+    const current_alias = isAlias(current.id);
+    if (candidate_alias != current_alias) return candidate_alias;
+    return stringGreater(candidate.id, current.id);
+}
+
+fn fuzzyProviderRank(provider: []const u8) u8 {
+    if (std.ascii.eqlIgnoreCase(provider, "amazon-bedrock")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "azure-openai-responses")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "cloudflare-ai-gateway")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "cloudflare-workers-ai")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "github-copilot")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "google-vertex")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "openrouter")) return 1;
+    if (std.ascii.eqlIgnoreCase(provider, "vercel-ai-gateway")) return 1;
+    return 0;
+}
+
 test "resolveCliModel resolves provider-prefixed model ids" {
     const allocator = std.testing.allocator;
     var result = try resolveCliModel(allocator, null, "openai/gpt-5.4");
@@ -309,7 +333,7 @@ test "resolveCliModel supports fuzzy matching and thinking suffix" {
 
     try std.testing.expect(result.error_message == null);
     try std.testing.expectEqualStrings("anthropic", result.provider_name.?);
-    try std.testing.expectEqualStrings("claude-sonnet-4-5", result.model_name.?);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", result.model_name.?);
     try std.testing.expectEqual(cli.ThinkingLevel.high, result.thinking.?);
 }
 
@@ -325,12 +349,12 @@ test "resolveCliModel prefers provider split over gateway raw id when provider m
 
 test "resolveCliModel falls back to raw slash model id when inferred provider has no match" {
     const allocator = std.testing.allocator;
-    var result = try resolveCliModel(allocator, null, "openai/gpt-4o:extended");
+    var result = try resolveCliModel(allocator, null, "openai/gpt-4o-audio-preview");
     defer result.deinit(allocator);
 
     try std.testing.expect(result.error_message == null);
     try std.testing.expectEqualStrings("openrouter", result.provider_name.?);
-    try std.testing.expectEqualStrings("openai/gpt-4o:extended", result.model_name.?);
+    try std.testing.expectEqualStrings("openai/gpt-4o-audio-preview", result.model_name.?);
 }
 
 test "resolveCliModel preserves explicit provider custom model ids" {

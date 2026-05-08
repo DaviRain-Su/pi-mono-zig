@@ -178,6 +178,18 @@ describe("AI Providers Abort Tests", () => {
 		});
 	});
 
+	describe.skipIf(!process.env.TOGETHER_API_KEY)("Together AI Provider Abort", () => {
+		const llm = getModel("together", "moonshotai/Kimi-K2.6");
+
+		it("should abort mid-stream", { retry: 3 }, async () => {
+			await testAbortSignal(llm, { reasoningEffort: "high" });
+		});
+
+		it("should handle immediate abort", { retry: 3 }, async () => {
+			await testImmediateAbort(llm, { reasoningEffort: "high" });
+		});
+	});
+
 	describe.skipIf(!process.env.MINIMAX_API_KEY)("MiniMax Provider Abort", () => {
 		const llm = getModel("minimax", "MiniMax-M2.7");
 

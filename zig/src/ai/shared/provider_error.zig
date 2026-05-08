@@ -83,6 +83,8 @@ pub fn isAbortRequested(options: ?types.StreamOptions) bool {
 pub fn runtimeErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RequestAborted => "Request was aborted",
+        error.MissingCloudflareAccountId => "Cloudflare configuration incomplete: set CLOUDFLARE_ACCOUNT_ID and retry.",
+        error.MissingCloudflareGatewayId => "Cloudflare AI Gateway configuration incomplete: set CLOUDFLARE_GATEWAY_ID and retry.",
         else => @errorName(err),
     };
 }
@@ -638,6 +640,17 @@ test "setup runtime helper message preserves metadata and abort stop reason" {
     try std.testing.expectEqualStrings("fixture-model", message.model);
     try std.testing.expectEqual(types.StopReason.aborted, message.stop_reason);
     try std.testing.expectEqualStrings("Request was aborted", message.error_message.?);
+}
+
+test "runtime helper formats Cloudflare placeholder configuration errors" {
+    try std.testing.expectEqualStrings(
+        "Cloudflare configuration incomplete: set CLOUDFLARE_ACCOUNT_ID and retry.",
+        runtimeErrorMessage(error.MissingCloudflareAccountId),
+    );
+    try std.testing.expectEqualStrings(
+        "Cloudflare AI Gateway configuration incomplete: set CLOUDFLARE_GATEWAY_ID and retry.",
+        runtimeErrorMessage(error.MissingCloudflareGatewayId),
+    );
 }
 
 test "coerceStopReasonForToolCalls only upgrades stop after tool calls" {

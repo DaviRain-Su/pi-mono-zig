@@ -220,6 +220,7 @@ pub fn findInitialDefaultModel(
 ) !?ai.Model {
     for (ai.model_registry.builtInProviderConfigs()) |provider| {
         if (std.mem.eql(u8, provider.provider, "faux")) continue;
+        if (try skipInitialDefaultProvider(allocator, env_map, provider.provider, configured_credentials)) continue;
         if (!try hasProviderCredentials(allocator, env_map, provider.provider, configured_credentials)) continue;
 
         const model_id = provider.default_model_id orelse provider.provider;
@@ -600,6 +601,18 @@ fn hasProviderCredentials(
     return (try resolveAvailableProviderAuthStatus(allocator, env_map, provider, configured_credentials)) != .missing;
 }
 
+fn skipInitialDefaultProvider(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    configured_credentials: ConfiguredCredentials,
+) !bool {
+    if (std.mem.eql(u8, provider, "kimi-code-openai")) {
+        return try hasProviderCredentials(allocator, env_map, "kimi-coding", configured_credentials);
+    }
+    return false;
+}
+
 fn isLocalBaseUrl(value: []const u8) bool {
     return containsIgnoreCase(value, "localhost") or
         containsIgnoreCase(value, "127.0.0.1") or
@@ -696,6 +709,9 @@ fn missingApiKeyMessage(provider: []const u8) []const u8 {
     }
     if (std.mem.eql(u8, provider, "fireworks")) {
         return "Fireworks credentials required.\nSet FIREWORKS_API_KEY, pass --api-key, or run /login fireworks.";
+    }
+    if (std.mem.eql(u8, provider, "together")) {
+        return "Together AI credentials required.\nSet TOGETHER_API_KEY, pass --api-key, or run /login together.";
     }
     if (std.mem.eql(u8, provider, "opencode")) {
         return "OpenCode Zen credentials required.\nSet OPENCODE_API_KEY, pass --api-key, or run /login opencode.";
@@ -850,6 +866,7 @@ test "resolveProviderConfig accepts provider catalog parity providers" {
     try env_map.put("DEEPSEEK_API_KEY", "deepseek-key");
     try env_map.put("ZAI_API_KEY", "zai-key");
     try env_map.put("CLOUDFLARE_API_KEY", "cloudflare-key");
+    try env_map.put("TOGETHER_API_KEY", "together-key");
     try env_map.put("XIAOMI_API_KEY", "xiaomi-key");
     try env_map.put("XIAOMI_TOKEN_PLAN_CN_API_KEY", "xiaomi-cn-key");
     try env_map.put("XIAOMI_TOKEN_PLAN_AMS_API_KEY", "xiaomi-ams-key");
@@ -870,6 +887,7 @@ test "resolveProviderConfig accepts provider catalog parity providers" {
         .{ .provider = "zai", .expected_key = "zai-key", .model_id = "glm-4.7", .api = "openai-completions", .base_url = "https://open.bigmodel.cn/api/coding/paas/v4", .display_name = "ZAI" },
         .{ .provider = "cloudflare-workers-ai", .expected_key = "cloudflare-key", .model_id = "@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .display_name = "Cloudflare Workers AI" },
         .{ .provider = "cloudflare-ai-gateway", .expected_key = "cloudflare-key", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .display_name = "Cloudflare AI Gateway" },
+        .{ .provider = "together", .expected_key = "together-key", .model_id = "moonshotai/Kimi-K2.6", .api = "openai-completions", .base_url = "https://api.together.ai/v1", .display_name = "Together AI" },
         .{ .provider = "xiaomi", .expected_key = "xiaomi-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo" },
         .{ .provider = "xiaomi-token-plan-cn", .expected_key = "xiaomi-cn-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo Token Plan (China)" },
         .{ .provider = "xiaomi-token-plan-ams", .expected_key = "xiaomi-ams-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo Token Plan (Amsterdam)" },
@@ -1060,6 +1078,7 @@ test "listAvailableModels surfaces provider catalog parity auth states" {
         .{ .provider = "zai", .model_id = "glm-4.7", .env_var = "ZAI_API_KEY" },
         .{ .provider = "cloudflare-workers-ai", .model_id = "@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
         .{ .provider = "cloudflare-ai-gateway", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
+        .{ .provider = "together", .model_id = "moonshotai/Kimi-K2.6", .env_var = "TOGETHER_API_KEY" },
         .{ .provider = "xiaomi", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_API_KEY" },
         .{ .provider = "xiaomi-token-plan-cn", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_TOKEN_PLAN_CN_API_KEY" },
         .{ .provider = "xiaomi-token-plan-ams", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
@@ -1215,8 +1234,7 @@ test "KIMI_API_KEY configures Kimi Code providers without legacy Kimi" {
     try std.testing.expect(configured_kimi_code_openai);
 
     const model = (try findInitialDefaultModel(allocator, &env_map, .{})).?;
-    try std.testing.expect(std.mem.eql(u8, model.provider, "kimi-coding") or
-        std.mem.eql(u8, model.provider, "kimi-code-openai"));
+    try std.testing.expectEqualStrings("kimi-coding", model.provider);
     try std.testing.expectEqualStrings("kimi-for-coding", model.id);
 }
 
@@ -1335,6 +1353,10 @@ test "resolveProviderErrorMessage includes provider-specific env and login guida
     const cloudflare_gateway = resolveProviderErrorMessage(error.MissingApiKey, "cloudflare-ai-gateway");
     try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "CLOUDFLARE_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, cloudflare_gateway, "/login cloudflare-ai-gateway") != null);
+
+    const together = resolveProviderErrorMessage(error.MissingApiKey, "together");
+    try std.testing.expect(std.mem.indexOf(u8, together, "TOGETHER_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, together, "/login together") != null);
 
     const xiaomi_sgp = resolveProviderErrorMessage(error.MissingApiKey, "xiaomi-token-plan-sgp");
     try std.testing.expect(std.mem.indexOf(u8, xiaomi_sgp, "XIAOMI_TOKEN_PLAN_SGP_API_KEY") != null);

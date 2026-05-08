@@ -53,7 +53,7 @@ termux-open-url "https://example.com"
 ## Opening Files
 ```bash
 termux-open file.pdf          # Opens with default app
-termux-open -c image.jpg      # Choose app
+termux-open --chooser image.jpg      # Choose app
 ```
 
 ## Clipboard

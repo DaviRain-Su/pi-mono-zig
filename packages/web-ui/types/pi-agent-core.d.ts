@@ -86,6 +86,7 @@ export interface AgentToolResult<TDetails> {
 export type AgentToolUpdateCallback<TDetails = unknown> = (partialResult: AgentToolResult<TDetails>) => void;
 
 export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = unknown> extends Tool<TParameters> {
+	name: string;
 	label: string;
 	prepareArguments?: (args: unknown) => Static<TParameters>;
 	execute: (
