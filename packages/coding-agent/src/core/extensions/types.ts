@@ -1042,6 +1042,10 @@ export const EXTENSION_EVENT_NAMES = [
 
 export type ExtensionEventName = (typeof EXTENSION_EVENT_NAMES)[number];
 
+export function isExtensionEventName(event: string): event is ExtensionEventName {
+	return (EXTENSION_EVENT_NAMES as readonly string[]).includes(event);
+}
+
 type AssertNoExtensionEventDrift<T extends never> = T;
 type ExtensionEventNameMissing = Exclude<ExtensionEvent["type"], ExtensionEventName>;
 type ExtensionEventNameExtra = Exclude<ExtensionEventName, ExtensionEvent["type"]>;

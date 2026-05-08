@@ -46,6 +46,7 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.js";
+import { isExtensionEventName } from "./types.js";
 
 /** Modules available to extensions via virtualModules (for compiled Bun binary) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
@@ -268,6 +269,9 @@ function createExtensionAPI(
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
 			runtime.assertActive();
+			if (typeof event !== "string" || !isExtensionEventName(event)) {
+				throw new Error(`Unknown extension event "${String(event)}". Supported events: use ExtensionEventName.`);
+			}
 			const list = extension.handlers.get(event) ?? [];
 			list.push(handler);
 			extension.handlers.set(event, list);

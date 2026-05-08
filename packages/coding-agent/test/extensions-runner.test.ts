@@ -365,6 +365,212 @@ describe("subscriber event contract parity", () => {
 			"agent_end",
 		]);
 	});
+
+	it("rejects unknown pi.on event names during subscription", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-unknown-event-"));
+		try {
+			const runtime = createExtensionRuntime();
+			const badFactory = (pi: unknown) => {
+				const unsafePi = pi as { on(event: string, handler: () => void): void };
+				unsafePi.on("not_a_real_event", () => {});
+			};
+
+			await expect(
+				loadExtensionFromFactory(badFactory, tempDir, createEventBus(), runtime, "<unknown-event-extension>"),
+			).rejects.toThrow('Unknown extension event "not_a_real_event"');
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("diagnoses malformed result-bearing subscriber returns and ignores their side effects", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-malformed-subscriber-result-"));
+		try {
+			const runtime = createExtensionRuntime();
+			const badExtension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_before_switch", () => ({ cancel: "yes" }) as unknown as { cancel: boolean });
+					pi.on("resources_discover", () => ({ skillPaths: [42] }) as unknown as { skillPaths: string[] });
+					pi.on(
+						"input",
+						() => ({ action: "transform", text: 42 }) as unknown as { action: "transform"; text: string },
+					);
+					pi.on("tool_result", () => ({ content: "invalid" }) as unknown as { content: [] });
+					pi.on("message_end", () => ({ message: "invalid" }) as unknown as { message: AgentMessage });
+					pi.on("context", () => ({ messages: "invalid" }) as unknown as { messages: AgentMessage[] });
+					pi.on("before_agent_start", () => ({ systemPrompt: 42 }) as unknown as { systemPrompt: string });
+					pi.on("tool_call", () => ({ block: "yes" }) as unknown as { block: boolean });
+					pi.on("user_bash", () => ({ result: "invalid" }) as never);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<bad-result-extension>",
+			);
+			const goodExtension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("session_before_switch", () => ({ cancel: true }));
+					pi.on("resources_discover", () => ({ skillPaths: ["/valid-skill"] }));
+					pi.on("input", () => ({ action: "transform", text: "valid-input" }));
+					pi.on("tool_result", () => ({ content: [{ type: "text", text: "valid-result" }], isError: true }));
+					pi.on("message_end", (event) => ({ message: { ...event.message, timestamp: 2 } }));
+					pi.on("context", () => ({ messages: [{ role: "user", content: "valid-context", timestamp: 1 }] }));
+					pi.on("before_agent_start", () => ({ systemPrompt: "valid-system" }));
+					pi.on("tool_call", () => ({ block: true, reason: "valid-block" }));
+					pi.on("user_bash", () => ({
+						result: { output: "valid", exitCode: 0, cancelled: false, truncated: false },
+					}));
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<good-result-extension>",
+			);
+
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
+			const modelRegistry = ModelRegistry.create(authStorage);
+			const runner = new ExtensionRunner(
+				[badExtension, goodExtension],
+				runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			const errors: Array<{ extensionPath: string; event: string; error: string }> = [];
+			runner.onError((error) => errors.push(error));
+
+			await expect(
+				runner.emit({ type: "session_before_switch", reason: "new", targetSessionFile: "next.jsonl" }),
+			).resolves.toEqual({ cancel: true });
+			await expect(runner.emitResourcesDiscover(tempDir, "startup")).resolves.toMatchObject({
+				skillPaths: [{ path: "/valid-skill", extensionPath: "<good-result-extension>" }],
+			});
+			await expect(runner.emitInput("original", undefined, "interactive")).resolves.toEqual({
+				action: "transform",
+				text: "valid-input",
+				images: undefined,
+			});
+			await expect(
+				runner.emitToolResult({
+					type: "tool_result",
+					toolName: "read",
+					toolCallId: "tool-1",
+					input: {},
+					content: [{ type: "text", text: "original" }],
+					details: undefined,
+					isError: false,
+				}),
+			).resolves.toEqual({
+				content: [{ type: "text", text: "valid-result" }],
+				details: undefined,
+				isError: true,
+			});
+			await expect(
+				runner.emitMessageEnd({
+					type: "message_end",
+					message: { role: "user", content: "original", timestamp: 1 },
+				}),
+			).resolves.toMatchObject({ role: "user", timestamp: 2 });
+			await expect(runner.emitContext([{ role: "user", content: "original", timestamp: 1 }])).resolves.toEqual([
+				{ role: "user", content: "valid-context", timestamp: 1 },
+			]);
+			await expect(runner.emitBeforeAgentStart("prompt", undefined, "system", { cwd: tempDir })).resolves.toEqual({
+				messages: undefined,
+				systemPrompt: "valid-system",
+			});
+			await expect(
+				runner.emitToolCall({
+					type: "tool_call",
+					toolName: "read",
+					toolCallId: "tool-1",
+					input: { path: "file.txt" },
+				}),
+			).resolves.toEqual({ block: true, reason: "valid-block" });
+			await expect(
+				runner.emitUserBash({
+					type: "user_bash",
+					command: "echo original",
+					excludeFromContext: false,
+					cwd: tempDir,
+				}),
+			).resolves.toEqual({ result: { output: "valid", exitCode: 0, cancelled: false, truncated: false } });
+
+			expect(errors.map((error) => error.event)).toEqual([
+				"session_before_switch",
+				"resources_discover",
+				"input",
+				"tool_result",
+				"message_end",
+				"context",
+				"before_agent_start",
+				"tool_call",
+				"user_bash",
+			]);
+			for (const error of errors) {
+				expect(error.extensionPath).toBe("<bad-result-extension>");
+				expect(error.error).toContain("Invalid subscriber result");
+			}
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("attributes resource discovery output to the producing extension metadata", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-resource-attribution-"));
+		try {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("resources_discover", () => ({ skillPaths: ["/package-skill"] }));
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"/tmp/package-root/extensions/entry.ts",
+			);
+			extension.sourceInfo = {
+				path: "/tmp/package-root/extensions/entry.ts",
+				source: "/tmp/package-root",
+				scope: "user",
+				origin: "package",
+				baseDir: "/tmp/package-root",
+				provenance: {
+					lockEntryKey: "pkg",
+					sourceIdentity: "pkg",
+					packageRoot: "/tmp/package-root",
+					packageRootSha256: "sha256-package",
+				},
+			};
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
+			const modelRegistry = ModelRegistry.create(authStorage);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+
+			const discovered = await runner.emitResourcesDiscover(tempDir, "startup");
+
+			expect(discovered.skillPaths).toEqual([
+				{
+					path: "/package-skill",
+					extensionPath: "/tmp/package-root/extensions/entry.ts",
+					metadata: {
+						source: "/tmp/package-root",
+						scope: "user",
+						origin: "package",
+						baseDir: "/tmp/package-root",
+						provenance: {
+							lockEntryKey: "pkg",
+							sourceIdentity: "pkg",
+							packageRoot: "/tmp/package-root",
+							packageRootSha256: "sha256-package",
+						},
+					},
+				},
+			]);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("sub-agent readiness envelope validation", () => {
@@ -2924,13 +3130,25 @@ describe("ExtensionRunner", () => {
 
 			expect(errors).toEqual(["resources boom"]);
 			expect(resources.skillPaths).toEqual([
-				{ path: "/skills/one", extensionPath: path.join(extensionsDir, "resources-1.ts") },
+				{
+					path: "/skills/one",
+					extensionPath: path.join(extensionsDir, "resources-1.ts"),
+					metadata: expect.objectContaining({ source: "extension:resources-1", scope: "temporary" }),
+				},
 			]);
 			expect(resources.promptPaths).toEqual([
-				{ path: "/prompts/one", extensionPath: path.join(extensionsDir, "resources-1.ts") },
+				{
+					path: "/prompts/one",
+					extensionPath: path.join(extensionsDir, "resources-1.ts"),
+					metadata: expect.objectContaining({ source: "extension:resources-1", scope: "temporary" }),
+				},
 			]);
 			expect(resources.themePaths).toEqual([
-				{ path: "/themes/three", extensionPath: path.join(extensionsDir, "resources-3.ts") },
+				{
+					path: "/themes/three",
+					extensionPath: path.join(extensionsDir, "resources-3.ts"),
+					metadata: expect.objectContaining({ source: "extension:resources-3", scope: "temporary" }),
+				},
 			]);
 		});
 
@@ -2990,7 +3208,13 @@ describe("ExtensionRunner", () => {
 			expect((globalThis as { resourceSignalWasProvided?: boolean }).resourceSignalWasProvided).toBe(true);
 			expect(resources).toEqual({
 				skillPaths: [],
-				promptPaths: [{ path: "/prompt-after-timeout", extensionPath: path.join(extensionsDir, "timeout-2.ts") }],
+				promptPaths: [
+					{
+						path: "/prompt-after-timeout",
+						extensionPath: path.join(extensionsDir, "timeout-2.ts"),
+						metadata: expect.objectContaining({ source: "extension:timeout-2", scope: "temporary" }),
+					},
+				],
 				themePaths: [],
 			});
 			expect(errors).toEqual([

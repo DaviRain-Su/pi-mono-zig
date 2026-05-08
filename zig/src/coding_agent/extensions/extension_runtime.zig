@@ -3479,6 +3479,7 @@ fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
 
 test "lifecycle support matrix documents timeouts reasons results and shutdown per runtime" {
     const matrix = lifecycleSupportMatrix();
+    const canonical_event_surface = extension_events.eventSurfaceNames();
     try std.testing.expectEqual(@as(usize, 5), matrix.len);
     for (matrix) |entry| {
         try std.testing.expect(entry.event_names.len > 0);
@@ -3496,6 +3497,15 @@ test "lifecycle support matrix documents timeouts reasons results and shutdown p
         try std.testing.expectEqual(default_extension_handler_timeout_ms, entry.timeout_default_ms);
         try std.testing.expectEqualStrings("lifecycle-handler-timeout-ms", entry.timeout_source);
         try std.testing.expectEqualStrings("ignored", entry.late_results);
+        switch (entry.runtime) {
+            .typescript, .process_jsonl, .zig => {
+                try std.testing.expectEqual(canonical_event_surface.len, entry.event_names.len);
+                for (canonical_event_surface, 0..) |event_name, index| {
+                    try std.testing.expectEqualStrings(event_name, entry.event_names[index]);
+                }
+            },
+            .wasm, .native => {},
+        }
     }
 }
 
