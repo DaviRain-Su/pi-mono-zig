@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const enforcement = @import("enforcement.zig");
 const extension_registry = @import("extension_registry.zig");
 const extension_protocol = @import("extension_protocol.zig");
@@ -61,7 +62,7 @@ pub const HostProcess = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
-            .pgid = 0,
+            .pgid = null,
         });
         errdefer if (child.id != null) child.kill(io);
 
@@ -278,18 +279,24 @@ pub const HostProcess = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const file = self.stdin_file orelse return;
-        const fd = file.handle;
-        // Set O_NONBLOCK on the fd temporarily so a full pipe drops the event
-        // rather than blocking the agent loop.
-        const nonblock_mask: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-        const prev_flags: c_int = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
-        if (prev_flags == -1) return;
-        defer _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags);
-        _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags | @as(c_int, @intCast(nonblock_mask)));
-        // Best-effort write of frame + newline. EAGAIN (pipe full) or any other
-        // error means the event is dropped.
-        _ = std.c.write(fd, frame_json.ptr, frame_json.len);
-        _ = std.c.write(fd, "\n", 1);
+        if (builtin.os.tag == .windows) {
+            // On Windows, write directly — pipe semantics differ from POSIX.
+            _ = file.writeStreamingAll(self.io, frame_json) catch return;
+            _ = file.writeStreamingAll(self.io, "\n") catch return;
+        } else {
+            const fd = file.handle;
+            // Set O_NONBLOCK on the fd temporarily so a full pipe drops the event
+            // rather than blocking the agent loop.
+            const nonblock_mask: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+            const prev_flags: c_int = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+            if (prev_flags == -1) return;
+            defer _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags);
+            _ = std.c.fcntl(fd, std.c.F.SETFL, prev_flags | @as(c_int, @intCast(nonblock_mask)));
+            // Best-effort write of frame + newline. EAGAIN (pipe full) or any other
+            // error means the event is dropped.
+            _ = std.c.write(fd, frame_json.ptr, frame_json.len);
+            _ = std.c.write(fd, "\n", 1);
+        }
     }
 
     fn sendInitialize(self: *HostProcess, initialize: InitializeFrame) !void {
@@ -323,8 +330,12 @@ pub const HostProcess = struct {
 
     fn killProcessGroup(self: *HostProcess) void {
         if (self.child.id) |pid| {
-            std.posix.kill(-pid, .TERM) catch {};
-            std.posix.kill(-pid, .KILL) catch {};
+            if (builtin.os.tag == .windows) {
+                _ = std.os.windows.ntdll.NtTerminateProcess(pid, @enumFromInt(@as(u32, 1)));
+            } else {
+                std.posix.kill(-pid, .TERM) catch {};
+                std.posix.kill(-pid, .KILL) catch {};
+            }
         }
     }
 };
@@ -356,7 +367,8 @@ fn readerMain(host: *HostProcess) void {
     var buffer: [4096]u8 = undefined;
     while (true) {
         const file = host.stdout_file orelse break;
-        const bytes_read = std.posix.read(file.handle, &buffer) catch |err| {
+        var reader = file.reader(host.io, &buffer);
+        const bytes_read = reader.interface.readSliceShort(&buffer) catch |err| {
             host.reader_err = err;
             break;
         };

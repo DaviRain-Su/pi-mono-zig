@@ -401,7 +401,7 @@ pub const StdioClient = struct {
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
-            .pgid = 0,
+            .pgid = null,
         });
         errdefer if (child.id != null) child.kill(io);
 
@@ -463,8 +463,12 @@ pub const StdioClient = struct {
 
     fn killProcessGroup(self: *StdioClient) void {
         if (self.child.id) |pid| {
-            std.posix.kill(-pid, .TERM) catch {};
-            std.posix.kill(-pid, .KILL) catch {};
+            if (@import("builtin").os.tag == .windows) {
+                _ = std.os.windows.ntdll.NtTerminateProcess(pid, @enumFromInt(@as(u32, 1)));
+            } else {
+                std.posix.kill(-pid, .TERM) catch {};
+                std.posix.kill(-pid, .KILL) catch {};
+            }
         }
     }
 
@@ -476,6 +480,38 @@ pub const StdioClient = struct {
 
     fn recvMessage(self: *StdioClient, allocator: std.mem.Allocator) ![]u8 {
         const file = self.stdout_file orelse return ProtocolError.McpTransportEof;
+
+        if (@import("builtin").os.tag == .windows) {
+            // Windows: use WaitForSingleObject for timeout + File reader for I/O
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(allocator);
+            var elapsed: u64 = 0;
+            while (elapsed <= self.response_timeout_ms) : (elapsed += 10) {
+                // Check if data is available
+                const timeout_us: std.os.windows.LARGE_INTEGER = -@as(i64, 10) * 10000; // 10ms
+                _ = std.os.windows.ntdll.NtWaitForSingleObject(file.handle, .FALSE, &timeout_us);
+
+                if (self.wait_done.load(.seq_cst)) return if (line.items.len == 0) ProtocolError.McpChildExited else ProtocolError.McpTransportEof;
+
+                var buffer: [1024]u8 = undefined;
+                var reader = file.reader(self.io, &buffer);
+                const bytes_read = reader.interface.readSliceShort(&buffer) catch |err| return err;
+                if (bytes_read == 0) {
+                    std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+                    continue;
+                }
+                if (std.mem.indexOfScalar(u8, buffer[0..bytes_read], '\n')) |newline_index| {
+                    try line.appendSlice(allocator, buffer[0..newline_index]);
+                    const raw = line.items;
+                    const trimmed = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+                    return try allocator.dupe(u8, trimmed);
+                }
+                try line.appendSlice(allocator, buffer[0..bytes_read]);
+            }
+            return ProtocolError.McpTransportTimeout;
+        }
+
+        // POSIX: use fcntl for non-blocking I/O
         const fd = file.handle;
         const previous_flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
         if (previous_flags == -1) return ProtocolError.McpTransportEof;

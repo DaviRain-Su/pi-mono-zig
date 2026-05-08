@@ -1108,6 +1108,12 @@ pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectIte
 }
 
 pub fn pollForInput() !bool {
+    if (@import("builtin").os.tag == .windows) {
+        const stdin_handle = std.Io.File.stdin().handle;
+        const timeout: std.os.windows.LARGE_INTEGER = -@as(i64, 50) * 10000; // 50ms
+        const status = std.os.windows.ntdll.NtWaitForSingleObject(stdin_handle, .FALSE, &timeout);
+        return status == .SUCCESS;
+    }
     var fds = [_]std.posix.pollfd{
         .{
             .fd = 0,
