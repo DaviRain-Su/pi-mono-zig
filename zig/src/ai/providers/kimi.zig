@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const env_api_keys = @import("../env_api_keys.zig");
@@ -832,23 +833,20 @@ fn finishCurrentBlock(
                 });
             },
             .tool_call => |*tool_call| {
-                const id = try allocator.dupe(u8, std.mem.trim(u8, tool_call.id.items, " "));
-                errdefer allocator.free(id);
-                const name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " "));
-                errdefer allocator.free(name);
-                const arguments = try parseStreamingJsonToValue(allocator, std.mem.trim(u8, tool_call.partial_args.items, " "));
-                errdefer freeJsonValue(allocator, arguments);
-
-                const stored_tool_call: types.ToolCall = .{
-                    .id = id,
-                    .name = name,
-                    .arguments = arguments,
+                const stored_tool_call: types.ToolCall = blk: {
+                    const id = try allocator.dupe(u8, std.mem.trim(u8, tool_call.id.items, " "));
+                    errdefer allocator.free(id);
+                    const name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " "));
+                    errdefer allocator.free(name);
+                    const arguments = try parseStreamingJsonToValue(allocator, std.mem.trim(u8, tool_call.partial_args.items, " "));
+                    errdefer freeJsonValue(allocator, arguments);
+                    break :blk .{
+                        .id = id,
+                        .name = name,
+                        .arguments = arguments,
+                    };
                 };
-                // Inline tool call is canonical; tool_calls keeps a borrow-only copy.
-                try content_blocks.append(allocator, .{ .tool_call = stored_tool_call });
-                errdefer _ = content_blocks.pop();
-                try tool_calls.append(allocator, stored_tool_call);
-                errdefer _ = tool_calls.pop();
+                try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, stored_tool_call);
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
