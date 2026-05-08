@@ -34,7 +34,11 @@ import type {
 	ExtensionEventName,
 	ProviderConfig,
 } from "../src/core/extensions/types.js";
-import { EXTENSION_EVENT_NAMES } from "../src/core/extensions/types.js";
+import {
+	DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+	EXTENSION_EVENT_NAMES,
+	EXTENSION_LIFECYCLE_SUPPORT_MATRIX,
+} from "../src/core/extensions/types.js";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import type { ResolvedWasmExtensionPackage } from "../src/core/package-manager.js";
@@ -287,6 +291,50 @@ describe("subscriber event contract parity", () => {
 
 		const checkedNames = EXTENSION_EVENT_NAMES satisfies readonly ExtensionEventName[];
 		expect(checkedNames).toHaveLength(30);
+	});
+
+	it("documents lifecycle runtime support matrix and handler timeout source", () => {
+		expect(DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS).toBeGreaterThan(0);
+		expect(EXTENSION_LIFECYCLE_SUPPORT_MATRIX).toMatchObject({
+			typescript: {
+				timeout: {
+					source: "ExtensionRunnerOptions.handlerTimeoutMs",
+					defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+					override: "per-runner",
+					abortSignal: true,
+					lateResults: "ignored",
+				},
+				shutdown: {
+					supported: true,
+					timeout: "same-handler-timeout",
+					exactlyOnce: true,
+				},
+			},
+			process_jsonl: {
+				unsupportedDiagnostics: true,
+				shutdown: { supported: true },
+			},
+			wasm: {
+				unsupportedDiagnostics: false,
+				shutdown: { supported: true },
+			},
+			native: {
+				unsupportedDiagnostics: false,
+				shutdown: { supported: true },
+			},
+		});
+		for (const runtime of ["typescript", "process_jsonl", "wasm", "native"] as const) {
+			expect(EXTENSION_LIFECYCLE_SUPPORT_MATRIX[runtime].events).toContain("session_start");
+			expect(EXTENSION_LIFECYCLE_SUPPORT_MATRIX[runtime].events).toContain("session_shutdown");
+			expect(EXTENSION_LIFECYCLE_SUPPORT_MATRIX[runtime].events).toContain("resources_discover");
+			expect(EXTENSION_LIFECYCLE_SUPPORT_MATRIX[runtime].reasons).toEqual([
+				"startup",
+				"reload",
+				"new",
+				"resume",
+				"fork",
+			]);
+		}
 	});
 
 	it("parses Zig JSON wire goldens as TS-compatible AgentEvent payloads", () => {
@@ -2802,6 +2850,75 @@ describe("ExtensionRunner", () => {
 			expect(resources.themePaths).toEqual([
 				{ path: "/themes/three", extensionPath: path.join(extensionsDir, "resources-3.ts") },
 			]);
+		});
+
+		it("times out lifecycle and resource handlers, aborts where supported, and ignores late results", async () => {
+			const extCode1 = `
+				export default function(pi) {
+					pi.on("session_start", async (event) => {
+						globalThis.lifecycleSignalWasProvided = event.signal instanceof AbortSignal;
+						await new Promise((resolve) => event.signal.addEventListener("abort", resolve, { once: true }));
+						globalThis.lifecycleAbortObserved = event.signal.aborted;
+					});
+					pi.on("resources_discover", async (event) => {
+						globalThis.resourceSignalWasProvided = event.signal instanceof AbortSignal;
+						await new Promise((resolve) => setTimeout(resolve, 25));
+						globalThis.lateResourceResultResolved = true;
+						return { skillPaths: ["/late-skill"] };
+					});
+				}
+			`;
+			const extCode2 = `
+				export default function(pi) {
+					pi.on("session_start", async () => {
+						globalThis.lifecycleSecondHandlerRan = true;
+					});
+					pi.on("resources_discover", async () => ({ promptPaths: ["/prompt-after-timeout"] }));
+				}
+			`;
+			delete (globalThis as { lifecycleSignalWasProvided?: boolean }).lifecycleSignalWasProvided;
+			delete (globalThis as { lifecycleAbortObserved?: boolean }).lifecycleAbortObserved;
+			delete (globalThis as { lifecycleSecondHandlerRan?: boolean }).lifecycleSecondHandlerRan;
+			delete (globalThis as { resourceSignalWasProvided?: boolean }).resourceSignalWasProvided;
+			delete (globalThis as { lateResourceResultResolved?: boolean }).lateResourceResultResolved;
+			fs.writeFileSync(path.join(extensionsDir, "timeout-1.ts"), extCode1);
+			fs.writeFileSync(path.join(extensionsDir, "timeout-2.ts"), extCode2);
+
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+				[],
+				{
+					handlerTimeoutMs: 5,
+				},
+			);
+			const errors: Array<{ event: string; error: string }> = [];
+			runner.onError((error) => errors.push({ event: error.event, error: error.error }));
+
+			await runner.emit({ type: "session_start", reason: "startup" });
+			const resources = await runner.emitResourcesDiscover(tempDir, "startup");
+
+			expect((globalThis as { lifecycleSignalWasProvided?: boolean }).lifecycleSignalWasProvided).toBe(true);
+			expect((globalThis as { lifecycleAbortObserved?: boolean }).lifecycleAbortObserved).toBe(true);
+			expect((globalThis as { lifecycleSecondHandlerRan?: boolean }).lifecycleSecondHandlerRan).toBe(true);
+			expect((globalThis as { resourceSignalWasProvided?: boolean }).resourceSignalWasProvided).toBe(true);
+			expect(resources).toEqual({
+				skillPaths: [],
+				promptPaths: [{ path: "/prompt-after-timeout", extensionPath: path.join(extensionsDir, "timeout-2.ts") }],
+				themePaths: [],
+			});
+			expect(errors).toEqual([
+				{ event: "session_start", error: "Extension handler timed out after 5ms" },
+				{ event: "resources_discover", error: "Extension handler timed out after 5ms" },
+			]);
+
+			await new Promise((resolve) => setTimeout(resolve, 35));
+			expect((globalThis as { lateResourceResultResolved?: boolean }).lateResourceResultResolved).toBe(true);
+			expect(resources.skillPaths).toEqual([]);
 		});
 
 		it("short-circuits cancellable lifecycle events at the first cancellation", async () => {

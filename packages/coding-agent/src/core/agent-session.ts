@@ -54,6 +54,7 @@ import {
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
+	type ExtensionLifecycleReason,
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
@@ -2048,10 +2049,10 @@ export class AgentSession {
 
 		this._applyExtensionBindings(this._extensionRunner);
 		await this._extensionRunner.emit(this._sessionStartEvent);
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason);
 	}
 
-	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
+	private async extendResourcesFromExtensions(reason: ExtensionLifecycleReason): Promise<void> {
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
 			return;
 		}

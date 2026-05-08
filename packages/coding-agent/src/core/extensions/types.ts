@@ -495,11 +495,24 @@ export function defineTool<TParams extends TSchema, TDetails = unknown, TState =
 // Resource Events
 // ============================================================================
 
+export type ExtensionLifecycleReason = "startup" | "reload" | "new" | "resume" | "fork";
+
+/**
+ * Default bounded wait for one extension subscriber handler.
+ *
+ * Source/override: ExtensionRunnerOptions.handlerTimeoutMs. A timeout aborts the
+ * handler-local signal when the JavaScript runtime supports AbortController and
+ * ignores any late result from the timed-out handler.
+ */
+export const DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS = 5000;
+
 /** Fired after session_start to allow extensions to provide additional resource paths. */
 export interface ResourcesDiscoverEvent {
 	type: "resources_discover";
 	cwd: string;
-	reason: "startup" | "reload";
+	reason: ExtensionLifecycleReason;
+	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
+	signal?: AbortSignal;
 }
 
 /** Result from resources_discover event handler */
@@ -517,9 +530,11 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: "startup" | "reload" | "new" | "resume" | "fork";
+	reason: ExtensionLifecycleReason;
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
+	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
+	signal?: AbortSignal;
 }
 
 /** Fired before switching to another session (can be cancelled) */
@@ -527,6 +542,8 @@ export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	reason: "new" | "resume";
 	targetSessionFile?: string;
+	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
+	signal?: AbortSignal;
 }
 
 /** Fired before forking a session (can be cancelled) */
@@ -534,6 +551,8 @@ export interface SessionBeforeForkEvent {
 	type: "session_before_fork";
 	entryId: string;
 	position: "before" | "at";
+	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
+	signal?: AbortSignal;
 }
 
 /** Fired before context compaction (can be cancelled or customized) */
@@ -558,6 +577,8 @@ export interface SessionShutdownEvent {
 	reason: "quit" | "reload" | "new" | "resume" | "fork";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
+	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
+	signal?: AbortSignal;
 }
 
 /** Preparation data for tree navigation */
@@ -1026,6 +1047,87 @@ type ExtensionEventNameMissing = Exclude<ExtensionEvent["type"], ExtensionEventN
 type ExtensionEventNameExtra = Exclude<ExtensionEventName, ExtensionEvent["type"]>;
 type _ExtensionEventNamesCoverAllEvents = AssertNoExtensionEventDrift<ExtensionEventNameMissing>;
 type _ExtensionEventNamesContainOnlyEvents = AssertNoExtensionEventDrift<ExtensionEventNameExtra>;
+
+export const EXTENSION_LIFECYCLE_SUPPORT_MATRIX = {
+	typescript: {
+		events: EXTENSION_EVENT_NAMES,
+		payloadFields: {
+			session_start: ["type", "reason", "previousSessionFile", "signal"],
+			session_shutdown: ["type", "reason", "targetSessionFile", "signal"],
+			resources_discover: ["type", "cwd", "reason", "signal"],
+			session_before_switch: ["type", "reason", "targetSessionFile", "signal"],
+			session_before_fork: ["type", "entryId", "position", "signal"],
+		},
+		reasons: ["startup", "reload", "new", "resume", "fork"],
+		results: ["none", "cancellable", "resources"],
+		timeout: {
+			source: "ExtensionRunnerOptions.handlerTimeoutMs",
+			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+			override: "per-runner",
+			abortSignal: true,
+			lateResults: "ignored",
+		},
+		shutdown: { supported: true, timeout: "same-handler-timeout", exactlyOnce: true },
+		unsupportedDiagnostics: true,
+	},
+	process_jsonl: {
+		events: EXTENSION_EVENT_NAMES,
+		payloadFields: {
+			session_start: ["type", "reason", "previousSessionFile"],
+			session_shutdown: ["type", "reason", "targetSessionFile"],
+			resources_discover: ["type", "cwd", "reason"],
+		},
+		reasons: ["startup", "reload", "new", "resume", "fork"],
+		results: ["none", "cancellable", "resources"],
+		timeout: {
+			source: "lifecycle-handler-timeout-ms",
+			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+			override: "runtime-host",
+			abortSignal: false,
+			lateResults: "ignored",
+		},
+		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
+		unsupportedDiagnostics: true,
+	},
+	wasm: {
+		events: ["session_start", "session_shutdown", "resources_discover"],
+		payloadFields: {
+			session_start: ["type", "reason", "previousSessionFile"],
+			session_shutdown: ["type", "reason", "targetSessionFile"],
+			resources_discover: ["type", "cwd", "reason"],
+		},
+		reasons: ["startup", "reload", "new", "resume", "fork"],
+		results: ["none", "resources"],
+		timeout: {
+			source: "lifecycle-handler-timeout-ms",
+			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+			override: "runtime-host",
+			abortSignal: false,
+			lateResults: "ignored",
+		},
+		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
+		unsupportedDiagnostics: false,
+	},
+	native: {
+		events: ["session_start", "session_shutdown", "resources_discover"],
+		payloadFields: {
+			session_start: ["type", "reason", "previousSessionFile"],
+			session_shutdown: ["type", "reason", "targetSessionFile"],
+			resources_discover: ["type", "cwd", "reason"],
+		},
+		reasons: ["startup", "reload", "new", "resume", "fork"],
+		results: ["none", "resources"],
+		timeout: {
+			source: "lifecycle-handler-timeout-ms",
+			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
+			override: "runtime-host",
+			abortSignal: false,
+			lateResults: "ignored",
+		},
+		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
+		unsupportedDiagnostics: false,
+	},
+} as const;
 
 // ============================================================================
 // Event Results
@@ -1627,4 +1729,6 @@ export interface ExtensionError {
 	event: string;
 	error: string;
 	stack?: string;
+	phase?: string;
+	runtimeKind?: "typescript" | "process_jsonl" | "wasm" | "native" | "remote";
 }

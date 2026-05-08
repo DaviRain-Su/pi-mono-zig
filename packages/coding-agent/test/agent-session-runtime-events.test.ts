@@ -13,6 +13,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type {
 	ExtensionFactory,
+	ResourcesDiscoverEvent,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,
 	SessionShutdownEvent,
@@ -23,7 +24,8 @@ type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
 	| SessionShutdownEvent
-	| SessionStartEvent;
+	| SessionStartEvent
+	| ResourcesDiscoverEvent;
 
 describe("AgentSessionRuntime session lifecycle events", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
@@ -101,9 +103,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			pi.on("session_start", (event) => {
 				events.push(event);
 			});
+			pi.on("resources_discover", (event) => {
+				events.push(event);
+				return { skillPaths: [`/skills/${event.reason}`] };
+			});
 		});
 
-		expect(events).toEqual([{ type: "session_start", reason: "startup" }]);
+		expect(events).toEqual([
+			{ type: "session_start", reason: "startup" },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "startup" },
+		]);
 		events.length = 0;
 
 		await runtimeHost.session.prompt("hello");
@@ -118,6 +127,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			{ type: "session_before_switch", reason: "new", targetSessionFile: undefined },
 			{ type: "session_shutdown", reason: "new", targetSessionFile: secondSessionFile },
 			{ type: "session_start", reason: "new", previousSessionFile: originalSessionFile },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "new" },
 		]);
 
 		events.length = 0;
@@ -130,6 +140,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			{ type: "session_before_switch", reason: "resume", targetSessionFile: originalSessionFile },
 			{ type: "session_shutdown", reason: "resume", targetSessionFile: originalSessionFile },
 			{ type: "session_start", reason: "resume", previousSessionFile: secondSessionFile },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "resume" },
 		]);
 	});
 
@@ -143,9 +154,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			pi.on("session_start", (event) => {
 				events.push(event);
 			});
+			pi.on("resources_discover", (event) => {
+				events.push(event);
+				return { promptPaths: [`/prompts/${event.reason}`] };
+			});
 		});
 
-		expect(events).toEqual([{ type: "session_start", reason: "startup" }]);
+		expect(events).toEqual([
+			{ type: "session_start", reason: "startup" },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "startup" },
+		]);
 		events.length = 0;
 
 		await runtimeHost.session.prompt("hello");
@@ -183,6 +201,21 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		runtimeHost.setRebindSession(undefined);
 	});
 
+	it("emits shutdown exactly once for repeated dispose calls", async () => {
+		const events: RecordedSessionEvent[] = [];
+		const { runtimeHost } = await createRuntimeHost((pi) => {
+			pi.on("session_shutdown", (event) => {
+				events.push(event);
+			});
+		});
+
+		events.length = 0;
+		await runtimeHost.dispose();
+		await runtimeHost.dispose();
+
+		expect(events).toEqual([{ type: "session_shutdown", reason: "quit" }]);
+	});
+
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
 		const events: RecordedSessionEvent[] = [];
 		let cancelNextFork = false;
@@ -200,9 +233,16 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			pi.on("session_start", (event) => {
 				events.push(event);
 			});
+			pi.on("resources_discover", (event) => {
+				events.push(event);
+				return { promptPaths: [`/prompts/${event.reason}`] };
+			});
 		});
 
-		expect(events).toEqual([{ type: "session_start", reason: "startup" }]);
+		expect(events).toEqual([
+			{ type: "session_start", reason: "startup" },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "startup" },
+		]);
 		events.length = 0;
 
 		await runtimeHost.session.prompt("hello");
@@ -217,6 +257,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			{ type: "session_before_fork", entryId: userMessage.entryId, position: "before" },
 			{ type: "session_shutdown", reason: "fork", targetSessionFile: runtimeHost.session.sessionFile },
 			{ type: "session_start", reason: "fork", previousSessionFile },
+			{ type: "resources_discover", cwd: runtimeHost.cwd, reason: "fork" },
 		]);
 
 		events.length = 0;

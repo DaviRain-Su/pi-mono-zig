@@ -134,6 +134,7 @@ export type {
 	RegisteredCommand,
 	RegisteredTool,
 	ResolvedCommand,
+	ResourcesDiscoverEvent,
 	SessionBeforeCompactEvent,
 	SessionBeforeForkEvent,
 	SessionBeforeSwitchEvent,

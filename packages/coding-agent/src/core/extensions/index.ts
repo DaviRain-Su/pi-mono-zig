@@ -117,6 +117,7 @@ export type {
 	ExtensionFactory,
 	ExtensionFlag,
 	ExtensionHandler,
+	ExtensionLifecycleReason,
 	// Runtime
 	ExtensionRuntime,
 	ExtensionShortcut,
@@ -211,7 +212,9 @@ export type {
 } from "./types.js";
 // Type guards
 export {
+	DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
 	defineTool,
+	EXTENSION_LIFECYCLE_SUPPORT_MATRIX,
 	isBashToolResult,
 	isEditToolResult,
 	isFindToolResult,

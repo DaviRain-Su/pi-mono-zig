@@ -67,6 +67,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
 	private beforeSessionInvalidate?: () => void;
+	private currentSessionDisposed = false;
 
 	constructor(
 		private _session: AgentSession,
@@ -147,6 +148,9 @@ export class AgentSessionRuntime {
 	}
 
 	private async teardownCurrent(reason: SessionShutdownEvent["reason"], targetSessionFile?: string): Promise<void> {
+		if (this.currentSessionDisposed) {
+			return;
+		}
 		await emitSessionShutdownEvent(this.session.extensionRunner, {
 			type: "session_shutdown",
 			reason,
@@ -154,6 +158,7 @@ export class AgentSessionRuntime {
 		});
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
+		this.currentSessionDisposed = true;
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -161,6 +166,7 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this.currentSessionDisposed = false;
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -364,12 +370,7 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		await this.teardownCurrent("quit");
 	}
 }
 
