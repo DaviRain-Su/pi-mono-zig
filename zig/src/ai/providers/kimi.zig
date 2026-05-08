@@ -107,6 +107,12 @@ pub const KimiProvider = struct {
         var streaming = try client.requestStreaming(request);
         defer streaming.deinit();
 
+        if (options) |stream_options| {
+            if (stream_options.on_response) |callback| {
+                try provider_stream.invokeOnResponse(allocator, callback, streaming.status, streaming.response_headers, model);
+            }
+        }
+
         if (streaming.status != 200) {
             const response_body = try streaming.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);
             defer allocator.free(response_body);
@@ -1629,7 +1635,7 @@ test "stream preserves partial Kimi text before mid-stream abort terminal event"
     const chunks = [_]test_stream_server.DelayedChunk{
         .{
             .bytes = "data: {\"id\":\"kimi-abort\",\"choices\":[{\"delta\":{\"content\":\"partial kimi\"},\"finish_reason\":null}]}\n",
-            .delay_after_ms = 120,
+            .delay_after_ms = 1000,
         },
         .{ .bytes = "data: [DONE]\n" },
     };
@@ -1651,12 +1657,22 @@ test "stream preserves partial Kimi text before mid-stream abort terminal event"
     };
 
     var abort_signal = std.atomic.Value(bool).init(false);
-    const abort_thread = try test_stream_server.startAbortThread(io, &abort_signal, 20);
-    defer abort_thread.join();
+    const AbortAfterResponse = struct {
+        var signal: ?*std.atomic.Value(bool) = null;
+        var thread: ?std.Thread = null;
+
+        fn callback(_: u16, _: std.StringHashMap([]const u8), _: types.Model) !void {
+            thread = try test_stream_server.startAbortThread(std.testing.io, signal.?, 250);
+        }
+    };
+    AbortAfterResponse.signal = &abort_signal;
+    AbortAfterResponse.thread = null;
+    defer if (AbortAfterResponse.thread) |thread| thread.join();
 
     var stream = try KimiProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
         .api_key = "test-key",
         .signal = &abort_signal,
+        .on_response = &AbortAfterResponse.callback,
     });
     defer stream.deinit();
 

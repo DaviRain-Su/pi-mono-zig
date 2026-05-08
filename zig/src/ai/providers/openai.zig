@@ -10,6 +10,7 @@ const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 const chat_payload = @import("openai_chat_payload.zig");
 const chat_sse = @import("openai_chat_sse.zig");
+const test_stream_server = @import("test_stream_server.zig");
 
 const parseSseStreamLines = chat_sse.parseSseStreamLines;
 const parseChunkUsage = chat_sse.parseChunkUsage;
@@ -1798,7 +1799,7 @@ test "stream preserves partial text before mid-stream abort terminal event" {
         io,
         "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n",
         "data: [DONE]\n",
-        500,
+        1000,
     );
     defer server.deinit();
     try server.start();
@@ -1807,17 +1808,22 @@ test "stream preserves partial text before mid-stream abort terminal event" {
     defer allocator.free(url);
 
     var abort_signal = std.atomic.Value(bool).init(false);
-    const abort_thread = try std.Thread.spawn(.{}, struct {
-        fn run(signal: *std.atomic.Value(bool), test_io: std.Io) void {
-            std.Io.sleep(test_io, .fromMilliseconds(50), .awake) catch {};
-            signal.store(true, .seq_cst);
+    const AbortAfterResponse = struct {
+        var signal: ?*std.atomic.Value(bool) = null;
+        var thread: ?std.Thread = null;
+
+        fn callback(_: u16, _: std.StringHashMap([]const u8), _: types.Model) !void {
+            thread = try test_stream_server.startAbortThread(std.testing.io, signal.?, 250);
         }
-    }.run, .{ &abort_signal, io });
-    defer abort_thread.join();
+    };
+    AbortAfterResponse.signal = &abort_signal;
+    AbortAfterResponse.thread = null;
+    defer if (AbortAfterResponse.thread) |thread| thread.join();
 
     var stream = try OpenAIProvider.stream(allocator, io, runtimeFailureTestModel(url), runtimeFailureContext(), .{
         .api_key = "test-key",
         .signal = &abort_signal,
+        .on_response = &AbortAfterResponse.callback,
     });
     defer stream.deinit();
 

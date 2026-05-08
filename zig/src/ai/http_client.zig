@@ -1680,8 +1680,11 @@ const TestAcceptOnlyServer = struct {
 
     fn deinit(self: *TestAcceptOnlyServer) void {
         self.stopping.store(true, .release);
+        if (self.thread) |thread| {
+            self.wakeAccept();
+            thread.join();
+        }
         self.server.deinit(self.io);
-        if (self.thread) |thread| thread.join();
     }
 
     fn port(self: *const TestAcceptOnlyServer) u16 {
@@ -1691,13 +1694,17 @@ const TestAcceptOnlyServer = struct {
     fn run(self: *TestAcceptOnlyServer) void {
         const stream = self.server.accept(self.io) catch |err| switch (err) {
             error.SocketNotListening, error.Canceled, error.ConnectionAborted => return,
-            else => {
-                if (self.stopping.load(.acquire)) return;
-                std.debug.panic("test accept-only server accept failed: {}", .{err});
-            },
+            else => std.debug.panic("test accept-only server accept failed: {}", .{err}),
         };
         defer stream.close(self.io);
+        if (self.stopping.load(.acquire)) return;
         std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.hold_ms)), .awake) catch {};
+    }
+
+    fn wakeAccept(self: *TestAcceptOnlyServer) void {
+        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
+        const stream = address.connect(self.io, .{ .mode = .stream }) catch return;
+        stream.close(self.io);
     }
 };
 
