@@ -67,7 +67,9 @@ Package trust/provenance for local extensions records validated package identity
 
 Package-backed policies are bound to the locked digest identity, so stale, cross-scope, or legacy non-digest policy keys cannot authorize changed packages. The TypeScript and Zig implementations share the same digest/principal shape and are covered by package-manager, resource-loader, runner, and TS/Zig parity checks.
 
-Validation:
+Extension lifecycle hardening keeps capabilities in the extension layer while the core exposes only neutral substrate boundaries. Startup, teardown, cleanup, and timeout ordering are deterministic; extension-host APIs require policy gates; runtime adapters enforce declared capabilities; reserved sub-agent names and unsupported schema versions fail closed; and diagnostics use canonical envelopes with secret redaction.
+
+CLI-only validation:
 
 ```bash
 npm run check
