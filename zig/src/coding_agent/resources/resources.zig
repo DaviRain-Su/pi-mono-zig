@@ -1,5 +1,7 @@
 const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
+const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
+const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
@@ -882,6 +884,7 @@ fn addPackageSources(
                 defer if (scope == .project) allocator.free(base_dir);
                 const resolved = try resolvePath(allocator, base_dir, local.path);
                 defer allocator.free(resolved);
+                if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, resolved, pkg.source, scope, cwd, agent_dir)) continue;
                 try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, resolved, filter, .{
                     .source = pkg.source,
                     .scope = scope,
@@ -896,6 +899,7 @@ fn addPackageSources(
                     try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "npm source is not installed", install_path));
                     continue;
                 }
+                if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, install_path, pkg.source, scope, cwd, agent_dir)) continue;
                 try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, .{
                     .source = pkg.source,
                     .scope = scope,
@@ -910,6 +914,7 @@ fn addPackageSources(
                     try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "git source is not installed", install_path));
                     continue;
                 }
+                if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, install_path, pkg.source, scope, cwd, agent_dir)) continue;
                 try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, .{
                     .source = pkg.source,
                     .scope = scope,
@@ -919,6 +924,59 @@ fn addPackageSources(
             },
         }
     }
+}
+
+fn verifyLockedWasmPackageForResources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    package_root: []const u8,
+    source: []const u8,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !bool {
+    if (scope == .temporary) return true;
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    if (!pathExists(io, manifest_path)) return true;
+
+    const provenance_scope: provenance_lockfile.Scope = if (scope == .project) .project else .user;
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
+    defer allocator.free(lock_path);
+
+    var current_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer current_result.deinit(allocator);
+    if (current_result != .valid) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_validation_failed", "wasm package validation failed", manifest_path));
+        return false;
+    }
+
+    var loaded = try provenance_lockfile.readLockfile(allocator, io, provenance_scope, lock_path, "resolve");
+    defer loaded.deinit(allocator);
+    if (loaded.diagnostic) |diagnostic| {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, diagnostic.category, diagnostic.message, lock_path));
+        return false;
+    }
+    if (!pathExists(io, lock_path)) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lockfile", "missing extension provenance lockfile", lock_path));
+        return false;
+    }
+
+    var current_entry = try provenance_lockfile.createWasmLockEntry(allocator, provenance_scope, current_result.valid.package_root, &current_result.valid);
+    defer current_entry.deinit(allocator);
+    for (loaded.entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, current_entry.key)) continue;
+        if (provenance_lockfile.entriesEqual(entry, current_entry)) return true;
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_root_digest_mismatch", "extension provenance drift", package_root));
+        return false;
+    }
+
+    _ = source;
+    try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lock_entry", "missing extension provenance lock entry", lock_path));
+    return false;
 }
 
 fn collectPackageResourceRoot(
@@ -2081,6 +2139,98 @@ test "resolveConfiguredResources loads local, npm, and git resource sources" {
     try std.testing.expectEqual(@as(usize, 1), resolved.prompts.len);
     try std.testing.expect(std.mem.indexOf(u8, resolved.prompts[0].path, "summarize.md") != null);
     try std.testing.expectEqual(@as(usize, 2), resolved.themes.len);
+}
+
+test "resolveConfiguredResources denies wasm package resources without valid scope lock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/wasm-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/wasm-pkg/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/wasm-pkg/wasm/plugin.wasm",
+        .data = "\x00asm",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/wasm-pkg/extensions/main.ts",
+        .data = "export default {};\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/wasm-pkg/package.json",
+        .data =
+        \\{
+        \\  "pi": { "extensions": ["extensions/main.ts"] }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/wasm-pkg/pi-extension.json",
+        .data =
+        \\{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "com.example.locked-resource",
+        \\  "name": "Locked Resource",
+        \\  "version": "0.1.0",
+        \\  "description": "Locked resource fixture.",
+        \\  "artifact": { "kind": "wasm-component", "path": "wasm/plugin.wasm" },
+        \\  "tool": {
+        \\    "id": "example.lockedResource",
+        \\    "description": "Locked resource tool.",
+        \\    "inputSchema": {},
+        \\    "outputSchema": {}
+        \\  },
+        \\  "capabilities": []
+        \\}
+        ,
+    });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const fixture_root = try makeTmpPath(allocator, tmp, "repo/fixtures/wasm-pkg");
+    defer allocator.free(fixture_root);
+
+    var package_config = PackageSourceConfig{ .source = try allocator.dupe(u8, fixture_root) };
+    defer package_config.deinit(allocator);
+
+    var missing_lock = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer missing_lock.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), missing_lock.extensions.len);
+    try std.testing.expectEqual(@as(usize, 1), missing_lock.diagnostics.len);
+    try std.testing.expectEqualStrings("missing_lockfile", missing_lock.diagnostics[0].kind);
+
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, cwd, agent_dir);
+    defer allocator.free(lock_path);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, agent_dir);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{
+        .sub_path = lock_path,
+        .data = "{ malformed",
+    });
+
+    var malformed_lock = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer malformed_lock.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), malformed_lock.extensions.len);
+    try std.testing.expectEqual(@as(usize, 1), malformed_lock.diagnostics.len);
+    try std.testing.expectEqualStrings("malformed_lockfile", malformed_lock.diagnostics[0].kind);
 }
 
 test "loadResourceBundle loads skills templates and themes with selected theme" {

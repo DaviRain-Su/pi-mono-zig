@@ -6,6 +6,7 @@ const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
 const config_selector = @import("config_selector.zig");
 const package_command_parser = @import("package_command_parser.zig");
+const provenance_lockfile = @import("provenance_lockfile.zig");
 
 /// Package CLI subcommand parser/executor parity with the TypeScript
 /// `package-manager-cli.ts`. Local fixture behavior is preserved while
@@ -40,6 +41,7 @@ pub const ConfigKind = config_selector.ConfigKind;
 const ConfigSelectorState = config_selector.ConfigSelectorState;
 const loadSelectorState = config_selector.loadSelectorState;
 const saveSelectorState = config_selector.saveSelectorState;
+const ProvenanceScope = provenance_lockfile.Scope;
 
 pub const ConfigToggleAction = package_command_parser.ConfigToggleAction;
 pub const ConfigOptions = package_command_parser.ConfigOptions;
@@ -266,9 +268,8 @@ fn executeInstall(
     const packages_array_ptr = try ensurePackagesArray(allocator, &settings_object);
     const persisted_source = try normalizePackageSourceForSettings(allocator, source, command.local, options.cwd, options.agent_dir);
     defer allocator.free(persisted_source);
-
     const existing_index = try findPackageIndex(allocator, packages_array_ptr.*, source, command.local, options);
-    if (existing_index != null) {
+    if (existing_index != null and !isLocalSource(source)) {
         try stdout.print("Already installed: {s}\n", .{source});
         return .{ .exit_code = 0 };
     }
@@ -281,8 +282,30 @@ fn executeInstall(
         if (!installed) return .{ .exit_code = 1 };
     }
 
-    if (!try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, stderr)) {
+    var wasm_install = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
+    defer wasm_install.deinit(allocator);
+    if (wasm_install == .invalid) {
         return .{ .exit_code = 1 };
+    }
+
+    if (existing_index != null) {
+        if (wasm_install == .valid) {
+            const scope = provenanceScope(command.local);
+            const lockfile_path = try provenance_lockfile.lockfilePath(allocator, scope, options.cwd, options.agent_dir);
+            defer allocator.free(lockfile_path);
+            var lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
+            defer lock_snapshot.deinit(allocator);
+            try provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_install.valid);
+            var revalidated = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
+            defer revalidated.deinit(allocator);
+            if (revalidated != .valid or !provenance_lockfile.entriesEqual(wasm_install.valid, revalidated.valid)) {
+                try restoreFileSnapshot(allocator, io, lock_snapshot);
+                try stderr.print("Error: package provenance changed during install; refusing to persist trust for {s}\n", .{source});
+                return .{ .exit_code = 1 };
+            }
+        }
+        try stdout.print("Already installed: {s}\n", .{source});
+        return .{ .exit_code = 0 };
     }
 
     var entry_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
@@ -293,10 +316,51 @@ fn executeInstall(
     try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, persisted_source) });
     try packages_array_ptr.*.append(.{ .object = entry_object });
 
+    var lock_snapshot: ?FileSnapshot = null;
+    defer if (lock_snapshot) |*snapshot| snapshot.deinit(allocator);
+    var wrote_lock = false;
+    errdefer if (wrote_lock) {
+        if (lock_snapshot) |snapshot| restoreFileSnapshot(allocator, io, snapshot) catch {};
+    };
+    if (wasm_install == .valid) {
+        const scope = provenanceScope(command.local);
+        const lockfile_path = try provenance_lockfile.lockfilePath(allocator, scope, options.cwd, options.agent_dir);
+        defer allocator.free(lockfile_path);
+        lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
+        try provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_install.valid);
+        wrote_lock = true;
+
+        var revalidated = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
+        defer revalidated.deinit(allocator);
+        if (revalidated != .valid or !provenance_lockfile.entriesEqual(wasm_install.valid, revalidated.valid)) {
+            try restoreFileSnapshot(allocator, io, lock_snapshot.?);
+            wrote_lock = false;
+            try stderr.print("Error: package provenance changed during install; refusing to persist trust for {s}\n", .{source});
+            return .{ .exit_code = 1 };
+        }
+    }
+
     try writeSettingsObject(allocator, io, settings_path, settings_object);
+    wrote_lock = false;
     try stdout.print("Installed {s}\n", .{source});
     return .{ .exit_code = 0 };
 }
+
+const LocalPathMode = enum { input, settings };
+
+const LocalWasmInstallValidation = union(enum) {
+    absent,
+    invalid,
+    valid: provenance_lockfile.LockEntry,
+
+    fn deinit(self: *LocalWasmInstallValidation, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .valid => |*entry| entry.deinit(allocator),
+            else => {},
+        }
+        self.* = .absent;
+    }
+};
 
 const WasmPackagePolicyRequest = struct {
     policy_lookup_key: []u8,
@@ -313,18 +377,21 @@ fn validateLocalWasmPackageForInstall(
     source: []const u8,
     is_project: bool,
     options: ExecuteOptions,
+    mode: LocalPathMode,
     stderr: *std.Io.Writer,
-) !bool {
-    if (!isLocalSource(source)) return true;
+) !LocalWasmInstallValidation {
+    if (!isLocalSource(source)) return .absent;
 
-    _ = is_project;
-    const package_root = try resolveLocalPathFromCwd(allocator, options.cwd, source);
+    const package_root = switch (mode) {
+        .input => try resolveLocalPathFromCwd(allocator, options.cwd, source),
+        .settings => try resolveLocalPathFromScopeBase(allocator, source, is_project, options.cwd, options.agent_dir),
+    };
     defer allocator.free(package_root);
 
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
     _ = std.Io.Dir.statFile(.cwd(), io, manifest_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return true,
+        error.FileNotFound => return .absent,
         else => return err,
     };
 
@@ -351,9 +418,11 @@ fn validateLocalWasmPackageForInstall(
     defer result.deinit(allocator);
     if (result == .invalid) {
         try writeWasmValidationDiagnostics(stderr, result.invalid);
-        return false;
+        return .invalid;
     }
-    return true;
+    const source_identity = try allocator.dupe(u8, result.valid.package_root);
+    defer allocator.free(source_identity);
+    return .{ .valid = try provenance_lockfile.createWasmLockEntry(allocator, provenanceScope(is_project), source_identity, &result.valid) };
 }
 
 fn readWasmPackagePolicyRequest(
@@ -462,6 +531,57 @@ fn jsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
     };
 }
 
+const FileSnapshot = struct {
+    path: []u8,
+    existed: bool,
+    bytes: ?[]u8 = null,
+
+    fn deinit(self: *FileSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.bytes) |bytes| allocator.free(bytes);
+        self.* = undefined;
+    }
+};
+
+fn captureFileSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !FileSnapshot {
+    const bytes = std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .path = try allocator.dupe(u8, path),
+            .existed = false,
+            .bytes = null,
+        },
+        else => return err,
+    };
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .existed = true,
+        .bytes = bytes,
+    };
+}
+
+fn restoreFileSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    snapshot: FileSnapshot,
+) !void {
+    if (!snapshot.existed) {
+        std.Io.Dir.deleteFileAbsolute(io, snapshot.path) catch {};
+        return;
+    }
+    if (snapshot.bytes) |bytes| {
+        try common.writeFileAbsolute(io, snapshot.path, bytes, true);
+    }
+    _ = allocator;
+}
+
+fn provenanceScope(is_project: bool) ProvenanceScope {
+    return if (is_project) .project else .user;
+}
+
 fn executeRemove(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -491,11 +611,36 @@ fn executeRemove(
         try stderr.print("Error: No matching package found for {s}\n", .{source});
         return .{ .exit_code = 1 };
     }
+    const matched_source = try packageSourceFromItem(allocator, packages_value_ptr.?.array.items[matched_index.?]);
+    defer allocator.free(matched_source);
+
+    const scope = provenanceScope(command.local);
+    const lockfile_path = try provenance_lockfile.lockfilePath(allocator, scope, options.cwd, options.agent_dir);
+    defer allocator.free(lockfile_path);
+    var settings_snapshot = try captureFileSnapshot(allocator, io, settings_path);
+    defer settings_snapshot.deinit(allocator);
+    var lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
+    defer lock_snapshot.deinit(allocator);
 
     const removed = packages_value_ptr.?.array.orderedRemove(matched_index.?);
     common.deinitJsonValue(allocator, removed);
 
-    try writeSettingsObject(allocator, io, settings_path, settings_object);
+    writeSettingsObject(allocator, io, settings_path, settings_object) catch |err| {
+        try restoreFileSnapshot(allocator, io, settings_snapshot);
+        return err;
+    };
+    removeLocalWasmProvenanceForSource(allocator, io, source, command.local, options, .input, lockfile_path) catch |err| {
+        try restoreFileSnapshot(allocator, io, settings_snapshot);
+        try restoreFileSnapshot(allocator, io, lock_snapshot);
+        try stderr.print("Error: failed to remove extension provenance for {s}: {s}\n", .{ source, @errorName(err) });
+        return .{ .exit_code = 1 };
+    };
+    removeLocalWasmProvenanceForSource(allocator, io, matched_source, command.local, options, .settings, lockfile_path) catch |err| {
+        try restoreFileSnapshot(allocator, io, settings_snapshot);
+        try restoreFileSnapshot(allocator, io, lock_snapshot);
+        try stderr.print("Error: failed to remove extension provenance for {s}: {s}\n", .{ source, @errorName(err) });
+        return .{ .exit_code = 1 };
+    };
     try stdout.print("Removed {s}\n", .{source});
     return .{ .exit_code = 0 };
 }
@@ -608,6 +753,15 @@ fn executeExtensionUpdates(
         }
     }
 
+    const user_lock_path = try provenance_lockfile.lockfilePath(allocator, .user, options.cwd, options.agent_dir);
+    defer allocator.free(user_lock_path);
+    const project_lock_path = try provenance_lockfile.lockfilePath(allocator, .project, options.cwd, options.agent_dir);
+    defer allocator.free(project_lock_path);
+    var user_lock_snapshot = try captureFileSnapshot(allocator, io, user_lock_path);
+    defer user_lock_snapshot.deinit(allocator);
+    var project_lock_snapshot = try captureFileSnapshot(allocator, io, project_lock_path);
+    defer project_lock_snapshot.deinit(allocator);
+
     for (sources.items) |entry| {
         const updated = if (isNpmSource(entry.source))
             try executeNpmUpdate(allocator, io, entry.source, entry.is_project, options, stderr)
@@ -615,7 +769,30 @@ fn executeExtensionUpdates(
             try executeGitUpdate(allocator, io, entry.source, entry.is_project, options, stderr)
         else
             true;
-        if (!updated) return .{ .exit_code = 1 };
+        if (!updated) {
+            try restoreFileSnapshot(allocator, io, user_lock_snapshot);
+            try restoreFileSnapshot(allocator, io, project_lock_snapshot);
+            return .{ .exit_code = 1 };
+        }
+        if (isLocalSource(entry.source)) {
+            var wasm_update = try validateLocalWasmPackageForInstall(allocator, io, entry.source, entry.is_project, options, .settings, stderr);
+            defer wasm_update.deinit(allocator);
+            if (wasm_update == .invalid) {
+                try restoreFileSnapshot(allocator, io, user_lock_snapshot);
+                try restoreFileSnapshot(allocator, io, project_lock_snapshot);
+                return .{ .exit_code = 1 };
+            }
+            if (wasm_update == .valid) {
+                const scope = provenanceScope(entry.is_project);
+                const lockfile_path = if (entry.is_project) project_lock_path else user_lock_path;
+                provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_update.valid) catch |err| {
+                    try restoreFileSnapshot(allocator, io, user_lock_snapshot);
+                    try restoreFileSnapshot(allocator, io, project_lock_snapshot);
+                    try stderr.print("Error: failed to update extension provenance for {s}: {s}\n", .{ entry.source, @errorName(err) });
+                    return .{ .exit_code = 1 };
+                };
+            }
+        }
     }
 
     return .{ .exit_code = 0 };
@@ -1793,6 +1970,58 @@ fn findPackageIndex(
     return null;
 }
 
+fn packageSourceFromItem(allocator: std.mem.Allocator, item: std.json.Value) ![]u8 {
+    return switch (item) {
+        .string => |source| allocator.dupe(u8, source),
+        .object => |object| blk: {
+            const value = object.get("source") orelse return error.InvalidPackageSource;
+            if (value != .string) return error.InvalidPackageSource;
+            break :blk allocator.dupe(u8, value.string);
+        },
+        else => error.InvalidPackageSource,
+    };
+}
+
+fn realpathOrResolved(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return allocator.dupe(u8, path);
+    return allocator.dupe(u8, std.mem.span(resolved));
+}
+
+fn localProvenanceKeyForSource(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    mode: LocalPathMode,
+) ![]u8 {
+    const resolved = switch (mode) {
+        .input => try resolveLocalPathFromCwd(allocator, options.cwd, source),
+        .settings => try resolveLocalPathFromScopeBase(allocator, source, is_project, options.cwd, options.agent_dir),
+    };
+    defer allocator.free(resolved);
+    const identity = try realpathOrResolved(allocator, resolved);
+    defer allocator.free(identity);
+    return std.fmt.allocPrint(allocator, "local:{s}", .{identity});
+}
+
+fn removeLocalWasmProvenanceForSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    mode: LocalPathMode,
+    lockfile_path: []const u8,
+) !void {
+    if (!isLocalSource(source)) return;
+    const key = try localProvenanceKeyForSource(allocator, source, is_project, options, mode);
+    defer allocator.free(key);
+    _ = try provenance_lockfile.removeEntry(allocator, io, provenanceScope(is_project), lockfile_path, key);
+}
+
 fn writeSettingsObject(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1884,6 +2113,23 @@ fn makeAbsoluteTmpPath(allocator: std.mem.Allocator, tmp: anytype, relative: []c
 
 fn readSettings(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .limited(1024 * 1024));
+}
+
+fn readOptionalTestFile(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    return std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+fn lockfilePathForTest(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    is_project: bool,
+) ![]u8 {
+    if (is_project) return std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "extensions.lock.json" });
+    return std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "extensions.lock.json" });
 }
 
 fn readFirstPackageSource(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -2368,6 +2614,96 @@ test "wasm package install honors final artifact approved grants" {
     const expected_source = try normalizePackageSourceForSettings(allocator, "./fixtures/wasm-final", false, cwd, agent_dir);
     defer allocator.free(expected_source);
     try std.testing.expect(std.mem.indexOf(u8, settings, expected_source) != null);
+}
+
+test "VAL-INSTALL-001 successful wasm install writes provenance lock before settings trust" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-lock", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-lock" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, final_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-lock" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lockfile = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lockfile);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"schemaVersion\": \"pi-extension-lock.v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"kind\": \"wasm-extension\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"artifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, manifest_result.valid.artifact_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, manifest_result.valid.package_root_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"scope\": \"user\"") != null);
+}
+
+test "VAL-INSTALL-009 remove deletes matching wasm provenance lock entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-remove", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-remove" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, final_key, "file.read", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-remove" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+
+    const remove_result = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-remove" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), remove_result.exit_code);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lockfile = try readOptionalTestFile(allocator, lockfile_path);
+    defer if (lockfile) |bytes| allocator.free(bytes);
+    if (lockfile) |bytes| {
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "wasm-remove") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, manifest_result.valid.artifact_sha256) == null);
+    }
 }
 
 test "wasm project install rejects approved grants from malformed resource limits policy" {
