@@ -4300,8 +4300,8 @@ test "collapse m2 app state defaults and snapshots all_expanded" {
 test "collapse m2 preview thresholds match collapsible chat kinds" {
     try std.testing.expectEqual(@as(?usize, 1), previewThreshold(.thinking));
     try std.testing.expectEqual(@as(?usize, 3), previewThreshold(.tool_result));
-    try std.testing.expectEqual(@as(?usize, 5), previewThreshold(.assistant));
-    try std.testing.expectEqual(@as(?usize, 5), previewThreshold(.markdown));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.assistant));
+    try std.testing.expectEqual(@as(?usize, null), previewThreshold(.markdown));
     try std.testing.expectEqual(@as(?usize, null), previewThreshold(.welcome));
     try std.testing.expectEqual(@as(?usize, null), previewThreshold(.info));
     try std.testing.expectEqual(@as(?usize, null), previewThreshold(.@"error"));

@@ -175,7 +175,7 @@ inline fn parseSs3(input: []const u8) Result {
         'R' => .{ .codepoint = Key.f3 },
         'S' => .{ .codepoint = Key.f4 },
         else => {
-            log.warn("unhandled ss3: {x}", .{input[2]});
+            // Silently ignore unhandled SS3 sequences to avoid TUI corruption.
             return .{
                 .event = null,
                 .n = 3,

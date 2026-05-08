@@ -217,7 +217,7 @@ pub fn previewThreshold(kind: ChatKind) ?usize {
     return switch (kind) {
         .thinking => 1,
         .tool_result => 3,
-        .assistant, .markdown => 5,
+        .assistant, .markdown => null,
         .welcome, .info, .@"error", .user, .tool_call, .bash_execution => null,
     };
 }

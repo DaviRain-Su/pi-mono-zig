@@ -742,6 +742,7 @@ pub fn submitEditorText(
 
     try prompt_worker.start(allocator, session, app_state, expanded, prompt_images);
     prompt_worker_active.* = true;
+    app_state.setToolOutputExpanded(false);
     try editor.addToHistory(trimmed);
     clearEditor(app_state, editor);
     try app_state.setStatus("thinking");
