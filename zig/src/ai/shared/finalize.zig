@@ -9,6 +9,26 @@ pub fn appendInlineToolCall(
     tool_calls: *std.ArrayList(types.ToolCall),
     owned_tool_call: types.ToolCall,
 ) !void {
+    try storeInlineToolCall(allocator, content_blocks, tool_calls, null, owned_tool_call);
+}
+
+pub fn insertInlineToolCall(
+    allocator: std.mem.Allocator,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    insert_index: usize,
+    owned_tool_call: types.ToolCall,
+) !void {
+    try storeInlineToolCall(allocator, content_blocks, tool_calls, insert_index, owned_tool_call);
+}
+
+fn storeInlineToolCall(
+    allocator: std.mem.Allocator,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    maybe_insert_index: ?usize,
+    owned_tool_call: types.ToolCall,
+) !void {
     var transferred = false;
     errdefer {
         if (!transferred) freeToolCallOwned(allocator, owned_tool_call);
@@ -19,7 +39,11 @@ pub fn appendInlineToolCall(
         if (!transferred) _ = tool_calls.pop();
     }
 
-    try content_blocks.append(allocator, .{ .tool_call = owned_tool_call });
+    if (maybe_insert_index) |insert_index| {
+        try content_blocks.insert(allocator, insert_index, .{ .tool_call = owned_tool_call });
+    } else {
+        try content_blocks.append(allocator, .{ .tool_call = owned_tool_call });
+    }
     transferred = true;
 }
 
@@ -61,6 +85,26 @@ test "appendInlineToolCall transfers owned data inline and keeps borrow-only cop
     try std.testing.expectEqual(content_blocks.items[0].tool_call.id.ptr, tool_calls.items[0].id.ptr);
     try std.testing.expectEqual(content_blocks.items[0].tool_call.name.ptr, tool_calls.items[0].name.ptr);
     try std.testing.expectEqual(content_blocks.items[0].tool_call.thought_signature.?.ptr, tool_calls.items[0].thought_signature.?.ptr);
+}
+
+test "insertInlineToolCall transfers owned data at requested content index" {
+    const allocator = std.testing.allocator;
+    var content_blocks: std.ArrayList(types.ContentBlock) = .empty;
+    defer content_blocks.deinit(allocator);
+    var tool_calls: std.ArrayList(types.ToolCall) = .empty;
+    defer tool_calls.deinit(allocator);
+
+    try content_blocks.append(allocator, .{ .text = .{ .text = "before" } });
+    try content_blocks.append(allocator, .{ .text = .{ .text = "after" } });
+
+    const tool_call = try makeTestToolCall(allocator, false);
+    try insertInlineToolCall(allocator, &content_blocks, &tool_calls, 1, tool_call);
+    defer freeToolCallOwned(allocator, content_blocks.items[1].tool_call);
+
+    try std.testing.expectEqual(@as(usize, 3), content_blocks.items.len);
+    try std.testing.expect(content_blocks.items[1] == .tool_call);
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.items.len);
+    try std.testing.expectEqual(content_blocks.items[1].tool_call.id.ptr, tool_calls.items[0].id.ptr);
 }
 
 test "appendInlineToolCall frees owned data when tool-call bookkeeping append fails" {

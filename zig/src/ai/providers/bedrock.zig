@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
@@ -2133,17 +2134,7 @@ fn handleContentBlockStop(
                     .arguments = arguments,
                 };
             };
-            var final_tool_call_transferred = false;
-            errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
-            // Single allocation: content_blocks owns the strings via the inline
-            // tool_call block. tool_calls keeps a borrow-only copy for length
-            // checks; tool_calls.deinit only frees its buffer.
-            try tool_calls.append(allocator, final_tool_call);
-            errdefer if (!final_tool_call_transferred) {
-                _ = tool_calls.pop();
-            };
-            try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = final_tool_call });
-            final_tool_call_transferred = true;
+            try finalize.insertInlineToolCall(allocator, content_blocks, tool_calls, @min(entry.event_index, content_blocks.items.len), final_tool_call);
             stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
         },
     }
@@ -2233,17 +2224,7 @@ fn finalizeOutputFromPartials(
                         .arguments = arguments,
                     };
                 };
-                var final_tool_call_transferred = false;
-                errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
-                // Single allocation: content_blocks owns the strings via the inline
-                // tool_call block; tool_calls keeps a borrow-only copy for length
-                // checks. ArrayList.deinit only frees its buffer.
-                try tool_calls.append(allocator, final_tool_call);
-                errdefer if (!final_tool_call_transferred) {
-                    _ = tool_calls.pop();
-                };
-                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = final_tool_call });
-                final_tool_call_transferred = true;
+                try finalize.insertInlineToolCall(allocator, content_blocks, tool_calls, @min(entry.event_index, content_blocks.items.len), final_tool_call);
                 stream_ptr.push(.{ .event_type = .toolcall_end, .content_index = @intCast(entry.event_index), .tool_call = final_tool_call });
             },
         }
@@ -2291,15 +2272,7 @@ fn collectOutputFromPartials(
                         .arguments = arguments,
                     };
                 };
-                var final_tool_call_transferred = false;
-                errdefer if (!final_tool_call_transferred) freeToolCallOwned(allocator, final_tool_call);
-                // Single allocation: see note in the main streaming branch.
-                try tool_calls.append(allocator, final_tool_call);
-                errdefer if (!final_tool_call_transferred) {
-                    _ = tool_calls.pop();
-                };
-                try insertContentBlockAtEventIndex(allocator, content_blocks, entry.event_index, .{ .tool_call = final_tool_call });
-                final_tool_call_transferred = true;
+                try finalize.insertInlineToolCall(allocator, content_blocks, tool_calls, @min(entry.event_index, content_blocks.items.len), final_tool_call);
             },
         }
     }
@@ -2919,13 +2892,6 @@ pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) v
 
 fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     provider_json.freeValue(allocator, value);
-}
-
-fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
 }
 
 const BedrockOnResponseCapture = struct {
