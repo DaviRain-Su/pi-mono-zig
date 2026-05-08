@@ -551,7 +551,7 @@ fn buildValidManifestResult(
 ) !ValidationResult {
     const owned_package_root = try realpathAlloc(allocator, fields.package_root);
     errdefer allocator.free(owned_package_root);
-    const owned_manifest_path = try std.fs.path.join(allocator, &.{ fields.package_root, MANIFEST_FILE_NAME });
+    const owned_manifest_path = try std.fs.path.join(allocator, &.{ owned_package_root, MANIFEST_FILE_NAME });
     errdefer allocator.free(owned_manifest_path);
     const owned_artifact_sha256 = try computeArtifactSha256(allocator, fields.artifact_absolute_path);
     errdefer allocator.free(owned_artifact_sha256);

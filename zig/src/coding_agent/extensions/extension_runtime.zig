@@ -731,6 +731,33 @@ pub fn startLockedWasmPackageRuntimes(
         handoff.approved_capabilities = approved_capabilities;
         handoff.resource_limits = enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits);
 
+        if (handoff.deniedRuntimeCapability(.initialize, "runtime/handoff")) |denial| {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase={s}; category={s}; capability={s}; branch={s}; mode={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; policyDigest={s}; requiredPolicy={s}; wasm extension capability denied before runtime registration",
+                .{
+                    denial.phase.jsonName(),
+                    denial.category,
+                    denial.capability.jsonName(),
+                    denial.branch.jsonName(),
+                    denial.mode,
+                    package.manifest.tool_id,
+                    package.source_info.source,
+                    package.lock_entry.scope.jsonName(),
+                    package.manifest.package_root,
+                    package.manifest.manifest_path,
+                    package.manifest.artifact_absolute_path,
+                    package.manifest.package_root_sha256,
+                    package.manifest.artifact_sha256,
+                    policy_key,
+                    policy_key,
+                },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, denial.category, message, package.manifest.manifest_path));
+            continue;
+        }
+
         const seen = try seen_tools.getOrPut(package.manifest.tool_id);
         if (seen.found_existing) {
             const message = try std.fmt.allocPrint(
@@ -747,11 +774,24 @@ pub fn startLockedWasmPackageRuntimes(
             _ = seen_tools.remove(package.manifest.tool_id);
             const message = try std.fmt.allocPrint(
                 allocator,
-                "phase=load; tool={s}; packageRoot={s}; wasm runtime handoff failed: {s}",
-                .{ package.manifest.tool_id, package.manifest.package_root, @errorName(err) },
+                "phase=load; category={s}; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; abi=wasm-component; contract={s}; reason={s}; wasm runtime contract failed closed before tool registration",
+                .{
+                    runtimeContractCategory(err),
+                    package.manifest.id,
+                    package.manifest.tool_id,
+                    package.source_info.source,
+                    package.lock_entry.scope.jsonName(),
+                    package.manifest.package_root,
+                    package.manifest.manifest_path,
+                    package.manifest.artifact_absolute_path,
+                    package.manifest.package_root_sha256,
+                    package.manifest.artifact_sha256,
+                    package.manifest.schema_version,
+                    @errorName(err),
+                },
             );
             defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "runtime_handoff_failed", message, package.manifest.manifest_path));
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, runtimeContractCategory(err), message, package.manifest.manifest_path));
             continue;
         };
         {
@@ -810,11 +850,19 @@ fn cloneResourceDiagnostic(allocator: std.mem.Allocator, diagnostic: resources_m
 }
 
 fn makeResourceDiagnostic(allocator: std.mem.Allocator, kind: []const u8, message: []const u8, path: []const u8) !resources_mod.Diagnostic {
+    const redacted_message = try resources_mod.redactDiagnosticValue(allocator, message);
+    errdefer allocator.free(redacted_message);
+    const redacted_path = try resources_mod.redactDiagnosticValue(allocator, path);
+    errdefer allocator.free(redacted_path);
     return .{
         .kind = try allocator.dupe(u8, kind),
-        .message = try allocator.dupe(u8, message),
-        .path = try allocator.dupe(u8, path),
+        .message = redacted_message,
+        .path = redacted_path,
     };
+}
+
+fn runtimeContractCategory(_: anyerror) []const u8 {
+    return "runtime_contract_failed";
 }
 
 fn deinitResourceDiagnosticsList(allocator: std.mem.Allocator, diagnostics: *std.ArrayList(resources_mod.Diagnostic)) void {
@@ -2907,13 +2955,14 @@ test "locked wasm packages resolve to policy gated runtime set and unload cleanl
     );
 }
 
-test "locked wasm runtime set omits missing policy and abi invalid packages" {
+test "locked wasm runtime set omits missing policy, capability-denied, and abi invalid packages" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
     try tmp.dir.createDirPath(std.testing.io, "project/no-policy/wasm");
-    try tmp.dir.createDirPath(std.testing.io, "project/invalid-abi/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "project/capability-denied/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "project/invalid-abi-token=pi-secret/wasm");
 
     const manifest_template =
         \\{{
@@ -2929,17 +2978,21 @@ test "locked wasm runtime set omits missing policy and abi invalid packages" {
         \\    "inputSchema": {{}},
         \\    "outputSchema": {{}}
         \\  }},
-        \\  "capabilities": []
+        \\  "capabilities": [{s}]
         \\}}
     ;
-    const no_policy_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.no-policy", "No Policy", "example.noPolicy" });
+    const no_policy_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.no-policy", "No Policy", "example.noPolicy", "" });
     defer allocator.free(no_policy_manifest);
-    const invalid_abi_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.invalid-abi", "Invalid ABI", "example.invalidAbi" });
+    const capability_denied_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.capability-denied", "Capability Denied", "example.capabilityDenied", "\"file.read\"" });
+    defer allocator.free(capability_denied_manifest);
+    const invalid_abi_manifest = try std.fmt.allocPrint(allocator, manifest_template, .{ "com.example.invalid-abi", "Invalid ABI", "example.invalidAbi", "" });
     defer allocator.free(invalid_abi_manifest);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/no-policy/pi-extension.json", .data = no_policy_manifest });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/no-policy/wasm/plugin.wasm", .data = "\x00asm" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi/pi-extension.json", .data = invalid_abi_manifest });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi/wasm/plugin.wasm", .data = "\x00asm" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/capability-denied/pi-extension.json", .data = capability_denied_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/capability-denied/wasm/plugin.wasm", .data = "\x00asm" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi-token=pi-secret/pi-extension.json", .data = invalid_abi_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/invalid-abi-token=pi-secret/wasm/plugin.wasm", .data = "\x00asm" });
 
     const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
     defer allocator.free(home_dir);
@@ -2949,7 +3002,9 @@ test "locked wasm runtime set omits missing policy and abi invalid packages" {
     defer allocator.free(agent_dir);
     const no_policy_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/no-policy");
     defer allocator.free(no_policy_root);
-    const invalid_abi_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/invalid-abi");
+    const capability_denied_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/capability-denied");
+    defer allocator.free(capability_denied_root);
+    const invalid_abi_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/invalid-abi-token=pi-secret");
     defer allocator.free(invalid_abi_root);
 
     const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
@@ -2965,6 +3020,15 @@ test "locked wasm runtime set omits missing policy and abi invalid packages" {
     defer no_policy_lock.deinit(allocator);
     try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, no_policy_lock);
 
+    var capability_denied_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, capability_denied_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer capability_denied_result.deinit(allocator);
+    try std.testing.expect(capability_denied_result == .valid);
+    var capability_denied_lock = try provenance_lockfile.createWasmLockEntry(allocator, .user, capability_denied_result.valid.package_root, &capability_denied_result.valid);
+    defer capability_denied_lock.deinit(allocator);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, capability_denied_lock);
+
     var invalid_abi_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, invalid_abi_root, .{
         .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
     });
@@ -2974,11 +3038,13 @@ test "locked wasm runtime set omits missing policy and abi invalid packages" {
     defer invalid_abi_lock.deinit(allocator);
     try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, invalid_abi_lock);
 
+    const capability_policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&capability_denied_result.valid));
+    defer allocator.free(capability_policy_key);
     const invalid_policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&invalid_abi_result.valid));
     defer allocator.free(invalid_policy_key);
     const settings_json = try std.fmt.allocPrint(allocator,
-        \\{{"packages":["{s}","{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["example.invalidAbi"]}}}}}}}}
-    , .{ no_policy_root, invalid_abi_root, invalid_policy_key });
+        \\{{"packages":["{s}","{s}","{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["example.capabilityDenied"]}}}},"{s}":{{"resourceLimits":{{"toolScopes":["example.invalidAbi"]}}}}}}}}
+    , .{ no_policy_root, capability_denied_root, invalid_abi_root, capability_policy_key, invalid_policy_key });
     defer allocator.free(settings_json);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
 
@@ -2999,16 +3065,33 @@ test "locked wasm runtime set omits missing policy and abi invalid packages" {
     defer runtime_set.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), runtime_set.entries.len);
-    try std.testing.expectEqual(@as(usize, 2), runtime_set.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 3), runtime_set.diagnostics.len);
     var missing_policy_seen = false;
-    var handoff_failure_seen = false;
+    var denied_capability_seen = false;
+    var runtime_contract_seen = false;
     for (runtime_set.diagnostics) |diagnostic| {
         if (std.mem.eql(u8, diagnostic.kind, "missing_policy")) missing_policy_seen = true;
-        if (std.mem.eql(u8, diagnostic.kind, "runtime_handoff_failed")) handoff_failure_seen = true;
+        if (std.mem.eql(u8, diagnostic.kind, "denied_capability")) {
+            denied_capability_seen = true;
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "capability=file.read") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "tool=example.capabilityDenied") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "scope=user") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "requiredPolicy=") != null);
+        }
+        if (std.mem.eql(u8, diagnostic.kind, "runtime_contract_failed")) {
+            runtime_contract_seen = true;
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "phase=load") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "tool=example.invalidAbi") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "artifactPath=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "contract=pi-extension.v0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "pi-secret") == null);
+        }
     }
     try std.testing.expect(missing_policy_seen);
-    try std.testing.expect(handoff_failure_seen);
+    try std.testing.expect(denied_capability_seen);
+    try std.testing.expect(runtime_contract_seen);
     try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "example.noPolicy"));
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "example.capabilityDenied"));
     try std.testing.expectEqual(@as(?agent.AgentTool, null), try runtime_set.agentTool(allocator, "example.invalidAbi"));
 }
 

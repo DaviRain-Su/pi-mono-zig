@@ -1218,13 +1218,52 @@ fn appendWasmProvenanceMismatchDiagnostic(
         return;
     }
 
+    const identity_mismatch = firstLockIdentityMismatch(locked_entry, current_entry);
     const message = try std.fmt.allocPrint(
         allocator,
-        "phase=resolve; source={s}; scope={s}; packageRoot={s}; recovery=run update for the package; extension provenance lock entry differs from current package identity",
-        .{ source, scope_name, package_root },
+        "phase=resolve; source={s}; scope={s}; packageRoot={s}; field={s}; expected={s}; actual={s}; manifestPath={s}; artifactPath={s}; tool={s}; recovery=run update for the package; extension provenance lock entry differs from current package identity",
+        .{
+            source,
+            scope_name,
+            package_root,
+            identity_mismatch.field,
+            identity_mismatch.expected,
+            identity_mismatch.actual,
+            current_entry.manifest_path,
+            current_entry.artifact_absolute_path orelse current_entry.artifact_path orelse "",
+            current_entry.manifest_tool_id orelse "",
+        },
     );
     defer allocator.free(message);
     try diagnostics.append(allocator, try makeDiagnostic(allocator, "manifest_identity_mismatch", message, package_root));
+}
+
+const LockIdentityMismatch = struct {
+    field: []const u8,
+    expected: []const u8,
+    actual: []const u8,
+};
+
+fn firstLockIdentityMismatch(
+    locked_entry: provenance_lockfile.LockEntry,
+    current_entry: provenance_lockfile.LockEntry,
+) LockIdentityMismatch {
+    if (locked_entry.scope != current_entry.scope) return .{ .field = "scope", .expected = locked_entry.scope.jsonName(), .actual = current_entry.scope.jsonName() };
+    if (!std.mem.eql(u8, locked_entry.source_type, current_entry.source_type)) return .{ .field = "source.type", .expected = locked_entry.source_type, .actual = current_entry.source_type };
+    if (!std.mem.eql(u8, locked_entry.source_identity, current_entry.source_identity)) return .{ .field = "source.identity", .expected = locked_entry.source_identity, .actual = current_entry.source_identity };
+    if (!optionalStringEqual(locked_entry.source_specifier, current_entry.source_specifier)) return .{ .field = "source.specifier", .expected = locked_entry.source_specifier orelse "", .actual = current_entry.source_specifier orelse "" };
+    if (!std.mem.eql(u8, locked_entry.manifest_kind, current_entry.manifest_kind)) return .{ .field = "manifest.kind", .expected = locked_entry.manifest_kind, .actual = current_entry.manifest_kind };
+    if (!optionalStringEqual(locked_entry.manifest_schema_version, current_entry.manifest_schema_version)) return .{ .field = "manifest.schemaVersion", .expected = locked_entry.manifest_schema_version orelse "", .actual = current_entry.manifest_schema_version orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_id, current_entry.manifest_id)) return .{ .field = "manifest.id", .expected = locked_entry.manifest_id orelse "", .actual = current_entry.manifest_id orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_name, current_entry.manifest_name)) return .{ .field = "manifest.name", .expected = locked_entry.manifest_name orelse "", .actual = current_entry.manifest_name orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_version, current_entry.manifest_version)) return .{ .field = "manifest.version", .expected = locked_entry.manifest_version orelse "", .actual = current_entry.manifest_version orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_tool_id, current_entry.manifest_tool_id)) return .{ .field = "manifest.toolId", .expected = locked_entry.manifest_tool_id orelse "", .actual = current_entry.manifest_tool_id orelse "" };
+    if (!std.mem.eql(u8, locked_entry.package_root, current_entry.package_root)) return .{ .field = "packageRoot", .expected = locked_entry.package_root, .actual = current_entry.package_root };
+    if (!std.mem.eql(u8, locked_entry.manifest_path, current_entry.manifest_path)) return .{ .field = "manifestPath", .expected = locked_entry.manifest_path, .actual = current_entry.manifest_path };
+    if (!optionalStringEqual(locked_entry.artifact_kind, current_entry.artifact_kind)) return .{ .field = "artifact.kind", .expected = locked_entry.artifact_kind orelse "", .actual = current_entry.artifact_kind orelse "" };
+    if (!optionalStringEqual(locked_entry.artifact_path, current_entry.artifact_path)) return .{ .field = "artifact.path", .expected = locked_entry.artifact_path orelse "", .actual = current_entry.artifact_path orelse "" };
+    if (!optionalStringEqual(locked_entry.artifact_absolute_path, current_entry.artifact_absolute_path)) return .{ .field = "artifact.absolutePath", .expected = locked_entry.artifact_absolute_path orelse "", .actual = current_entry.artifact_absolute_path orelse "" };
+    return .{ .field = "unknown", .expected = "", .actual = "" };
 }
 
 fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1930,11 +1969,77 @@ fn readOptionalFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
 }
 
 fn makeDiagnostic(allocator: std.mem.Allocator, kind: []const u8, message: []const u8, path: []const u8) !Diagnostic {
+    const redacted_message = try redactDiagnosticValue(allocator, message);
+    errdefer allocator.free(redacted_message);
+    const redacted_path = try redactDiagnosticValue(allocator, path);
+    errdefer allocator.free(redacted_path);
     return .{
         .kind = try allocator.dupe(u8, kind),
-        .message = try allocator.dupe(u8, message),
-        .path = try allocator.dupe(u8, path),
+        .message = redacted_message,
+        .path = redacted_path,
     };
+}
+
+pub fn redactDiagnosticValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var index: usize = 0;
+    while (index < value.len) {
+        if (startsWithIgnoreCase(value[index..], "Bearer ")) {
+            try out.writer.writeAll("Bearer [REDACTED]");
+            index = skipUntilDelimiter(value, index + "Bearer ".len);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "api_key=")) {
+            try out.writer.writeAll("api_key=[REDACTED]");
+            index = skipUntilDelimiter(value, index + "api_key=".len);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "access_token=")) {
+            try out.writer.writeAll("access_token=[REDACTED]");
+            index = skipUntilDelimiter(value, index + "access_token=".len);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "token=")) {
+            try out.writer.writeAll("token=[REDACTED]");
+            index = skipUntilDelimiter(value, index + "token=".len);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "x-api-key:")) {
+            try out.writer.writeAll("x-api-key: [REDACTED]");
+            index = skipUntilDelimiter(value, index + "x-api-key:".len);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "sk-")) {
+            try out.writer.writeAll("[REDACTED]");
+            index = skipUntilDelimiter(value, index);
+            continue;
+        }
+        if (startsWithIgnoreCase(value[index..], "secret")) {
+            try out.writer.writeAll("[REDACTED]");
+            index += "secret".len;
+            continue;
+        }
+        try out.writer.writeByte(value[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    if (value.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn skipUntilDelimiter(value: []const u8, start: usize) usize {
+    var index = start;
+    while (index < value.len) : (index += 1) {
+        switch (value[index]) {
+            ' ', '\t', '\r', '\n', '&', '"', '\'', ',', ')' => return index,
+            else => {},
+        }
+    }
+    return index;
 }
 
 fn cloneDiagnostic(allocator: std.mem.Allocator, diagnostic: Diagnostic) !Diagnostic {

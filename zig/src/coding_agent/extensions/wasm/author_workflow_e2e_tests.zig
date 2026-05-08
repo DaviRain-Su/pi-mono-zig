@@ -497,6 +497,23 @@ test "VAL-TRUST digest-bound policy and provenance denials fail closed" {
         try std.testing.expectEqualStrings(exact_user_policy_key, runtime_set.entries[0].policy_lookup_key);
     }
 
+    const lock_before_tamper = try readFile(allocator, lock_path);
+    defer allocator.free(lock_before_tamper);
+    const forged_package_root_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const tampered_lock = try std.mem.replaceOwned(u8, allocator, lock_before_tamper, initial_manifest.valid.package_root_sha256, forged_package_root_digest);
+    defer allocator.free(tampered_lock);
+    try tools_common.writeFileAbsolute(std.testing.io, lock_path, tampered_lock, true);
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "package_root_digest_mismatch", &.{
+        forged_package_root_digest,
+        initial_manifest.valid.package_root_sha256,
+        "actual=",
+        "scope=user",
+    });
+    const lock_after_tamper_diagnostic = try readFile(allocator, lock_path);
+    defer allocator.free(lock_after_tamper_diagnostic);
+    try std.testing.expectEqualStrings(tampered_lock, lock_after_tamper_diagnostic);
+    try tools_common.writeFileAbsolute(std.testing.io, lock_path, lock_before_tamper, true);
+
     const lock_before_artifact_drift = try readFile(allocator, lock_path);
     defer allocator.free(lock_before_artifact_drift);
     try appendFile(allocator, initial_manifest.valid.artifact_absolute_path, "\nARTIFACT-DRIFT");

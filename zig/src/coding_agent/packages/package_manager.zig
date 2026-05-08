@@ -88,6 +88,12 @@ pub const ExecuteOptions = struct {
     /// Required when stdout_is_tty is true; used to initialize the vaxis
     /// terminal backend. When null, TUI is disabled even if stdout_is_tty.
     env_map: ?*const std.process.Environ.Map = null,
+    /// Test-only fault injection used to prove lifecycle state writes are
+    /// transactional when the settings file cannot be replaced.
+    fail_settings_write_for_testing: bool = false,
+    /// Test-only fault injection used to prove lifecycle state writes are
+    /// transactional when the provenance lockfile cannot be replaced.
+    fail_lockfile_write_for_testing: bool = false,
 };
 
 pub const SelfUpdatePackageManager = enum { npm, pnpm, yarn, bun };
@@ -217,7 +223,7 @@ fn executeConfig(
     }
 
     try array_ptr.append(.{ .string = new_entry });
-    try writeSettingsObject(allocator, io, settings_path, settings_object);
+    try writeSettingsObject(allocator, io, settings_path, settings_object, options);
 
     const action_label: []const u8 = if (action == .enable) "Enabled" else "Disabled";
     try stdout.print("{s} {s}: {s}\n", .{ action_label, kind.settingsKey(), pattern });
@@ -332,12 +338,14 @@ fn executeInstall(
     }
 
     var entry_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer {
+    var entry_object_owned_by_settings = false;
+    errdefer if (!entry_object_owned_by_settings) {
         const cleanup: std.json.Value = .{ .object = entry_object };
         common.deinitJsonValue(allocator, cleanup);
-    }
+    };
     try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, persisted_source) });
     try packages_array_ptr.*.append(.{ .object = entry_object });
+    entry_object_owned_by_settings = true;
 
     var lock_snapshot: ?FileSnapshot = null;
     defer if (lock_snapshot) |*snapshot| snapshot.deinit(allocator);
@@ -350,7 +358,7 @@ fn executeInstall(
         const lockfile_path = try provenance_lockfile.lockfilePath(allocator, scope, options.cwd, options.agent_dir);
         defer allocator.free(lockfile_path);
         lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
-        try provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_install.valid);
+        try writeProvenanceEntry(allocator, io, scope, lockfile_path, wasm_install.valid, options);
         wrote_lock = true;
 
         var revalidated = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
@@ -363,7 +371,7 @@ fn executeInstall(
         }
     }
 
-    try writeSettingsObject(allocator, io, settings_path, settings_object);
+    try writeSettingsObject(allocator, io, settings_path, settings_object, options);
     wrote_lock = false;
     const redacted_source = try redactDiagnosticValue(allocator, source);
     defer allocator.free(redacted_source);
@@ -721,7 +729,7 @@ fn executeRemove(
     const removed = packages_value_ptr.?.array.orderedRemove(matched_index.?);
     common.deinitJsonValue(allocator, removed);
 
-    writeSettingsObject(allocator, io, settings_path, settings_object) catch |err| {
+    writeSettingsObject(allocator, io, settings_path, settings_object, options) catch |err| {
         try restoreFileSnapshot(allocator, io, settings_snapshot);
         return err;
     };
@@ -884,7 +892,7 @@ fn executeExtensionUpdates(
             if (wasm_update == .valid) {
                 const scope = provenanceScope(entry.is_project);
                 const lockfile_path = if (entry.is_project) project_lock_path else user_lock_path;
-                provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_update.valid) catch |err| {
+                writeProvenanceEntry(allocator, io, scope, lockfile_path, wasm_update.valid, options) catch |err| {
                     try restoreFileSnapshot(allocator, io, user_lock_snapshot);
                     try restoreFileSnapshot(allocator, io, project_lock_snapshot);
                     try stderr.print("Error: failed to update extension provenance for {s}: {s}\n", .{ entry.source, @errorName(err) });
@@ -1900,7 +1908,11 @@ fn packageSourcesMatchForScope(
         defer allocator.free(configured_path);
         const input_path = try resolveLocalPathFromCwd(allocator, options.cwd, input_source);
         defer allocator.free(input_path);
-        return std.mem.eql(u8, configured_path, input_path);
+        const configured_identity = try realpathOrResolved(allocator, configured_path);
+        defer allocator.free(configured_identity);
+        const input_identity = try realpathOrResolved(allocator, input_path);
+        defer allocator.free(input_identity);
+        return std.mem.eql(u8, configured_identity, input_identity);
     }
     return false;
 }
@@ -2270,7 +2282,7 @@ fn removeLocalWasmProvenanceForSource(
     if (!isLocalSource(source)) return;
     const key = try localProvenanceKeyForSource(allocator, source, is_project, options, mode);
     defer allocator.free(key);
-    _ = try provenance_lockfile.removeEntry(allocator, io, provenanceScope(is_project), lockfile_path, key);
+    _ = try removeProvenanceEntry(allocator, io, provenanceScope(is_project), lockfile_path, key, options);
 }
 
 fn writeSettingsObject(
@@ -2278,12 +2290,38 @@ fn writeSettingsObject(
     io: std.Io,
     settings_path: []const u8,
     settings_object: std.json.ObjectMap,
+    options: ExecuteOptions,
 ) !void {
+    if (options.fail_settings_write_for_testing) return error.InjectedSettingsWriteFailure;
     try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
     const value: std.json.Value = .{ .object = settings_object };
     const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(serialized);
     try common.writeFileAbsolute(io, settings_path, serialized, true);
+}
+
+fn writeProvenanceEntry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scope: ProvenanceScope,
+    lockfile_path: []const u8,
+    entry: provenance_lockfile.LockEntry,
+    options: ExecuteOptions,
+) !void {
+    if (options.fail_lockfile_write_for_testing) return error.InjectedLockfileWriteFailure;
+    try provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, entry);
+}
+
+fn removeProvenanceEntry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scope: ProvenanceScope,
+    lockfile_path: []const u8,
+    key: []const u8,
+    options: ExecuteOptions,
+) !bool {
+    if (options.fail_lockfile_write_for_testing) return error.InjectedLockfileWriteFailure;
+    return try provenance_lockfile.removeEntry(allocator, io, scope, lockfile_path, key);
 }
 
 fn collectScopePackages(
@@ -3072,6 +3110,187 @@ test "wasm package install rejects unsupported native dynamic artifacts without 
     const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
     defer allocator.free(lockfile_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lockfile_path, .{}));
+}
+
+test "VAL-TRUST invalid wasm manifest diagnostics are redacted and leave no trust state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/pi-secret-invalid");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/pi-secret-invalid/pi-extension.json",
+        .data =
+        \\{
+        \\  "schemaVersion": "pi-extension.v0?token=pi-test-secret",
+        \\  "id": "com.example.invalid",
+        \\  "name": "Invalid",
+        \\  "version": "0.1.0",
+        \\  "description": "Invalid secret-bearing manifest.",
+        \\  "artifact": { "kind": "wasm-component", "path": "wasm/plugin.wasm" },
+        \\  "tool": {
+        \\    "id": "example.invalid",
+        \\    "description": "Invalid tool.",
+        \\    "inputSchema": {},
+        \\    "outputSchema": {}
+        \\  },
+        \\  "capabilities": []
+        \\}
+        ,
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/pi-secret-invalid" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "unsupported schema version") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "token=[REDACTED]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "pi-test-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "Installed") == null);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, settings_path, .{}));
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lockfile_path, .{}));
+}
+
+test "VAL-TRUST path aliases share canonical same-scope identity without crossing scopes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-canonical", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    const real_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-canonical" });
+    defer allocator.free(real_root);
+    const alias_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-canonical-alias" });
+    defer allocator.free(alias_root);
+    try std.Io.Dir.symLinkAbsolute(std.testing.io, real_root, alias_root, .{});
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_real = try runCommand(allocator, &.{ "install", "./fixtures/wasm-canonical" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_real.exit_code);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const install_alias_same_scope = try runCommand(allocator, &.{ "install", "./fixtures/wasm-canonical-alias" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_alias_same_scope.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Already installed") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const user_settings = try readSettings(allocator, user_settings_path);
+    defer allocator.free(user_settings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, user_settings, "\"source\""));
+    const user_lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(user_lockfile_path);
+    const user_lockfile = try readSettings(allocator, user_lockfile_path);
+    defer allocator.free(user_lockfile);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, user_lockfile, "\"key\""));
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const install_alias_project_scope = try runCommand(allocator, &.{ "install", "./fixtures/wasm-canonical-alias", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_alias_project_scope.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "scope: project") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project_settings = try readSettings(allocator, project_settings_path);
+    defer allocator.free(project_settings);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, project_settings, "\"source\""));
+    const project_lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, true);
+    defer allocator.free(project_lockfile_path);
+    const project_lockfile = try readSettings(allocator, project_lockfile_path);
+    defer allocator.free(project_lockfile);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, project_lockfile, "\"key\""));
+}
+
+test "VAL-TRUST lifecycle write failures preserve settings and provenance atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-atomic-a", "file.read", true);
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-atomic-b", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_a = try runCommand(allocator, &.{ "install", "./fixtures/wasm-atomic-a" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_a.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const settings_before_failed_install = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_before_failed_install);
+    const lock_before_failed_install = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before_failed_install);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    var fail_settings_options = options;
+    fail_settings_options.fail_settings_write_for_testing = true;
+    try std.testing.expectError(
+        error.InjectedSettingsWriteFailure,
+        runCommand(allocator, &.{ "install", "./fixtures/wasm-atomic-b" }, fail_settings_options, &stdout_buf, &stderr_buf),
+    );
+    const settings_after_failed_install = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_failed_install);
+    const lock_after_failed_install = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_install);
+    try std.testing.expectEqualStrings(settings_before_failed_install, settings_after_failed_install);
+    try std.testing.expectEqualStrings(lock_before_failed_install, lock_after_failed_install);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    var fail_lock_options = options;
+    fail_lock_options.fail_lockfile_write_for_testing = true;
+    const failed_remove = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-atomic-a" }, fail_lock_options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), failed_remove.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "InjectedLockfileWriteFailure") != null);
+    const settings_after_failed_remove = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_failed_remove);
+    const lock_after_failed_remove = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_remove);
+    try std.testing.expectEqualStrings(settings_before_failed_install, settings_after_failed_remove);
+    try std.testing.expectEqualStrings(lock_before_failed_install, lock_after_failed_remove);
 }
 
 test "wasm package install honors final artifact approved grants" {
