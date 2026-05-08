@@ -157,6 +157,10 @@ class MockSpawnedProcess extends EventEmitter {
 	}
 }
 
+type PackageManagerCommandHarness = {
+	runCommand(command: string, args: string[], options?: { cwd?: string }): Promise<void>;
+};
+
 // Helper to check if a resource is enabled
 const isEnabled = (r: ResolvedResource, pathMatch: string, matchFn: "endsWith" | "includes" = "endsWith") => {
 	const normalizedPath = normalizeForMatch(r.path);
@@ -1538,33 +1542,36 @@ Content`,
 		it("should emit progress events on install attempt", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			const runCommandSpy = vi
+				.spyOn(packageManager as unknown as PackageManagerCommandHarness, "runCommand")
+				.mockRejectedValue(new Error("offline fixture npm install failure"));
 
-			// Use public install method which emits progress events
-			try {
-				await packageManager.install("npm:nonexistent-package@1.0.0");
-			} catch {
-				// Expected to fail - package doesn't exist
-			}
+			// Use public install method, but replace the npm registry call with a deterministic offline fixture failure.
+			await expect(packageManager.install("npm:nonexistent-package@1.0.0")).rejects.toThrow(
+				"offline fixture npm install failure",
+			);
 
 			// Should have emitted start event before failure
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
 			// Should have emitted error event
 			expect(events.some((e) => e.type === "error")).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledWith("npm", ["install", "-g", "nonexistent-package@1.0.0"], undefined);
 		});
 
 		it("should recognize github URLs without git: prefix", async () => {
 			const events: ProgressEvent[] = [];
 			packageManager.setProgressCallback((event) => events.push(event));
+			const runCommandSpy = vi
+				.spyOn(packageManager as unknown as PackageManagerCommandHarness, "runCommand")
+				.mockRejectedValue(new Error("offline fixture git clone failure"));
 			const previousGitTerminalPrompt = process.env.GIT_TERMINAL_PROMPT;
 			process.env.GIT_TERMINAL_PROMPT = "0";
 
 			try {
-				// This should be parsed as a git source, not throw "unsupported"
-				try {
-					await packageManager.install("https://github.com/nonexistent/repo");
-				} catch {
-					// Expected to fail - repo doesn't exist
-				}
+				// This should be parsed as a git source, not throw "unsupported"; clone is a deterministic fixture failure.
+				await expect(packageManager.install("https://github.com/nonexistent/repo")).rejects.toThrow(
+					"offline fixture git clone failure",
+				);
 			} finally {
 				if (previousGitTerminalPrompt === undefined) {
 					delete process.env.GIT_TERMINAL_PROMPT;
@@ -1575,6 +1582,11 @@ Content`,
 
 			// Should have attempted clone, not thrown unsupported error
 			expect(events.some((e) => e.type === "start" && e.action === "install")).toBe(true);
+			expect(runCommandSpy).toHaveBeenCalledWith("git", [
+				"clone",
+				"https://github.com/nonexistent/repo",
+				join(agentDir, "git", "github.com", "nonexistent", "repo"),
+			]);
 		});
 
 		it("should parse package source types from docs examples", () => {
