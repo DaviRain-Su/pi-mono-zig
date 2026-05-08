@@ -1111,7 +1111,7 @@ fn executePreparedToolCallInternal(
 
     return .{
         .result = result,
-        .is_error = false,
+        .is_error = result.is_error,
     };
 }
 
@@ -1211,6 +1211,7 @@ fn finalizeExecutedToolCall(
         }
     }
 
+    result.is_error = is_error;
     try emitToolExecutionEnd(
         prepared.tool_call,
         result,
@@ -1231,6 +1232,7 @@ fn createErrorToolResult(allocator: std.mem.Allocator, message: []const u8) !typ
     return .{
         .content = content,
         .details = null,
+        .is_error = true,
     };
 }
 
@@ -1272,12 +1274,14 @@ fn emitToolExecutionEnd(
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
 ) !void {
+    var emitted_result = result;
+    emitted_result.is_error = is_error;
     try emit(emit_context, .{
         .event_type = .tool_execution_end,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .args = tool_call.arguments,
-        .result = result,
+        .result = emitted_result,
         .is_error = is_error,
     });
 }
@@ -1287,11 +1291,13 @@ fn createToolResultMessage(
     result: types.AgentToolResult,
     is_error: bool,
 ) types.ToolResultMessage {
+    var emitted_result = result;
+    emitted_result.is_error = is_error;
     return .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
-        .content = result.content,
-        .details = result.details,
+        .content = emitted_result.content,
+        .details = emitted_result.details,
         .is_error = is_error,
         .timestamp = types.nowMilliseconds(),
     };
@@ -1396,6 +1402,7 @@ fn cloneToolResult(
     return .{
         .content = try cloneContentBlocks(allocator, result.content),
         .details = if (result.details) |details| try cloneJsonValue(allocator, details) else null,
+        .is_error = result.is_error,
     };
 }
 

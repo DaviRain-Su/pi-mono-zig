@@ -1339,7 +1339,7 @@ fn wasmAgentToolExecute(
                 null,
                 "execute input must be a JSON object",
             );
-            return invalidInputAgentToolResult(allocator);
+            return invalidInputAgentToolResult(allocator, runtime);
         },
         else => return err,
     };
@@ -1348,14 +1348,79 @@ fn wasmAgentToolExecute(
         .output_bytes = output_json.len,
         .output_lines = countLogicalLines(output_json),
     });
-    return .{ .content = try tools_common.makeTextContent(allocator, output_json) };
+    const details = try wasmRuntimeDetailsJson(allocator, runtime);
+    errdefer if (details) |value| tools_common.deinitJsonValue(allocator, value);
+    return .{
+        .content = try tools_common.makeTextContent(allocator, output_json),
+        .details = details,
+    };
 }
 
-fn invalidInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentToolResult {
-    return .{ .content = try tools_common.makeTextContent(
+fn invalidInputAgentToolResult(allocator: std.mem.Allocator, runtime: *const WasmRuntime) !agent.AgentToolResult {
+    const details = try wasmRuntimeDetailsJson(allocator, runtime);
+    errdefer if (details) |value| tools_common.deinitJsonValue(allocator, value);
+    return .{
+        .content = try tools_common.makeTextContent(
+            allocator,
+            "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
+        ),
+        .details = details,
+        .is_error = true,
+    };
+}
+
+fn wasmRuntimeDetailsJson(allocator: std.mem.Allocator, runtime: *const WasmRuntime) !?std.json.Value {
+    if (runtime.manifest.policy_lookup_key == null) return null;
+
+    var runtime_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = runtime_object });
+
+    try putJsonString(allocator, &runtime_object, "runtimeKind", "wasm");
+    try putJsonString(allocator, &runtime_object, "extensionId", runtime.manifest.id);
+    try putJsonString(allocator, &runtime_object, "extensionName", runtime.manifest.name);
+    try putJsonString(allocator, &runtime_object, "extensionVersion", runtime.manifest.version);
+    try putJsonString(allocator, &runtime_object, "toolId", runtime.manifest.tool_id);
+    try putOptionalJsonString(allocator, &runtime_object, "packageRoot", runtime.manifest.package_root);
+    try putOptionalJsonString(allocator, &runtime_object, "manifestPath", runtime.manifest.manifest_path);
+    try putJsonString(allocator, &runtime_object, "artifactPath", runtime.manifest.artifact_absolute_path);
+    try putOptionalJsonString(allocator, &runtime_object, "artifactSha256", runtime.manifest.artifact_sha256);
+    try putOptionalJsonString(allocator, &runtime_object, "packageRootSha256", runtime.manifest.package_root_sha256);
+    try putOptionalJsonString(allocator, &runtime_object, "policyLookupKey", runtime.manifest.policy_lookup_key);
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = root });
+    try root.put(
         allocator,
-        "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object\"}}",
-    ) };
+        try allocator.dupe(u8, "extensionRuntime"),
+        .{ .object = runtime_object },
+    );
+    return .{ .object = root };
+}
+
+fn putJsonString(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, key),
+        .{ .string = try allocator.dupe(u8, value) },
+    );
+}
+
+fn putOptionalJsonString(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        try putJsonString(allocator, object, key, text);
+    } else {
+        try object.put(allocator, try allocator.dupe(u8, key), .null);
+    }
 }
 
 fn countLogicalLines(value: []const u8) u64 {
@@ -2730,6 +2795,7 @@ test "locked wasm packages resolve to policy gated runtime set and unload cleanl
     defer success_params.deinit();
     const success = try agent_tool.execute.?(allocator, "locked-package-success", success_params.value, agent_tool.execute_context, null, null, null);
     defer tools_common.deinitContentBlocks(allocator, success.content);
+    defer if (success.details) |details| tools_common.deinitJsonValue(allocator, details);
     try std.testing.expect(std.mem.indexOf(u8, success.content[0].text.text, "\"content\":\"alpha\\nbravo\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, wasmRuntime(runtime_set.entries[0].adapter.ptr).manifest.policy_lookup_key.?, manifest_result.valid.artifact_sha256) != null);
 

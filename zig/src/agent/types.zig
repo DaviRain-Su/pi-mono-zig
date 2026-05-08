@@ -53,6 +53,7 @@ pub const AfterToolCallResult = struct {
 pub const AgentToolResult = struct {
     content: []const ai.ContentBlock,
     details: ?std.json.Value = null,
+    is_error: bool = false,
 };
 
 pub const AgentToolUpdateCallback = *const fn (
