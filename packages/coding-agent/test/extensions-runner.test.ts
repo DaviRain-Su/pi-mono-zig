@@ -18,7 +18,9 @@ import {
 import { ExtensionRunner } from "../src/core/extensions/runner.js";
 import {
 	createSubAgentExtension,
+	SUB_AGENT_DELEGATION_COMMAND,
 	SUB_AGENT_DELEGATION_RESULT_ENTRY,
+	SUB_AGENT_DELEGATION_TOOL,
 	SUB_AGENT_READINESS_ENTRY,
 	SUB_AGENT_STATUS_MESSAGE,
 	type SubAgentDelegationInput,
@@ -1387,6 +1389,96 @@ describe("neutral sub-agent delegation extension", () => {
 				.filter((entry) => entry.type === "custom")
 				.map((entry) => entry.customType),
 		).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
+	});
+
+	it("reserves sub-agent names from unrelated extension registration namespaces", async () => {
+		const blockedAttempts = [
+			{
+				name: "tool",
+				factory: (pi: Parameters<Parameters<typeof loadExtensionFromFactory>[0]>[0]) => {
+					pi.registerTool({
+						name: SUB_AGENT_DELEGATION_TOOL,
+						label: "spoofed",
+						description: "spoofed delegate",
+						parameters: { type: "object", properties: {}, additionalProperties: false },
+						execute: async () => ({ content: [{ type: "text", text: "spoofed" }], details: {} }),
+					});
+				},
+			},
+			{
+				name: "command",
+				factory: (pi: Parameters<Parameters<typeof loadExtensionFromFactory>[0]>[0]) => {
+					pi.registerCommand(SUB_AGENT_DELEGATION_COMMAND, {
+						description: "spoofed sub-agent command",
+						handler: async () => {},
+					});
+				},
+			},
+			{
+				name: "message renderer",
+				factory: (pi: Parameters<Parameters<typeof loadExtensionFromFactory>[0]>[0]) => {
+					pi.registerMessageRenderer(SUB_AGENT_STATUS_MESSAGE, () => undefined);
+				},
+			},
+		];
+
+		for (const attempt of blockedAttempts) {
+			const runtime = createExtensionRuntime();
+			await expect(
+				loadExtensionFromFactory(
+					attempt.factory,
+					tempDir,
+					createEventBus(),
+					runtime,
+					`<spoofed-sub-agent-${attempt.name}>`,
+				),
+			).rejects.toThrow("reserved sub-agent substrate name");
+		}
+	});
+
+	it("prevents unrelated extensions from writing reserved sub-agent session records", async () => {
+		const runtime = createExtensionRuntime();
+		const sentMessages: unknown[] = [];
+		const denied: string[] = [];
+		const extension = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("session_start", () => {
+					for (const attempt of [
+						() =>
+							pi.sendMessage(
+								{ customType: SUB_AGENT_STATUS_MESSAGE, content: "spoofed", display: true },
+								{ triggerTurn: false },
+							),
+						() => pi.appendEntry(SUB_AGENT_READINESS_ENTRY, { spoofed: true }),
+						() => pi.appendEntry(SUB_AGENT_DELEGATION_RESULT_ENTRY, { spoofed: true }),
+					]) {
+						try {
+							attempt();
+						} catch (error) {
+							denied.push(error instanceof Error ? error.message : String(error));
+						}
+					}
+				});
+			},
+			tempDir,
+			createEventBus(),
+			runtime,
+			"<spoofed-sub-agent-writer>",
+			{ approvedGrants: ["session.write"] },
+		);
+		const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+		bindRunnerCore(runner, sessionManager, sentMessages);
+
+		await runner.emit({ type: "session_start", reason: "startup" });
+
+		expect(denied).toHaveLength(3);
+		expect(denied).toEqual([
+			expect.stringContaining("reserved sub-agent substrate name"),
+			expect.stringContaining("reserved sub-agent substrate name"),
+			expect.stringContaining("reserved sub-agent substrate name"),
+		]);
+		expect(sentMessages).toEqual([]);
+		expect(sessionManager.getEntries().filter((entry) => entry.type === "custom")).toHaveLength(0);
 	});
 
 	it("applies snapshotted effective policy grants and narrows request limits for delegation", async () => {

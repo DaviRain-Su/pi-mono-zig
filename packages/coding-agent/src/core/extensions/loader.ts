@@ -35,6 +35,11 @@ import {
 } from "../extension-policy.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "../source-info.js";
 import { hasWasmExtensionManifest } from "../wasm-extension-package.js";
+import {
+	assertSubAgentReservedNameAllowed,
+	isSubAgentExtensionFactory,
+	isSubAgentReservedName,
+} from "./subagent-reserved-names.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -282,6 +287,7 @@ function createExtensionAPI(
 
 		registerTool(tool: ToolDefinition): void {
 			runtime.assertActive();
+			assertSubAgentReservedNameAllowed(tool.name, extension.ownsSubAgentReservedNames, "register");
 			extension.tools.set(tool.name, {
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
@@ -291,6 +297,7 @@ function createExtensionAPI(
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
 			runtime.assertActive();
+			assertSubAgentReservedNameAllowed(name, extension.ownsSubAgentReservedNames, "register");
 			extension.commands.set(name, {
 				name,
 				sourceInfo: extension.sourceInfo,
@@ -322,6 +329,7 @@ function createExtensionAPI(
 
 		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
 			runtime.assertActive();
+			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "register");
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
 		},
 
@@ -335,7 +343,10 @@ function createExtensionAPI(
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			runtime.assertActive();
-			if (!String(message.customType).startsWith("sub_agent.")) {
+			const customType = String(message.customType);
+			const isSubAgentReserved = isSubAgentReservedName(customType);
+			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "write");
+			if (!isSubAgentReserved) {
 				assertGrant("session.write", "send_message");
 			}
 			runtime.sendMessage(message, options);
@@ -349,7 +360,9 @@ function createExtensionAPI(
 
 		appendEntry(customType: string, data?: unknown): void {
 			runtime.assertActive();
-			if (!customType.startsWith("sub_agent.")) {
+			const isSubAgentReserved = isSubAgentReservedName(customType);
+			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "write");
+			if (!isSubAgentReserved) {
 				assertGrant("session.write", "append_entry", { customType });
 			}
 			runtime.appendEntry(customType, data);
@@ -460,7 +473,7 @@ async function loadExtensionModule(extensionPath: string) {
 function createExtension(
 	extensionPath: string,
 	resolvedPath: string,
-	options?: { sourceInfo?: SourceInfo; effectivePolicy?: ExtensionPolicy },
+	options?: { sourceInfo?: SourceInfo; effectivePolicy?: ExtensionPolicy; ownsSubAgentReservedNames?: boolean },
 ): Extension {
 	const source =
 		extensionPath.startsWith("<") && extensionPath.endsWith(">")
@@ -475,6 +488,7 @@ function createExtension(
 		sourceInfo,
 		identity: createTypeScriptExtensionIdentity({ configuredPath: extensionPath, resolvedPath, sourceInfo }),
 		effectivePolicy: options?.effectivePolicy,
+		ownsSubAgentReservedNames: options?.ownsSubAgentReservedNames,
 		handlers: new Map(),
 		tools: new Map(),
 		messageRenderers: new Map(),
@@ -495,12 +509,15 @@ async function loadExtension(
 
 	try {
 		const sourceInfo = options?.resolveSourceInfo?.({ configuredPath: extensionPath, resolvedPath });
-		const extension = createExtension(extensionPath, resolvedPath, { sourceInfo });
-		extension.effectivePolicy = options?.resolveEffectivePolicy?.(extension.identity);
 		const factory = await loadExtensionModule(resolvedPath);
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
+		const extension = createExtension(extensionPath, resolvedPath, {
+			sourceInfo,
+			ownsSubAgentReservedNames: isSubAgentExtensionFactory(factory),
+		});
+		extension.effectivePolicy = options?.resolveEffectivePolicy?.(extension.identity);
 
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 		await factory(api);
@@ -523,7 +540,10 @@ export async function loadExtensionFromFactory(
 	extensionPath = "<inline>",
 	effectivePolicy?: ExtensionPolicy,
 ): Promise<Extension> {
-	const extension = createExtension(extensionPath, extensionPath, { effectivePolicy });
+	const extension = createExtension(extensionPath, extensionPath, {
+		effectivePolicy,
+		ownsSubAgentReservedNames: isSubAgentExtensionFactory(factory),
+	});
 	const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 	await factory(api);
 	return extension;

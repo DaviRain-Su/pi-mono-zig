@@ -534,6 +534,7 @@ pub const Registry = struct {
         custom_type: []const u8,
         extension_path: []const u8,
     ) !void {
+        if (isSubAgentReservedName(custom_type)) return error.ReservedSubAgentName;
         if (self.findMessageRendererIndex(custom_type)) |idx| {
             self.message_renderers.items[idx].deinit(self.allocator);
             self.message_renderers.items[idx] = try makeMessageRenderer(self.allocator, custom_type, extension_path);
@@ -582,6 +583,7 @@ pub const Registry = struct {
         render_shell: ?[]const u8,
         extension_path: []const u8,
     ) !void {
+        if (isSubAgentReservedName(name)) return error.ReservedSubAgentName;
         // TS behavior: re-registering the same tool replaces the existing
         // entry. Mirrors the loader+runner overwrite contract.
         if (self.findToolIndex(name)) |idx| {
@@ -608,6 +610,7 @@ pub const Registry = struct {
         description: ?[]const u8,
         extension_path: []const u8,
     ) !void {
+        if (isSubAgentReservedName(name)) return error.ReservedSubAgentName;
         // TypeScript stores commands in a per-extension map. A repeated
         // command in the same extension refreshes that entry, while the
         // same command name from another extension remains registered and
@@ -781,6 +784,7 @@ pub const Registry = struct {
         resource_path: ?[]const u8,
         extension_path: []const u8,
     ) !void {
+        if (isSubAgentReservedName(id) or (command != null and isSubAgentReservedName(command.?)) or (resource_path != null and isSubAgentReservedName(resource_path.?))) return error.ReservedSubAgentName;
         if (self.findCapabilityIndex(id)) |idx| {
             self.capabilities.items[idx].deinit(self.allocator);
             self.capabilities.items[idx] = try makeCapability(self.allocator, id, kind, title, description, command, resource_path, extension_path);
@@ -1205,6 +1209,7 @@ pub const Registry = struct {
         placement: WidgetPlacement,
         extension_path: []const u8,
     ) !void {
+        if (isSubAgentReservedName(key)) return error.ReservedSubAgentName;
         // Replace existing widget with the same key
         for (self.widgets.items, 0..) |*widget, idx| {
             if (std.mem.eql(u8, widget.key, key)) {
@@ -1285,6 +1290,17 @@ pub const RegistrySurfaceCounts = struct {
     message_renderers: usize,
     ui_request_ids: usize,
 };
+
+fn isSubAgentReservedName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "sub_agent.delegate") or
+        std.mem.eql(u8, name, "sub_agent.readiness") or
+        std.mem.eql(u8, name, "sub_agent.delegation.result") or
+        std.mem.eql(u8, name, "sub_agent.status") or
+        std.mem.eql(u8, name, "sub_agent_readiness") or
+        std.mem.eql(u8, name, "sub-agent") or
+        std.mem.eql(u8, name, "/sub-agent") or
+        std.mem.startsWith(u8, name, "sub_agent.");
+}
 
 pub fn registrySurfaceNames() []const []const u8 {
     return &.{
@@ -1642,6 +1658,7 @@ pub fn applyHostFrame(
 
 fn applyRegisterToolFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const name = optionalString(object, "name") orelse return .ignored_malformed;
+    if (isSubAgentReservedName(name)) return .ignored_malformed;
     const label = optionalString(object, "label") orelse name;
     const description = optionalString(object, "description") orelse "";
     const parameters = object.get("parameters") orelse .null;
@@ -1677,6 +1694,7 @@ fn applyToolRenderHook(registry: *Registry, object: std.json.ObjectMap, name: []
 
 fn applyRegisterCommandFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const name = optionalString(object, "name") orelse return .ignored_malformed;
+    if (isSubAgentReservedName(name)) return .ignored_malformed;
     const description = optionalString(object, "description");
     try registry.registerCommand(name, description, extension_path);
     return .registered_command;
@@ -1758,11 +1776,14 @@ fn applyUnregisterProviderFrame(registry: *Registry, object: std.json.ObjectMap)
 
 fn applyRegisterCapabilityFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const id = optionalString(object, "id") orelse return .ignored_malformed;
+    if (isSubAgentReservedName(id)) return .ignored_malformed;
     const kind = optionalString(object, "kind") orelse return .ignored_malformed;
     const title = optionalString(object, "title") orelse return .ignored_malformed;
     const description = optionalString(object, "description");
     const command = optionalString(object, "command");
+    if (command != null and isSubAgentReservedName(command.?)) return .ignored_malformed;
     const resource_path = optionalString(object, "resourcePath");
+    if (resource_path != null and isSubAgentReservedName(resource_path.?)) return .ignored_malformed;
     try registry.registerCapability(id, kind, title, description, command, resource_path, extension_path);
     return .registered_capability;
 }
@@ -1861,6 +1882,7 @@ fn applyClearEditorComponentFrame(registry: *Registry) FrameOutcome {
 
 fn applySetWidgetFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const key = optionalString(object, "key") orelse return .ignored_malformed;
+    if (isSubAgentReservedName(key)) return .ignored_malformed;
     const lines = try optionalLinesArray(registry.allocator, object, "lines");
     defer registry.allocator.free(lines);
     const placement = parseWidgetPlacement(optionalString(object, "placement") orelse "aboveEditor");
@@ -1892,6 +1914,7 @@ fn applyClearExtensionRegistrationsFrame(registry: *Registry, object: std.json.O
 
 fn applyRegisterMessageRendererFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
+    if (isSubAgentReservedName(custom_type)) return .ignored_malformed;
     try registry.registerMessageRenderer(custom_type, extension_path);
     return .registered_message_renderer;
 }
@@ -2244,6 +2267,35 @@ test "applyHostFrame supports register and unregister surfaces with malformed fr
     try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
     try std.testing.expectEqual(@as(usize, 2), registry.flags.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+}
+
+test "sub-agent reserved names cannot mutate generic registry namespaces" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    try std.testing.expectError(error.ReservedSubAgentName, registry.registerTool("sub_agent.delegate", "Delegate", "spoofed", "/tmp/ext.ts"));
+    try std.testing.expectError(error.ReservedSubAgentName, registry.registerCommand("sub-agent", "spoofed", "/tmp/ext.ts"));
+    try std.testing.expectError(error.ReservedSubAgentName, registry.registerCapability("sub_agent.readiness", "status", "Readiness", null, null, null, "/tmp/ext.ts"));
+    try std.testing.expectError(error.ReservedSubAgentName, registry.setWidgetHook("sub_agent.status", &.{"spoofed"}, .above_editor, "/tmp/ext.ts"));
+    try std.testing.expectError(error.ReservedSubAgentName, registry.registerMessageRenderer("sub_agent.delegation.result", "/tmp/ext.ts"));
+
+    const frames =
+        \\{ "type": "register_tool", "name": "sub_agent.delegate", "label": "Delegate", "description": "spoofed", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_command", "name": "sub-agent", "description": "spoofed", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_capability", "id": "sub_agent.readiness", "kind": "status", "title": "Readiness", "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "set_widget", "key": "sub_agent.status", "lines": ["spoofed"], "extensionPath": "/tmp/ext.ts" }
+        \\{ "type": "register_message_renderer", "customType": "sub_agent.delegation.result", "extensionPath": "/tmp/ext.ts" }
+        \\
+    ;
+
+    const applied = try applyHostFrameStream(&registry, frames);
+    try std.testing.expectEqual(@as(usize, 0), applied);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.widgets.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
 }
 
 test "applyHostFrame replaces re-registered tool metadata for dynamic refresh" {

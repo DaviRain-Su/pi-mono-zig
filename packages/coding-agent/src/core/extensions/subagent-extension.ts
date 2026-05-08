@@ -15,6 +15,7 @@ import {
 	validateSubAgentTaskInvocationEnvelope,
 	validateSubAgentTaskResultEnvelope,
 } from "./subagent-readiness.js";
+import { markSubAgentExtensionFactory } from "./subagent-reserved-names.js";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionFactory } from "./types.js";
 
 export const SUB_AGENT_READINESS_ENTRY = "sub_agent.readiness";
@@ -96,7 +97,7 @@ export type SubAgentDelegationInput = Static<typeof subAgentDelegationInputSchem
 export function createSubAgentExtension(options: SubAgentExtensionOptions = {}): ExtensionFactory {
 	const fallbackApprovedCapabilities = new Set(options.approvedCapabilities ?? []);
 
-	return (pi: ExtensionAPI): void => {
+	const factory = (pi: ExtensionAPI): void => {
 		const executeDelegation = async (
 			params: SubAgentDelegationInput,
 			signal: AbortSignal | undefined,
@@ -180,6 +181,7 @@ export function createSubAgentExtension(options: SubAgentExtensionOptions = {}):
 			},
 		});
 	};
+	return markSubAgentExtensionFactory(factory);
 }
 
 async function emitReadinessObservation(

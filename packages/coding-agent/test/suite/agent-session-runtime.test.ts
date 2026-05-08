@@ -61,6 +61,21 @@ describe("AgentSessionRuntime characterization", () => {
 
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+		const fauxProviderConfig = {
+			baseUrl: faux.getModel().baseUrl,
+			apiKey: "faux-key",
+			api: faux.api,
+			models: faux.models.map((registeredModel) => ({
+				id: registeredModel.id,
+				name: registeredModel.name,
+				api: registeredModel.api,
+				reasoning: registeredModel.reasoning,
+				input: registeredModel.input,
+				cost: registeredModel.cost,
+				contextWindow: registeredModel.contextWindow,
+				maxTokens: registeredModel.maxTokens,
+			})),
+		};
 
 		const runtimeOptions = {
 			agentDir: tempDir,
@@ -68,26 +83,7 @@ describe("AgentSessionRuntime characterization", () => {
 			model: options?.bootstrapModel === false ? undefined : faux.getModel(),
 			thinkingLevel: options?.bootstrapThinkingLevel === false ? undefined : undefined,
 			resourceLoaderOptions: {
-				extensionFactories: [
-					(pi: ExtensionAPI) => {
-						pi.registerProvider(faux.getModel().provider, {
-							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
-							api: faux.api,
-							models: faux.models.map((registeredModel) => ({
-								id: registeredModel.id,
-								name: registeredModel.name,
-								api: registeredModel.api,
-								reasoning: registeredModel.reasoning,
-								input: registeredModel.input,
-								cost: registeredModel.cost,
-								contextWindow: registeredModel.contextWindow,
-								maxTokens: registeredModel.maxTokens,
-							})),
-						});
-						extensionFactory(pi);
-					},
-				],
+				extensionFactories: [extensionFactory],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
@@ -98,6 +94,7 @@ describe("AgentSessionRuntime characterization", () => {
 				...runtimeOptions,
 				cwd,
 			});
+			services.modelRegistry.registerProvider(faux.getModel().provider, fauxProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,
@@ -465,29 +462,25 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			authStorage: otherAuthStorage,
 			resourceLoaderOptions: {
-				extensionFactories: [
-					(pi: ExtensionAPI) => {
-						pi.registerProvider(faux.getModel().provider, {
-							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
-							api: faux.api,
-							models: faux.models.map((registeredModel) => ({
-								id: registeredModel.id,
-								name: registeredModel.name,
-								api: registeredModel.api,
-								reasoning: registeredModel.reasoning,
-								input: registeredModel.input,
-								cost: registeredModel.cost,
-								contextWindow: registeredModel.contextWindow,
-								maxTokens: registeredModel.maxTokens,
-							})),
-						});
-					},
-				],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
 			},
+		};
+		const otherProviderConfig = {
+			baseUrl: faux.getModel().baseUrl,
+			apiKey: "faux-key",
+			api: faux.api,
+			models: faux.models.map((registeredModel) => ({
+				id: registeredModel.id,
+				name: registeredModel.name,
+				api: registeredModel.api,
+				reasoning: registeredModel.reasoning,
+				input: registeredModel.input,
+				cost: registeredModel.cost,
+				contextWindow: registeredModel.contextWindow,
+				maxTokens: registeredModel.maxTokens,
+			})),
 		};
 		const createOtherRuntime: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
@@ -498,6 +491,7 @@ describe("AgentSessionRuntime characterization", () => {
 				...otherRuntimeOptions,
 				cwd,
 			});
+			services.modelRegistry.registerProvider(faux.getModel().provider, otherProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,
@@ -538,29 +532,25 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			authStorage: otherAuthStorage,
 			resourceLoaderOptions: {
-				extensionFactories: [
-					(pi: ExtensionAPI) => {
-						pi.registerProvider(faux.getModel().provider, {
-							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
-							api: faux.api,
-							models: faux.models.map((registeredModel) => ({
-								id: registeredModel.id,
-								name: registeredModel.name,
-								api: registeredModel.api,
-								reasoning: registeredModel.reasoning,
-								input: registeredModel.input,
-								cost: registeredModel.cost,
-								contextWindow: registeredModel.contextWindow,
-								maxTokens: registeredModel.maxTokens,
-							})),
-						});
-					},
-				],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
 			},
+		};
+		const otherProviderConfig = {
+			baseUrl: faux.getModel().baseUrl,
+			apiKey: "faux-key",
+			api: faux.api,
+			models: faux.models.map((registeredModel) => ({
+				id: registeredModel.id,
+				name: registeredModel.name,
+				api: registeredModel.api,
+				reasoning: registeredModel.reasoning,
+				input: registeredModel.input,
+				cost: registeredModel.cost,
+				contextWindow: registeredModel.contextWindow,
+				maxTokens: registeredModel.maxTokens,
+			})),
 		};
 		const createOtherRuntime: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
@@ -571,6 +561,7 @@ describe("AgentSessionRuntime characterization", () => {
 				...otherRuntimeOptions,
 				cwd,
 			});
+			services.modelRegistry.registerProvider(faux.getModel().provider, otherProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,

@@ -409,6 +409,7 @@ pub const ProtocolState = struct {
         const outcome = extension_registry.applyHostFrame(&self.registry, frame) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.WriteFailed => return err,
+            error.ReservedSubAgentName => .ignored_malformed,
         };
         switch (outcome) {
             .ignored_unsupported => try self.addUnsupportedRegistryFrameDiagnostic(type_name),

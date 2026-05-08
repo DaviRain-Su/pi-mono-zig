@@ -1708,6 +1708,7 @@ export interface Extension {
 	sourceInfo: SourceInfo;
 	identity: TypeScriptExtensionIdentity;
 	effectivePolicy?: ExtensionPolicy;
+	ownsSubAgentReservedNames?: boolean;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
