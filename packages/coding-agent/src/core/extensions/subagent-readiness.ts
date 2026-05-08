@@ -143,12 +143,27 @@ const FORBIDDEN_PRODUCT_FIELDS = new Set([
 	"ui",
 	"ux",
 	"slashCommand",
+	"workflow",
+	"workflowPreset",
+	"wiki",
+	"wikiPreset",
+	"qa",
+	"qaPreset",
+	"review",
+	"reviewPreset",
 	"spawn",
 	"spawnPolicy",
 	"automaticSpawn",
 	"orchestrationPolicy",
+	"remoteUrl",
+	"remoteWasmUrl",
+	"signature",
+	"signing",
+	"publisher",
+	"marketplace",
 	"modelSelectionUi",
 	"approvalPolicy",
+	"approvalUi",
 ]);
 const CANCELLATION_STATES = new Set<SubAgentCancellationState>(["pending", "requested", "propagated", "completed"]);
 const RESULT_STATUSES = new Set<SubAgentTaskStatus>(["pending", "running", "completed", "failed", "cancelled"]);
@@ -308,9 +323,27 @@ function validateNumericSummary(object: JsonObject, path: string): void {
 }
 
 function rejectForbiddenProductFields(object: JsonObject, path: string): void {
-	for (const field of Object.keys(object)) {
-		if (FORBIDDEN_PRODUCT_FIELDS.has(field))
-			throw new Error(`${path}.${field}: product UX/spawn policy is not allowed`);
+	for (const [field, value] of Object.entries(object)) {
+		const fieldPath = `${path}.${field}`;
+		if (FORBIDDEN_PRODUCT_FIELDS.has(field)) throw new Error(`${fieldPath}: product UX/spawn policy is not allowed`);
+		rejectForbiddenProductFieldsInValue(value, fieldPath);
+	}
+}
+
+function rejectForbiddenProductFieldsInValue(value: unknown, path: string): void {
+	if (value === null || typeof value !== "object") {
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const [index, entry] of value.entries()) {
+			rejectForbiddenProductFieldsInValue(entry, `${path}[${index}]`);
+		}
+		return;
+	}
+	for (const [field, entry] of Object.entries(value as JsonObject)) {
+		const fieldPath = `${path}.${field}`;
+		if (FORBIDDEN_PRODUCT_FIELDS.has(field)) throw new Error(`${fieldPath}: product UX/spawn policy is not allowed`);
+		rejectForbiddenProductFieldsInValue(entry, fieldPath);
 	}
 }
 

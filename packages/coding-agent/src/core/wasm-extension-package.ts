@@ -42,6 +42,32 @@ const UNSUPPORTED_SURFACE_FIELDS = [
 	"prompts",
 	"skills",
 ];
+const UNSUPPORTED_TRUST_PRODUCT_FIELDS = new Set([
+	"signature",
+	"signing",
+	"publisher",
+	"marketplace",
+	"approvalUi",
+	"approvalPolicy",
+	"remoteUrl",
+	"remoteWasmUrl",
+	"workflow",
+	"workflowPreset",
+	"wiki",
+	"wikiPreset",
+	"qa",
+	"qaPreset",
+	"review",
+	"reviewPreset",
+	"spawn",
+	"spawnPolicy",
+	"automaticSpawn",
+	"orchestrationPolicy",
+	"modelSelectionUi",
+	"ui",
+	"ux",
+	"slashCommand",
+]);
 
 export interface WasmExtensionPackageManifest {
 	kind: "wasm-extension";
@@ -186,6 +212,10 @@ export function readWasmExtensionPackagePolicyRequest(packageRoot: string): Wasm
 			`$.schemaVersion: unsupported schema version "${schemaVersion}"; expected ${WASM_EXTENSION_SCHEMA_VERSION}`,
 		);
 	}
+	const unsupportedTrustProductPath = scanUnsupportedTrustProductSurface(root, "$");
+	if (unsupportedTrustProductPath) {
+		throw new Error(`${unsupportedTrustProductPath}: unsupported v0 trust/product surface`);
+	}
 
 	const id = requiredString(root, "$", "id");
 	const name = requiredString(root, "$", "name");
@@ -279,6 +309,28 @@ function requiredString(object: JsonObject, parentPath: string, field: string): 
 
 function requiredObject(object: JsonObject, parentPath: string, field: string): JsonObject {
 	return expectObject(requiredValue(object, parentPath, field), `${parentPath}.${field}`);
+}
+
+function scanUnsupportedTrustProductSurface(value: unknown, path: string): string | undefined {
+	if (value === null || typeof value !== "object") {
+		return undefined;
+	}
+	if (Array.isArray(value)) {
+		for (const [index, entry] of value.entries()) {
+			const nested = scanUnsupportedTrustProductSurface(entry, `${path}[${index}]`);
+			if (nested) return nested;
+		}
+		return undefined;
+	}
+	for (const [key, entry] of Object.entries(value as JsonObject)) {
+		const fieldPath = `${path}.${key}`;
+		if (UNSUPPORTED_TRUST_PRODUCT_FIELDS.has(key)) {
+			return fieldPath;
+		}
+		const nested = scanUnsupportedTrustProductSurface(entry, fieldPath);
+		if (nested) return nested;
+	}
+	return undefined;
 }
 
 function readCapabilities(root: JsonObject): string[] {

@@ -41,6 +41,210 @@ export type {
 	RpcSessionState,
 } from "./rpc-types.js";
 
+type JsonObject = Record<string, unknown>;
+
+const RPC_COMMAND_BASE_FIELDS = new Set(["id", "type"]);
+const RPC_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const RPC_QUEUE_MODES = new Set(["all", "one-at-a-time"]);
+const RPC_STREAMING_BEHAVIORS = new Set(["steer", "followUp"]);
+const RPC_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateRpcCommand(value: unknown): RpcCommand {
+	const command = expectJsonObject(value, "$");
+	const type = expectRequiredString(command, "$", "type");
+	const id = optionalString(command, "$", "id");
+	if (id !== undefined && id.length === 0) {
+		throw new Error("$.id: must not be empty");
+	}
+
+	switch (type) {
+		case "prompt":
+			rejectUnknownFields(command, ["message", "images", "streamingBehavior"]);
+			expectRequiredString(command, "$", "message");
+			validateImageArray(command.images, "$.images");
+			if (command.streamingBehavior !== undefined) {
+				expectEnum(command.streamingBehavior, "$.streamingBehavior", RPC_STREAMING_BEHAVIORS);
+			}
+			break;
+		case "steer":
+		case "follow_up":
+			rejectUnknownFields(command, ["message", "images"]);
+			expectRequiredString(command, "$", "message");
+			validateImageArray(command.images, "$.images");
+			break;
+		case "abort":
+		case "get_state":
+		case "cycle_model":
+		case "get_available_models":
+		case "cycle_thinking_level":
+		case "abort_retry":
+		case "abort_bash":
+		case "get_session_stats":
+		case "clone":
+		case "get_fork_messages":
+		case "get_last_assistant_text":
+		case "get_messages":
+		case "get_commands":
+			rejectUnknownFields(command, []);
+			break;
+		case "new_session":
+			rejectUnknownFields(command, ["parentSession"]);
+			optionalString(command, "$", "parentSession");
+			break;
+		case "set_model":
+			rejectUnknownFields(command, ["provider", "modelId"]);
+			expectRequiredString(command, "$", "provider");
+			expectRequiredString(command, "$", "modelId");
+			break;
+		case "set_thinking_level":
+			rejectUnknownFields(command, ["level"]);
+			expectEnum(requiredValue(command, "$", "level"), "$.level", RPC_THINKING_LEVELS);
+			break;
+		case "set_steering_mode":
+		case "set_follow_up_mode":
+			rejectUnknownFields(command, ["mode"]);
+			expectEnum(requiredValue(command, "$", "mode"), "$.mode", RPC_QUEUE_MODES);
+			break;
+		case "compact":
+			rejectUnknownFields(command, ["customInstructions"]);
+			optionalString(command, "$", "customInstructions");
+			break;
+		case "set_auto_compaction":
+		case "set_auto_retry":
+			rejectUnknownFields(command, ["enabled"]);
+			expectRequiredBoolean(command, "$", "enabled");
+			break;
+		case "bash":
+			rejectUnknownFields(command, ["command"]);
+			expectRequiredString(command, "$", "command");
+			break;
+		case "export_html":
+			rejectUnknownFields(command, ["outputPath"]);
+			optionalString(command, "$", "outputPath");
+			break;
+		case "switch_session":
+			rejectUnknownFields(command, ["sessionPath"]);
+			expectRequiredString(command, "$", "sessionPath");
+			break;
+		case "fork":
+			rejectUnknownFields(command, ["entryId"]);
+			expectRequiredString(command, "$", "entryId");
+			break;
+		case "set_session_name":
+			rejectUnknownFields(command, ["name"]);
+			expectRequiredString(command, "$", "name");
+			break;
+		default:
+			throw new Error(`$.type: unsupported RPC command type "${type}"`);
+	}
+
+	return command as unknown as RpcCommand;
+}
+
+function rpcCommandErrorMetadata(value: unknown): { id: string | undefined; type: string } {
+	if (!isJsonObject(value)) return { id: undefined, type: "schema" };
+	return {
+		id: typeof value.id === "string" ? value.id : undefined,
+		type: typeof value.type === "string" ? value.type : "schema",
+	};
+}
+
+function rejectUnknownFields(object: JsonObject, allowedFields: readonly string[]): void {
+	const allowed = new Set([...RPC_COMMAND_BASE_FIELDS, ...allowedFields]);
+	for (const field of Object.keys(object)) {
+		if (!allowed.has(field)) {
+			throw new Error(`$.${field}: unsupported RPC command field`);
+		}
+	}
+}
+
+function validateImageArray(value: unknown, path: string): void {
+	if (value === undefined) return;
+	if (!Array.isArray(value)) {
+		throw new Error(`${path}: expected array`);
+	}
+	for (const [index, entry] of value.entries()) {
+		validateImage(entry, `${path}[${index}]`);
+	}
+}
+
+function validateImage(value: unknown, path: string): void {
+	const image = expectJsonObject(value, path);
+	if (Object.hasOwn(image, "source")) {
+		throw new Error(`${path}.source: unsupported image source`);
+	}
+	for (const field of Object.keys(image)) {
+		if (field !== "type" && field !== "data" && field !== "mimeType") {
+			throw new Error(`${path}.${field}: unsupported image field`);
+		}
+	}
+	const type = expectRequiredString(image, path, "type");
+	if (type !== "image") {
+		throw new Error(`${path}.type: expected "image"`);
+	}
+	const data = expectRequiredString(image, path, "data");
+	if (data.length === 0) {
+		throw new Error(`${path}.data: must not be empty`);
+	}
+	const mimeType = expectRequiredString(image, path, "mimeType");
+	if (!RPC_IMAGE_MIME_TYPES.has(mimeType)) {
+		throw new Error(`${path}.mimeType: unsupported image MIME type "${mimeType}"`);
+	}
+}
+
+function expectJsonObject(value: unknown, path: string): JsonObject {
+	if (!isJsonObject(value)) {
+		throw new Error(`${path}: expected object`);
+	}
+	return value;
+}
+
+function requiredValue(object: JsonObject, parentPath: string, field: string): unknown {
+	if (!Object.hasOwn(object, field)) {
+		throw new Error(`${parentPath}.${field}: missing required field`);
+	}
+	return object[field];
+}
+
+function expectRequiredString(object: JsonObject, parentPath: string, field: string): string {
+	const value = requiredValue(object, parentPath, field);
+	if (typeof value !== "string") {
+		throw new Error(`${parentPath}.${field}: expected string`);
+	}
+	return value;
+}
+
+function optionalString(object: JsonObject, parentPath: string, field: string): string | undefined {
+	const value = object[field];
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new Error(`${parentPath}.${field}: expected string`);
+	}
+	return value;
+}
+
+function expectRequiredBoolean(object: JsonObject, parentPath: string, field: string): boolean {
+	const value = requiredValue(object, parentPath, field);
+	if (typeof value !== "boolean") {
+		throw new Error(`${parentPath}.${field}: expected boolean`);
+	}
+	return value;
+}
+
+function expectEnum(value: unknown, path: string, allowed: ReadonlySet<string>): string {
+	if (typeof value !== "string") {
+		throw new Error(`${path}: expected string`);
+	}
+	if (!allowed.has(value)) {
+		throw new Error(`${path}: unsupported value "${value}"`);
+	}
+	return value;
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -716,7 +920,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
-		const command = parsed as RpcCommand;
+		let command: RpcCommand;
+		try {
+			command = validateRpcCommand(parsed);
+		} catch (schemaError: unknown) {
+			const metadata = rpcCommandErrorMetadata(parsed);
+			output(
+				error(metadata.id, metadata.type, schemaError instanceof Error ? schemaError.message : String(schemaError)),
+			);
+			return;
+		}
 		try {
 			const response = await handleCommand(command);
 			if (response) {

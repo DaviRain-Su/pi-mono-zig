@@ -268,6 +268,8 @@ function createDiagnostic(options: {
 	phase: "resolve" | "write";
 	source?: string;
 	path?: string;
+	expected?: string;
+	actual?: string;
 	message: string;
 }): ExtensionProvenanceDiagnostic {
 	return {
@@ -277,6 +279,8 @@ function createDiagnostic(options: {
 		phase: options.phase,
 		source: options.source,
 		path: options.path,
+		expected: options.expected,
+		actual: options.actual,
 		message: options.message,
 		recoveryHint: "Run install or update for the package to refresh trusted extension provenance.",
 	};
@@ -332,7 +336,19 @@ export function readExtensionProvenanceLockfile(options: {
 		const object = expectObject(parsed, "$");
 		const schemaVersion = requiredString(object, "$", "schemaVersion");
 		if (schemaVersion !== EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION) {
-			throw new Error(`$.schemaVersion: unsupported schema version`);
+			return {
+				entries: new Map(),
+				diagnostic: createDiagnostic({
+					category: "malformed_lockfile",
+					scope: options.scope,
+					lockfilePath: options.lockfilePath,
+					phase: options.phase,
+					path: "$.schemaVersion",
+					expected: EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION,
+					actual: schemaVersion,
+					message: `Malformed extension provenance lockfile: $.schemaVersion: unsupported schema version "${schemaVersion}"; expected ${EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION}`,
+				}),
+			};
 		}
 		if (!Array.isArray(object.entries)) {
 			throw new Error("$.entries: expected array");

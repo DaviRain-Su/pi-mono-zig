@@ -525,6 +525,17 @@ Content`,
 					expected: "$: malformed JSON",
 				},
 				{
+					name: "unsupported-schema",
+					mutate: (packageRoot) => {
+						const manifest = JSON.parse(readFileSync(join(packageRoot, "pi-extension.json"), "utf-8"));
+						manifest.schemaVersion = "pi-extension.v1";
+						manifest.capabilities = ["file.read"];
+						manifest.artifact.path = "wasm/missing.wasm";
+						writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
+					},
+					expected: '$.schemaVersion: unsupported schema version "pi-extension.v1"; expected pi-extension.v0',
+				},
+				{
 					name: "unsupported-surface",
 					mutate: (packageRoot) => {
 						const manifest = JSON.parse(readFileSync(join(packageRoot, "pi-extension.json"), "utf-8"));
@@ -532,6 +543,15 @@ Content`,
 						writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
 					},
 					expected: "$.commands: unsupported v0 surface; only $.tool is supported",
+				},
+				{
+					name: "nested-trust-surface",
+					mutate: (packageRoot) => {
+						const manifest = JSON.parse(readFileSync(join(packageRoot, "pi-extension.json"), "utf-8"));
+						manifest.tool.outputSchema = { metadata: { publisher: "marketplace" } };
+						writeFileSync(join(packageRoot, "pi-extension.json"), JSON.stringify(manifest));
+					},
+					expected: "$.tool.outputSchema.metadata.publisher: unsupported v0 trust/product surface",
 				},
 				{
 					name: "unknown-capability",
@@ -1814,6 +1834,33 @@ Content`,
 				}),
 			]);
 			expect(readFileSync(lockPath, "utf-8")).toBe(beforeBytes);
+		});
+
+		it("should reject future lockfile schemas without trusting partial entries", async () => {
+			const pkgDir = join(tempDir, "future-lock-schema");
+			writeTypeScriptPackage(pkgDir);
+			await packageManager.installAndPersist(pkgDir);
+			await settingsManager.flush();
+			const lockPath = join(agentDir, "extensions.lock.json");
+			const lock = readJsonFile(lockPath) as Record<string, unknown>;
+			lock.schemaVersion = "pi-extension-lock.v1";
+			writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+			settingsManager.setPackages([pkgDir]);
+
+			const result = await packageManager.resolve();
+
+			expect(result.extensions).toHaveLength(0);
+			expect(result.diagnostics).toEqual([
+				expect.objectContaining({
+					category: "malformed_lockfile",
+					scope: "user",
+					lockfilePath: lockPath,
+					path: "$.schemaVersion",
+					actual: "pi-extension-lock.v1",
+					expected: "pi-extension-lock.v0",
+				}),
+			]);
+			expect(readFileSync(lockPath, "utf-8")).toContain("pi-extension-lock.v1");
 		});
 
 		it("should reject unsupported v0 trust surfaces without trusting partial lock data", async () => {

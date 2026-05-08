@@ -396,7 +396,7 @@ const subagent_limit_fields = [_][]const u8{ "maxChildren", "depth", "turns", "t
 const subagent_resource_summary_fields = [_][]const u8{ "turns", "outputBytes", "outputLines", "childrenStarted", "limitDetails" };
 const subagent_resource_summary_number_fields = [_][]const u8{ "turns", "outputBytes", "outputLines", "childrenStarted" };
 const subagent_limit_detail_fields = [_][]const u8{ "limit", "actual", "truncated", "reason" };
-const subagent_forbidden_fields = [_][]const u8{ "ui", "ux", "slashCommand", "spawn", "spawnPolicy", "automaticSpawn", "orchestrationPolicy", "modelSelectionUi", "approvalPolicy" };
+const subagent_forbidden_fields = [_][]const u8{ "ui", "ux", "slashCommand", "workflow", "workflowPreset", "wiki", "wikiPreset", "qa", "qaPreset", "review", "reviewPreset", "spawn", "spawnPolicy", "automaticSpawn", "orchestrationPolicy", "remoteUrl", "remoteWasmUrl", "signature", "signing", "publisher", "marketplace", "modelSelectionUi", "approvalPolicy", "approvalUi" };
 const subagent_cancellation_states = [_][]const u8{ "pending", "requested", "propagated", "completed" };
 const subagent_result_statuses = [_][]const u8{ "pending", "running", "completed", "failed", "cancelled" };
 const MAX_SAFE_INTEGER: u64 = 9007199254740991;
@@ -492,14 +492,30 @@ pub fn validateSubAgentTaskResultEnvelope(allocator: std.mem.Allocator, object: 
     return .{ .valid = .task_result };
 }
 
-fn forbiddenFieldDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8) !?SubAgentReadinessDiagnostic {
+fn forbiddenFieldDiagnostic(allocator: std.mem.Allocator, object: std.json.ObjectMap, parent_path: []const u8) anyerror!?SubAgentReadinessDiagnostic {
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
+        const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, entry.key_ptr.* });
+        defer allocator.free(path);
         if (stringInComptimeTable(entry.key_ptr.*, &subagent_forbidden_fields)) {
-            const path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ parent_path, entry.key_ptr.* });
-            defer allocator.free(path);
             return (try invalidReadiness(allocator, path, "product UX/spawn policy is not allowed")).invalid;
         }
+        if (try forbiddenValueDiagnostic(allocator, entry.value_ptr.*, path)) |diagnostic| return diagnostic;
+    }
+    return null;
+}
+
+fn forbiddenValueDiagnostic(allocator: std.mem.Allocator, value: std.json.Value, path: []const u8) anyerror!?SubAgentReadinessDiagnostic {
+    switch (value) {
+        .object => |object| return forbiddenFieldDiagnostic(allocator, object, path),
+        .array => |array| {
+            for (array.items, 0..) |entry, index| {
+                const item_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index });
+                defer allocator.free(item_path);
+                if (try forbiddenValueDiagnostic(allocator, entry, item_path)) |diagnostic| return diagnostic;
+            }
+        },
+        else => {},
     }
     return null;
 }
@@ -2068,6 +2084,37 @@ test "sub-agent readiness envelope validation rejects every forbidden product po
         try std.testing.expect(result_validation == .invalid);
         try std.testing.expectEqualStrings(expected_path, result_validation.invalid.path);
         try std.testing.expectEqualStrings("product UX/spawn policy is not allowed", result_validation.invalid.message);
+    }
+}
+
+test "sub-agent readiness envelope validation rejects nested product and trust fields" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        json: []const u8,
+        path: []const u8,
+    }{
+        .{
+            .json = "{\"type\":\"sub_agent_task_invocation\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"input\":{},\"metadata\":{\"safe\":true,\"nested\":{\"workflowPreset\":\"review\"}}}",
+            .path = "$.metadata.nested.workflowPreset",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"completed\",\"startedAt\":1,\"completedAt\":2,\"details\":{\"nested\":{\"publisher\":\"marketplace\"}}}",
+            .path = "$.details.nested.publisher",
+        },
+        .{
+            .json = "{\"type\":\"sub_agent_task_result\",\"agentId\":\"agent\",\"runId\":\"run\",\"taskId\":\"task\",\"sessionId\":\"session\",\"status\":\"failed\",\"startedAt\":1,\"completedAt\":2,\"error\":{\"reason\":\"failed\",\"details\":{\"remoteUrl\":\"https://example.invalid/ext.wasm\"}}}",
+            .path = "$.error.details.remoteUrl",
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.json, .{});
+        defer parsed.deinit();
+        var validation = try validateSubAgentReadinessEnvelope(allocator, parsed.value);
+        defer validation.deinit(allocator);
+        try std.testing.expect(validation == .invalid);
+        try std.testing.expectEqualStrings(case.path, validation.invalid.path);
+        try std.testing.expectEqualStrings("product UX/spawn policy is not allowed", validation.invalid.message);
     }
 }
 

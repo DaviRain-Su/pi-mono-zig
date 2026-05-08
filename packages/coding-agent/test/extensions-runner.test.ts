@@ -51,12 +51,27 @@ const SUB_AGENT_FORBIDDEN_PRODUCT_FIELDS = [
 	"ui",
 	"ux",
 	"slashCommand",
+	"workflow",
+	"workflowPreset",
+	"wiki",
+	"wikiPreset",
+	"qa",
+	"qaPreset",
+	"review",
+	"reviewPreset",
 	"spawn",
 	"spawnPolicy",
 	"automaticSpawn",
 	"orchestrationPolicy",
+	"remoteUrl",
+	"remoteWasmUrl",
+	"signature",
+	"signing",
+	"publisher",
+	"marketplace",
 	"modelSelectionUi",
 	"approvalPolicy",
+	"approvalUi",
 ] as const;
 
 const AGENT_EVENT_GOLDEN_FIXTURES = [
@@ -670,6 +685,27 @@ describe("sub-agent readiness envelope validation", () => {
 		expect(() => validateSubAgentTaskResultEnvelope({ ...result, status: "complete" })).toThrow(
 			'$.status: unsupported task status "complete"',
 		);
+	});
+
+	it("rejects forbidden product and trust fields recursively in opaque readiness metadata", () => {
+		expect(() =>
+			validateSubAgentTaskInvocationEnvelope({
+				...invocation,
+				metadata: { safe: true, nested: { workflowPreset: "review" } },
+			}),
+		).toThrow("$.metadata.nested.workflowPreset: product UX/spawn policy is not allowed");
+		expect(() =>
+			validateSubAgentTaskResultEnvelope({
+				...result,
+				details: { safe: true, nested: { publisher: "marketplace" } },
+			}),
+		).toThrow("$.details.nested.publisher: product UX/spawn policy is not allowed");
+		expect(() =>
+			validateSubAgentTaskResultEnvelope({
+				...result,
+				error: { reason: "failed", details: { remoteUrl: "https://example.invalid/ext.wasm" } },
+			}),
+		).toThrow("$.error.details.remoteUrl: product UX/spawn policy is not allowed");
 	});
 
 	it("validates cancellation propagation and resource limit detail paths", () => {

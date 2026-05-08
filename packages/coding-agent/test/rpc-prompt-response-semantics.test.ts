@@ -406,6 +406,63 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	it("rejects malformed RPC command schemas before provider or session side effects", async () => {
+		let providerCalls = 0;
+		const { lineHandler, cleanup, runtimeHost } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			onProviderCall: () => {
+				providerCalls++;
+			},
+		});
+
+		try {
+			lineHandler(
+				JSON.stringify({
+					id: "future-prompt",
+					type: "prompt",
+					message: "must not run",
+					workflowPreset: "review",
+				}),
+			);
+			lineHandler(
+				JSON.stringify({
+					id: "bad-image",
+					type: "prompt",
+					message: "must not run either",
+					images: [{ type: "image", source: { type: "url", url: "https://example.invalid/image.png" } }],
+				}),
+			);
+
+			await vi.waitFor(() => {
+				const records = parseOutputLines(rpcIo.outputLines);
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						id: "future-prompt",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: expect.stringContaining("$.workflowPreset: unsupported RPC command field"),
+					}),
+				);
+				expect(records).toContainEqual(
+					expect.objectContaining({
+						id: "bad-image",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: expect.stringContaining("$.images[0].source: unsupported image source"),
+					}),
+				);
+			});
+
+			expect(providerCalls).toBe(0);
+			expect(runtimeHost.session.sessionManager.getEntries()).toHaveLength(0);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("emits one success response when prompt is queued during streaming", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 100 });
 

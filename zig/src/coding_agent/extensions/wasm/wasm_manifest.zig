@@ -419,6 +419,7 @@ pub fn validateManifestTextWithOptions(
         defer allocator.free(message);
         return invalidOne(allocator, .validate, "$.schemaVersion", message);
     }
+    if (try unsupportedTrustProductSurfaceDiagnostic(allocator, parsed.value, "$")) |diagnostic| return diagnostic;
     if (try requiredString(allocator, root, "$", "id")) |diagnostic| return diagnostic;
     const extension_id = requiredStringValue(root, "id");
     if (try requiredString(allocator, root, "$", "name")) |diagnostic| return diagnostic;
@@ -641,6 +642,73 @@ const unsupported_surface_fields = [_][]const u8{
     "prompts",
     "skills",
 };
+
+const unsupported_trust_product_fields = [_][]const u8{
+    "signature",
+    "signing",
+    "publisher",
+    "marketplace",
+    "approvalUi",
+    "approvalPolicy",
+    "remoteUrl",
+    "remoteWasmUrl",
+    "workflow",
+    "workflowPreset",
+    "wiki",
+    "wikiPreset",
+    "qa",
+    "qaPreset",
+    "review",
+    "reviewPreset",
+    "spawn",
+    "spawnPolicy",
+    "automaticSpawn",
+    "orchestrationPolicy",
+    "modelSelectionUi",
+    "ui",
+    "ux",
+    "slashCommand",
+};
+
+fn unsupportedTrustProductSurfaceDiagnostic(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    path: []const u8,
+) !?ValidationResult {
+    switch (value) {
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                const field_path = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ path, entry.key_ptr.* });
+                defer allocator.free(field_path);
+                if (stringInComptimeTable(entry.key_ptr.*, &unsupported_trust_product_fields)) {
+                    return try invalidOne(allocator, .validate, field_path, "unsupported v0 trust/product surface");
+                }
+                if (try unsupportedTrustProductSurfaceDiagnostic(allocator, entry.value_ptr.*, field_path)) |diagnostic| {
+                    return diagnostic;
+                }
+            }
+        },
+        .array => |array| {
+            for (array.items, 0..) |entry, index| {
+                const item_path = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ path, index });
+                defer allocator.free(item_path);
+                if (try unsupportedTrustProductSurfaceDiagnostic(allocator, entry, item_path)) |diagnostic| {
+                    return diagnostic;
+                }
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn stringInComptimeTable(value: []const u8, comptime table: []const []const u8) bool {
+    inline for (table) |candidate| {
+        if (std.mem.eql(u8, value, candidate)) return true;
+    }
+    return false;
+}
 
 fn invalidOne(
     allocator: std.mem.Allocator,
@@ -1811,6 +1879,12 @@ test "wasm manifest rejects zero multiple and non-tool declarations" {
     );
     defer command_surface.deinit(allocator);
     try expectInvalid(&command_surface, "$.commands", "unsupported v0 surface; only $.tool is supported");
+
+    var nested_trust_surface = try validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Nested trust surface","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{"metadata":{"publisher":"marketplace"}}},"capabilities":[]}
+    );
+    defer nested_trust_surface.deinit(allocator);
+    try expectInvalid(&nested_trust_surface, "$.tool.outputSchema.metadata.publisher", "unsupported v0 trust/product surface");
 }
 
 test "wasm manifest validates artifact kind and constrained paths before load success" {
