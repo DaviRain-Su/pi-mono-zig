@@ -2104,7 +2104,7 @@ test "thinking cycle skips xhigh unless the active model supports it" {
 
     var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp",
-        .model = ai.model_registry.find("openai", "gpt-4.1-mini").?,
+        .model = ai.model_registry.find("anthropic", "claude-sonnet-4-5").?,
     });
     defer session.deinit();
     var state = try AppState.init(allocator, std.testing.io);

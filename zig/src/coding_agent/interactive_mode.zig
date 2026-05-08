@@ -3294,7 +3294,7 @@ test "model slash exact match switches and persists default selection" {
         &env_map,
         &session,
         &current_provider,
-        "GPT-5.4",
+        "openai/gpt-5.4",
         options,
         &runtime_config,
         &state,
@@ -3347,7 +3347,7 @@ test "model slash unmatched argument opens selector with initial search" {
         &env_map,
         &session,
         &current_provider,
-        "gpt-5",
+        "definitely-no-such-model",
         options,
         null,
         &state,
@@ -3356,10 +3356,10 @@ test "model slash unmatched argument opens selector with initial search" {
 
     try std.testing.expect(overlay != null);
     try std.testing.expect(overlay.? == .model);
-    try std.testing.expect(std.mem.indexOf(u8, overlay.?.hint(), "gpt-5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlay.?.hint(), "definitely-no-such-model") != null);
     for (overlay.?.model.items) |item| {
-        try std.testing.expect(std.mem.indexOf(u8, item.label, "gpt") != null or
-            std.mem.indexOf(u8, item.description orelse "", "gpt") != null);
+        try std.testing.expect(std.mem.indexOf(u8, item.label, "definitely-no-such-model") != null or
+            std.mem.indexOf(u8, item.description orelse "", "definitely-no-such-model") != null);
     }
     try std.testing.expectEqualStrings("faux", session.agent.getModel().provider);
     try std.testing.expectEqualStrings("faux-1", session.agent.getModel().id);

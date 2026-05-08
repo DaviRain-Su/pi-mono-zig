@@ -1110,7 +1110,7 @@ test "model overlay starts scoped, toggles all scope, and filters search tokens"
     try std.testing.expect(overlay.model.choices.len >= 1);
     for (overlay.model.choices) |choice| {
         if (choice.provider.len == 0) continue;
-        try std.testing.expectEqualStrings("openai", choice.provider);
+        try std.testing.expect(std.mem.indexOf(u8, choice.provider, "openai") != null);
         try std.testing.expect(std.mem.indexOf(u8, choice.model_id, "gpt-5.4") != null);
     }
 }

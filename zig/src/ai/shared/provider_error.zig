@@ -14,7 +14,24 @@ pub fn formatHttpStatusError(
     const detail = try sanitizeProviderErrorDetail(allocator, body);
     defer allocator.free(detail);
 
+    if (bigModelSubscriptionHint(status, detail)) |hint| {
+        return std.fmt.allocPrint(allocator, "HTTP {d}: {s}\nHint: {s}", .{ status, detail, hint });
+    }
     return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status, detail });
+}
+
+fn bigModelSubscriptionHint(status: u16, detail: []const u8) ?[]const u8 {
+    if (status != 429) return null;
+    if (std.mem.indexOf(u8, detail, "1311") == null) return null;
+    if (!isBigModelSubscriptionPermissionDetail(detail)) return null;
+    return "BigModel/ZAI model is not enabled for this subscription. Try zai/glm-4.7.";
+}
+
+fn isBigModelSubscriptionPermissionDetail(detail: []const u8) bool {
+    const has_chinese_permission_wording =
+        std.mem.indexOf(u8, detail, "暂未开放") != null and
+        std.mem.indexOf(u8, detail, "权限") != null;
+    return has_chinese_permission_wording or std.ascii.indexOfIgnoreCase(detail, "glm-") != null;
 }
 
 pub fn pushHttpStatusError(
@@ -494,6 +511,35 @@ test "HTTP provider error formatter redacts secrets paths ids and bounds body" {
     try std.testing.expect(std.mem.indexOf(u8, message, "AIza-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, message, "req_random") == null);
     try std.testing.expect(std.mem.indexOf(u8, message, "/Users/alice") == null);
+}
+
+test "HTTP provider error formatter hints BigModel subscription model access" {
+    const allocator = std.testing.allocator;
+
+    const body =
+        \\{"error":{"code":"1311","message":"当前订阅套餐暂未开放GLM-5.1权限"}}
+    ;
+    const message = try formatHttpStatusError(allocator, 429, body);
+    defer allocator.free(message);
+
+    try std.testing.expect(std.mem.startsWith(u8, message, "HTTP 429: "));
+    try std.testing.expect(std.mem.indexOf(u8, message, "not enabled for this subscription") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "zai/glm-4.7") != null);
+}
+
+test "HTTP provider error formatter does not hint unrelated 1311 throttles" {
+    const allocator = std.testing.allocator;
+
+    const body =
+        \\{"error":{"code":"rate_limit","message":"Too many requests; retry after reference 1311"}}
+    ;
+    const message = try formatHttpStatusError(allocator, 429, body);
+    defer allocator.free(message);
+
+    try std.testing.expect(std.mem.startsWith(u8, message, "HTTP 429: "));
+    try std.testing.expect(std.mem.indexOf(u8, message, "Too many requests") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "not enabled for this subscription") == null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "zai/glm-4.7") == null);
 }
 
 test "HTTP status helper emits one terminal error event with result identity" {

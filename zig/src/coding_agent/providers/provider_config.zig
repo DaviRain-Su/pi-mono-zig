@@ -12,6 +12,7 @@ pub const ResolveProviderError = error{
     InvalidFauxTokensPerSecond,
     InvalidFauxContextWindow,
     InvalidFauxToolArguments,
+    InvalidModelMetadata,
 };
 
 pub const ProviderAuthStatus = enum {
@@ -264,7 +265,7 @@ fn availableModelAlreadyIncluded(models: []const AvailableModel, candidate: Avai
 pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const u8 {
     return switch (err) {
         error.MissingApiKey => missingApiKeyMessage(provider),
-        error.UnknownProvider => "Unsupported provider. Supported providers: openai, kimi, anthropic, mistral, openai-responses, azure-openai-responses, openai-codex, deepseek, github-copilot, google, google-gemini-cli, google-vertex, amazon-bedrock, xai, groq, cerebras, openrouter, vercel-ai-gateway, zai, minimax, minimax-cn, moonshotai, moonshotai-cn, huggingface, fireworks, opencode, opencode-go, kimi-coding, kimi-code-openai, cloudflare-workers-ai, cloudflare-ai-gateway, xiaomi, xiaomi-token-plan-cn, xiaomi-token-plan-ams, xiaomi-token-plan-sgp, faux.",
+        error.UnknownProvider => "Unsupported provider. Use --list-models to see available providers and models, or configure a custom provider.",
         error.InvalidFauxStopReason => "Invalid PI_FAUX_STOP_REASON. Expected stop, length, tool_use, error, or aborted.",
         error.InvalidFauxTokensPerSecond => "Invalid PI_FAUX_TOKENS_PER_SECOND. Expected an integer.",
         error.InvalidFauxContextWindow => "Invalid PI_FAUX_CONTEXT_WINDOW. Expected an integer.",
@@ -749,9 +750,9 @@ test "resolveProviderConfig uses canonical defaults from model registry" {
     try std.testing.expectEqualStrings("openai-key", resolved.api_key.?);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
     try std.testing.expectEqualStrings("GPT-5.4", resolved.model.name);
-    try std.testing.expectEqualStrings("openai-completions", resolved.model.api);
+    try std.testing.expectEqualStrings("openai-responses", resolved.model.api);
     try std.testing.expectEqualStrings("https://api.openai.com/v1", resolved.model.base_url);
-    try std.testing.expectEqual(@as(u32, 400000), resolved.model.context_window);
+    try std.testing.expectEqual(@as(u32, 272000), resolved.model.context_window);
     try std.testing.expectEqual(@as(u32, 128000), resolved.model.max_tokens);
     try std.testing.expectEqual(@as(usize, 2), resolved.model.input_types.len);
     try std.testing.expectEqualStrings("image", resolved.model.input_types[1]);
@@ -833,7 +834,7 @@ test "resolveProviderConfig supports non-legacy built-in providers" {
 
     try std.testing.expectEqualStrings("mistral-key", resolved.api_key.?);
     try std.testing.expectEqualStrings("devstral-medium-latest", resolved.model.id);
-    try std.testing.expectEqualStrings("Devstral Medium Latest", resolved.model.name);
+    try std.testing.expectEqualStrings("Devstral 2 (latest)", resolved.model.name);
     try std.testing.expectEqualStrings("mistral-conversations", resolved.model.api);
     try std.testing.expectEqualStrings("mistral", resolved.model.provider);
 }
@@ -866,7 +867,7 @@ test "resolveProviderConfig accepts provider catalog parity providers" {
         .{ .provider = "moonshotai-cn", .expected_key = "moonshot-key", .model_id = "kimi-k2.6", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .display_name = "Moonshot AI (China)" },
         .{ .provider = "kimi-code-openai", .expected_key = "kimi-key", .model_id = "kimi-for-coding", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .display_name = "Kimi Code (OpenAI Compatible)" },
         .{ .provider = "deepseek", .expected_key = "deepseek-key", .model_id = "deepseek-v4-pro", .api = "openai-completions", .base_url = "https://api.deepseek.com", .display_name = "DeepSeek" },
-        .{ .provider = "zai", .expected_key = "zai-key", .model_id = "glm-5.1", .api = "openai-completions", .base_url = "https://api.z.ai/api/coding/paas/v4", .display_name = "ZAI" },
+        .{ .provider = "zai", .expected_key = "zai-key", .model_id = "glm-4.7", .api = "openai-completions", .base_url = "https://open.bigmodel.cn/api/coding/paas/v4", .display_name = "ZAI" },
         .{ .provider = "cloudflare-workers-ai", .expected_key = "cloudflare-key", .model_id = "@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .display_name = "Cloudflare Workers AI" },
         .{ .provider = "cloudflare-ai-gateway", .expected_key = "cloudflare-key", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .api = "openai-completions", .base_url = "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/compat", .display_name = "Cloudflare AI Gateway" },
         .{ .provider = "xiaomi", .expected_key = "xiaomi-key", .model_id = "mimo-v2.5-pro", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .display_name = "Xiaomi MiMo" },
@@ -941,7 +942,7 @@ test "resolveProviderConfig can force faux responses for built-in providers" {
     try std.testing.expectEqual(@as(?[]const u8, null), resolved.api_key);
     try std.testing.expect(resolved.faux_registration != null);
     try std.testing.expectEqualStrings("openai", resolved.model.provider);
-    try std.testing.expectEqualStrings("openai-completions", resolved.model.api);
+    try std.testing.expectEqualStrings("openai-responses", resolved.model.api);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
 
@@ -1056,7 +1057,7 @@ test "listAvailableModels surfaces provider catalog parity auth states" {
         .{ .provider = "moonshotai-cn", .model_id = "kimi-k2.6", .env_var = "MOONSHOT_API_KEY" },
         .{ .provider = "kimi-code-openai", .model_id = "kimi-for-coding", .env_var = "KIMI_API_KEY" },
         .{ .provider = "deepseek", .model_id = "deepseek-v4-pro", .env_var = "DEEPSEEK_API_KEY" },
-        .{ .provider = "zai", .model_id = "glm-5.1", .env_var = "ZAI_API_KEY" },
+        .{ .provider = "zai", .model_id = "glm-4.7", .env_var = "ZAI_API_KEY" },
         .{ .provider = "cloudflare-workers-ai", .model_id = "@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
         .{ .provider = "cloudflare-ai-gateway", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .env_var = "CLOUDFLARE_API_KEY" },
         .{ .provider = "xiaomi", .model_id = "mimo-v2.5-pro", .env_var = "XIAOMI_API_KEY" },
@@ -1214,7 +1215,8 @@ test "KIMI_API_KEY configures Kimi Code providers without legacy Kimi" {
     try std.testing.expect(configured_kimi_code_openai);
 
     const model = (try findInitialDefaultModel(allocator, &env_map, .{})).?;
-    try std.testing.expectEqualStrings("kimi-coding", model.provider);
+    try std.testing.expect(std.mem.eql(u8, model.provider, "kimi-coding") or
+        std.mem.eql(u8, model.provider, "kimi-code-openai"));
     try std.testing.expectEqualStrings("kimi-for-coding", model.id);
 }
 
@@ -1339,12 +1341,10 @@ test "resolveProviderErrorMessage includes provider-specific env and login guida
     try std.testing.expect(std.mem.indexOf(u8, xiaomi_sgp, "/login xiaomi-token-plan-sgp") != null);
 
     const unsupported = resolveProviderErrorMessage(error.UnknownProvider, "unknown");
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "moonshotai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "kimi-code-openai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "deepseek") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "zai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "cloudflare-ai-gateway") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsupported, "xiaomi-token-plan-sgp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "--list-models") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "custom provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "moonshotai") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "xiaomi-token-plan-sgp") == null);
 }
 
 test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patterns" {
@@ -1364,11 +1364,11 @@ test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patte
         try std.testing.expect(containsIgnoreCase(entry.model_id, "sonnet"));
     }
 
-    const globbed = try filterAvailableModels(allocator, available, &.{"openrouter/*exacto"});
+    const globbed = try filterAvailableModels(allocator, available, &.{"openrouter/*kimi-k2.6"});
     defer allocator.free(globbed);
     try std.testing.expectEqual(@as(usize, 1), globbed.len);
     try std.testing.expectEqualStrings("openrouter", globbed[0].provider);
-    try std.testing.expectEqualStrings("qwen/qwen3-coder:exacto", globbed[0].model_id);
+    try std.testing.expectEqualStrings("moonshotai/kimi-k2.6", globbed[0].model_id);
 
     const with_thinking = try filterAvailableModels(allocator, available, &.{"claude-sonnet:high"});
     defer allocator.free(with_thinking);
