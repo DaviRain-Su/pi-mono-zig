@@ -69,9 +69,13 @@ Package-backed policies are bound to the locked digest identity, so stale, cross
 
 Extension lifecycle hardening keeps capabilities in the extension layer while the core exposes only neutral substrate boundaries. Startup, teardown, cleanup, and timeout ordering are deterministic; extension-host APIs require policy gates; runtime adapters enforce declared capabilities; reserved sub-agent names and unsupported schema versions fail closed; and diagnostics use canonical envelopes with secret redaction.
 
-CLI-only validation:
+The Zig Extension SDK and package authoring substrate is complete for WASM-first standalone extensions: authors can copy the template, build a plugin, install/update/remove it locally, and rely on lock/provenance verification, scope discovery, digest-bound policy gating, drift denial, runtime handoff, execution, and canonical diagnostics. The completed substrate remains Zig-only and does not change production TypeScript source behavior.
+
+CLI-only validation for this substrate:
 
 ```bash
+cd zig && zig build test-coding-agent
+cd zig && zig build test-ts-rpc-parity
 npm run check
 ```
 
