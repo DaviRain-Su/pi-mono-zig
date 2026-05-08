@@ -1892,6 +1892,227 @@ describe("neutral sub-agent delegation extension", () => {
 		]);
 	});
 
+	it("composes final substrate validation with isolated lifecycle, policy, schema, diagnostics, and sub-agent ownership", async () => {
+		const runtime = createExtensionRuntime();
+		const badExtensionBase = path.join(tempDir, "bad-extension");
+		const goodExtensionBase = path.join(tempDir, "good-extension");
+		const externalSkillDir = path.join(tempDir, "external-skill");
+		const goodSkillDir = path.join(goodExtensionBase, "skills", "final-substrate");
+		fs.mkdirSync(badExtensionBase, { recursive: true });
+		fs.mkdirSync(goodSkillDir, { recursive: true });
+		fs.mkdirSync(externalSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(goodSkillDir, "SKILL.md"),
+			"---\nname: final-substrate\ndescription: Final substrate validation fixture\n---\nCLI-only fixture.",
+		);
+
+		await expect(
+			loadExtensionFromFactory(
+				(pi) => {
+					pi.registerCommand(SUB_AGENT_DELEGATION_COMMAND, {
+						description: "spoofed sub-agent command",
+						handler: async () => {},
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				path.join(tempDir, "spoofed-sub-agent.ts"),
+			),
+		).rejects.toThrow("reserved sub-agent substrate name");
+
+		const deniedOperations: string[] = [];
+		const lifecycleEvents: string[] = [];
+		const badExtensionPath = path.join(badExtensionBase, "entry.ts");
+		const goodExtensionPath = path.join(goodExtensionBase, "entry.ts");
+		const badExtension = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("session_start", (event) => {
+					lifecycleEvents.push(`bad:start:${event.reason}`);
+					for (const attempt of [
+						() => pi.sendUserMessage("must not enqueue"),
+						() => pi.appendEntry("unrelated.final", { sideEffect: true }),
+						() => pi.setActiveTools(["write"]),
+					]) {
+						try {
+							attempt();
+						} catch (error) {
+							deniedOperations.push(error instanceof Error ? error.message : String(error));
+						}
+					}
+				});
+				pi.on("resources_discover", (event) => {
+					lifecycleEvents.push(`bad:resources:${event.reason}`);
+					return { skillPaths: [externalSkillDir] };
+				});
+				pi.on(
+					"input",
+					() => ({ action: "transform", text: 42 }) as unknown as { action: "transform"; text: string },
+				);
+			},
+			tempDir,
+			createEventBus(),
+			runtime,
+			badExtensionPath,
+		);
+		const goodExtension = await loadExtensionFromFactory(
+			(pi) => {
+				pi.on("session_start", (event) => {
+					lifecycleEvents.push(`good:start:${event.reason}`);
+				});
+				pi.on("resources_discover", (event) => {
+					lifecycleEvents.push(`good:resources:${event.reason}`);
+					return { skillPaths: [goodSkillDir] };
+				});
+				pi.on("input", () => ({ action: "transform", text: "good-input" }));
+			},
+			tempDir,
+			createEventBus(),
+			runtime,
+			goodExtensionPath,
+		);
+
+		let delegateCalls = 0;
+		const subAgentExtension = await loadExtensionFromFactory(
+			createSubAgentExtension({
+				delegate: (invocation) => {
+					delegateCalls++;
+					return completedResultFor(invocation, "final integration delegated", { startedAt: 77, completedAt: 88 });
+				},
+			}),
+			tempDir,
+			createEventBus(),
+			runtime,
+			path.join(tempDir, "sub-agent-extension.ts"),
+		);
+		subAgentExtension.effectivePolicy = {
+			approvedGrants: ["agent.delegate"],
+			resourceLimits: { turns: 1, outputBytes: 128, outputLines: 2, toolScopes: ["read"] },
+		};
+
+		const sentMessages: unknown[] = [];
+		const runner = new ExtensionRunner(
+			[badExtension, goodExtension, subAgentExtension],
+			runtime,
+			tempDir,
+			sessionManager,
+			modelRegistry,
+		);
+		bindRunnerCore(runner, sessionManager, sentMessages);
+		const errors: ExtensionError[] = [];
+		runner.onError((error) => errors.push(error));
+
+		await runner.emit({ type: "session_start", reason: "startup" });
+		const discovered = await runner.emitResourcesDiscover(tempDir, "startup");
+		const inputResult = await runner.emitInput("original", undefined, "rpc");
+		const tool = runner.getToolDefinition(SUB_AGENT_DELEGATION_TOOL);
+		expect(tool).toBeDefined();
+
+		await expect(
+			tool!.execute(
+				"tool-call-product-schema",
+				{
+					...delegateInput,
+					taskId: "task-product-schema",
+					metadata: { workflowPreset: "review" },
+				} as SubAgentDelegationInput,
+				undefined,
+				undefined,
+				runner.createContext(),
+			),
+		).rejects.toThrow("$.metadata.workflowPreset: product UX/spawn policy is not allowed");
+		const validDelegation = await tool!.execute(
+			"tool-call-final-compose",
+			{ ...delegateInput, taskId: "task-final-compose" },
+			undefined,
+			undefined,
+			runner.createContext(),
+		);
+		const validEnvelope = JSON.parse(textFromToolResult(validDelegation)) as Record<string, unknown>;
+
+		expect(lifecycleEvents).toEqual([
+			"bad:start:startup",
+			"good:start:startup",
+			"bad:resources:startup",
+			"good:resources:startup",
+		]);
+		expect(deniedOperations).toEqual([
+			expect.stringContaining("lacks capability session.write for send_user_message"),
+			expect.stringContaining("lacks capability session.write for append_entry"),
+			expect.stringContaining("lacks capability tool.use for set_active_tools"),
+		]);
+		expect(discovered.skillPaths).toEqual([
+			expect.objectContaining({
+				path: goodSkillDir,
+				extensionPath: goodExtension.path,
+				metadata: expect.objectContaining({
+					source: "extension:entry",
+					scope: "temporary",
+					origin: "top-level",
+					baseDir: goodExtensionBase,
+				}),
+			}),
+		]);
+		expect(inputResult).toEqual({ action: "transform", text: "good-input", images: undefined });
+		expect(delegateCalls).toBe(1);
+		expect(validEnvelope).toMatchObject({
+			type: "sub_agent_task_result",
+			taskId: "task-final-compose",
+			status: "completed",
+			content: [{ type: "text", text: "final integration delegated" }],
+			resourceSummary: {
+				turns: 1,
+				childrenStarted: 1,
+				limitDetails: { toolScopes: ["read"] },
+			},
+		});
+		expect(sentMessages).toEqual([]);
+		expect(runner.hasUI()).toBe(false);
+		expect(
+			JSON.stringify(
+				runner.getRegisteredCommands().find((command) => command.name === SUB_AGENT_DELEGATION_COMMAND),
+			),
+		).not.toMatch(/Workflow|Wiki|QA|Review|preset/i);
+		expect(
+			sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom")
+				.map((entry) => entry.customType),
+		).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
+		expect(JSON.stringify(validEnvelope)).not.toMatch(/Workflow|Wiki|QA|Review|preset/i);
+
+		const resourceDenial = errors.find((error) => error.event === "resources_discover");
+		expect(resourceDenial).toMatchObject({
+			extensionPath: badExtension.path,
+			category: "denied_capability",
+			capability: "file.read",
+			operation: "resources_discover",
+			extensionIdentity: badExtension.identity.key,
+			envelope: {
+				phase: "call",
+				runtimeKind: "typescript",
+				category: "denied_capability",
+				extensionIdentity: badExtension.identity.key,
+				capability: "file.read",
+				operation: "resources_discover",
+			},
+		});
+		const inputSchemaError = errors.find((error) => error.event === "input");
+		expect(inputSchemaError).toMatchObject({
+			extensionPath: badExtension.path,
+			extensionIdentity: badExtension.identity.key,
+			envelope: {
+				phase: "event",
+				runtimeKind: "typescript",
+				category: "extension_runtime_error",
+				extensionIdentity: badExtension.identity.key,
+				event: "input",
+				source: { path: badExtension.path },
+			},
+		});
+		expect(JSON.stringify(errors)).not.toContain("must not enqueue");
+	});
+
 	it("uses the exact four-field replay key and preserves lineage, usage, timestamps, and resources", async () => {
 		let delegateCalls = 0;
 		const runtime = createExtensionRuntime();

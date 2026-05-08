@@ -58,7 +58,7 @@
 		{
 			"path": "responses-basic.jsonl",
 			"description": "runRpcMode stdout bytes for success, success-with-data, null data, command errors, parse error, and unknown-command quirk responses.",
-			"byteLength": 4835,
+			"byteLength": 4874,
 			"lineCount": 22
 		},
 		{

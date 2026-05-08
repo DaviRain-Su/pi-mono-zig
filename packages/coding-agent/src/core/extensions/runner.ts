@@ -1050,6 +1050,7 @@ export class ExtensionRunner {
 					error: `Extension handler timed out after ${timeoutMs}ms`,
 					phase: "event",
 					runtimeKind: "typescript",
+					extensionIdentity: ext.identity.key,
 				});
 				return undefined;
 			}
@@ -1081,6 +1082,7 @@ export class ExtensionRunner {
 				stack,
 				phase: "event",
 				runtimeKind: "typescript",
+				extensionIdentity: ext.identity.key,
 			});
 			return undefined;
 		} finally {
@@ -1104,6 +1106,7 @@ export class ExtensionRunner {
 			error: `Invalid subscriber result for ${eventType} at ${result.path}: ${result.message}`,
 			phase: "event",
 			runtimeKind: "typescript",
+			extensionIdentity: ext.identity.key,
 		});
 		return true;
 	}
@@ -1393,6 +1396,9 @@ export class ExtensionRunner {
 						extensionPath: ext.path,
 						event: "message_end",
 						error: "message_end handlers must return a message with the same role",
+						phase: "event",
+						runtimeKind: "typescript",
+						extensionIdentity: ext.identity.key,
 					});
 					continue;
 				}

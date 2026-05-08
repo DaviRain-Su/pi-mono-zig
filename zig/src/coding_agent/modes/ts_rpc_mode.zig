@@ -807,7 +807,7 @@ const TsRpcServer = struct {
         // navigate_to is a Zig-only extension command not in the TypeScript protocol.
         // Allow it through without the isKnownCommandType gate.
         if (!std.mem.eql(u8, command, "navigate_to") and !isKnownCommandType(command)) {
-            try self.writeUnknownCommand(command);
+            try self.writeUnsupportedCommandType(id, command);
             return;
         }
 
@@ -1311,6 +1311,16 @@ const TsRpcServer = struct {
             try self.allocator.dupe(u8, "Unknown command: undefined");
         defer self.allocator.free(message);
         try self.writeErrorResponse(null, command, message);
+    }
+
+    fn writeUnsupportedCommandType(self: *TsRpcServer, id: ?[]const u8, command: []const u8) !void {
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "$.type: unsupported RPC command type \"{s}\"",
+            .{command},
+        );
+        defer self.allocator.free(message);
+        try self.writeErrorResponse(id, command, message);
     }
 
     fn parseErrorMessage(self: *TsRpcServer, line: []const u8) ![]u8 {
@@ -2644,7 +2654,7 @@ test "TS RPC writer preserves response field order from TypeScript fixtures" {
     }
 }
 
-test "TS RPC parse error and unknown command match TypeScript byte fixtures" {
+test "TS RPC parse error and unsupported command type match TypeScript byte fixtures" {
     const allocator = std.testing.allocator;
     var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_capture.deinit();
@@ -2662,7 +2672,7 @@ test "TS RPC parse error and unknown command match TypeScript byte fixtures" {
 
     try std.testing.expectEqualStrings(
         "{\"type\":\"response\",\"command\":\"parse\",\"success\":false,\"error\":\"Failed to parse command: Expected property name or '}' in JSON at position 1 (line 1 column 2)\"}\n" ++
-            "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
+            "{\"id\":\"mystery\",\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"$.type: unsupported RPC command type \\\"mystery_command\\\"\"}\n",
         stdout_capture.writer.buffered(),
     );
 }
