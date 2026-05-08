@@ -1664,6 +1664,7 @@ const TestAcceptOnlyServer = struct {
     server: std.Io.net.Server,
     hold_ms: u64,
     thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn init(io: std.Io, hold_ms: u64) !TestAcceptOnlyServer {
         return .{
@@ -1678,6 +1679,7 @@ const TestAcceptOnlyServer = struct {
     }
 
     fn deinit(self: *TestAcceptOnlyServer) void {
+        self.stopping.store(true, .release);
         self.server.deinit(self.io);
         if (self.thread) |thread| thread.join();
     }
@@ -1689,7 +1691,10 @@ const TestAcceptOnlyServer = struct {
     fn run(self: *TestAcceptOnlyServer) void {
         const stream = self.server.accept(self.io) catch |err| switch (err) {
             error.SocketNotListening, error.Canceled, error.ConnectionAborted => return,
-            else => std.debug.panic("test accept-only server accept failed: {}", .{err}),
+            else => {
+                if (self.stopping.load(.acquire)) return;
+                std.debug.panic("test accept-only server accept failed: {}", .{err});
+            },
         };
         defer stream.close(self.io);
         std.Io.sleep(self.io, .fromMilliseconds(@intCast(self.hold_ms)), .awake) catch {};
