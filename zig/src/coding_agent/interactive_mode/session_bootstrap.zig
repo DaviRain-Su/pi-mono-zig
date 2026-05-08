@@ -126,7 +126,22 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
     );
     errdefer current_provider.deinit(allocator);
 
-    var built_tools = try tool_adapters.buildAgentTools(allocator, app_context, options.selected_tools);
+    var built_tools = try tool_adapters.buildAgentToolsWithOptions(allocator, app_context, .{
+        .selected_tools = options.selected_tools,
+        .include_builtin_tools = options.include_builtin_tools,
+        .include_installed_wasm_tools = options.include_installed_wasm_tools,
+        .runtime_config = options.runtime_config,
+        .resource_options = if (options.runtime_config) |runtime_config| .{
+            .cwd = options.cwd,
+            .agent_dir = runtime_config.agent_dir,
+            .global = shared.settingsResources(runtime_config.global_settings),
+            .project = shared.settingsResources(runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        } else null,
+    });
     errdefer built_tools.deinit();
 
     var session = openInitialSessionWithMissingCwd(

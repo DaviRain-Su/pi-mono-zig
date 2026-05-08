@@ -96,6 +96,7 @@ pub fn dispatchRunMode(
         );
     }
 
+    const construction_selected_tools = constructionToolSelection(options, dispatch_options.selected_tools);
     return try coding_agent.runInteractiveMode(
         allocator,
         io,
@@ -114,7 +115,9 @@ pub fn dispatchRunMode(
             .fork = options.fork,
             .no_session = options.no_session,
             .model_patterns = options.models,
-            .selected_tools = dispatch_options.selected_tools,
+            .selected_tools = construction_selected_tools,
+            .include_builtin_tools = includeBuiltinTools(options),
+            .include_installed_wasm_tools = includeInstalledWasmTools(options),
             .initial_prompt = initial_input.prompt,
             .initial_messages = initial_input.messages,
             .initial_images = initial_input.images,
@@ -150,8 +153,24 @@ fn dispatchNonInteractiveMode(
     stderr: *std.Io.Writer,
 ) !u8 {
     const cwd = dispatch_options.cwd;
+    const construction_selected_tools = constructionToolSelection(options, dispatch_options.selected_tools);
     var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
-    var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, dispatch_options.selected_tools);
+    var built_tools = try coding_agent.interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
+        .selected_tools = construction_selected_tools,
+        .include_builtin_tools = includeBuiltinTools(options),
+        .include_installed_wasm_tools = includeInstalledWasmTools(options),
+        .runtime_config = &prepared.runtime_config,
+        .resource_options = .{
+            .cwd = cwd,
+            .agent_dir = prepared.runtime_config.agent_dir,
+            .global = coding_agent.interactive_mode.settingsResources(prepared.runtime_config.global_settings),
+            .project = coding_agent.interactive_mode.settingsResources(prepared.runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        },
+    });
     defer built_tools.deinit();
 
     var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
@@ -174,7 +193,9 @@ fn dispatchNonInteractiveMode(
             .fork = options.fork,
             .no_session = options.no_session,
             .model_patterns = options.models,
-            .selected_tools = dispatch_options.selected_tools,
+            .selected_tools = construction_selected_tools,
+            .include_builtin_tools = includeBuiltinTools(options),
+            .include_installed_wasm_tools = includeInstalledWasmTools(options),
             .initial_prompt = null,
             .initial_messages = &.{},
             .initial_images = &.{},
@@ -249,6 +270,21 @@ fn dispatchNonInteractiveMode(
         stdout,
         stderr,
     );
+}
+
+fn includeBuiltinTools(options: *const cli.Args) bool {
+    if (options.no_tools) return options.tools != null;
+    return !options.no_builtin_tools;
+}
+
+fn includeInstalledWasmTools(options: *const cli.Args) bool {
+    if (options.no_tools) return options.tools != null;
+    return true;
+}
+
+fn constructionToolSelection(options: *const cli.Args, selected_tools: ?[]const []const u8) ?[]const []const u8 {
+    if (options.no_builtin_tools and !options.no_tools and options.tools == null) return null;
+    return selected_tools;
 }
 
 const OwnedTsRpcExtensionHostOptions = struct {

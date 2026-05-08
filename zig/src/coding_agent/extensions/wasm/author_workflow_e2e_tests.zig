@@ -2,9 +2,12 @@ const std = @import("std");
 const ai = @import("ai");
 const config_mod = @import("../../config/config.zig");
 const extension_runtime = @import("../extension_runtime.zig");
+const interactive_mode = @import("../../interactive_mode.zig");
 const package_manager = @import("../../packages/package_manager.zig");
+const print_mode = @import("../../modes/print_mode.zig");
 const resources_mod = @import("../../resources/resources.zig");
 const sdk = @import("pi_extension_sdk.zig");
+const session_mod = @import("../../sessions/session.zig");
 const tools_common = @import("../../tools/common.zig");
 const wasm_manifest = @import("wasm_manifest.zig");
 
@@ -173,6 +176,88 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     try expectNoAuthorTool(allocator, &removed_runtime_set, "fixture.echo");
 }
 
+test "VAL-RUNTIME normal agent construction includes installed wasm tools with filters" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer ai.model_registry.resetForTesting();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+
+    const package_root = try copyTemplateToTmp(allocator, &tmp, "project/runtime-tool-plugin");
+    defer allocator.free(package_root);
+    try runTemplateBuild(allocator, package_root);
+
+    var install_result = try runPackageCommand(allocator, &.{ "install", package_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer install_result.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const persisted_source = try installedPackageSource(allocator, settings_path);
+    defer allocator.free(persisted_source);
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const policy_key = try extension_runtime.wasmPolicyLookupKey(
+        allocator,
+        extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    );
+    defer allocator.free(policy_key);
+    try writeAuthorSettings(allocator, settings_path, persisted_source, policy_key, "template.echo");
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = normalConstructionFactory },
+    });
+
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "default construction", .{
+        .include_installed_wasm_tools = true,
+    }, .text, "default construction ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "selected builtins", .{
+        .selected_tools = &.{ "read", "grep" },
+        .include_installed_wasm_tools = true,
+    }, .text, "selected builtins ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "selected wasm", .{
+        .selected_tools = &.{"template.echo"},
+        .include_installed_wasm_tools = true,
+    }, .text, "selected wasm ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "no tools", .{
+        .selected_tools = &.{},
+        .include_builtin_tools = false,
+        .include_installed_wasm_tools = false,
+    }, .text, "no tools ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "no builtins", .{
+        .include_builtin_tools = false,
+        .include_installed_wasm_tools = true,
+    }, .text, "no builtins ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "no tools explicit wasm", .{
+        .selected_tools = &.{"template.echo"},
+        .include_installed_wasm_tools = true,
+    }, .text, "no tools explicit wasm ok\n");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "json construction", .{
+        .include_installed_wasm_tools = true,
+    }, .json, null);
+}
+
 const CommandCapture = struct {
     exit_code: u8,
     stdout: []u8,
@@ -184,6 +269,156 @@ const CommandCapture = struct {
         self.* = undefined;
     }
 };
+
+fn normalConstructionFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try std.testing.expect(context.messages.len >= 1);
+    const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
+    const tools = context.tools orelse &.{};
+    const response_text = responseTextForNormalConstructionPrompt(prompt) orelse return error.UnexpectedNormalConstructionPrompt;
+    if (std.mem.eql(u8, prompt, "default construction") or std.mem.eql(u8, prompt, "json construction")) {
+        try expectProviderToolPresent(tools, "read");
+        try expectProviderToolPresent(tools, "bash");
+        try expectProviderToolPresent(tools, "write");
+        try expectProviderToolPresent(tools, "edit");
+        try expectProviderToolPresent(tools, "grep");
+        try expectProviderToolPresent(tools, "find");
+        try expectProviderToolPresent(tools, "ls");
+        try expectProviderToolPresent(tools, "template.echo");
+    } else if (std.mem.eql(u8, prompt, "selected builtins")) {
+        try expectProviderToolNamesExactly(tools, &.{ "read", "grep" });
+    } else if (std.mem.eql(u8, prompt, "selected wasm")) {
+        try expectProviderToolNamesExactly(tools, &.{"template.echo"});
+    } else if (std.mem.eql(u8, prompt, "no tools")) {
+        try expectProviderToolNamesExactly(tools, &.{});
+    } else if (std.mem.eql(u8, prompt, "no builtins")) {
+        try expectProviderToolNamesExactly(tools, &.{"template.echo"});
+    } else if (std.mem.eql(u8, prompt, "no tools explicit wasm")) {
+        try expectProviderToolNamesExactly(tools, &.{"template.echo"});
+    } else {
+        return error.UnexpectedNormalConstructionPrompt;
+    }
+
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText(response_text);
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn responseTextForNormalConstructionPrompt(prompt: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, prompt, "default construction")) return "default construction ok";
+    if (std.mem.eql(u8, prompt, "selected builtins")) return "selected builtins ok";
+    if (std.mem.eql(u8, prompt, "selected wasm")) return "selected wasm ok";
+    if (std.mem.eql(u8, prompt, "no tools")) return "no tools ok";
+    if (std.mem.eql(u8, prompt, "no builtins")) return "no builtins ok";
+    if (std.mem.eql(u8, prompt, "no tools explicit wasm")) return "no tools explicit wasm ok";
+    if (std.mem.eql(u8, prompt, "json construction")) return "json construction ok";
+    return null;
+}
+
+fn runNormalConstructionCase(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    model: ai.Model,
+    prompt: []const u8,
+    tool_options: interactive_mode.ToolBuildOptions,
+    output_mode: print_mode.OutputMode,
+    expected_stdout: ?[]const u8,
+) !void {
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("PI_OFFLINE", "1");
+
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(
+        allocator,
+        std.testing.io,
+        &env_map,
+        project_dir,
+        .{ .discover_models = false },
+    );
+    defer runtime_config.deinit();
+
+    var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
+    var build_options = tool_options;
+    build_options.runtime_config = &runtime_config;
+    build_options.resource_options = .{
+        .cwd = project_dir,
+        .agent_dir = runtime_config.agent_dir,
+        .global = interactive_mode.settingsResources(runtime_config.global_settings),
+        .project = interactive_mode.settingsResources(runtime_config.project_settings),
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    };
+
+    var built_tools = try interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, build_options);
+    defer built_tools.deinit();
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_dir,
+        .system_prompt = "sys",
+        .model = model,
+        .tools = built_tools.items,
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try print_mode.runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        prompt,
+        .{
+            .mode = output_mode,
+            .install_signal_handlers = false,
+        },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    if (expected_stdout) |value| {
+        try std.testing.expectEqualStrings(value, stdout_capture.writer.buffered());
+    } else {
+        try expectContains(stdout_capture.writer.buffered(), "\"type\":\"agent_start\"");
+        try expectContains(stdout_capture.writer.buffered(), "\"type\":\"agent_end\"");
+    }
+}
+
+fn expectProviderToolPresent(tools: []const ai.types.Tool, name: []const u8) !void {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return;
+    }
+    return error.ExpectedProviderToolMissing;
+}
+
+fn expectProviderToolNamesExactly(tools: []const ai.types.Tool, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, tools.len);
+    for (expected) |name| try expectProviderToolPresent(tools, name);
+    for (tools) |tool| {
+        var found = false;
+        for (expected) |name| {
+            if (std.mem.eql(u8, tool.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
 
 fn runPackageCommand(
     allocator: std.mem.Allocator,

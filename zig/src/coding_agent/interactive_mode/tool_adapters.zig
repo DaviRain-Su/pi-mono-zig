@@ -2,7 +2,10 @@ const std = @import("std");
 const agent = @import("agent");
 const tools = @import("../tools/root.zig");
 const common = @import("../tools/common.zig");
+const config_mod = @import("../config/config.zig");
+const extension_runtime = @import("../extensions/extension_runtime.zig");
 const provider_config = @import("../providers/provider_config.zig");
+const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const shared = @import("shared.zig");
@@ -12,12 +15,22 @@ const AppContext = shared.AppContext;
 pub const BuiltTools = struct {
     allocator: std.mem.Allocator,
     items: []agent.AgentTool,
+    locked_wasm_runtimes: ?extension_runtime.LockedWasmRuntimeSet = null,
 
     pub fn deinit(self: *BuiltTools) void {
         for (self.items) |item| common.deinitJsonValue(self.allocator, item.parameters);
         self.allocator.free(self.items);
+        if (self.locked_wasm_runtimes) |*runtime_set| runtime_set.deinit();
         self.* = undefined;
     }
+};
+
+pub const ToolBuildOptions = struct {
+    selected_tools: ?[]const []const u8 = null,
+    include_builtin_tools: bool = true,
+    include_installed_wasm_tools: bool = true,
+    runtime_config: ?*const config_mod.RuntimeConfig = null,
+    resource_options: ?resources_mod.ResolveResourcesOptions = null,
 };
 
 pub fn buildAgentTools(
@@ -25,24 +38,83 @@ pub fn buildAgentTools(
     app_context: *AppContext,
     selected_tools: ?[]const []const u8,
 ) !BuiltTools {
+    return buildAgentToolsWithOptions(allocator, app_context, .{
+        .selected_tools = selected_tools,
+    });
+}
+
+pub fn buildAgentToolsWithOptions(
+    allocator: std.mem.Allocator,
+    app_context: *AppContext,
+    options: ToolBuildOptions,
+) !BuiltTools {
     var items = std.ArrayList(agent.AgentTool).empty;
     errdefer {
         for (items.items) |item| common.deinitJsonValue(allocator, item.parameters);
         items.deinit(allocator);
     }
 
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.BashTool.name, tools.BashTool.description, try tools.BashTool.schema(allocator), runBashTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.WriteTool.name, tools.WriteTool.description, try tools.WriteTool.schema(allocator), runWriteTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.EditTool.name, tools.EditTool.description, try tools.EditTool.schema(allocator), runEditTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
-    try appendToolIfEnabled(allocator, &items, app_context, selected_tools, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
+    if (options.include_builtin_tools) {
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.BashTool.name, tools.BashTool.description, try tools.BashTool.schema(allocator), runBashTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.WriteTool.name, tools.WriteTool.description, try tools.WriteTool.schema(allocator), runWriteTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.EditTool.name, tools.EditTool.description, try tools.EditTool.schema(allocator), runEditTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
+        try appendToolIfEnabled(allocator, &items, app_context, options.selected_tools, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
+    }
+
+    var locked_wasm_runtimes: ?extension_runtime.LockedWasmRuntimeSet = null;
+    errdefer if (locked_wasm_runtimes) |*runtime_set| runtime_set.deinit();
+    if (options.include_installed_wasm_tools) {
+        if (options.runtime_config) |runtime_config| {
+            if (options.resource_options) |resource_options| {
+                locked_wasm_runtimes = try extension_runtime.startLockedWasmPackageRuntimes(
+                    allocator,
+                    app_context.tool_runtime.io,
+                    runtime_config,
+                    resource_options,
+                );
+                try appendLockedWasmTools(allocator, &items, &locked_wasm_runtimes.?, options.selected_tools);
+            }
+        }
+    }
 
     return .{
         .allocator = allocator,
         .items = try items.toOwnedSlice(allocator),
+        .locked_wasm_runtimes = locked_wasm_runtimes,
     };
+}
+
+fn appendLockedWasmTools(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(agent.AgentTool),
+    runtime_set: *extension_runtime.LockedWasmRuntimeSet,
+    selected_tools: ?[]const []const u8,
+) !void {
+    for (runtime_set.entries) |entry| {
+        if (!toolNameIsEnabled(selected_tools, entry.tool_id)) continue;
+        if (hasToolName(items.items, entry.tool_id)) continue;
+        var tool = (try runtime_set.agentTool(allocator, entry.tool_id)) orelse continue;
+        errdefer extension_runtime.deinitAgentTool(allocator, &tool);
+        try items.append(allocator, tool);
+    }
+}
+
+fn toolNameIsEnabled(selected_tools: ?[]const []const u8, name: []const u8) bool {
+    const allowlist = selected_tools orelse return true;
+    for (allowlist) |allowed| {
+        if (std.mem.eql(u8, allowed, name)) return true;
+    }
+    return false;
+}
+
+fn hasToolName(items: []const agent.AgentTool, name: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return true;
+    }
+    return false;
 }
 
 fn appendToolIfEnabled(
@@ -55,18 +127,9 @@ fn appendToolIfEnabled(
     schema: std.json.Value,
     execute: agent.types.ExecuteToolFn,
 ) !void {
-    if (selected_tools) |allowlist| {
-        var enabled = false;
-        for (allowlist) |allowed| {
-            if (std.mem.eql(u8, allowed, name)) {
-                enabled = true;
-                break;
-            }
-        }
-        if (!enabled) {
-            common.deinitJsonValue(allocator, schema);
-            return;
-        }
+    if (!toolNameIsEnabled(selected_tools, name)) {
+        common.deinitJsonValue(allocator, schema);
+        return;
     }
 
     try items.append(allocator, .{
