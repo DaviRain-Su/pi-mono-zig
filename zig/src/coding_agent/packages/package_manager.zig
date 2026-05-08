@@ -736,7 +736,9 @@ fn executeRemove(
         try stderr.print("Error: failed to remove extension provenance for {s}: {s}\n", .{ source, @errorName(err) });
         return .{ .exit_code = 1 };
     };
-    try stdout.print("Removed {s}\n", .{source});
+    const redacted_source = try redactDiagnosticValue(allocator, source);
+    defer allocator.free(redacted_source);
+    try stdout.print("Removed {s}\n  scope: {s}\n", .{ redacted_source, scope.jsonName() });
     return .{ .exit_code = 0 };
 }
 
@@ -2671,7 +2673,7 @@ test "VAL-M12-PKG-004 remove detaches package without deleting other settings" {
 
     const result = try runCommand(allocator, &.{ "remove", "./fixtures/pkg" }, options, &stdout_buf, &stderr_buf);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expectEqualStrings("Removed ./fixtures/pkg\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("Removed ./fixtures/pkg\n  scope: user\n", stdout_buf.items);
 
     const updated = try readSettings(allocator, settings_path);
     defer allocator.free(updated);
@@ -3204,6 +3206,116 @@ test "VAL-INSTALL-009 remove deletes matching wasm provenance lock entry" {
     }
 }
 
+test "VAL-PKG-011-012-013-020 wasm remove is scoped, preserves collateral, and diagnostics are read-only" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-shared", "file.read", true);
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-other", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-shared" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-shared", "-l" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-other" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const user_lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(user_lockfile_path);
+    const project_lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, true);
+    defer allocator.free(project_lockfile_path);
+
+    const remove_user = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-shared" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), remove_user.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Removed ./fixtures/wasm-shared") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "scope: user") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const user_settings_after_remove = try readSettings(allocator, user_settings_path);
+    defer allocator.free(user_settings_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, user_settings_after_remove, "wasm-shared") == null);
+    try std.testing.expect(std.mem.indexOf(u8, user_settings_after_remove, "wasm-other") != null);
+
+    const project_settings_after_remove = try readSettings(allocator, project_settings_path);
+    defer allocator.free(project_settings_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, project_settings_after_remove, "wasm-shared") != null);
+
+    const user_lock_after_remove = try readSettings(allocator, user_lockfile_path);
+    defer allocator.free(user_lock_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, user_lock_after_remove, "wasm-shared") == null);
+    try std.testing.expect(std.mem.indexOf(u8, user_lock_after_remove, "wasm-other") != null);
+    const project_lock_after_remove = try readSettings(allocator, project_lockfile_path);
+    defer allocator.free(project_lock_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, project_lock_after_remove, "wasm-shared") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_result = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_result.exit_code);
+    const user_header = std.mem.indexOf(u8, stdout_buf.items, "User packages:") orelse return error.ExpectedUserPackagesHeader;
+    const project_header = std.mem.indexOf(u8, stdout_buf.items, "Project packages:") orelse return error.ExpectedProjectPackagesHeader;
+    try std.testing.expect(user_header < project_header);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items[user_header..project_header], "wasm-other") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items[project_header..], "wasm-shared") != null);
+
+    const user_settings_before_diagnostic = try readSettings(allocator, user_settings_path);
+    defer allocator.free(user_settings_before_diagnostic);
+    const user_lock_before_diagnostic = try readSettings(allocator, user_lockfile_path);
+    defer allocator.free(user_lock_before_diagnostic);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const first_missing = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-shared" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), first_missing.exit_code);
+    const first_missing_stderr = try allocator.dupe(u8, stderr_buf.items);
+    defer allocator.free(first_missing_stderr);
+    try std.testing.expect(std.mem.indexOf(u8, first_missing_stderr, "No matching package found") != null);
+    const user_settings_after_diagnostic = try readSettings(allocator, user_settings_path);
+    defer allocator.free(user_settings_after_diagnostic);
+    const user_lock_after_diagnostic = try readSettings(allocator, user_lockfile_path);
+    defer allocator.free(user_lock_after_diagnostic);
+    try std.testing.expectEqualStrings(user_settings_before_diagnostic, user_settings_after_diagnostic);
+    try std.testing.expectEqualStrings(user_lock_before_diagnostic, user_lock_after_diagnostic);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const second_missing = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-shared" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), second_missing.exit_code);
+    try std.testing.expectEqualStrings(first_missing_stderr, stderr_buf.items);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const remove_project = try runCommand(allocator, &.{ "remove", "./fixtures/wasm-shared", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), remove_project.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "scope: project") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const user_settings_after_project_remove = try readSettings(allocator, user_settings_path);
+    defer allocator.free(user_settings_after_project_remove);
+    try std.testing.expect(std.mem.indexOf(u8, user_settings_after_project_remove, "wasm-other") != null);
+    const project_lock_after_project_remove = try readSettings(allocator, project_lockfile_path);
+    defer allocator.free(project_lock_after_project_remove);
+    try std.testing.expect(std.mem.indexOf(u8, project_lock_after_project_remove, "wasm-shared") == null);
+}
+
 test "wasm project install ignores unrelated malformed global policy" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3511,7 +3623,7 @@ test "VAL-M12-PKG-005 uninstall alias matches remove" {
         &stderr_buf,
     );
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expectEqualStrings("Removed ./fixtures/pkg\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("Removed ./fixtures/pkg\n  scope: user\n", stdout_buf.items);
 }
 
 test "VAL-M12-PKG-006 update no-op leaves settings unchanged" {
