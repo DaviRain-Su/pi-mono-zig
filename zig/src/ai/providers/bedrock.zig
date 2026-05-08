@@ -2230,10 +2230,12 @@ fn finalizeOutputFromPartials(
         }
     }
 
-    output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{ .content_transfer = .when_output_empty });
     // Tool calls live inline in output.content; legacy AssistantMessage.tool_calls
     // is intentionally left null. tool_calls ArrayList holds borrow-only copies.
-    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 }
 
 fn collectOutputFromPartials(
@@ -2277,9 +2279,11 @@ fn collectOutputFromPartials(
         }
     }
 
-    output.content = if (output.content.len == 0 and content_blocks.items.len > 0) try content_blocks.toOwnedSlice(allocator) else output.content;
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{ .content_transfer = .when_output_empty });
     // Tool calls are emitted inline; legacy field intentionally null.
-    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 }
 
 fn parseCompleteToolArguments(allocator: std.mem.Allocator, input: []const u8) !?std.json.Parsed(std.json.Value) {
@@ -2387,10 +2391,14 @@ fn finalizeOutput(
         try emitStreamFailureMessage(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, output.stop_reason, "An unknown error occurred");
         return;
     }
-    output.content = try content_blocks.toOwnedSlice(allocator);
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{
+        .content_transfer = .always,
+        .coerce_stop_reason_for_tool_calls = true,
+    });
     // Tool calls are emitted inline; legacy field intentionally null.
-    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
-    output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 
     stream_ptr.push(.{ .event_type = .done, .message = output.* });
     stream_ptr.end(output.*);

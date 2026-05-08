@@ -21,7 +21,9 @@ pub const shared = struct {
     pub const provider_error = @import("shared/provider_error.zig");
     pub const provider_json = @import("shared/provider_json.zig");
     pub const provider_stream = @import("shared/provider_stream.zig");
+    pub const responses_api = @import("shared/responses_api.zig");
     pub const simple_options = @import("shared/simple_options.zig");
+    pub const sse_loop = @import("shared/sse_loop.zig");
     pub const transform_messages = @import("shared/transform_messages.zig");
 };
 
@@ -118,7 +120,9 @@ test {
     _ = @import("shared/provider_error.zig");
     _ = @import("shared/provider_json.zig");
     _ = @import("shared/provider_stream.zig");
+    _ = @import("shared/responses_api.zig");
     _ = @import("shared/simple_options.zig");
+    _ = @import("shared/sse_loop.zig");
     _ = @import("shared/transform_messages.zig");
     _ = @import("providers/faux.zig");
 }

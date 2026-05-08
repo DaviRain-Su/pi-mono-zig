@@ -10,33 +10,18 @@ const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
+const responses_api = @import("../shared/responses_api.zig");
 const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
 
-const MessagePartKind = enum {
-    output_text,
-    refusal,
-};
-
-const CurrentBlock = union(enum) {
-    text: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-        part_kind: MessagePartKind,
-    },
-    thinking: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-        signature: ?[]const u8,
-    },
-    tool_call: struct {
-        event_index: usize,
-        id: ?[]const u8,
-        name: ?[]const u8,
-        partial_json: std.ArrayList(u8),
-    },
-};
+const CurrentBlock = responses_api.CurrentBlock;
+const deinitCurrentBlock = responses_api.deinitCurrentBlock;
+const extractMessageText = responses_api.extractMessageText;
+const extractReasoningSummary = responses_api.extractReasoningSummary;
+const finalizeCurrentBlock = responses_api.finalizeCurrentBlock;
+const updateCurrentMessagePart = responses_api.updateCurrentMessagePart;
 
 const ToolCallRef = struct {
     output_index: ?usize = null,
@@ -394,239 +379,28 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, error.RequestAborted);
-            return;
-        }
-
-        const data = provider_stream.parseCanonicalSseDataLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        const event_type_value = value.object.get("type") orelse continue;
-        if (event_type_value != .string) continue;
-        const event_type = event_type_value.string;
-
-        if (std.mem.eql(u8, event_type, "response.created")) {
-            if (value.object.get("response")) |response_value| {
-                updateResponseIdFromResponseObject(allocator, &output, response_value) catch {};
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const item_value = value.object.get("item") orelse continue;
-            try handleOutputItemAdded(allocator, value, item_value, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, stream_ptr);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.added")) {
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        try thinking.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .thinking_delta,
-                            .content_index = @intCast(thinking.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        if (thinking.text.items.len > 0) {
-                            try thinking.text.appendSlice(allocator, "\n\n");
-                            stream_ptr.push(.{
-                                .event_type = .thinking_delta,
-                                .content_index = @intCast(thinking.event_index),
-                                .delta = try allocator.dupe(u8, "\n\n"),
-                                .owns_delta = true,
-                            });
-                        }
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        try thinking.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .thinking_delta,
-                            .content_index = @intCast(thinking.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.content_part.added")) {
-            const part_value = value.object.get("part") orelse continue;
-            updateCurrentMessagePart(part_value, &current_block);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_text.delta") or std.mem.eql(u8, event_type, "response.refusal.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .text => |*text| {
-                        try text.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .text_delta,
-                            .content_index = @intCast(text.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            const ref = extractToolCallRef(value, null);
-            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, null);
-            try tool_call.partial_json.appendSlice(allocator, delta_value.string);
-            stream_ptr.push(.{
-                .event_type = .toolcall_delta,
-                .content_index = @intCast(tool_call.event_index),
-                .delta = try allocator.dupe(u8, delta_value.string),
-                .owns_delta = true,
-            });
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const arguments_value = value.object.get("arguments") orelse continue;
-            if (arguments_value != .string) continue;
-            const ref = extractToolCallRef(value, null);
-            const tool_call = try ensureActiveToolCall(allocator, &active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, null);
-            const previous = tool_call.partial_json.items;
-            if (std.mem.startsWith(u8, arguments_value.string, previous)) {
-                const delta = arguments_value.string[previous.len..];
-                tool_call.partial_json.clearRetainingCapacity();
-                try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
-                if (delta.len > 0) {
-                    stream_ptr.push(.{
-                        .event_type = .toolcall_delta,
-                        .content_index = @intCast(tool_call.event_index),
-                        .delta = try allocator.dupe(u8, delta),
-                        .owns_delta = true,
-                    });
-                }
-            } else {
-                tool_call.partial_json.clearRetainingCapacity();
-                try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const item_value = value.object.get("item") orelse continue;
-            if (isFunctionCallItem(item_value)) {
-                try finalizeActiveToolCallForItem(allocator, value, item_value, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
-            } else {
-                try finalizeCurrentBlock(allocator, item_value, &current_block, &content_blocks, &tool_calls, stream_ptr);
-                try flushPendingFinalizedToolCalls(allocator, &pending_tool_calls, &content_blocks, &tool_calls);
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
-            if (value.object.get("response")) |response_value| {
-                try updateCompletedResponse(allocator, &output, response_value, model);
-            }
-            break;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.failed")) {
-            const error_message = try extractFailureMessage(allocator, value.object.get("response"));
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
-            output.stop_reason = .error_reason;
-            output.error_message = error_message;
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
-            return;
-        }
-
-        if (std.mem.eql(u8, event_type, "error")) {
-            const error_message = try extractTopLevelErrorMessage(allocator, value);
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
-            output.stop_reason = .error_reason;
-            output.error_message = error_message;
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
-            return;
-        }
+    var handler = OpenAIResponsesSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .active_tool_calls = &active_tool_calls,
+        .pending_tool_calls = &pending_tool_calls,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(OpenAIResponsesSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped and !handler.normal_completion) {
+        return;
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
     try flushPendingFinalizedToolCalls(allocator, &pending_tool_calls, &content_blocks, &tool_calls);
     try finalizeActiveToolCalls(allocator, &active_tool_calls, &pending_tool_calls, &content_blocks, &tool_calls, stream_ptr);
-    const had_tool_calls = tool_calls.items.len > 0;
-    output.content = try content_blocks.toOwnedSlice(allocator);
+    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
     // Tool calls live inline in output.content; legacy field intentionally null.
 
-    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, had_tool_calls);
-    if (output.usage.total_tokens == 0) {
-        output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
-    }
     calculateCost(model, &output.usage);
 
     stream_ptr.push(.{
@@ -634,6 +408,315 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const OpenAIResponsesSseDataResult = enum {
+    continue_loop,
+    complete_loop,
+    stop_loop,
+};
+
+const OpenAIResponsesSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    model: types.Model,
+    normal_completion: bool = false,
+
+    pub fn extractDataLine(_: *OpenAIResponsesSseLoopHandler, line: []const u8) ?[]const u8 {
+        return provider_stream.parseCanonicalSseDataLine(line);
+    }
+
+    pub fn isDoneData(_: *OpenAIResponsesSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *OpenAIResponsesSseLoopHandler, data: []const u8) !bool {
+        var state = OpenAIResponsesSseState{
+            .allocator = self.allocator,
+            .stream_ptr = self.stream_ptr,
+            .output = self.output,
+            .current_block = self.current_block,
+            .active_tool_calls = self.active_tool_calls,
+            .pending_tool_calls = self.pending_tool_calls,
+            .content_blocks = self.content_blocks,
+            .tool_calls = self.tool_calls,
+            .model = self.model,
+        };
+        const result = try processOpenAIResponsesSseData(&state, data);
+        switch (result) {
+            .continue_loop => return true,
+            .complete_loop => {
+                self.normal_completion = true;
+                return false;
+            },
+            .stop_loop => return false,
+        }
+    }
+
+    pub fn handleRuntimeFailure(self: *OpenAIResponsesSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.active_tool_calls,
+            self.pending_tool_calls,
+            self.content_blocks,
+            self.tool_calls,
+            err,
+        );
+    }
+};
+
+const OpenAIResponsesSseState = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    active_tool_calls: *std.ArrayList(ActiveToolCallBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    model: types.Model,
+};
+
+fn processOpenAIResponsesSseData(state: *OpenAIResponsesSseState, data: []const u8) !OpenAIResponsesSseDataResult {
+    const allocator = state.allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, state.stream_ptr, state.output, state.current_block, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.tool_calls, err);
+            return .stop_loop;
+        },
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return .continue_loop;
+
+    const event_type_value = value.object.get("type") orelse return .continue_loop;
+    if (event_type_value != .string) return .continue_loop;
+    const event_type = event_type_value.string;
+
+    if (std.mem.eql(u8, event_type, "response.created")) {
+        if (value.object.get("response")) |response_value| {
+            updateResponseIdFromResponseObject(allocator, state.output, response_value) catch {};
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+        const item_value = value.object.get("item") orelse return .continue_loop;
+        try handleOutputItemAdded(allocator, value, item_value, state.current_block, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.stream_ptr);
+        return .continue_loop;
+    }
+
+    if (try handleOpenAIResponsesReasoningEvent(state, event_type, value)) |result| return result;
+    if (try handleOpenAIResponsesTextEvent(state, event_type, value)) |result| return result;
+    if (try handleOpenAIResponsesToolEvent(state, event_type, value)) |result| return result;
+
+    if (std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
+        if (value.object.get("response")) |response_value| {
+            try updateCompletedResponse(allocator, state.output, response_value, state.model);
+        }
+        return .complete_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.failed")) {
+        const error_message = try extractFailureMessage(allocator, value.object.get("response"));
+        try emitOpenAIResponsesTerminalError(state, error_message);
+        return .stop_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "error")) {
+        const error_message = try extractTopLevelErrorMessage(allocator, value);
+        try emitOpenAIResponsesTerminalError(state, error_message);
+        return .stop_loop;
+    }
+
+    return .continue_loop;
+}
+
+fn handleOpenAIResponsesReasoningEvent(
+    state: *OpenAIResponsesSseState,
+    event_type: []const u8,
+    value: std.json.Value,
+) !?OpenAIResponsesSseDataResult {
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.added")) {
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        try appendOpenAIResponsesThinkingDelta(state, delta_value.string);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .thinking => |*thinking| {
+                    if (thinking.text.items.len > 0) {
+                        try thinking.text.appendSlice(state.allocator, "\n\n");
+                        state.stream_ptr.push(.{
+                            .event_type = .thinking_delta,
+                            .content_index = @intCast(thinking.event_index),
+                            .delta = try state.allocator.dupe(u8, "\n\n"),
+                            .owns_delta = true,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        try appendOpenAIResponsesThinkingDelta(state, delta_value.string);
+        return .continue_loop;
+    }
+
+    return null;
+}
+
+fn appendOpenAIResponsesThinkingDelta(state: *OpenAIResponsesSseState, delta: []const u8) !void {
+    if (state.current_block.*) |*block| {
+        switch (block.*) {
+            .thinking => |*thinking| {
+                try thinking.text.appendSlice(state.allocator, delta);
+                state.stream_ptr.push(.{
+                    .event_type = .thinking_delta,
+                    .content_index = @intCast(thinking.event_index),
+                    .delta = try state.allocator.dupe(u8, delta),
+                    .owns_delta = true,
+                });
+            },
+            else => {},
+        }
+    }
+}
+
+fn handleOpenAIResponsesTextEvent(
+    state: *OpenAIResponsesSseState,
+    event_type: []const u8,
+    value: std.json.Value,
+) !?OpenAIResponsesSseDataResult {
+    if (std.mem.eql(u8, event_type, "response.content_part.added")) {
+        const part_value = value.object.get("part") orelse return .continue_loop;
+        updateCurrentMessagePart(part_value, state.current_block);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_text.delta") or std.mem.eql(u8, event_type, "response.refusal.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .text => |*text| {
+                    try text.text.appendSlice(state.allocator, delta_value.string);
+                    state.stream_ptr.push(.{
+                        .event_type = .text_delta,
+                        .content_index = @intCast(text.event_index),
+                        .delta = try state.allocator.dupe(u8, delta_value.string),
+                        .owns_delta = true,
+                    });
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    return null;
+}
+
+fn handleOpenAIResponsesToolEvent(
+    state: *OpenAIResponsesSseState,
+    event_type: []const u8,
+    value: std.json.Value,
+) !?OpenAIResponsesSseDataResult {
+    const allocator = state.allocator;
+    if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        const ref = extractToolCallRef(value, null);
+        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, state.content_blocks.items.len + state.pending_tool_calls.items.len, ref, null);
+        try tool_call.partial_json.appendSlice(allocator, delta_value.string);
+        state.stream_ptr.push(.{
+            .event_type = .toolcall_delta,
+            .content_index = @intCast(tool_call.event_index),
+            .delta = try allocator.dupe(u8, delta_value.string),
+            .owns_delta = true,
+        });
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
+        const arguments_value = value.object.get("arguments") orelse return .continue_loop;
+        if (arguments_value != .string) return .continue_loop;
+        const ref = extractToolCallRef(value, null);
+        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, state.content_blocks.items.len + state.pending_tool_calls.items.len, ref, null);
+        try replaceDoneToolArguments(state, tool_call, arguments_value.string);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+        const item_value = value.object.get("item") orelse return .continue_loop;
+        if (isFunctionCallItem(item_value)) {
+            try finalizeActiveToolCallForItem(allocator, value, item_value, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.tool_calls, state.stream_ptr);
+        } else {
+            try finalizeCurrentBlock(allocator, item_value, state.current_block, state.content_blocks, state.tool_calls, state.stream_ptr);
+            try flushPendingFinalizedToolCalls(allocator, state.pending_tool_calls, state.content_blocks, state.tool_calls);
+        }
+        return .continue_loop;
+    }
+
+    return null;
+}
+
+fn replaceDoneToolArguments(
+    state: *OpenAIResponsesSseState,
+    tool_call: *ActiveToolCallBlock,
+    arguments: []const u8,
+) !void {
+    const previous = tool_call.partial_json.items;
+    if (std.mem.startsWith(u8, arguments, previous)) {
+        const delta = arguments[previous.len..];
+        tool_call.partial_json.clearRetainingCapacity();
+        try tool_call.partial_json.appendSlice(state.allocator, arguments);
+        if (delta.len > 0) {
+            state.stream_ptr.push(.{
+                .event_type = .toolcall_delta,
+                .content_index = @intCast(tool_call.event_index),
+                .delta = try state.allocator.dupe(u8, delta),
+                .owns_delta = true,
+            });
+        }
+    } else {
+        tool_call.partial_json.clearRetainingCapacity();
+        try tool_call.partial_json.appendSlice(state.allocator, arguments);
+    }
+}
+
+fn emitOpenAIResponsesTerminalError(state: *OpenAIResponsesSseState, error_message: []const u8) !void {
+    try finalizeOutputFromPartials(state.allocator, state.output, state.current_block, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.tool_calls, state.stream_ptr);
+    state.output.stop_reason = .error_reason;
+    state.output.error_message = error_message;
+    state.stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = state.output.*,
+    });
+    state.stream_ptr.end(state.output.*);
 }
 
 fn finalizeOutputFromPartials(
@@ -649,11 +732,28 @@ fn finalizeOutputFromPartials(
     try finalizeCurrentBlock(allocator, null, current_block, content_blocks, tool_calls, stream_ptr);
     try flushPendingFinalizedToolCalls(allocator, pending_tool_calls, content_blocks, tool_calls);
     try finalizeActiveToolCalls(allocator, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
-    if (output.content.len == 0 and content_blocks.items.len > 0) {
-        output.content = try content_blocks.toOwnedSlice(allocator);
-    }
+    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, .when_output_empty, .preserve, false);
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
+}
+
+fn finalizeCollectedOutput(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    content_transfer: finalize.ContentTransferMode,
+    total_tokens: finalize.TotalTokenMode,
+    coerce_stop_reason_for_tool_calls: bool,
+) !void {
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{
+        .content_transfer = content_transfer,
+        .total_tokens = total_tokens,
+        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
+    });
 }
 
 fn emitRuntimeFailure(
@@ -716,25 +816,6 @@ fn handleOutputItemAdded(
             if (arguments_value == .string and arguments_value.string.len > 0) {
                 try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
             }
-        }
-    }
-}
-
-fn updateCurrentMessagePart(item_value: std.json.Value, current_block: *?CurrentBlock) void {
-    if (item_value != .object) return;
-    const part_type_value = item_value.object.get("type") orelse return;
-    if (part_type_value != .string) return;
-
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                if (std.mem.eql(u8, part_type_value.string, "refusal")) {
-                    text.part_kind = .refusal;
-                } else {
-                    text.part_kind = .output_text;
-                }
-            },
-            else => {},
         }
     }
 }
@@ -987,104 +1068,6 @@ fn flushPendingFinalizedToolCalls(
         errdefer freeToolCallOwned(allocator, pending.tool_call);
         try appendFinalizedToolCallCopies(allocator, pending.tool_call, content_blocks, tool_calls);
         freeToolCallOwned(allocator, pending.tool_call);
-    }
-}
-
-fn finalizeCurrentBlock(
-    allocator: std.mem.Allocator,
-    maybe_item_value: ?std.json.Value,
-    current_block: *?CurrentBlock,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-) !void {
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                const owned = if (try extractMessageText(allocator, maybe_item_value)) |final_text|
-                    final_text
-                else
-                    try allocator.dupe(u8, text.text.items);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
-                stream_ptr.push(.{
-                    .event_type = .text_end,
-                    .content_index = @intCast(text.event_index),
-                    .content = owned,
-                });
-            },
-            .thinking => |*thinking| {
-                const owned = if (try extractReasoningSummary(allocator, maybe_item_value)) |final_text|
-                    final_text
-                else
-                    try allocator.dupe(u8, thinking.text.items);
-                const signature = if (maybe_item_value) |item_value| blk: {
-                    if (item_value == .object) {
-                        if (item_value.object.get("encrypted_content")) |encrypted| {
-                            if (encrypted == .string) break :blk try allocator.dupe(u8, encrypted.string);
-                        }
-                    }
-                    break :blk null;
-                } else if (thinking.signature) |existing|
-                    try allocator.dupe(u8, existing)
-                else
-                    null;
-                try content_blocks.append(allocator, .{ .thinking = .{
-                    .thinking = owned,
-                    .signature = signature,
-                    .redacted = false,
-                } });
-                stream_ptr.push(.{
-                    .event_type = .thinking_end,
-                    .content_index = @intCast(thinking.event_index),
-                    .content = owned,
-                });
-            },
-            .tool_call => |*tool_call| {
-                const item_id_owned = if (tool_call.id == null and maybe_item_value != null)
-                    try extractCombinedToolCallId(allocator, maybe_item_value.?)
-                else
-                    null;
-                defer if (item_id_owned) |value| allocator.free(value);
-                const final_id = item_id_owned orelse tool_call.id orelse "";
-
-                const item_name_owned = if (tool_call.name == null and maybe_item_value != null)
-                    try extractOwnedStringField(allocator, maybe_item_value.?, "name")
-                else
-                    null;
-                defer if (item_name_owned) |value| allocator.free(value);
-                const final_name = item_name_owned orelse tool_call.name orelse "";
-
-                const arguments_source = if (maybe_item_value) |item_value|
-                    extractStringField(item_value, "arguments") orelse tool_call.partial_json.items
-                else
-                    tool_call.partial_json.items;
-                const arguments = try parseStreamingJsonToValue(allocator, arguments_source);
-                const stored_tool_call = blk: {
-                    const id = try allocator.dupe(u8, final_id);
-                    errdefer allocator.free(id);
-                    const name = try allocator.dupe(u8, final_name);
-                    errdefer allocator.free(name);
-                    break :blk types.ToolCall{
-                        .id = id,
-                        .name = name,
-                        .arguments = arguments,
-                    };
-                };
-                try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, stored_tool_call);
-                stream_ptr.push(.{
-                    .event_type = .toolcall_end,
-                    .content_index = @intCast(tool_call.event_index),
-                    .tool_call = .{
-                        .id = try allocator.dupe(u8, stored_tool_call.id),
-                        .name = try allocator.dupe(u8, stored_tool_call.name),
-                        .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
-                    },
-                });
-            },
-        }
-
-        deinitCurrentBlock(allocator, block);
-        current_block.* = null;
     }
 }
 
@@ -1788,81 +1771,6 @@ fn extractStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
     return field_value.string;
 }
 
-fn extractMessageText(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
-    const item_value = maybe_item_value orelse return null;
-    if (item_value != .object) return null;
-    const content_value = item_value.object.get("content") orelse return null;
-    if (content_value != .array) return null;
-
-    var total_len: usize = 0;
-    for (content_value.array.items) |part| {
-        if (part != .object) continue;
-        const part_type = extractStringField(part, "type") orelse continue;
-        if (std.mem.eql(u8, part_type, "output_text")) {
-            if (extractStringField(part, "text")) |text| total_len += text.len;
-        } else if (std.mem.eql(u8, part_type, "refusal")) {
-            if (extractStringField(part, "refusal")) |text| total_len += text.len;
-        }
-    }
-    if (total_len == 0) return null;
-
-    var buffer = std.ArrayList(u8).empty;
-    errdefer buffer.deinit(allocator);
-    for (content_value.array.items) |part| {
-        if (part != .object) continue;
-        const part_type = extractStringField(part, "type") orelse continue;
-        if (std.mem.eql(u8, part_type, "output_text")) {
-            if (extractStringField(part, "text")) |text| try buffer.appendSlice(allocator, text);
-        } else if (std.mem.eql(u8, part_type, "refusal")) {
-            if (extractStringField(part, "refusal")) |text| try buffer.appendSlice(allocator, text);
-        }
-    }
-    return try buffer.toOwnedSlice(allocator);
-}
-
-fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
-    const item_value = maybe_item_value orelse return null;
-    if (item_value != .object) return null;
-
-    if (item_value.object.get("summary")) |summary_value| {
-        if (summary_value == .array and summary_value.array.items.len > 0) {
-            if (try extractJoinedTextFields(allocator, summary_value)) |summary_text| {
-                return summary_text;
-            }
-        }
-    }
-
-    if (item_value.object.get("content")) |content_value| {
-        if (content_value == .array and content_value.array.items.len > 0) {
-            if (try extractJoinedTextFields(allocator, content_value)) |content_text| {
-                return content_text;
-            }
-        }
-    }
-
-    return null;
-}
-
-fn extractJoinedTextFields(allocator: std.mem.Allocator, array_value: std.json.Value) !?[]const u8 {
-    if (array_value != .array) return null;
-
-    var buffer = std.ArrayList(u8).empty;
-    errdefer buffer.deinit(allocator);
-    var appended: usize = 0;
-    for (array_value.array.items) |part| {
-        if (part != .object) continue;
-        const text = extractStringField(part, "text") orelse continue;
-        if (appended > 0) try buffer.appendSlice(allocator, "\n\n");
-        try buffer.appendSlice(allocator, text);
-        appended += 1;
-    }
-    if (buffer.items.len == 0) {
-        buffer.deinit(allocator);
-        return null;
-    }
-    return try buffer.toOwnedSlice(allocator);
-}
-
 fn updateResponseIdFromResponseObject(allocator: std.mem.Allocator, output: *types.AssistantMessage, response_value: std.json.Value) !void {
     if (response_value != .object) return;
     const response_id = extractStringField(response_value, "id") orelse return;
@@ -1981,21 +1889,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
     usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
-}
-
-fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
-    switch (block.*) {
-        .text => |*text| text.text.deinit(allocator),
-        .thinking => |*thinking| {
-            thinking.text.deinit(allocator);
-            if (thinking.signature) |signature| allocator.free(signature);
-        },
-        .tool_call => |*tool_call| {
-            if (tool_call.id) |id| allocator.free(id);
-            if (tool_call.name) |name| allocator.free(name);
-            tool_call.partial_json.deinit(allocator);
-        },
-    }
 }
 
 fn getCompat(model: types.Model) ResponsesCompat {
@@ -2699,6 +2592,131 @@ test "parseSseStreamLines streams text and captures response_id" {
     try std.testing.expectEqualStrings("Hello", event5.message.?.content[0].text.text);
 
     freeAssistantMessageOwned(allocator, event5.message.?);
+}
+
+test "parseSseStreamLines preserves canonical-only data-line tolerance" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "event: ignored\n" ++
+            "data:{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"compact\",\"message\":\"must be ignored\"}}}\n" ++
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_canonical_only\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"canonical\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"canonical\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_canonical_only\",\"status\":\"completed\"}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    defer freeEventOwned(allocator, delta);
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+    try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("resp_canonical_only", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
+test "parseSseStreamLines fills missing total tokens from full usage before cost" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_usage\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Usage\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Usage\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_usage\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .cost = .{
+            .input = 1.0,
+            .output = 2.0,
+            .cache_read = 0.5,
+        },
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    while (stream.next()) |event| {
+        if (event.event_type != .done) {
+            freeEventOwned(allocator, event);
+            continue;
+        }
+        try std.testing.expect(event.message != null);
+        try std.testing.expectEqual(@as(u32, 5), event.message.?.usage.input);
+        try std.testing.expectEqual(@as(u32, 5), event.message.?.usage.output);
+        try std.testing.expectEqual(@as(u32, 2), event.message.?.usage.cache_read);
+        try std.testing.expectEqual(@as(u32, 12), event.message.?.usage.total_tokens);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.000005), event.message.?.usage.cost.input, 0.0000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.000010), event.message.?.usage.cost.output, 0.0000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.000001), event.message.?.usage.cost.cache_read, 0.0000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.000016), event.message.?.usage.cost.total, 0.0000001);
+        freeAssistantMessageOwned(allocator, event.message.?);
+        return;
+    }
+
+    return error.ExpectedDoneEvent;
 }
 
 test "parseSseStreamLines streams reasoning_text deltas and final content fallback" {

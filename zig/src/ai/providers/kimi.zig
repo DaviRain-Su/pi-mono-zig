@@ -7,6 +7,7 @@ const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
 
@@ -530,187 +531,223 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
-            return;
-        }
-
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-
-        const data = parseSseLine(trimmed) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-
-        if (parsed.value != .object) continue;
-        const value = parsed.value;
-
-        if (value.object.get("id")) |id_value| {
-            if (id_value == .string and output.response_id == null) {
-                output.response_id = try allocator.dupe(u8, id_value.string);
-            }
-        }
-
-        if (value.object.get("usage")) |usage_value| {
-            output.usage = parseChunkUsage(usage_value);
-        }
-
-        const choices = value.object.get("choices") orelse continue;
-        if (choices != .array or choices.array.items.len == 0) continue;
-
-        const choice = choices.array.items[0];
-        if (choice != .object) continue;
-
-        if (choice.object.get("usage")) |usage_value| {
-            output.usage = parseChunkUsage(usage_value);
-        }
-
-        if (choice.object.get("finish_reason")) |finish_reason| {
-            if (finish_reason == .string) {
-                const mapped = mapStopReason(finish_reason.string);
-                output.stop_reason = mapped.stop_reason;
-                if (mapped.error_message) |error_message| {
-                    output.error_message = error_message;
-                }
-            }
-        }
-
-        const delta = choice.object.get("delta") orelse continue;
-        if (delta != .object) continue;
-
-        if (delta.object.get("reasoning_content")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try appendTextDelta(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr, reasoning_value.string, true);
-            }
-        } else if (delta.object.get("reasoning")) |reasoning_value| {
-            if (reasoning_value == .string and reasoning_value.string.len > 0) {
-                try appendTextDelta(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr, reasoning_value.string, true);
-            }
-        }
-
-        if (delta.object.get("content")) |content_value| {
-            if (content_value == .string and content_value.string.len > 0) {
-                try appendTextDelta(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr, content_value.string, false);
-            }
-        }
-
-        if (delta.object.get("tool_calls")) |tool_calls_value| {
-            if (tool_calls_value == .array) {
-                for (tool_calls_value.array.items) |tool_call_value| {
-                    if (tool_call_value != .object) continue;
-
-                    const tool_call_id = if (tool_call_value.object.get("id")) |id_value|
-                        if (id_value == .string) id_value.string else null
-                    else
-                        null;
-
-                    const tool_call_name = if (tool_call_value.object.get("function")) |function_value| blk: {
-                        if (function_value == .object) {
-                            if (function_value.object.get("name")) |name_value| {
-                                if (name_value == .string) break :blk name_value.string;
-                            }
-                        }
-                        break :blk null;
-                    } else null;
-
-                    const tool_call_arguments = if (tool_call_value.object.get("function")) |function_value| blk: {
-                        if (function_value == .object) {
-                            if (function_value.object.get("arguments")) |arguments_value| {
-                                if (arguments_value == .string) break :blk arguments_value.string;
-                            }
-                        }
-                        break :blk null;
-                    } else null;
-
-                    const needs_new_block = blk: {
-                        if (current_block == null) break :blk true;
-                        if (current_block.? != .tool_call) break :blk true;
-                        if (tool_call_id) |id| {
-                            const current_id = std.mem.trim(u8, current_block.?.tool_call.id.items, " ");
-                            if (current_id.len > 0 and !std.mem.eql(u8, current_id, id)) break :blk true;
-                        }
-                        break :blk false;
-                    };
-
-                    if (needs_new_block) {
-                        try finishCurrentBlock(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr);
-                        current_block = .{ .tool_call = .{
-                            .event_index = content_blocks.items.len,
-                            .id = std.ArrayList(u8).empty,
-                            .name = std.ArrayList(u8).empty,
-                            .partial_args = std.ArrayList(u8).empty,
-                        } };
-                        stream_ptr.push(.{
-                            .event_type = .toolcall_start,
-                            .content_index = @intCast(content_blocks.items.len),
-                        });
-                    }
-
-                    if (current_block) |*block| {
-                        if (block.* == .tool_call) {
-                            if (tool_call_id) |id| {
-                                block.tool_call.id.clearRetainingCapacity();
-                                try block.tool_call.id.appendSlice(allocator, id);
-                            }
-                            if (tool_call_name) |name| {
-                                block.tool_call.name.clearRetainingCapacity();
-                                try block.tool_call.name.appendSlice(allocator, name);
-                            }
-                            const event_delta = if (tool_call_arguments) |arguments| blk: {
-                                try block.tool_call.partial_args.appendSlice(allocator, arguments);
-                                break :blk try allocator.dupe(u8, arguments);
-                            } else null;
-
-                            stream_ptr.push(.{
-                                .event_type = .toolcall_delta,
-                                .content_index = @intCast(block.tool_call.event_index),
-                                .delta = event_delta,
-                                .owns_delta = event_delta != null,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+    var handler = KimiSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+    };
+    const loop_result = try sse_loop.run(KimiSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) {
+        return;
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr);
 
-    const had_tool_calls = tool_calls.items.len > 0;
-
-    if (content_blocks.items.len > 0) {
-        const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
-        for (content_blocks.items, 0..) |block, index| blocks[index] = block;
-        output.content = blocks;
-    }
-
+    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, true);
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
-
-    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, had_tool_calls);
 
     stream_ptr.push(.{
         .event_type = .done,
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const KimiSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+
+    pub fn extractDataLine(_: *KimiSseLoopHandler, line: []const u8) ?[]const u8 {
+        return parseSseLine(line);
+    }
+
+    pub fn isDoneData(_: *KimiSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *KimiSseLoopHandler, data: []const u8) !bool {
+        return try processKimiSseData(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            data,
+        );
+    }
+
+    pub fn handleRuntimeFailure(self: *KimiSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            err,
+        );
+    }
+};
+
+fn processKimiSseData(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    data: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, stream_ptr, output, current_block, content_blocks, tool_calls, err);
+            return false;
+        },
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return true;
+    const value = parsed.value;
+
+    if (value.object.get("id")) |id_value| {
+        if (id_value == .string and output.response_id == null) {
+            output.response_id = try allocator.dupe(u8, id_value.string);
+        }
+    }
+
+    if (value.object.get("usage")) |usage_value| {
+        output.usage = parseChunkUsage(usage_value);
+    }
+
+    const choices = value.object.get("choices") orelse return true;
+    if (choices != .array or choices.array.items.len == 0) return true;
+
+    const choice = choices.array.items[0];
+    if (choice != .object) return true;
+
+    if (choice.object.get("usage")) |usage_value| {
+        output.usage = parseChunkUsage(usage_value);
+    }
+
+    if (choice.object.get("finish_reason")) |finish_reason| {
+        if (finish_reason == .string) {
+            const mapped = mapStopReason(finish_reason.string);
+            output.stop_reason = mapped.stop_reason;
+            if (mapped.error_message) |error_message| {
+                output.error_message = error_message;
+            }
+        }
+    }
+
+    const delta = choice.object.get("delta") orelse return true;
+    if (delta != .object) return true;
+
+    if (delta.object.get("reasoning_content")) |reasoning_value| {
+        if (reasoning_value == .string and reasoning_value.string.len > 0) {
+            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, reasoning_value.string, true);
+        }
+    } else if (delta.object.get("reasoning")) |reasoning_value| {
+        if (reasoning_value == .string and reasoning_value.string.len > 0) {
+            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, reasoning_value.string, true);
+        }
+    }
+
+    if (delta.object.get("content")) |content_value| {
+        if (content_value == .string and content_value.string.len > 0) {
+            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, content_value.string, false);
+        }
+    }
+
+    if (delta.object.get("tool_calls")) |tool_calls_value| {
+        if (tool_calls_value == .array) {
+            for (tool_calls_value.array.items) |tool_call_value| {
+                if (tool_call_value != .object) continue;
+
+                const tool_call_id = if (tool_call_value.object.get("id")) |id_value|
+                    if (id_value == .string) id_value.string else null
+                else
+                    null;
+
+                const tool_call_name = if (tool_call_value.object.get("function")) |function_value| blk: {
+                    if (function_value == .object) {
+                        if (function_value.object.get("name")) |name_value| {
+                            if (name_value == .string) break :blk name_value.string;
+                        }
+                    }
+                    break :blk null;
+                } else null;
+
+                const tool_call_arguments = if (tool_call_value.object.get("function")) |function_value| blk: {
+                    if (function_value == .object) {
+                        if (function_value.object.get("arguments")) |arguments_value| {
+                            if (arguments_value == .string) break :blk arguments_value.string;
+                        }
+                    }
+                    break :blk null;
+                } else null;
+
+                const needs_new_block = blk: {
+                    if (current_block.* == null) break :blk true;
+                    if (current_block.*.? != .tool_call) break :blk true;
+                    if (tool_call_id) |id| {
+                        const current_id = std.mem.trim(u8, current_block.*.?.tool_call.id.items, " ");
+                        if (current_id.len > 0 and !std.mem.eql(u8, current_id, id)) break :blk true;
+                    }
+                    break :blk false;
+                };
+
+                if (needs_new_block) {
+                    try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
+                    current_block.* = .{ .tool_call = .{
+                        .event_index = content_blocks.items.len,
+                        .id = std.ArrayList(u8).empty,
+                        .name = std.ArrayList(u8).empty,
+                        .partial_args = std.ArrayList(u8).empty,
+                    } };
+                    stream_ptr.push(.{
+                        .event_type = .toolcall_start,
+                        .content_index = @intCast(content_blocks.items.len),
+                    });
+                }
+
+                if (current_block.*) |*block| {
+                    if (block.* == .tool_call) {
+                        if (tool_call_id) |id| {
+                            block.tool_call.id.clearRetainingCapacity();
+                            try block.tool_call.id.appendSlice(allocator, id);
+                        }
+                        if (tool_call_name) |name| {
+                            block.tool_call.name.clearRetainingCapacity();
+                            try block.tool_call.name.appendSlice(allocator, name);
+                        }
+                        const event_delta = if (tool_call_arguments) |arguments| blk: {
+                            try block.tool_call.partial_args.appendSlice(allocator, arguments);
+                            break :blk try allocator.dupe(u8, arguments);
+                        } else null;
+
+                        stream_ptr.push(.{
+                            .event_type = .toolcall_delta,
+                            .content_index = @intCast(block.tool_call.event_index),
+                            .delta = event_delta,
+                            .owns_delta = event_delta != null,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
 }
 
 fn finalizeOutputFromPartials(
@@ -722,14 +759,27 @@ fn finalizeOutputFromPartials(
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
-    if (output.content.len == 0 and content_blocks.items.len > 0) {
-        const blocks = try allocator.alloc(types.ContentBlock, content_blocks.items.len);
-        for (content_blocks.items, 0..) |block, index| blocks[index] = block;
-        output.content = blocks;
-        content_blocks.clearRetainingCapacity();
-    }
+    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, .when_output_empty, false);
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
+}
+
+fn finalizeCollectedOutput(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    content_transfer: finalize.ContentTransferMode,
+    coerce_stop_reason_for_tool_calls: bool,
+) !void {
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{
+        .content_transfer = content_transfer,
+        .total_tokens = .preserve,
+        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
+    });
 }
 
 fn emitRuntimeFailure(
@@ -1148,6 +1198,58 @@ test "parseSseStream emits kimi thinking and text events" {
     try std.testing.expectEqual(types.StopReason.stop, event8.message.?.stop_reason);
 }
 
+test "parseSseStream keeps Kimi compact data-line tolerance under shared SSE loop" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "event: message\n" ++
+            "data:{\"id\":\"cmpl_compact\",\"choices\":[{\"delta\":{\"content\":\"Compact\"},\"finish_reason\":\"stop\"}]}\n" ++
+            "data:[DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    defer freeEvent(allocator, delta);
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("Compact", delta.delta.?);
+    const text_end = stream_instance.next().?;
+    defer freeEvent(allocator, text_end);
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqualStrings("cmpl_compact", done.message.?.response_id.?);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
 test "parseChunk rejects malformed provider control envelopes without JSON repair" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.SyntaxError, parseChunk(allocator, "{\"id\":\"chunk\" trailing"));
@@ -1237,6 +1339,68 @@ test "parseSseStream emits kimi tool call events across fragmented deltas" {
     );
 
     freeAssistantMessageOwned(allocator, event6.message.?);
+}
+
+test "parseSseStream coerces stop reason when finalized output contains tool calls" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_kimi\",\"function\":{\"name\":\"run_terminal\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"stop\"}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    const event1 = stream_instance.next().?;
+    defer freeEvent(allocator, event1);
+    try std.testing.expectEqual(types.EventType.start, event1.event_type);
+
+    const event2 = stream_instance.next().?;
+    defer freeEvent(allocator, event2);
+    try std.testing.expectEqual(types.EventType.toolcall_start, event2.event_type);
+
+    const event3 = stream_instance.next().?;
+    defer freeEvent(allocator, event3);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, event3.event_type);
+
+    const event4 = stream_instance.next().?;
+    defer freeEvent(allocator, event4);
+    try std.testing.expectEqual(types.EventType.toolcall_end, event4.event_type);
+
+    const event5 = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, event5.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, event5.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), event5.message.?.content.len);
+    try std.testing.expect(event5.message.?.content[0] == .tool_call);
+    try std.testing.expect(event5.message.?.tool_calls == null);
+    try std.testing.expect(stream_instance.next() == null);
+
+    freeAssistantMessageOwned(allocator, event5.message.?);
 }
 
 test "sanitizeSurrogates matches openai surrogate filtering" {

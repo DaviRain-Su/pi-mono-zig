@@ -603,7 +603,7 @@ test "parse anthropic stream emits text events" {
 
     const body =
         "event: message_start\n" ++
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3}}}\n" ++
         "\n" ++
         "event: content_block_start\n" ++
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
@@ -636,6 +636,7 @@ test "parse anthropic stream emits text events" {
         .provider = "anthropic",
         .base_url = "https://api.anthropic.com/v1",
         .input_types = &[_][]const u8{"text"},
+        .cost = .{ .input = 3, .output = 15, .cache_read = 0.3, .cache_write = 3.75 },
         .context_window = 200000,
         .max_tokens = 64000,
     };
@@ -651,6 +652,12 @@ test "parse anthropic stream emits text events" {
     const done = stream_instance.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqualStrings("Hello", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(@as(u32, 10), done.message.?.usage.input);
+    try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
+    try std.testing.expectEqual(@as(u32, 2), done.message.?.usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 3), done.message.?.usage.cache_write);
+    try std.testing.expectEqual(@as(u32, 20), done.message.?.usage.total_tokens);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00011685), done.message.?.usage.cost.total, 0.000000001);
 }
 
 test "parse anthropic stream handles compact data fields and provider errors" {
@@ -1951,13 +1958,10 @@ fn parseSseStreamLines(
         return;
     }
 
-    output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
-    calculateCost(model, &output.usage);
-    output.content = try content_blocks.toOwnedSlice(allocator);
+    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, model, .always, true);
     // Tool calls live inline in output.content; legacy AssistantMessage.tool_calls
     // is intentionally left null. tool_calls ArrayList holds borrow-only copies
     // and tool_calls.deinit only releases its buffer.
-    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -2012,10 +2016,28 @@ fn finalizeOutputFromPartials(
         }
     }
 
-    output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
-    calculateCost(model, &output.usage);
-    if (output.content.len == 0 and content_blocks.items.len > 0) output.content = try content_blocks.toOwnedSlice(allocator);
+    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, model, .when_output_empty, false);
     // Tool calls are emitted inline; legacy field intentionally null.
+}
+
+fn finalizeCollectedOutput(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    model: types.Model,
+    content_transfer: finalize.ContentTransferMode,
+    coerce_stop_reason_for_tool_calls: bool,
+) !void {
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{
+        .content_transfer = content_transfer,
+        .total_tokens = .preserve_or_full_usage,
+        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
+    });
+    calculateCost(model, &output.usage);
 }
 
 fn emitRuntimeFailure(

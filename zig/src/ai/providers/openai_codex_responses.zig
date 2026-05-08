@@ -1,13 +1,13 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
-const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
-const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const responses_api = @import("../shared/responses_api.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 
@@ -15,29 +15,11 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const DEFAULT_CODEX_SYSTEM_PROMPT = "You are a helpful assistant.";
 const CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
-const MessagePartKind = enum {
-    output_text,
-    refusal,
-};
-
-const CurrentBlock = union(enum) {
-    text: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-        part_kind: MessagePartKind,
-    },
-    thinking: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-        signature: ?[]const u8,
-    },
-    tool_call: struct {
-        event_index: usize,
-        id: ?[]const u8,
-        name: ?[]const u8,
-        partial_json: std.ArrayList(u8),
-    },
-};
+const CurrentBlock = responses_api.CurrentBlock;
+const deinitCurrentBlock = responses_api.deinitCurrentBlock;
+const extractReasoningSummary = responses_api.extractReasoningSummary;
+const finalizeCurrentBlock = responses_api.finalizeCurrentBlock;
+const updateCurrentMessagePart = responses_api.updateCurrentMessagePart;
 
 pub const OpenAICodexResponsesProvider = struct {
     pub const api = "openai-codex-responses";
@@ -608,242 +590,24 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        if (isAbortRequested(options)) {
-            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
-            return;
-        }
-
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "event:")) continue;
-        const data = parseSseLine(trimmed) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
-                return;
-            },
-        };
-        defer parsed.deinit();
-        const value = parsed.value;
-        if (value != .object) continue;
-
-        const event_type = extractStringField(value, "type") orelse continue;
-
-        if (std.mem.eql(u8, event_type, "response.created")) {
-            if (value.object.get("response")) |response_value| {
-                updateResponseIdFromResponseObject(allocator, &output, response_value) catch {};
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-            const item_value = value.object.get("item") orelse continue;
-            try handleOutputItemAdded(allocator, item_value, &current_block, &content_blocks, stream_ptr);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.added")) {
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        try thinking.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .thinking_delta,
-                            .content_index = @intCast(thinking.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        if (thinking.text.items.len > 0) {
-                            try thinking.text.appendSlice(allocator, "\n\n");
-                            stream_ptr.push(.{
-                                .event_type = .thinking_delta,
-                                .content_index = @intCast(thinking.event_index),
-                                .delta = try allocator.dupe(u8, "\n\n"),
-                                .owns_delta = true,
-                            });
-                        }
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .thinking => |*thinking| {
-                        try thinking.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .thinking_delta,
-                            .content_index = @intCast(thinking.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.content_part.added")) {
-            const part_value = value.object.get("part") orelse continue;
-            updateCurrentMessagePart(part_value, &current_block);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_text.delta") or std.mem.eql(u8, event_type, "response.refusal.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .text => |*text| {
-                        try text.text.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .text_delta,
-                            .content_index = @intCast(text.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-            const delta_value = value.object.get("delta") orelse continue;
-            if (delta_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .tool_call => |*tool_call| {
-                        try tool_call.partial_json.appendSlice(allocator, delta_value.string);
-                        stream_ptr.push(.{
-                            .event_type = .toolcall_delta,
-                            .content_index = @intCast(tool_call.event_index),
-                            .delta = try allocator.dupe(u8, delta_value.string),
-                            .owns_delta = true,
-                        });
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
-            const arguments_value = value.object.get("arguments") orelse continue;
-            if (arguments_value != .string) continue;
-            if (current_block) |*block| {
-                switch (block.*) {
-                    .tool_call => |*tool_call| {
-                        const previous = tool_call.partial_json.items;
-                        if (std.mem.startsWith(u8, arguments_value.string, previous)) {
-                            const delta = arguments_value.string[previous.len..];
-                            if (delta.len > 0) {
-                                tool_call.partial_json.clearRetainingCapacity();
-                                try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
-                                stream_ptr.push(.{
-                                    .event_type = .toolcall_delta,
-                                    .content_index = @intCast(tool_call.event_index),
-                                    .delta = try allocator.dupe(u8, delta),
-                                    .owns_delta = true,
-                                });
-                            }
-                        } else {
-                            tool_call.partial_json.clearRetainingCapacity();
-                            try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
-                        }
-                    },
-                    else => {},
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-            const item_value = value.object.get("item") orelse continue;
-            try finalizeCurrentBlock(allocator, item_value, &current_block, &content_blocks, &tool_calls, stream_ptr);
-            continue;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.done") or std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
-            if (value.object.get("response")) |response_value| {
-                try updateCompletedResponse(allocator, &output, response_value, model);
-            }
-            break;
-        }
-
-        if (std.mem.eql(u8, event_type, "response.failed")) {
-            const error_message = try extractFailureMessage(allocator, value.object.get("response"));
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
-            output.stop_reason = .error_reason;
-            output.error_message = error_message;
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
-            return;
-        }
-
-        if (std.mem.eql(u8, event_type, "error")) {
-            const error_message = try extractTopLevelErrorMessage(allocator, value);
-            try finalizeOutputFromPartials(allocator, &output, &current_block, &content_blocks, &tool_calls, stream_ptr);
-            output.stop_reason = .error_reason;
-            output.error_message = error_message;
-            stream_ptr.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = output,
-            });
-            stream_ptr.end(output);
-            return;
-        }
+    var handler = CodexResponsesSseLoopHandler{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .model = model,
+    };
+    const loop_result = try sse_loop.run(CodexResponsesSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped and !handler.normal_completion) {
+        return;
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
-    const had_tool_calls = tool_calls.items.len > 0;
-    output.content = try content_blocks.toOwnedSlice(allocator);
+    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
     // Tool calls live inline in output.content; legacy field intentionally null.
 
-    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, had_tool_calls);
-    if (output.usage.total_tokens == 0) {
-        output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
-    }
     calculateCost(model, &output.usage);
 
     stream_ptr.push(.{
@@ -851,6 +615,283 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+const CodexResponsesSseDataResult = enum {
+    continue_loop,
+    complete_loop,
+    stop_loop,
+};
+
+const CodexResponsesSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    model: types.Model,
+    normal_completion: bool = false,
+
+    pub fn extractDataLine(_: *CodexResponsesSseLoopHandler, line: []const u8) ?[]const u8 {
+        return parseSseLine(line);
+    }
+
+    pub fn isDoneData(_: *CodexResponsesSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *CodexResponsesSseLoopHandler, data: []const u8) !bool {
+        var state = CodexResponsesSseState{
+            .allocator = self.allocator,
+            .stream_ptr = self.stream_ptr,
+            .output = self.output,
+            .current_block = self.current_block,
+            .content_blocks = self.content_blocks,
+            .tool_calls = self.tool_calls,
+            .model = self.model,
+        };
+        const result = try processCodexResponsesSseData(&state, data);
+        switch (result) {
+            .continue_loop => return true,
+            .complete_loop => {
+                self.normal_completion = true;
+                return false;
+            },
+            .stop_loop => return false,
+        }
+    }
+
+    pub fn handleRuntimeFailure(self: *CodexResponsesSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailure(
+            self.allocator,
+            self.stream_ptr,
+            self.output,
+            self.current_block,
+            self.content_blocks,
+            self.tool_calls,
+            err,
+        );
+    }
+};
+
+const CodexResponsesSseState = struct {
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    current_block: *?CurrentBlock,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    model: types.Model,
+};
+
+fn processCodexResponsesSseData(state: *CodexResponsesSseState, data: []const u8) !CodexResponsesSseDataResult {
+    const allocator = state.allocator;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            try emitRuntimeFailure(allocator, state.stream_ptr, state.output, state.current_block, state.content_blocks, state.tool_calls, err);
+            return .stop_loop;
+        },
+    };
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object) return .continue_loop;
+
+    const event_type = extractStringField(value, "type") orelse return .continue_loop;
+
+    if (std.mem.eql(u8, event_type, "response.created")) {
+        if (value.object.get("response")) |response_value| {
+            updateResponseIdFromResponseObject(allocator, state.output, response_value) catch {};
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_item.added")) {
+        const item_value = value.object.get("item") orelse return .continue_loop;
+        try handleOutputItemAdded(allocator, item_value, state.current_block, state.content_blocks, state.stream_ptr);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.added")) {
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        try appendCodexThinkingDelta(state, delta_value.string);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_summary_part.done")) {
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .thinking => |*thinking| {
+                    if (thinking.text.items.len > 0) {
+                        try thinking.text.appendSlice(allocator, "\n\n");
+                        state.stream_ptr.push(.{
+                            .event_type = .thinking_delta,
+                            .content_index = @intCast(thinking.event_index),
+                            .delta = try allocator.dupe(u8, "\n\n"),
+                            .owns_delta = true,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.reasoning_text.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        try appendCodexThinkingDelta(state, delta_value.string);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.content_part.added")) {
+        const part_value = value.object.get("part") orelse return .continue_loop;
+        updateCurrentMessagePart(part_value, state.current_block);
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_text.delta") or std.mem.eql(u8, event_type, "response.refusal.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .text => |*text| {
+                    try text.text.appendSlice(allocator, delta_value.string);
+                    state.stream_ptr.push(.{
+                        .event_type = .text_delta,
+                        .content_index = @intCast(text.event_index),
+                        .delta = try allocator.dupe(u8, delta_value.string),
+                        .owns_delta = true,
+                    });
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
+        const delta_value = value.object.get("delta") orelse return .continue_loop;
+        if (delta_value != .string) return .continue_loop;
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .tool_call => |*tool_call| {
+                    try tool_call.partial_json.appendSlice(allocator, delta_value.string);
+                    state.stream_ptr.push(.{
+                        .event_type = .toolcall_delta,
+                        .content_index = @intCast(tool_call.event_index),
+                        .delta = try allocator.dupe(u8, delta_value.string),
+                        .owns_delta = true,
+                    });
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
+        const arguments_value = value.object.get("arguments") orelse return .continue_loop;
+        if (arguments_value != .string) return .continue_loop;
+        if (state.current_block.*) |*block| {
+            switch (block.*) {
+                .tool_call => |*tool_call| {
+                    const previous = tool_call.partial_json.items;
+                    if (std.mem.startsWith(u8, arguments_value.string, previous)) {
+                        const delta = arguments_value.string[previous.len..];
+                        tool_call.partial_json.clearRetainingCapacity();
+                        try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
+                        if (delta.len > 0) {
+                            state.stream_ptr.push(.{
+                                .event_type = .toolcall_delta,
+                                .content_index = @intCast(tool_call.event_index),
+                                .delta = try allocator.dupe(u8, delta),
+                                .owns_delta = true,
+                            });
+                        }
+                    } else {
+                        tool_call.partial_json.clearRetainingCapacity();
+                        try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
+                    }
+                },
+                else => {},
+            }
+        }
+        return .continue_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.output_item.done")) {
+        const item_value = value.object.get("item") orelse return .continue_loop;
+        try finalizeCurrentBlock(allocator, item_value, state.current_block, state.content_blocks, state.tool_calls, state.stream_ptr);
+        return .continue_loop;
+    }
+
+    if (try handleCodexTerminalEvent(state, event_type, value)) |result| return result;
+
+    return .continue_loop;
+}
+
+fn handleCodexTerminalEvent(
+    state: *CodexResponsesSseState,
+    event_type: []const u8,
+    value: std.json.Value,
+) !?CodexResponsesSseDataResult {
+    if (std.mem.eql(u8, event_type, "response.done") or std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
+        if (value.object.get("response")) |response_value| {
+            try updateCompletedResponse(state.allocator, state.output, response_value, state.model);
+        }
+        return .complete_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "response.failed")) {
+        const error_message = try extractFailureMessage(state.allocator, value.object.get("response"));
+        try emitCodexResponsesTerminalError(state, error_message);
+        return .stop_loop;
+    }
+
+    if (std.mem.eql(u8, event_type, "error")) {
+        const error_message = try extractTopLevelErrorMessage(state.allocator, value);
+        try emitCodexResponsesTerminalError(state, error_message);
+        return .stop_loop;
+    }
+
+    return null;
+}
+
+fn appendCodexThinkingDelta(state: *CodexResponsesSseState, delta: []const u8) !void {
+    if (state.current_block.*) |*block| {
+        switch (block.*) {
+            .thinking => |*thinking| {
+                try thinking.text.appendSlice(state.allocator, delta);
+                state.stream_ptr.push(.{
+                    .event_type = .thinking_delta,
+                    .content_index = @intCast(thinking.event_index),
+                    .delta = try state.allocator.dupe(u8, delta),
+                    .owns_delta = true,
+                });
+            },
+            else => {},
+        }
+    }
+}
+
+fn emitCodexResponsesTerminalError(state: *CodexResponsesSseState, error_message: []const u8) !void {
+    try finalizeOutputFromPartials(state.allocator, state.output, state.current_block, state.content_blocks, state.tool_calls, state.stream_ptr);
+    state.output.stop_reason = .error_reason;
+    state.output.error_message = error_message;
+    state.stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = state.output.*,
+    });
+    state.stream_ptr.end(state.output.*);
 }
 
 fn finalizeOutputFromPartials(
@@ -862,11 +903,28 @@ fn finalizeOutputFromPartials(
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finalizeCurrentBlock(allocator, null, current_block, content_blocks, tool_calls, stream_ptr);
-    if (output.content.len == 0 and content_blocks.items.len > 0) {
-        output.content = try content_blocks.toOwnedSlice(allocator);
-    }
+    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, .when_output_empty, .preserve, false);
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
+}
+
+fn finalizeCollectedOutput(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    tool_calls: *std.ArrayList(types.ToolCall),
+    content_transfer: finalize.ContentTransferMode,
+    total_tokens: finalize.TotalTokenMode,
+    coerce_stop_reason_for_tool_calls: bool,
+) !void {
+    try finalize.finalizeOutput(allocator, output, .{
+        .content_blocks = content_blocks,
+        .tool_calls = tool_calls,
+    }, .{
+        .content_transfer = content_transfer,
+        .total_tokens = total_tokens,
+        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
+    });
 }
 
 fn emitRuntimeFailure(
@@ -896,165 +954,22 @@ fn handleOutputItemAdded(
 
     if (std.mem.eql(u8, item_type, "reasoning")) {
         if (current_block.* != null) return;
-        current_block.* = .{ .thinking = .{
-            .event_index = content_blocks.items.len,
-            .text = std.ArrayList(u8).empty,
-            .signature = null,
-        } };
+        current_block.* = responses_api.initThinkingBlock(content_blocks.items.len);
         stream_ptr.push(.{ .event_type = .thinking_start, .content_index = @intCast(content_blocks.items.len) });
         return;
     }
 
     if (std.mem.eql(u8, item_type, "message")) {
         if (current_block.* != null) return;
-        current_block.* = .{ .text = .{
-            .event_index = content_blocks.items.len,
-            .text = std.ArrayList(u8).empty,
-            .part_kind = .output_text,
-        } };
+        current_block.* = responses_api.initTextBlock(content_blocks.items.len);
         stream_ptr.push(.{ .event_type = .text_start, .content_index = @intCast(content_blocks.items.len) });
         return;
     }
 
     if (std.mem.eql(u8, item_type, "function_call")) {
         if (current_block.* != null) return;
-        current_block.* = .{ .tool_call = .{
-            .event_index = content_blocks.items.len,
-            .id = try extractCombinedToolCallId(allocator, item_value),
-            .name = try extractOwnedStringField(allocator, item_value, "name"),
-            .partial_json = std.ArrayList(u8).empty,
-        } };
-
-        if (current_block.*) |*block| {
-            switch (block.*) {
-                .tool_call => |*tool_call| {
-                    if (item_value.object.get("arguments")) |arguments_value| {
-                        if (arguments_value == .string and arguments_value.string.len > 0) {
-                            try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
-                        }
-                    }
-                },
-                else => {},
-            }
-        }
-
+        current_block.* = try responses_api.initToolCallBlockFromItem(allocator, content_blocks.items.len, item_value);
         stream_ptr.push(.{ .event_type = .toolcall_start, .content_index = @intCast(content_blocks.items.len) });
-    }
-}
-
-fn updateCurrentMessagePart(item_value: std.json.Value, current_block: *?CurrentBlock) void {
-    if (item_value != .object) return;
-    const part_type = extractStringField(item_value, "type") orelse return;
-
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                text.part_kind = if (std.mem.eql(u8, part_type, "refusal")) .refusal else .output_text;
-            },
-            else => {},
-        }
-    }
-}
-
-fn finalizeCurrentBlock(
-    allocator: std.mem.Allocator,
-    maybe_item_value: ?std.json.Value,
-    current_block: *?CurrentBlock,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-) !void {
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                const final_text = if (extractFinalTextFromItem(maybe_item_value, text.part_kind)) |value|
-                    if (value.len > 0 or text.text.items.len == 0) value else text.text.items
-                else
-                    text.text.items;
-                const owned = try allocator.dupe(u8, final_text);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
-                stream_ptr.push(.{
-                    .event_type = .text_end,
-                    .content_index = @intCast(text.event_index),
-                    .content = owned,
-                });
-            },
-            .thinking => |*thinking| {
-                const extracted_text = try extractReasoningSummary(allocator, maybe_item_value);
-                defer if (extracted_text) |final_text| allocator.free(final_text);
-                const owned = if (extracted_text) |final_text|
-                    try allocator.dupe(u8, final_text)
-                else
-                    try allocator.dupe(u8, thinking.text.items);
-                const signature = if (maybe_item_value) |item_value| blk: {
-                    if (item_value == .object) {
-                        if (item_value.object.get("encrypted_content")) |encrypted| {
-                            if (encrypted == .string) break :blk try allocator.dupe(u8, encrypted.string);
-                        }
-                    }
-                    break :blk null;
-                } else if (thinking.signature) |existing|
-                    try allocator.dupe(u8, existing)
-                else
-                    null;
-                try content_blocks.append(allocator, .{ .thinking = .{
-                    .thinking = owned,
-                    .signature = signature,
-                    .redacted = false,
-                } });
-                stream_ptr.push(.{
-                    .event_type = .thinking_end,
-                    .content_index = @intCast(thinking.event_index),
-                    .content = owned,
-                });
-            },
-            .tool_call => |*tool_call| {
-                const item_id_owned = if (tool_call.id == null and maybe_item_value != null)
-                    try extractCombinedToolCallId(allocator, maybe_item_value.?)
-                else
-                    null;
-                defer if (item_id_owned) |value| allocator.free(value);
-                const final_id = item_id_owned orelse tool_call.id orelse "";
-
-                const item_name_owned = if (tool_call.name == null and maybe_item_value != null)
-                    try extractOwnedStringField(allocator, maybe_item_value.?, "name")
-                else
-                    null;
-                defer if (item_name_owned) |value| allocator.free(value);
-                const final_name = item_name_owned orelse tool_call.name orelse "";
-
-                const arguments_source = if (maybe_item_value) |item_value|
-                    extractStringField(item_value, "arguments") orelse tool_call.partial_json.items
-                else
-                    tool_call.partial_json.items;
-                const arguments = try parseStreamingJsonToValue(allocator, arguments_source);
-                const stored_tool_call = blk: {
-                    errdefer freeJsonValue(allocator, arguments);
-                    const id = try allocator.dupe(u8, final_id);
-                    errdefer allocator.free(id);
-                    const name = try allocator.dupe(u8, final_name);
-                    errdefer allocator.free(name);
-                    break :blk types.ToolCall{
-                        .id = id,
-                        .name = name,
-                        .arguments = arguments,
-                    };
-                };
-                try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, stored_tool_call);
-                stream_ptr.push(.{
-                    .event_type = .toolcall_end,
-                    .content_index = @intCast(tool_call.event_index),
-                    .tool_call = .{
-                        .id = try allocator.dupe(u8, stored_tool_call.id),
-                        .name = try allocator.dupe(u8, stored_tool_call.name),
-                        .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
-                    },
-                });
-            },
-        }
-
-        deinitCurrentBlock(allocator, block);
-        current_block.* = null;
     }
 }
 
@@ -1218,97 +1133,11 @@ fn parseUsage(value: std.json.Value) types.Usage {
     return usage;
 }
 
-fn extractFinalTextFromItem(maybe_item_value: ?std.json.Value, part_kind: MessagePartKind) ?[]const u8 {
-    const item_value = maybe_item_value orelse return null;
-    if (item_value != .object) return null;
-    const content = item_value.object.get("content") orelse return null;
-    if (content != .array) return null;
-
-    const expected_type: []const u8 = switch (part_kind) {
-        .output_text => "output_text",
-        .refusal => "refusal",
-    };
-    for (content.array.items) |part| {
-        if (part != .object) continue;
-        const part_type = extractStringField(part, "type") orelse continue;
-        if (!std.mem.eql(u8, part_type, expected_type)) continue;
-        return extractStringField(part, "text");
-    }
-    return null;
-}
-
-fn extractReasoningSummary(allocator: std.mem.Allocator, maybe_item_value: ?std.json.Value) !?[]const u8 {
-    const item_value = maybe_item_value orelse return null;
-    if (item_value != .object) return null;
-
-    if (item_value.object.get("summary")) |summary_value| {
-        if (summary_value == .array and summary_value.array.items.len > 0) {
-            if (try extractJoinedTextFields(allocator, summary_value)) |summary_text| {
-                return summary_text;
-            }
-        }
-    }
-
-    if (item_value.object.get("content")) |content_value| {
-        if (content_value == .array and content_value.array.items.len > 0) {
-            if (try extractJoinedTextFields(allocator, content_value)) |content_text| {
-                return content_text;
-            }
-        }
-    }
-
-    return null;
-}
-
-fn extractJoinedTextFields(allocator: std.mem.Allocator, array_value: std.json.Value) !?[]const u8 {
-    if (array_value != .array) return null;
-
-    var buffer = std.ArrayList(u8).empty;
-    errdefer buffer.deinit(allocator);
-    var appended: usize = 0;
-    for (array_value.array.items) |part| {
-        if (part != .object) continue;
-        const text = extractStringField(part, "text") orelse continue;
-        if (appended > 0) try buffer.appendSlice(allocator, "\n\n");
-        try buffer.appendSlice(allocator, text);
-        appended += 1;
-    }
-    if (buffer.items.len == 0) {
-        buffer.deinit(allocator);
-        return null;
-    }
-    return try buffer.toOwnedSlice(allocator);
-}
-
-fn extractCombinedToolCallId(allocator: std.mem.Allocator, item_value: std.json.Value) !?[]const u8 {
-    if (item_value != .object) return null;
-    const call_id = extractStringField(item_value, "call_id") orelse return null;
-    const item_id = extractStringField(item_value, "id");
-    if (item_id) |value| {
-        return try std.fmt.allocPrint(allocator, "{s}|{s}", .{ call_id, value });
-    }
-    return try allocator.dupe(u8, call_id);
-}
-
-fn extractOwnedStringField(allocator: std.mem.Allocator, value: std.json.Value, key: []const u8) !?[]const u8 {
-    const string = extractStringField(value, key) orelse return null;
-    return try allocator.dupe(u8, string);
-}
-
 fn extractStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const field_value = value.object.get(key) orelse return null;
     if (field_value != .string) return null;
     return field_value.string;
-}
-
-fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !std.json.Value {
-    if (input.len == 0) return .{ .object = try initObject(allocator) };
-    const parsed = json_parse.parseStreamingJson(allocator, input) catch {
-        return .{ .object = try initObject(allocator) };
-    };
-    defer parsed.deinit();
-    return try cloneJsonValue(allocator, parsed.value);
 }
 
 fn extractFailureMessage(allocator: std.mem.Allocator, response_value: ?std.json.Value) ![]const u8 {
@@ -1404,25 +1233,6 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
         allocator.free(entry.value_ptr.*);
     }
     headers.deinit();
-}
-
-fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
-    switch (block.*) {
-        .text => |*text| text.text.deinit(allocator),
-        .thinking => |*thinking| {
-            thinking.text.deinit(allocator);
-            if (thinking.signature) |signature| allocator.free(signature);
-        },
-        .tool_call => |*tool_call| {
-            if (tool_call.id) |id| allocator.free(id);
-            if (tool_call.name) |name| allocator.free(name);
-            tool_call.partial_json.deinit(allocator);
-        },
-    }
-}
-
-fn isAbortRequested(options: ?types.StreamOptions) bool {
-    return abort_helper.isRequestedFromOptions(options);
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
@@ -1653,6 +1463,64 @@ test "parseSseStreamLines handles response.done terminal events" {
     freeAssistantMessageOwned(allocator, done.message.?);
 }
 
+test "parseSseStreamLines preserves Codex canonical data-line strictness" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data:{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"compact_ignored\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"ignored compact\"}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"canonical\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"canonical\"}]}}\n" ++
+            "data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_codex_canonical\",\"status\":\"completed\"}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+
+    const delta = stream_instance.next().?;
+    defer freeEventOwned(allocator, delta);
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("canonical", delta.delta.?);
+
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("canonical", text_end.content.?);
+
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("canonical", done.message.?.content[0].text.text);
+    try std.testing.expect(stream_instance.next() == null);
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
 test "parseSseStreamLines emits Codex reasoning_text deltas with final content fallback" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
@@ -1816,6 +1684,48 @@ test "parseSseStreamLines maps incomplete Codex responses to length" {
     try std.testing.expect(done.message != null);
     try std.testing.expectEqual(types.StopReason.length, done.message.?.stop_reason);
     freeAssistantMessageOwned(allocator, done.message.?);
+}
+
+test "finalizeCollectedOutput preserves Codex finalization semantics" {
+    const allocator = std.testing.allocator;
+
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(allocator);
+
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    defer tool_calls.deinit(allocator);
+
+    try content_blocks.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, "hello") } });
+    try finalize.appendInlineToolCall(allocator, &content_blocks, &tool_calls, .{
+        .id = try allocator.dupe(u8, "call_1|item_1"),
+        .name = try allocator.dupe(u8, "lookup"),
+        .arguments = .null,
+    });
+
+    var output = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .model = "gpt-5.1-codex",
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    output.usage.input = 5;
+    output.usage.output = 3;
+    output.usage.cache_read = 2;
+    output.usage.cache_write = 1;
+
+    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
+    defer freeAssistantMessageOwned(allocator, output);
+
+    try std.testing.expectEqual(@as(usize, 0), content_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 2), output.content.len);
+    try std.testing.expectEqualStrings("hello", output.content[0].text.text);
+    try std.testing.expect(output.content[1] == .tool_call);
+    try std.testing.expectEqual(types.StopReason.tool_use, output.stop_reason);
+    try std.testing.expectEqual(@as(u32, 11), output.usage.total_tokens);
+    try std.testing.expectEqual(output.content[1].tool_call.id.ptr, tool_calls.items[0].id.ptr);
 }
 
 test "extractAccountId reads ChatGPT account ID from JWT payload" {
