@@ -60,8 +60,9 @@ const PartialToolCallBlock = struct {
     }
 
     fn setFinal(self: *PartialToolCallBlock, allocator: std.mem.Allocator, tool_call: ai.ToolCall) !void {
+        const cloned = try cloneToolCall(allocator, tool_call);
         if (self.final_tool_call) |existing| deinitToolCall(allocator, existing);
-        self.final_tool_call = try cloneToolCall(allocator, tool_call);
+        self.final_tool_call = cloned;
     }
 };
 
@@ -1655,14 +1656,15 @@ fn cloneContentBlocks(
     blocks: []const ai.ContentBlock,
 ) ![]const ai.ContentBlock {
     const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
-    errdefer allocator.free(cloned);
+    var initialized_len: usize = 0;
+    errdefer {
+        deinitContentBlocks(allocator, cloned[0..initialized_len]);
+        allocator.free(cloned);
+    }
 
     for (blocks, 0..) |block, index| {
-        cloned[index] = cloneContentBlock(allocator, block) catch |err| {
-            deinitContentBlocks(allocator, cloned[0..index]);
-            allocator.free(cloned);
-            return err;
-        };
+        cloned[index] = try cloneContentBlock(allocator, block);
+        initialized_len += 1;
     }
 
     return cloned;
@@ -1673,25 +1675,53 @@ fn cloneContentBlock(
     block: ai.ContentBlock,
 ) !ai.ContentBlock {
     return switch (block) {
-        .text => |text| .{
-            .text = .{
-                .text = try allocator.dupe(u8, text.text),
-                .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
-            },
+        .text => |text| blk: {
+            const owned_text = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(owned_text);
+
+            const text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
+            errdefer if (text_signature) |signature| allocator.free(signature);
+
+            break :blk .{
+                .text = .{
+                    .text = owned_text,
+                    .text_signature = text_signature,
+                },
+            };
         },
-        .image => |image| .{
-            .image = .{
-                .data = try allocator.dupe(u8, image.data),
-                .mime_type = try allocator.dupe(u8, image.mime_type),
-            },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            errdefer allocator.free(mime_type);
+
+            break :blk .{
+                .image = .{
+                    .data = data,
+                    .mime_type = mime_type,
+                },
+            };
         },
-        .thinking => |thinking| .{
-            .thinking = .{
-                .thinking = try allocator.dupe(u8, thinking.thinking),
-                .thinking_signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
-                .signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
-                .redacted = thinking.redacted,
-            },
+        .thinking => |thinking| blk: {
+            const thinking_text = try allocator.dupe(u8, thinking.thinking);
+            errdefer allocator.free(thinking_text);
+
+            const source_signature = ai.thinkingSignature(thinking);
+            const thinking_signature = if (source_signature) |signature| try allocator.dupe(u8, signature) else null;
+            errdefer if (thinking_signature) |signature| allocator.free(signature);
+
+            const signature = if (source_signature) |source| try allocator.dupe(u8, source) else null;
+            errdefer if (signature) |owned_signature| allocator.free(owned_signature);
+
+            break :blk .{
+                .thinking = .{
+                    .thinking = thinking_text,
+                    .thinking_signature = thinking_signature,
+                    .signature = signature,
+                    .redacted = thinking.redacted,
+                },
+            };
         },
         .tool_call => |tool_call| .{ .tool_call = try cloneToolCall(allocator, tool_call) },
     };
@@ -1723,9 +1753,10 @@ fn deinitContentBlocks(
 
 /// Tool-call clone ownership audit:
 /// - `PartialToolCallBlock.setFinal` retains at most one cloned final tool call
-///   and releases it on replacement or `PartialToolCallBlock.deinit`.
+///   and releases the previous clone only after the replacement clone succeeds.
 /// - `cloneContentBlock` retains cloned inline tool calls inside a cloned
-///   content slice; `deinitContentBlocks` releases those clones.
+///   content slice; `cloneContentBlocks` unwinds initialized blocks on error,
+///   and `deinitContentBlocks` releases those clones.
 /// Keep all future `cloneToolCall` retainers paired with `deinitToolCall`.
 fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
@@ -1846,7 +1877,12 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
                 clone.deinit();
             }
             for (arr.items) |item| {
-                try clone.append(try cloneJsonValue(allocator, item));
+                const cloned_item = try cloneJsonValue(allocator, item);
+                var item_transferred = false;
+                errdefer if (!item_transferred) deinitJsonValue(allocator, cloned_item);
+
+                try clone.append(cloned_item);
+                item_transferred = true;
             }
             break :blk .{ .array = clone };
         },
@@ -1862,11 +1898,17 @@ fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json
             }
             var iterator = obj.iterator();
             while (iterator.next()) |entry| {
-                try clone.put(
-                    allocator,
-                    try allocator.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValue(allocator, entry.value_ptr.*),
-                );
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                var key_transferred = false;
+                errdefer if (!key_transferred) allocator.free(key);
+
+                const cloned_value = try cloneJsonValue(allocator, entry.value_ptr.*);
+                var value_transferred = false;
+                errdefer if (!value_transferred) deinitJsonValue(allocator, cloned_value);
+
+                try clone.put(allocator, key, cloned_value);
+                key_transferred = true;
+                value_transferred = true;
             }
             break :blk .{ .object = clone };
         },
@@ -3636,6 +3678,113 @@ test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
     try std.testing.expect(cloned[0].tool_call.name.ptr != source[0].tool_call.name.ptr);
     try std.testing.expect(cloned[0].tool_call.arguments.string.ptr != source[0].tool_call.arguments.string.ptr);
     try std.testing.expect(cloned[0].tool_call.thought_signature.?.ptr != source[0].tool_call.thought_signature.?.ptr);
+}
+
+fn checkCloneToolCallAllocation(allocator: std.mem.Allocator, source: ai.ToolCall) !void {
+    const cloned = try cloneToolCall(allocator, source);
+    defer deinitToolCall(allocator, cloned);
+}
+
+fn checkCloneContentBlocksAllocation(allocator: std.mem.Allocator, source: []const ai.ContentBlock) !void {
+    const cloned = try cloneContentBlocks(allocator, source);
+    defer {
+        deinitContentBlocks(allocator, cloned);
+        allocator.free(cloned);
+    }
+}
+
+test "ISS-403 PartialToolCallBlock keeps existing final tool call on replacement allocation failure" {
+    const allocator = std.testing.allocator;
+
+    var partial_tool_call = PartialToolCallBlock{};
+    defer partial_tool_call.deinit(allocator);
+
+    try partial_tool_call.setFinal(allocator, .{
+        .id = "stable-tool",
+        .name = "lookup",
+        .arguments = .{ .string = "stable args" },
+        .thought_signature = "stable signature",
+    });
+
+    var fail_index: usize = 0;
+    while (fail_index < 4) : (fail_index += 1) {
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_state.allocator();
+
+        try std.testing.expectError(
+            error.OutOfMemory,
+            partial_tool_call.setFinal(failing_allocator, .{
+                .id = "replacement-tool",
+                .name = "lookup",
+                .arguments = .{ .string = "replacement args" },
+                .thought_signature = "replacement signature",
+            }),
+        );
+
+        try std.testing.expectEqualStrings("stable-tool", partial_tool_call.final_tool_call.?.id);
+        try std.testing.expectEqualStrings("lookup", partial_tool_call.final_tool_call.?.name);
+        try std.testing.expectEqualStrings("stable args", partial_tool_call.final_tool_call.?.arguments.string);
+        try std.testing.expectEqualStrings("stable signature", partial_tool_call.final_tool_call.?.thought_signature.?);
+    }
+}
+
+test "ISS-403 cloneToolCall allocation failures clean partial clones" {
+    const allocator = std.testing.allocator;
+
+    const source_args = try jsonStringObject(allocator, "query", "owned source");
+    defer deinitJsonValue(allocator, source_args);
+
+    const source = ai.ToolCall{
+        .id = "tool-with-owned-args",
+        .name = "lookup",
+        .arguments = source_args,
+        .thought_signature = "signature",
+    };
+    try std.testing.checkAllAllocationFailures(allocator, checkCloneToolCallAllocation, .{source});
+
+    var array_args = std.json.Array.init(allocator);
+    defer array_args.deinit();
+    try array_args.append(.{ .string = "array argument" });
+    try array_args.append(.{ .number_string = "123" });
+
+    const array_source = ai.ToolCall{
+        .id = "tool-with-array-args",
+        .name = "lookup",
+        .arguments = .{ .array = array_args },
+        .thought_signature = "signature",
+    };
+    try std.testing.checkAllAllocationFailures(allocator, checkCloneToolCallAllocation, .{array_source});
+}
+
+test "ISS-403 cloneContentBlocks allocation failures unwind owned blocks once" {
+    const allocator = std.testing.allocator;
+
+    const tool_args = try jsonStringObject(allocator, "query", "content tool args");
+    defer deinitJsonValue(allocator, tool_args);
+
+    const source = [_]ai.ContentBlock{
+        .{ .text = .{
+            .text = "text body",
+            .text_signature = "text signature",
+        } },
+        .{ .image = .{
+            .data = "base64-image",
+            .mime_type = "image/png",
+        } },
+        .{ .thinking = .{
+            .thinking = "thinking body",
+            .thinking_signature = "thinking signature",
+            .redacted = false,
+        } },
+        .{ .tool_call = .{
+            .id = "content-tool",
+            .name = "lookup",
+            .arguments = tool_args,
+            .thought_signature = "tool signature",
+        } },
+    };
+
+    try std.testing.checkAllAllocationFailures(allocator, checkCloneContentBlocksAllocation, .{source[0..]});
 }
 
 test "ISS-406 partial accumulator rejects stale explicit content_index reuse after end" {
