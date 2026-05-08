@@ -29,12 +29,15 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
 
     try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
     try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "project/sessions");
     const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
     defer allocator.free(home_dir);
     const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
     defer allocator.free(agent_dir);
     const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
     defer allocator.free(project_dir);
+    const session_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project/sessions");
+    defer allocator.free(session_dir);
 
     const package_root = try copyTemplateToTmp(allocator, &tmp, "project/author-plugin");
     defer allocator.free(package_root);
@@ -64,21 +67,72 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     defer install_result.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
     try expectContains(install_result.stdout, "Installed ");
+    try expectContains(install_result.stdout, "runtime: wasm");
+    try expectContains(install_result.stdout, "trust: locked");
+    try expectContains(install_result.stdout, "approval target: wasm:locked:user:");
+    try expectContains(install_result.stdout, initial_manifest.valid.package_root_sha256);
+    try expectContains(install_result.stdout, initial_manifest.valid.artifact_sha256);
     try std.testing.expectEqualStrings("", install_result.stderr);
+    const initial_policy_key = try extractApprovalTarget(allocator, install_result.stdout);
+    defer allocator.free(initial_policy_key);
 
     const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
     const persisted_source = try installedPackageSource(allocator, settings_path);
     defer allocator.free(persisted_source);
 
+    var list_result = try runPackageCommand(allocator, &.{"list"}, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer list_result.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), list_result.exit_code);
+    try expectContains(list_result.stdout, persisted_source);
+    try expectContains(list_result.stdout, "scope: user");
+    try expectContains(list_result.stdout, "runtime: wasm");
+    try expectContains(list_result.stdout, "trust: locked");
+    const listed_initial_policy_key = try extractApprovalTarget(allocator, list_result.stdout);
+    defer allocator.free(listed_initial_policy_key);
+    try std.testing.expectEqualStrings(initial_policy_key, listed_initial_policy_key);
+
+    const lock_path = try std.fs.path.join(allocator, &.{ agent_dir, "extensions.lock.json" });
+    defer allocator.free(lock_path);
+    const settings_before_native_rejection = try readFile(allocator, settings_path);
+    defer allocator.free(settings_before_native_rejection);
+    const lock_before_native_rejection = try readFile(allocator, lock_path);
+    defer allocator.free(lock_before_native_rejection);
+    const native_root = try writeNativeDynamicPackage(allocator, &tmp, "project/native-dynamic-plugin");
+    defer allocator.free(native_root);
+    var native_install = try runPackageCommand(allocator, &.{ "install", native_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer native_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 1), native_install.exit_code);
+    try std.testing.expectEqualStrings("", native_install.stdout);
+    try expectContains(native_install.stderr, "unsupported artifact kind");
+    try expectContains(native_install.stderr, "native-dylib");
+    const settings_after_native_rejection = try readFile(allocator, settings_path);
+    defer allocator.free(settings_after_native_rejection);
+    const lock_after_native_rejection = try readFile(allocator, lock_path);
+    defer allocator.free(lock_after_native_rejection);
+    try std.testing.expectEqualStrings(settings_before_native_rejection, settings_after_native_rejection);
+    try std.testing.expectEqualStrings(lock_before_native_rejection, lock_after_native_rejection);
+
     try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "missing_policy");
 
-    const initial_policy_key = try extension_runtime.wasmPolicyLookupKey(
-        allocator,
-        extension_runtime.WasmManifestHandoff.fromManifest(&initial_manifest.valid),
-    );
-    defer allocator.free(initial_policy_key);
     try writeAuthorSettings(allocator, settings_path, persisted_source, initial_policy_key, "template.echo");
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = forcedWasmSuccessToolCallFactory },
+        .{ .factory = verifyWasmSuccessResultFactory },
+        .{ .factory = forcedUpdatedWasmSuccessToolCallFactory },
+        .{ .factory = verifyUpdatedWasmSuccessResultFactory },
+        .{ .factory = postRemoveConstructionFactory },
+    });
 
     {
         var runtime_set = try startAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
@@ -97,9 +151,41 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
         try std.testing.expect(try runtime_set.unloadPackage(package_root));
         try expectNoAuthorTool(allocator, &runtime_set, "template.echo");
     }
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "default construction", .{
+        .include_installed_wasm_tools = true,
+    }, .text, "default construction ok\n");
+    try runNormalTemplateInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), initial_manifest.valid.artifact_sha256);
 
-    const lock_path = try std.fs.path.join(allocator, &.{ agent_dir, "extensions.lock.json" });
-    defer allocator.free(lock_path);
+    var project_install = try runPackageCommand(allocator, &.{ "install", package_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_install.exit_code);
+    try expectContains(project_install.stdout, "scope: project");
+    const project_policy_key = try extractApprovalTarget(allocator, project_install.stdout);
+    defer allocator.free(project_policy_key);
+    try expectContains(project_policy_key, "wasm:locked:project:");
+    try std.testing.expect(std.mem.indexOf(u8, project_policy_key, initial_manifest.valid.artifact_sha256) != null);
+    try expectRuntimeDiagnosticWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{
+        "scope=project",
+        initial_manifest.valid.package_root_sha256,
+        initial_manifest.valid.artifact_sha256,
+    }, 1);
+    var project_remove = try runPackageCommand(allocator, &.{ "remove", package_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_remove.exit_code);
+    try expectContains(project_remove.stdout, "Removed ");
+    {
+        var runtime_set = try startAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+        defer runtime_set.deinit();
+        try std.testing.expectEqual(@as(usize, 1), runtime_set.entries.len);
+        try std.testing.expectEqualStrings("template.echo", runtime_set.entries[0].tool_id);
+    }
+
     const lock_before_drift = try readFile(allocator, lock_path);
     defer allocator.free(lock_before_drift);
 
@@ -130,12 +216,26 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     try expectContains(edited_manifest.valid.output_schema_json, "\"echo\"");
     try std.testing.expect(!std.mem.eql(u8, initial_manifest.valid.artifact_sha256, edited_manifest.valid.artifact_sha256));
 
-    try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "missing_policy");
-    const edited_policy_key = try extension_runtime.wasmPolicyLookupKey(
-        allocator,
-        extension_runtime.WasmManifestHandoff.fromManifest(&edited_manifest.valid),
-    );
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "policy_digest_mismatch", &.{
+        initial_manifest.valid.package_root_sha256,
+        edited_manifest.valid.package_root_sha256,
+        initial_manifest.valid.artifact_sha256,
+        edited_manifest.valid.artifact_sha256,
+        "attemptedPolicy=",
+        "requiredPolicy=",
+    });
+
+    var updated_list_result = try runPackageCommand(allocator, &.{"list"}, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer updated_list_result.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), updated_list_result.exit_code);
+    const edited_policy_key = try extractApprovalTarget(allocator, updated_list_result.stdout);
     defer allocator.free(edited_policy_key);
+    try expectContains(edited_policy_key, edited_manifest.valid.package_root_sha256);
+    try expectContains(edited_policy_key, edited_manifest.valid.artifact_sha256);
+    try std.testing.expect(!std.mem.eql(u8, initial_policy_key, edited_policy_key));
     try writeAuthorSettings(allocator, settings_path, persisted_source, edited_policy_key, "fixture.echo");
 
     {
@@ -151,6 +251,7 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
             "{\"ok\":true,\"tool\":\"fixture.echo\",\"echo\":\"edited runtime output\"}",
         );
     }
+    try runNormalUpdatedTemplateInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), edited_manifest.valid.artifact_sha256);
 
     var remove_result = try runPackageCommand(allocator, &.{ "remove", package_root }, .{
         .cwd = project_dir,
@@ -174,6 +275,9 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     try std.testing.expectEqual(@as(usize, 0), removed_runtime_set.entries.len);
     try expectNoAuthorTool(allocator, &removed_runtime_set, "template.echo");
     try expectNoAuthorTool(allocator, &removed_runtime_set, "fixture.echo");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "post-remove construction", .{
+        .include_installed_wasm_tools = true,
+    }, .text, "post-remove construction ok\n");
 }
 
 test "VAL-RUNTIME normal agent construction includes installed wasm tools with filters" {
@@ -740,6 +844,66 @@ fn verifyWasmInvalidResultFactory(
     return ai.providers.faux.fauxAssistantMessage(blocks, .{});
 }
 
+fn forcedUpdatedWasmSuccessToolCallFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try std.testing.expect(context.messages.len >= 1);
+    const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
+    try std.testing.expectEqualStrings("call updated installed wasm", prompt);
+
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"operation\":\"echo\",\"value\":\"edited runtime output\"}", .{});
+    defer args.deinit();
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = try ai.providers.faux.fauxToolCall(allocator, "fixture.echo", args.value, .{ .id = "wasm-updated-success" });
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use });
+}
+
+fn verifyUpdatedWasmSuccessResultFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try expectLatestToolResult(context.messages, .{
+        .tool_call_id = "wasm-updated-success",
+        .tool_name = "fixture.echo",
+        .is_error = false,
+        .content_contains = "\"echo\":\"edited runtime output\"",
+        .expected_extension_id = "com.pi.template.echo",
+        .expected_artifact_sha256 = null,
+    });
+
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("updated installed wasm success observed");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn postRemoveConstructionFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try std.testing.expect(context.messages.len >= 1);
+    const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
+    try std.testing.expectEqualStrings("post-remove construction", prompt);
+    const tools = context.tools orelse &.{};
+    try expectProviderToolPresent(tools, "read");
+    try expectProviderToolPresent(tools, "bash");
+    try expectProviderToolAbsent(tools, "template.echo");
+    try expectProviderToolAbsent(tools, "fixture.echo");
+
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("post-remove construction ok");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
 const ExpectedToolResult = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
@@ -773,6 +937,119 @@ fn expectLatestToolResult(messages: []const ai.Message, expected: ExpectedToolRe
         }
     }
     return error.ExpectedToolResultMissing;
+}
+fn runNormalTemplateInvocation(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    session_dir: []const u8,
+    model: ai.Model,
+    expected_artifact_sha256: []const u8,
+) !void {
+    try runNormalTemplateInvocationWithPrompt(allocator, home_dir, agent_dir, project_dir, session_dir, model, .{
+        .prompt = "call installed wasm",
+        .expected_stdout = "installed wasm success observed\n",
+        .tool_name = "template.echo",
+        .tool_call_id = "wasm-normal-success",
+        .content_contains = "\"message\":\"normal agent path\"",
+        .expected_artifact_sha256 = expected_artifact_sha256,
+    });
+}
+
+fn runNormalUpdatedTemplateInvocation(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    session_dir: []const u8,
+    model: ai.Model,
+    expected_artifact_sha256: []const u8,
+) !void {
+    try runNormalTemplateInvocationWithPrompt(allocator, home_dir, agent_dir, project_dir, session_dir, model, .{
+        .prompt = "call updated installed wasm",
+        .expected_stdout = "updated installed wasm success observed\n",
+        .tool_name = "fixture.echo",
+        .tool_call_id = "wasm-updated-success",
+        .content_contains = "\"echo\":\"edited runtime output\"",
+        .expected_artifact_sha256 = expected_artifact_sha256,
+    });
+}
+
+const NormalInvocationExpected = struct {
+    prompt: []const u8,
+    expected_stdout: []const u8,
+    tool_name: []const u8,
+    tool_call_id: []const u8,
+    content_contains: []const u8,
+    expected_artifact_sha256: []const u8,
+};
+
+fn runNormalTemplateInvocationWithPrompt(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    session_dir: []const u8,
+    model: ai.Model,
+    expected: NormalInvocationExpected,
+) !void {
+    var runtime_config = try loadAuthorRuntimeConfig(allocator, home_dir, agent_dir, project_dir);
+    defer runtime_config.deinit();
+
+    var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
+    var built_tools = try interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
+        .selected_tools = &.{expected.tool_name},
+        .runtime_config = &runtime_config,
+        .resource_options = .{
+            .cwd = project_dir,
+            .agent_dir = runtime_config.agent_dir,
+            .global = interactive_mode.settingsResources(runtime_config.global_settings),
+            .project = interactive_mode.settingsResources(runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        },
+    });
+    defer built_tools.deinit();
+    try std.testing.expect(built_tools.locked_wasm_runtimes != null);
+    try std.testing.expectEqual(@as(usize, 1), built_tools.locked_wasm_runtimes.?.entries.len);
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_dir,
+        .system_prompt = "sys",
+        .model = model,
+        .session_dir = session_dir,
+        .tools = built_tools.items,
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    const exit_code = try print_mode.runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        expected.prompt,
+        .{ .mode = .text, .install_signal_handlers = false },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings(expected.expected_stdout, stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    try expectLatestToolResult(session.agent.getMessages(), .{
+        .tool_call_id = expected.tool_call_id,
+        .tool_name = expected.tool_name,
+        .is_error = false,
+        .content_contains = expected.content_contains,
+        .expected_extension_id = "com.pi.template.echo",
+        .expected_artifact_sha256 = expected.expected_artifact_sha256,
+    });
+    try std.testing.expectEqual(@as(usize, 0), built_tools.locked_wasm_runtimes.?.entries[0].adapter.pendingCount());
 }
 
 fn runNormalConstructionCase(
@@ -858,6 +1135,12 @@ fn expectProviderToolPresent(tools: []const ai.types.Tool, name: []const u8) !vo
         if (std.mem.eql(u8, tool.name, name)) return;
     }
     return error.ExpectedProviderToolMissing;
+}
+
+fn expectProviderToolAbsent(tools: []const ai.types.Tool, name: []const u8) !void {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return error.ExpectedProviderToolAbsent;
+    }
 }
 
 fn expectProviderToolNamesExactly(tools: []const ai.types.Tool, expected: []const []const u8) !void {
@@ -1129,6 +1412,14 @@ fn installedPackageSource(allocator: std.mem.Allocator, settings_path: []const u
     };
 }
 
+fn extractApprovalTarget(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const marker = "approval target:";
+    const marker_index = std.mem.indexOf(u8, text, marker) orelse return error.ExpectedApprovalTarget;
+    const after_marker = std.mem.trim(u8, text[marker_index + marker.len ..], " \t");
+    const newline_index = std.mem.indexOfScalar(u8, after_marker, '\n') orelse after_marker.len;
+    return allocator.dupe(u8, std.mem.trim(u8, after_marker[0..newline_index], " \t\r\n"));
+}
+
 fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype, package_relative_path: []const u8) ![]u8 {
     try tmp.dir.createDirPath(std.testing.io, package_relative_path);
     for (TEMPLATE_FILES) |relative_path| {
@@ -1145,6 +1436,43 @@ fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype, package_relativ
         defer allocator.free(target_path);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = target_path, .data = bytes });
     }
+    return absoluteTmpPath(allocator, &tmp.sub_path, package_relative_path);
+}
+
+fn writeNativeDynamicPackage(allocator: std.mem.Allocator, tmp: anytype, package_relative_path: []const u8) ![]u8 {
+    try tmp.dir.createDirPath(std.testing.io, package_relative_path);
+    const bin_relative_path = try std.fs.path.join(allocator, &.{ package_relative_path, "bin" });
+    defer allocator.free(bin_relative_path);
+    try tmp.dir.createDirPath(std.testing.io, bin_relative_path);
+    const artifact_relative_path = try std.fs.path.join(allocator, &.{ package_relative_path, "bin/plugin.dylib" });
+    defer allocator.free(artifact_relative_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = artifact_relative_path,
+        .data = "native dynamic plugin placeholder",
+    });
+    const manifest_relative_path = try std.fs.path.join(allocator, &.{ package_relative_path, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_relative_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_relative_path, .data =
+        \\{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "com.pi.native.dynamic",
+        \\  "name": "Native Dynamic",
+        \\  "version": "0.1.0",
+        \\  "description": "Unsupported native dynamic package.",
+        \\  "artifact": {
+        \\    "kind": "native-dylib",
+        \\    "path": "bin/plugin.dylib"
+        \\  },
+        \\  "tool": {
+        \\    "id": "native.dynamic",
+        \\    "description": "Unsupported native dynamic tool.",
+        \\    "inputSchema": {},
+        \\    "outputSchema": {}
+        \\  },
+        \\  "capabilities": []
+        \\}
+        \\
+    });
     return absoluteTmpPath(allocator, &tmp.sub_path, package_relative_path);
 }
 
@@ -1179,7 +1507,7 @@ fn writeEditedAuthorSource(allocator: std.mem.Allocator, package_root: []const u
         \\const metadata_json = sdk.staticMetadataJson(
         \\    "fixture.echo",
         \\    "Pi Zig Edited Fixture Echo",
-        \\    "0.2.0",
+        \\    "0.1.0",
         \\    "Returns fixture echo output after an author rebuild.",
         \\);
         \\const schema_json = sdk.staticSchemaJson(input_schema_json, output_schema_json);
@@ -1222,7 +1550,7 @@ fn writeEditedAuthorManifest(allocator: std.mem.Allocator, package_root: []const
         \\  "schemaVersion": "pi-extension.v0",
         \\  "id": "com.pi.template.echo",
         \\  "name": "Pi Zig Edited Fixture Echo",
-        \\  "version": "0.2.0",
+        \\  "version": "0.1.0",
         \\  "description": "Edited capability-free Zig WASM tool extension template.",
         \\  "artifact": {
         \\    "kind": "wasm-component",
