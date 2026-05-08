@@ -293,14 +293,32 @@ fn executeInstall(
             const scope = provenanceScope(command.local);
             const lockfile_path = try provenance_lockfile.lockfilePath(allocator, scope, options.cwd, options.agent_dir);
             defer allocator.free(lockfile_path);
-            var lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
-            defer lock_snapshot.deinit(allocator);
-            try provenance_lockfile.writeEntry(allocator, io, scope, lockfile_path, wasm_install.valid);
-            var revalidated = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
-            defer revalidated.deinit(allocator);
-            if (revalidated != .valid or !provenance_lockfile.entriesEqual(wasm_install.valid, revalidated.valid)) {
-                try restoreFileSnapshot(allocator, io, lock_snapshot);
-                try stderr.print("Error: package provenance changed during install; refusing to persist trust for {s}\n", .{source});
+            var locked_entry = lockedLocalWasmEntryForSource(
+                allocator,
+                io,
+                source,
+                command.local,
+                options,
+                .input,
+                scope,
+                lockfile_path,
+            ) catch |err| {
+                try stderr.print("Error: failed to read extension provenance for already installed package {s}: {s}\n", .{ source, @errorName(err) });
+                return .{ .exit_code = 1 };
+            };
+            defer if (locked_entry) |*entry| entry.deinit(allocator);
+            if (locked_entry == null) {
+                try stderr.print(
+                    "Error: package already installed but missing trusted provenance for {s}; run `pi update --extension {s}` to refresh trust explicitly.\n",
+                    .{ source, source },
+                );
+                return .{ .exit_code = 1 };
+            }
+            if (!provenance_lockfile.entriesEqual(locked_entry.?, wasm_install.valid)) {
+                try stderr.print(
+                    "Error: package already installed but source changed for {s}; run `pi update --extension {s}` to refresh trust explicitly.\n",
+                    .{ source, source },
+                );
                 return .{ .exit_code = 1 };
             }
         }
@@ -855,6 +873,7 @@ fn executeExtensionUpdates(
             var wasm_update = try validateLocalWasmPackageForInstall(allocator, io, entry.source, entry.is_project, options, .settings, stderr);
             defer wasm_update.deinit(allocator);
             if (wasm_update == .invalid) {
+                try stderr.print("Error: failed to update extension {s}\n", .{entry.source});
                 try restoreFileSnapshot(allocator, io, user_lock_snapshot);
                 try restoreFileSnapshot(allocator, io, project_lock_snapshot);
                 return .{ .exit_code = 1 };
@@ -2012,6 +2031,8 @@ fn loadWasmPackageListMetadata(
         if (entry.manifest_kind.len == 0 or !std.mem.eql(u8, entry.manifest_kind, "wasm-extension")) return null;
         const policy_key = try wasmPolicyLookupKeyFromLockEntry(allocator, entry);
         errdefer allocator.free(policy_key);
+        const trust_status = try localWasmTrustStatusForList(allocator, io, options, source, is_project, entry);
+        errdefer allocator.free(trust_status);
         return .{
             .extension_id = try allocator.dupe(u8, entry.manifest_id orelse "<unknown>"),
             .extension_version = try allocator.dupe(u8, entry.manifest_version orelse "<unknown>"),
@@ -2022,10 +2043,30 @@ fn loadWasmPackageListMetadata(
             .package_root_sha256 = try allocator.dupe(u8, entry.package_root_sha256),
             .policy_lookup_key = policy_key,
             .scope = try allocator.dupe(u8, entry.scope.jsonName()),
-            .trust_status = try allocator.dupe(u8, "locked"),
+            .trust_status = trust_status,
         };
     }
     return null;
+}
+
+fn localWasmTrustStatusForList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    source: []const u8,
+    is_project: bool,
+    locked_entry: provenance_lockfile.LockEntry,
+) ![]u8 {
+    var current = try computeLocalWasmLockEntryNoDiagnostics(allocator, io, source, is_project, options, .settings);
+    defer current.deinit(allocator);
+    return switch (current) {
+        .absent => allocator.dupe(u8, "locked"),
+        .invalid => allocator.dupe(u8, "invalid"),
+        .valid => |entry| if (provenance_lockfile.entriesEqual(locked_entry, entry))
+            allocator.dupe(u8, "locked")
+        else
+            allocator.dupe(u8, "drifted"),
+    };
 }
 
 fn settingsPathForScope(
@@ -2157,6 +2198,61 @@ fn localProvenanceKeyForSource(
     const identity = try realpathOrResolved(allocator, resolved);
     defer allocator.free(identity);
     return std.fmt.allocPrint(allocator, "local:{s}", .{identity});
+}
+
+fn computeLocalWasmLockEntryNoDiagnostics(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    mode: LocalPathMode,
+) !LocalWasmInstallValidation {
+    if (!isLocalSource(source)) return .absent;
+
+    const package_root = switch (mode) {
+        .input => try resolveLocalPathFromCwd(allocator, options.cwd, source),
+        .settings => try resolveLocalPathFromScopeBase(allocator, source, is_project, options.cwd, options.agent_dir),
+    };
+    defer allocator.free(package_root);
+
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    _ = std.Io.Dir.statFile(.cwd(), io, manifest_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .absent,
+        else => return err,
+    };
+
+    var result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer result.deinit(allocator);
+    if (result == .invalid) return .invalid;
+    const source_identity = try allocator.dupe(u8, result.valid.package_root);
+    defer allocator.free(source_identity);
+    return .{ .valid = try provenance_lockfile.createWasmLockEntry(allocator, provenanceScope(is_project), source_identity, &result.valid) };
+}
+
+fn lockedLocalWasmEntryForSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    mode: LocalPathMode,
+    scope: ProvenanceScope,
+    lockfile_path: []const u8,
+) !?provenance_lockfile.LockEntry {
+    if (!isLocalSource(source)) return null;
+    const key = try localProvenanceKeyForSource(allocator, source, is_project, options, mode);
+    defer allocator.free(key);
+    var loaded = try provenance_lockfile.readLockfile(allocator, io, scope, lockfile_path, "install");
+    defer loaded.deinit(allocator);
+    if (loaded.diagnostic != null) return error.MalformedLockfile;
+    for (loaded.entries) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return try entry.clone(allocator);
+    }
+    return null;
 }
 
 fn removeLocalWasmProvenanceForSource(
@@ -2707,6 +2803,171 @@ test "wasm package install preserves default-deny without approved grants" {
     const lockfile = try readSettings(allocator, lockfile_path);
     defer allocator.free(lockfile);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, lockfile, "\"key\""));
+}
+
+test "VAL-PKG-009-014-015-017 local wasm update is explicit and list is read-only after drift" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-update", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lock_before_drift = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before_drift);
+
+    const artifact_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-update/wasm/example-tool.wasm" });
+    defer allocator.free(artifact_path);
+    try common.writeFileAbsolute(std.testing.io, artifact_path, "\x00asmUPDATED", true);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_result = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "trust: drifted") != null);
+    const lock_after_list = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_list);
+    try std.testing.expectEqualStrings(lock_before_drift, lock_after_list);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const reinstall_result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), reinstall_result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "already installed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "pi update --extension") != null);
+    const lock_after_reinstall = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_reinstall);
+    try std.testing.expectEqualStrings(lock_before_drift, lock_after_reinstall);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "--extension", "./fixtures/wasm-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), update_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated ./fixtures/wasm-update") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const lock_after_update = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_update);
+    try std.testing.expect(!std.mem.eql(u8, lock_before_drift, lock_after_update));
+}
+
+test "VAL-PKG-010 failed local wasm update preserves previous trusted provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-failed-update", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-failed-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const settings_before = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_before);
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lock_before = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before);
+
+    const artifact_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-failed-update/wasm/example-tool.wasm" });
+    defer allocator.free(artifact_path);
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, artifact_path);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "./fixtures/wasm-failed-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), update_result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "artifact file was not found") != null);
+
+    const settings_after = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after);
+    const lock_after = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after);
+    try std.testing.expectEqualStrings(settings_before, settings_after);
+    try std.testing.expectEqualStrings(lock_before, lock_after);
+}
+
+test "VAL-PKG-019 batch local wasm update failure rolls back earlier refreshed provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-batch-a", "file.read", true);
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-batch-b", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-batch-a" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/wasm-batch-b" }, options, &stdout_buf, &stderr_buf);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lock_before = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before);
+
+    const artifact_a = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-batch-a/wasm/example-tool.wasm" });
+    defer allocator.free(artifact_a);
+    try common.writeFileAbsolute(std.testing.io, artifact_a, "\x00asmUPDATED-A", true);
+    const artifact_b = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-batch-b/wasm/example-tool.wasm" });
+    defer allocator.free(artifact_b);
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, artifact_b);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "--extensions" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), update_result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "wasm-batch-b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "artifact file was not found") != null);
+
+    const lock_after = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after);
+    try std.testing.expectEqualStrings(lock_before, lock_after);
 }
 
 test "wasm package install honors pre-artifact manifest approved grants" {
