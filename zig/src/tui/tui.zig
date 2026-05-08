@@ -60,12 +60,18 @@ pub const Renderer = struct {
     draw_overlays: std.ArrayList(DrawOverlayEntry) = .empty,
     next_overlay_id: usize = 1,
     last_render_stats: RenderStats = .{},
+    dirty: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *terminal_mod.Terminal) Renderer {
         return .{
             .allocator = allocator,
             .terminal = terminal,
+            .dirty = true,
         };
+    }
+
+    pub fn markDirty(self: *Renderer) void {
+        self.dirty = true;
     }
 
     pub fn getLastRenderStats(self: *const Renderer) RenderStats {
@@ -118,6 +124,9 @@ pub const Renderer = struct {
     }
 
     pub fn renderToVaxis(self: *Renderer, root: draw_mod.Component, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
+        if (!self.dirty) return;
+        self.dirty = false;
+
         const size = try self.terminal.refreshSize();
         try ensureVaxisSize(self.allocator, vx, tty, size);
 

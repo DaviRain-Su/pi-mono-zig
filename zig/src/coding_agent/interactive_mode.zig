@@ -466,10 +466,11 @@ pub fn runInteractiveMode(
             prompt_worker.join(allocator);
             prompt_worker_active = false;
             app_state.setToolOutputExpanded(true);
+            renderer.markDirty();
             if (should_exit) break;
         }
         installSessionUiCallbacks(&bootstrap.session, &app_state);
-        _ = app_state.pollBashExecution(allocator);
+        if (app_state.pollBashExecution(allocator)) renderer.markDirty();
 
         try app_state.pollClipboardPaste(.{
             .vx = input_loop.vaxis_state,
@@ -561,14 +562,13 @@ pub fn runInteractiveMode(
             }
         }
 
-        try renderer.renderToVaxis(screen.drawComponent(), input_loop.vaxis_state, input_loop.loop.tty.writer());
-
         if (should_exit and !prompt_worker_active) break;
 
         var handled_input = false;
         while (try input_loop.tryInputEvent()) |event| {
             defer event.deinit(allocator);
             handled_input = true;
+            renderer.markDirty();
             try dispatchInputEvent(
                 allocator,
                 io,
@@ -598,6 +598,8 @@ pub fn runInteractiveMode(
             app_context.suspend_requested = false;
             continue;
         }
+        try renderer.renderToVaxis(screen.drawComponent(), input_loop.vaxis_state, input_loop.loop.tty.writer());
+
         if (!handled_input) {
             std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
         }
