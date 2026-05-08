@@ -16,6 +16,7 @@ pub const oauth = struct {
 
 pub const shared = struct {
     pub const abort_signal = @import("shared/abort_signal.zig");
+    pub const finalize = @import("shared/finalize.zig");
     pub const overflow = @import("shared/overflow.zig");
     pub const provider_error = @import("shared/provider_error.zig");
     pub const provider_json = @import("shared/provider_json.zig");
@@ -112,6 +113,7 @@ test {
     _ = @import("oauth/types.zig");
     _ = @import("oauth/pkce.zig");
     _ = @import("shared/abort_signal.zig");
+    _ = @import("shared/finalize.zig");
     _ = @import("shared/overflow.zig");
     _ = @import("shared/provider_error.zig");
     _ = @import("shared/provider_json.zig");
