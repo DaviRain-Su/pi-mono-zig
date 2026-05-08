@@ -82,6 +82,16 @@ jobs:
           ZIG_VERSION="${{ steps.zig-package.outputs.version }}"
           ARCH="${{ steps.zig-package.outputs.arch }}"
           INSTALL_DIR="${{ steps.zig-package.outputs.install-dir }}"
+          add_zig_to_path() {
+            case "${ARCH}" in
+              *-windows)
+                cygpath -w "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+                ;;
+              *)
+                echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+                ;;
+            esac
+          }
           if [ -x "${INSTALL_DIR}/zig" ] || [ -x "${INSTALL_DIR}/zig.exe" ]; then
             if [ -x "${INSTALL_DIR}/zig.exe" ]; then
               ACTUAL_VERSION="$("${INSTALL_DIR}/zig.exe" version)"
@@ -92,7 +102,7 @@ jobs:
               echo "Expected cached Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
               exit 1
             fi
-            echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+            add_zig_to_path
             echo "${ACTUAL_VERSION}"
             exit 0
           fi
@@ -223,6 +233,7 @@ jobs:
             echo "Expected Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
             exit 1
           fi
+          add_zig_to_path
           echo "${ACTUAL_VERSION}"
 
       - name: Install system tools (Linux)
