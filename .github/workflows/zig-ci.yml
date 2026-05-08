@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     defaults:
       run:
         working-directory: zig
@@ -53,10 +53,11 @@ jobs:
           set -euo pipefail
           ZIG_VERSION=0.16.0
           case "${{ runner.os }}-${{ runner.arch }}" in
-            Linux-X64)   ARCH=x86_64-linux ;;
-            Linux-ARM64) ARCH=aarch64-linux ;;
-            macOS-X64)   ARCH=x86_64-macos ;;
-            macOS-ARM64) ARCH=aarch64-macos ;;
+            Linux-X64)     ARCH=x86_64-linux ;;
+            Linux-ARM64)   ARCH=aarch64-linux ;;
+            macOS-X64)     ARCH=x86_64-macos ;;
+            macOS-ARM64)   ARCH=aarch64-macos ;;
+            Windows-X64)   ARCH=x86_64-windows ;;
             *) echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
           esac
           echo "version=${ZIG_VERSION}" >> "${GITHUB_OUTPUT}"
@@ -81,8 +82,12 @@ jobs:
           ZIG_VERSION="${{ steps.zig-package.outputs.version }}"
           ARCH="${{ steps.zig-package.outputs.arch }}"
           INSTALL_DIR="${{ steps.zig-package.outputs.install-dir }}"
-          if [ -x "${INSTALL_DIR}/zig" ]; then
-            ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+          if [ -x "${INSTALL_DIR}/zig" ] || [ -x "${INSTALL_DIR}/zig.exe" ]; then
+            if [ -x "${INSTALL_DIR}/zig.exe" ]; then
+              ACTUAL_VERSION="$("${INSTALL_DIR}/zig.exe" version)"
+            else
+              ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+            fi
             if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
               echo "Expected cached Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
               exit 1
@@ -92,13 +97,23 @@ jobs:
             exit 0
           fi
 
-          TARBALL="zig-${ARCH}-${ZIG_VERSION}.tar.xz"
           case "${ARCH}" in
-            x86_64-linux)   EXPECTED_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
-            aarch64-linux)  EXPECTED_SHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
-            x86_64-macos)   EXPECTED_SHA=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7 ;;
-            aarch64-macos)  EXPECTED_SHA=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
-            *) echo "No Zig ${ZIG_VERSION} checksum configured for ${ARCH}" >&2; exit 1 ;;
+            *-windows)
+              ARCHIVE="zip"
+              TARBALL="zig-${ARCH}-${ZIG_VERSION}.zip"
+              EXPECTED_SHA=68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e
+              ;;
+            *)
+              ARCHIVE="tar"
+              TARBALL="zig-${ARCH}-${ZIG_VERSION}.tar.xz"
+              case "${ARCH}" in
+                x86_64-linux)   EXPECTED_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+                aarch64-linux)  EXPECTED_SHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+                x86_64-macos)   EXPECTED_SHA=0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7 ;;
+                aarch64-macos)  EXPECTED_SHA=b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489 ;;
+                *) echo "No Zig ${ZIG_VERSION} checksum configured for ${ARCH}" >&2; exit 1 ;;
+              esac
+              ;;
           esac
 
           DEST="${RUNNER_TEMP}/${TARBALL}"
@@ -150,16 +165,28 @@ jobs:
               --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 300 \
               --connect-timeout 30 --max-time 900 --continue-at - \
               --output "${SOURCE_DEST}" "${URL}"; then
-              ACTUAL_SHA="$(shasum -a 256 "${SOURCE_DEST}" | awk '{print $1}')"
+              if command -v shasum >/dev/null 2>&1; then
+                ACTUAL_SHA="$(shasum -a 256 "${SOURCE_DEST}" | awk '{print $1}')"
+              else
+                ACTUAL_SHA="$(sha256sum "${SOURCE_DEST}" | awk '{print $1}')"
+              fi
               if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
                 echo "Checksum mismatch from ${URL}: expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}" >&2
                 rm -f "${SOURCE_DEST}"
                 continue
               fi
-              if ! tar -tJf "${SOURCE_DEST}" >/dev/null; then
-                echo "Archive validation failed for ${URL}" >&2
-                rm -f "${SOURCE_DEST}"
-                continue
+              if [ "${ARCHIVE}" = "zip" ]; then
+                if ! unzip -tq "${SOURCE_DEST}" >/dev/null; then
+                  echo "Archive validation failed for ${URL}" >&2
+                  rm -f "${SOURCE_DEST}"
+                  continue
+                fi
+              else
+                if ! tar -tJf "${SOURCE_DEST}" >/dev/null; then
+                  echo "Archive validation failed for ${URL}" >&2
+                  rm -f "${SOURCE_DEST}"
+                  continue
+                fi
               fi
               mv "${SOURCE_DEST}" "${DEST}"
               DOWNLOADED=1
@@ -174,12 +201,24 @@ jobs:
             exit 1
           fi
 
-          tar -tJf "${DEST}" >/dev/null
           mkdir -p "${INSTALL_DIR}"
-          tar -xJf "${DEST}" -C "${INSTALL_DIR}" --strip-components=1
-          rm -f "${DEST}"
+          if [ "${ARCHIVE}" = "zip" ]; then
+            EXTRACT_TEMP="${RUNNER_TEMP}/zig-extract-${ARCH}"
+            mkdir -p "${EXTRACT_TEMP}"
+            unzip -q "${DEST}" -d "${EXTRACT_TEMP}"
+            mv "${EXTRACT_TEMP}/zig-${ARCH}-${ZIG_VERSION}/"* "${INSTALL_DIR}/"
+            rm -f "${DEST}"
+          else
+            tar -tJf "${DEST}" >/dev/null
+            tar -xJf "${DEST}" -C "${INSTALL_DIR}" --strip-components=1
+            rm -f "${DEST}"
+          fi
           echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
-          ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+          if [ -x "${INSTALL_DIR}/zig.exe" ]; then
+            ACTUAL_VERSION="$("${INSTALL_DIR}/zig.exe" version)"
+          else
+            ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+          fi
           if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
             echo "Expected Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
             exit 1
@@ -197,6 +236,13 @@ jobs:
       - name: Install system tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ripgrep fd
+
+      - name: Install system tools (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install ripgrep fd -y
+          echo "C:\ProgramData\chocolatey\bin" >> "${GITHUB_PATH}"
 
       - name: Verify external tools
         run: |
