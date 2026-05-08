@@ -14,11 +14,13 @@ const HOST_NOISE_DIRS = [_][]const u8{
     ".svn",
     ".pi",
     ".cache",
+    ".zig-cache",
     ".npm",
     ".yarn",
     ".pnpm-store",
     ".parcel-cache",
     ".turbo",
+    "zig-out",
 };
 const HOST_NOISE_FILES = [_][]const u8{
     "extensions.lock.json",
