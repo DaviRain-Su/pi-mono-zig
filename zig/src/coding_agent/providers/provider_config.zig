@@ -571,9 +571,9 @@ fn parseFauxStopReason(value: []const u8) ?ai.StopReason {
 
 fn defaultFauxErrorMessage(stop_reason: ai.StopReason) ?[]const u8 {
     return switch (stop_reason) {
+        .stop, .length, .tool_use => null,
         .error_reason => "Faux response failed",
         .aborted => "Request was aborted",
-        else => null,
     };
 }
 

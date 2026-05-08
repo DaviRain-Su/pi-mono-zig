@@ -650,7 +650,7 @@ fn handleOpenAIResponsesToolEvent(
         const delta_value = value.object.get("delta") orelse return .continue_loop;
         if (delta_value != .string) return .continue_loop;
         const ref = extractToolCallRef(value, null);
-        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, state.content_blocks.items.len + state.pending_tool_calls.items.len, ref, null);
+        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, nextToolCallContentIndex(state.content_blocks, state.pending_tool_calls, state.current_block), ref, null);
         try tool_call.partial_json.appendSlice(allocator, delta_value.string);
         state.stream_ptr.push(.{
             .event_type = .toolcall_delta,
@@ -665,7 +665,7 @@ fn handleOpenAIResponsesToolEvent(
         const arguments_value = value.object.get("arguments") orelse return .continue_loop;
         if (arguments_value != .string) return .continue_loop;
         const ref = extractToolCallRef(value, null);
-        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, state.content_blocks.items.len + state.pending_tool_calls.items.len, ref, null);
+        const tool_call = try ensureActiveToolCall(allocator, state.active_tool_calls, state.stream_ptr, nextToolCallContentIndex(state.content_blocks, state.pending_tool_calls, state.current_block), ref, null);
         try replaceDoneToolArguments(state, tool_call, arguments_value.string);
         return .continue_loop;
     }
@@ -673,7 +673,7 @@ fn handleOpenAIResponsesToolEvent(
     if (std.mem.eql(u8, event_type, "response.output_item.done")) {
         const item_value = value.object.get("item") orelse return .continue_loop;
         if (isFunctionCallItem(item_value)) {
-            try finalizeActiveToolCallForItem(allocator, value, item_value, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.tool_calls, state.stream_ptr);
+            try finalizeActiveToolCallForItem(allocator, value, item_value, state.active_tool_calls, state.pending_tool_calls, state.content_blocks, state.tool_calls, state.stream_ptr, nextToolCallContentIndex(state.content_blocks, state.pending_tool_calls, state.current_block));
         } else {
             try finalizeCurrentBlock(allocator, item_value, state.current_block, state.content_blocks, state.tool_calls, state.stream_ptr);
             try flushPendingFinalizedToolCalls(allocator, state.pending_tool_calls, state.content_blocks, state.tool_calls);
@@ -769,9 +769,7 @@ fn emitRuntimeFailure(
     err: anyerror,
 ) !void {
     try finalizeOutputFromPartials(allocator, output, current_block, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn handleOutputItemAdded(
@@ -812,7 +810,7 @@ fn handleOutputItemAdded(
 
     if (std.mem.eql(u8, item_type_value.string, "function_call")) {
         const ref = extractToolCallRef(event_value, item_value);
-        const tool_call = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, item_value);
+        const tool_call = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, nextToolCallContentIndex(content_blocks, pending_tool_calls, current_block), ref, item_value);
         if (item_value.object.get("arguments")) |arguments_value| {
             if (arguments_value == .string and arguments_value.string.len > 0) {
                 try tool_call.partial_json.appendSlice(allocator, arguments_value.string);
@@ -928,6 +926,14 @@ fn ensureActiveToolCall(
     return tool_call;
 }
 
+fn nextToolCallContentIndex(
+    content_blocks: *std.ArrayList(types.ContentBlock),
+    pending_tool_calls: *std.ArrayList(PendingFinalizedToolCallBlock),
+    current_block: *?CurrentBlock,
+) usize {
+    return content_blocks.items.len + pending_tool_calls.items.len + if (current_block.* != null) @as(usize, 1) else 0;
+}
+
 fn finalizeActiveToolCallAt(
     allocator: std.mem.Allocator,
     index: usize,
@@ -1011,6 +1017,7 @@ fn finalizeActiveToolCallForItem(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
+    completed_count: usize,
 ) !void {
     const ref = extractToolCallRef(event_value, item_value);
     var index: usize = 0;
@@ -1021,7 +1028,7 @@ fn finalizeActiveToolCallForItem(
         }
     }
 
-    _ = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, content_blocks.items.len + pending_tool_calls.items.len, ref, item_value);
+    _ = try ensureActiveToolCall(allocator, active_tool_calls, stream_ptr, completed_count, ref, item_value);
     try finalizeActiveToolCallAt(allocator, active_tool_calls.items.len - 1, item_value, active_tool_calls, pending_tool_calls, content_blocks, tool_calls, stream_ptr);
 }
 
@@ -2929,6 +2936,116 @@ test "parseSseStreamLines separates interleaved calls and lets final/object argu
     try std.testing.expectEqualStrings("Berlin", message.content[0].tool_call.arguments.object.get("city").?.string);
     try std.testing.expectEqual(@as(i64, 2), message.content[1].tool_call.arguments.object.get("count").?.integer);
     try std.testing.expect(message.content[1].tool_call.arguments.object.get("nested").?.object.get("ok").?.bool);
+
+    freeAssistantMessageOwned(allocator, message);
+}
+
+test "ISS-011 parseSseStreamLines keeps encrypted reasoning with multi-tool outputs" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_multi_reasoning\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_multi\",\"summary\":[]}}\n" ++
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"output_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n" ++
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"choose tools\"}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_weather\",\"call_id\":\"call_weather\",\"name\":\"get_weather\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_count\",\"call_id\":\"call_count\",\"name\":\"get_count\",\"arguments\":\"\"}}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"item_id\":\"fc_count\",\"delta\":\"{\\\"count\\\":\"}\n" ++
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"item_id\":\"fc_weather\",\"delta\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_multi\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"choose tools\"}],\"encrypted_content\":\"encrypted-multi\"}}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_weather\",\"call_id\":\"call_weather\",\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"id\":\"fc_count\",\"call_id\":\"call_count\",\"name\":\"get_count\",\"arguments\":{\"count\":2}}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_multi_reasoning\",\"status\":\"completed\"}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.thinking_start, stream.next().?.event_type);
+    const reasoning_delta = stream.next().?;
+    defer freeEventOwned(allocator, reasoning_delta);
+    try std.testing.expectEqual(types.EventType.thinking_delta, reasoning_delta.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), reasoning_delta.content_index);
+    try std.testing.expectEqualStrings("choose tools", reasoning_delta.delta.?);
+
+    const weather_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, weather_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), weather_start.content_index);
+    const count_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, count_start.event_type);
+    try std.testing.expectEqual(@as(?u32, 2), count_start.content_index);
+    const count_delta = stream.next().?;
+    defer freeEventOwned(allocator, count_delta);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, count_delta.event_type);
+    try std.testing.expectEqual(@as(?u32, 2), count_delta.content_index);
+    const weather_delta = stream.next().?;
+    defer freeEventOwned(allocator, weather_delta);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, weather_delta.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), weather_delta.content_index);
+
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 0), thinking_end.content_index);
+    try std.testing.expectEqualStrings("choose tools", thinking_end.content.?);
+    const weather_end = stream.next().?;
+    defer freeEventOwned(allocator, weather_end);
+    try std.testing.expectEqual(types.EventType.toolcall_end, weather_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 1), weather_end.content_index);
+    try std.testing.expectEqualStrings("call_weather|fc_weather", weather_end.tool_call.?.id);
+    const count_end = stream.next().?;
+    defer freeEventOwned(allocator, count_end);
+    try std.testing.expectEqual(types.EventType.toolcall_end, count_end.event_type);
+    try std.testing.expectEqual(@as(?u32, 2), count_end.content_index);
+    try std.testing.expectEqualStrings("call_count|fc_count", count_end.tool_call.?.id);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    const message = done.message.?;
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqualStrings("resp_multi_reasoning", message.response_id.?);
+    try std.testing.expect(message.tool_calls == null);
+    try std.testing.expectEqual(@as(usize, 3), message.content.len);
+    try std.testing.expect(message.content[0] == .thinking);
+    try std.testing.expect(message.content[1] == .tool_call);
+    try std.testing.expect(message.content[2] == .tool_call);
+    try std.testing.expectEqualStrings("choose tools", message.content[0].thinking.thinking);
+    const signature = types.thinkingSignature(message.content[0].thinking).?;
+    try std.testing.expect(std.mem.indexOf(u8, signature, "\"id\":\"rs_multi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, signature, "\"encrypted_content\":\"encrypted-multi\"") != null);
+    try std.testing.expectEqualStrings("call_weather|fc_weather", message.content[1].tool_call.id);
+    try std.testing.expectEqualStrings("Paris", message.content[1].tool_call.arguments.object.get("city").?.string);
+    try std.testing.expect(message.content[1].tool_call.thought_signature == null);
+    try std.testing.expectEqualStrings("call_count|fc_count", message.content[2].tool_call.id);
+    try std.testing.expectEqual(@as(i64, 2), message.content[2].tool_call.arguments.object.get("count").?.integer);
+    try std.testing.expect(message.content[2].tool_call.thought_signature == null);
+    try std.testing.expect(stream.next() == null);
 
     freeAssistantMessageOwned(allocator, message);
 }

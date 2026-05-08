@@ -7,6 +7,7 @@ const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const simple_options = @import("../shared/simple_options.zig");
@@ -151,7 +152,7 @@ pub const BedrockProvider = struct {
 
         streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+            else => provider_stream.emitSetupRuntimeFailure(&stream_instance, model, options, err),
         };
         return stream_instance;
     }
@@ -2378,26 +2379,6 @@ fn emitRuntimeFailure(
     );
 }
 
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (isAbortRequested(options)) error.RequestAborted else err;
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = provider_error.runtimeErrorMessage(effective_err),
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
-}
-
 fn finalizeOutputSafely(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -2453,7 +2434,20 @@ pub fn mapStopReason(reason: []const u8) !types.StopReason {
     if (std.mem.eql(u8, reason, "max_tokens")) return .length;
     if (std.mem.eql(u8, reason, "model_context_window_exceeded")) return .length;
     if (std.mem.eql(u8, reason, "tool_use")) return .tool_use;
+    if (std.mem.eql(u8, reason, "guardrail_intervened")) return .error_reason;
+    if (std.mem.eql(u8, reason, "content_filtered")) return .error_reason;
     return BedrockError.UnknownStopReason;
+}
+
+test "ISS-041 mapStopReason aligns Bedrock safety stops with terminal errors" {
+    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("end_turn"));
+    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("stop_sequence"));
+    try std.testing.expectEqual(types.StopReason.length, try mapStopReason("max_tokens"));
+    try std.testing.expectEqual(types.StopReason.length, try mapStopReason("model_context_window_exceeded"));
+    try std.testing.expectEqual(types.StopReason.tool_use, try mapStopReason("tool_use"));
+    try std.testing.expectEqual(types.StopReason.error_reason, try mapStopReason("guardrail_intervened"));
+    try std.testing.expectEqual(types.StopReason.error_reason, try mapStopReason("content_filtered"));
+    try std.testing.expectError(BedrockError.UnknownStopReason, mapStopReason("future_stop_reason"));
 }
 
 fn emitAuthError(

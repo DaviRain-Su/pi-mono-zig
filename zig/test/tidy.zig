@@ -177,6 +177,7 @@ const Tidy = struct {
 
         for (self.zig_files.items) |path| try self.scanFile(path);
         try self.scanTestRootCoverage();
+        try validateReviewTestMatrix(self.allocator, self.io, "docs/review/05_test_matrix.md");
         try self.emitReport();
     }
 
@@ -493,6 +494,60 @@ fn hasTestBlock(bytes: []const u8) bool {
     return false;
 }
 
+fn validateReviewTestMatrix(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const bytes = std.Io.Dir.readFileAlloc(
+        .cwd(),
+        io,
+        path,
+        allocator,
+        .limited(512 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    try validateReviewTestMatrixBytes(bytes);
+}
+
+fn validateReviewTestMatrixBytes(bytes: []const u8) !void {
+    var in_matrix = false;
+    var line_number: usize = 1;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| : (line_number += 1) {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.eql(u8, trimmed, "## Matrix")) {
+            in_matrix = true;
+            continue;
+        }
+        if (in_matrix and std.mem.startsWith(u8, trimmed, "## Evidence notes")) {
+            return;
+        }
+        if (!in_matrix or !std.mem.startsWith(u8, trimmed, "|")) continue;
+        if (std.mem.startsWith(u8, trimmed, "| Provider ") or std.mem.startsWith(u8, trimmed, "|---")) continue;
+
+        if (std.mem.indexOf(u8, trimmed, "❌") != null or
+            std.mem.indexOf(u8, trimmed, "⚠️") != null or
+            hasUnknownMatrixCell(trimmed))
+        {
+            std.debug.print(
+                "docs/review/05_test_matrix.md:{d}: error: matrix row contains unresolved missing/partial/unknown cell marker: {s}\n",
+                .{ line_number, trimmed },
+            );
+            return error.UnresolvedReviewMatrixCell;
+        }
+    }
+}
+
+fn hasUnknownMatrixCell(line: []const u8) bool {
+    var cells = std.mem.splitScalar(u8, line, '|');
+    _ = cells.next();
+    while (cells.next()) |cell| {
+        const trimmed = std.mem.trim(u8, cell, " \t\r");
+        if (std.mem.eql(u8, trimmed, "?")) return true;
+    }
+    return false;
+}
+
 fn resolveImportPath(allocator: std.mem.Allocator, importer_path: []const u8, import_spec: []const u8) ![]u8 {
     const base_dir = std.fs.path.dirname(importer_path) orelse "";
     const joined = if (base_dir.len == 0)
@@ -719,4 +774,46 @@ test "hasTestBlock detects named and anonymous Zig tests" {
     try std.testing.expect(hasTestBlock("test { _ = 1; }"));
     try std.testing.expect(!hasTestBlock("pub fn main() void {}"));
     try std.testing.expect(!hasTestBlock("std.debug.print(\"Comparator negative self-test {s}\", .{name});"));
+}
+
+test "review matrix check rejects unresolved missing partial and unknown cells" {
+    const clean =
+        \\# Test Coverage Matrix
+        \\
+        \\## Matrix
+        \\
+        \\| Provider | S1 | S2 |
+        \\|---|---|---|
+        \\| faux | ✅ | Deferred |
+        \\
+        \\## Evidence notes
+    ;
+    try validateReviewTestMatrixBytes(clean);
+
+    const missing =
+        \\## Matrix
+        \\| Provider | S1 |
+        \\|---|---|
+        \\| faux | ❌ |
+        \\## Evidence notes
+    ;
+    try std.testing.expectError(error.UnresolvedReviewMatrixCell, validateReviewTestMatrixBytes(missing));
+
+    const partial =
+        \\## Matrix
+        \\| Provider | S1 |
+        \\|---|---|
+        \\| faux | ⚠️ |
+        \\## Evidence notes
+    ;
+    try std.testing.expectError(error.UnresolvedReviewMatrixCell, validateReviewTestMatrixBytes(partial));
+
+    const unknown =
+        \\## Matrix
+        \\| Provider | S1 |
+        \\|---|---|
+        \\| faux | ? |
+        \\## Evidence notes
+    ;
+    try std.testing.expectError(error.UnresolvedReviewMatrixCell, validateReviewTestMatrixBytes(unknown));
 }

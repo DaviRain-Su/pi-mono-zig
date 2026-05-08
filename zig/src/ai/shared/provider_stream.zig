@@ -24,18 +24,7 @@ pub fn emitSetupRuntimeFailure(
     err: anyerror,
 ) void {
     const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
+    const message = provider_error.makeTerminalRuntimeMessage(model, effective_err);
     provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 

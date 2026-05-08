@@ -605,9 +605,7 @@ fn emitRuntimeFailure(
     err: anyerror,
 ) !void {
     try finalizeOutputFromPartials(allocator, output, current_block, content_slots, tool_calls, active_tool_calls, model, stream_ptr);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn buildMessagesValue(

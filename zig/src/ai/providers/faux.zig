@@ -588,21 +588,15 @@ fn buildStreamPlan(
     errdefer deinitStreamPlanBlocksPartial(allocator, blocks, block_index);
 
     var content_count: usize = 0;
-    var tool_call_count: usize = 0;
     for (response.content) |block| {
         switch (block) {
             .text, .thinking, .tool_call => content_count += 1,
         }
-        if (block == .tool_call) tool_call_count += 1;
     }
 
     const content_blocks = try allocator.alloc(types.ContentBlock, content_count);
     var content_index: usize = 0;
     errdefer deinitContentBlocksPartial(allocator, content_blocks, content_index);
-
-    const tool_calls = if (tool_call_count > 0) try allocator.alloc(types.ToolCall, tool_call_count) else null;
-    var tool_call_index: usize = 0;
-    errdefer if (tool_calls) |owned_tool_calls| deinitToolCallsPartial(allocator, owned_tool_calls, tool_call_index);
 
     for (response.content, 0..) |block, index| {
         switch (block) {
@@ -621,30 +615,31 @@ fn buildStreamPlan(
                 block_index += 1;
             },
             .tool_call => |tool_call| {
-                tool_calls.?[tool_call_index] = .{
+                const finalized_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool_call.id),
                     .name = try allocator.dupe(u8, tool_call.name),
                     .arguments = try cloneJsonValue(allocator, tool_call.arguments),
                     .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
                 };
-                const finalized_tool_call = tool_calls.?[tool_call_index];
-                const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, finalized_tool_call.arguments, .{});
-                content_blocks[content_index] = .{ .tool_call = .{
-                    .id = try allocator.dupe(u8, finalized_tool_call.id),
-                    .name = try allocator.dupe(u8, finalized_tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, finalized_tool_call.arguments),
-                    .thought_signature = if (finalized_tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
-                } };
-                content_index += 1;
+                var tool_call_transferred = false;
+                errdefer if (!tool_call_transferred) deinitToolCall(allocator, finalized_tool_call);
 
+                const serialized_arguments = try std.json.Stringify.valueAlloc(allocator, finalized_tool_call.arguments, .{});
+                var serialized_transferred = false;
+                errdefer if (!serialized_transferred) allocator.free(serialized_arguments);
+
+                content_blocks[content_index] = .{ .tool_call = finalized_tool_call };
+                tool_call_transferred = true;
+                const stored_tool_call = content_blocks[content_index].tool_call;
                 blocks[index] = .{ .tool_call = .{
-                    .id = finalized_tool_call.id,
-                    .name = finalized_tool_call.name,
-                    .arguments = finalized_tool_call.arguments,
-                    .thought_signature = finalized_tool_call.thought_signature,
+                    .id = stored_tool_call.id,
+                    .name = stored_tool_call.name,
+                    .arguments = stored_tool_call.arguments,
+                    .thought_signature = stored_tool_call.thought_signature,
                     .serialized_arguments = serialized_arguments,
                 } };
-                tool_call_index += 1;
+                serialized_transferred = true;
+                content_index += 1;
                 block_index += 1;
             },
         }
@@ -659,7 +654,7 @@ fn buildStreamPlan(
 
     var final_message = types.AssistantMessage{
         .content = content_blocks,
-        .tool_calls = tool_calls,
+        .tool_calls = null,
         .api = state.api,
         .provider = state.provider,
         .model = model.id,
@@ -1087,7 +1082,7 @@ test "registerFauxProvider queues responses and estimates usage" {
     try std.testing.expectEqual(@as(usize, 3), registration.state.call_count);
 }
 
-test "VAL-MSG-002 VAL-MSG-011 faux tool-call thought signature mirrors inline and legacy content" {
+test "VAL-MSG-002 VAL-MSG-011 ISS-110 faux tool-call thought signature stays inline-only" {
     const allocator = std.testing.allocator;
     const registration = try registerFauxProvider(allocator, .{});
     defer registration.unregister();
@@ -1135,8 +1130,116 @@ test "VAL-MSG-002 VAL-MSG-011 faux tool-call thought signature mirrors inline an
     try std.testing.expectEqual(@as(usize, 1), result.content.len);
     try std.testing.expect(result.content[0] == .tool_call);
     try std.testing.expectEqualStrings("faux-tool-thought-sig", result.content[0].tool_call.thought_signature.?);
-    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.?.len);
-    try std.testing.expectEqualStrings("faux-tool-thought-sig", result.tool_calls.?[0].thought_signature.?);
+    try std.testing.expect(result.tool_calls == null);
+}
+
+test "review matrix faux streams thinking multiple tools and empty success" {
+    const allocator = std.testing.allocator;
+    const registration = try registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var first_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try first_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
+    const first_args_value = std.json.Value{ .object = first_args };
+    defer deinitJsonValue(allocator, first_args_value);
+
+    var second_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try second_args.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = 2 });
+    const second_args_value = std.json.Value{ .object = second_args };
+    defer deinitJsonValue(allocator, second_args_value);
+
+    const first_tool = try fauxToolCall(allocator, "weather", first_args_value, .{ .id = "tool-weather" });
+    defer switch (first_tool) {
+        .tool_call => |value| {
+            allocator.free(value.id);
+            allocator.free(value.name);
+            deinitJsonValue(allocator, value.arguments);
+        },
+        else => unreachable,
+    };
+    const second_tool = try fauxToolCall(allocator, "count", second_args_value, .{ .id = "tool-count" });
+    defer switch (second_tool) {
+        .tool_call => |value| {
+            allocator.free(value.id);
+            allocator.free(value.name);
+            deinitJsonValue(allocator, value.arguments);
+        },
+        else => unreachable,
+    };
+
+    const rich_content = [_]FauxContentBlock{
+        fauxThinking("Need two tools"),
+        first_tool,
+        second_tool,
+    };
+    const empty_content = [_]FauxContentBlock{};
+    try registration.setResponses(&[_]FauxResponseStep{
+        .{ .message = fauxAssistantMessage(rich_content[0..], .{ .stop_reason = .tool_use }) },
+        .{ .message = fauxAssistantMessage(empty_content[0..], .{}) },
+    });
+
+    const context = types.Context{
+        .messages = &[_]types.Message{.{ .user = .{
+            .content = &[_]types.ContentBlock{.{ .text = .{ .text = "matrix sweep" } }},
+            .timestamp = 1,
+        } }},
+    };
+
+    var rich_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, null);
+    defer rich_stream.deinit();
+
+    const rich_events = try collectEventTypes(&rich_stream, allocator);
+    defer allocator.free(rich_events);
+    try std.testing.expect(rich_events.len >= 11);
+    try std.testing.expectEqual(types.EventType.start, rich_events[0]);
+    try std.testing.expectEqual(types.EventType.done, rich_events[rich_events.len - 1]);
+    var thinking_start_count: usize = 0;
+    var thinking_delta_count: usize = 0;
+    var thinking_end_count: usize = 0;
+    var toolcall_start_count: usize = 0;
+    var toolcall_delta_count: usize = 0;
+    var toolcall_end_count: usize = 0;
+    for (rich_events) |event_type| switch (event_type) {
+        .thinking_start => thinking_start_count += 1,
+        .thinking_delta => thinking_delta_count += 1,
+        .thinking_end => thinking_end_count += 1,
+        .toolcall_start => toolcall_start_count += 1,
+        .toolcall_delta => toolcall_delta_count += 1,
+        .toolcall_end => toolcall_end_count += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), thinking_start_count);
+    try std.testing.expect(thinking_delta_count >= 1);
+    try std.testing.expectEqual(@as(usize, 1), thinking_end_count);
+    try std.testing.expectEqual(@as(usize, 2), toolcall_start_count);
+    try std.testing.expect(toolcall_delta_count >= 2);
+    try std.testing.expectEqual(@as(usize, 2), toolcall_end_count);
+
+    var rich_result = rich_stream.result().?;
+    defer deinitAssistantMessage(allocator, &rich_result);
+    try std.testing.expectEqual(types.StopReason.tool_use, rich_result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 3), rich_result.content.len);
+    try std.testing.expect(rich_result.content[0] == .thinking);
+    try std.testing.expectEqualStrings("Need two tools", rich_result.content[0].thinking.thinking);
+    try std.testing.expect(rich_result.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("weather", rich_result.content[1].tool_call.name);
+    try std.testing.expect(rich_result.content[2] == .tool_call);
+    try std.testing.expectEqualStrings("count", rich_result.content[2].tool_call.name);
+    try std.testing.expect(rich_result.tool_calls == null);
+
+    var empty_stream = try FauxProvider.stream(allocator, std.Io.failing, registration.getModel(), context, null);
+    defer empty_stream.deinit();
+    const empty_events = try collectEventTypes(&empty_stream, allocator);
+    defer allocator.free(empty_events);
+    try std.testing.expectEqualSlices(types.EventType, &[_]types.EventType{
+        .start,
+        .done,
+    }, empty_events);
+
+    var empty_result = empty_stream.result().?;
+    defer deinitAssistantMessage(allocator, &empty_result);
+    try std.testing.expectEqual(types.StopReason.stop, empty_result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 0), empty_result.content.len);
 }
 
 test "registerFauxProvider aborts mid-stream and stops emitting events" {

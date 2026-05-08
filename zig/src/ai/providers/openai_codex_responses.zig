@@ -6,6 +6,7 @@ const env_api_keys = @import("../env_api_keys.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
 const responses_api = @import("../shared/responses_api.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const openai = @import("openai.zig");
@@ -37,7 +38,7 @@ pub const OpenAICodexResponsesProvider = struct {
 
         streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => emitSetupRuntimeFailure(&stream_instance, model, options, err),
+            else => provider_stream.emitSetupRuntimeFailure(&stream_instance, model, options, err),
         };
         return stream_instance;
     }
@@ -175,27 +176,6 @@ fn emitErrorMessage(
         .message = message,
     });
     stream_instance.end(message);
-}
-
-fn emitSetupRuntimeFailure(
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    options: ?types.StreamOptions,
-    err: anyerror,
-) void {
-    const effective_err = if (provider_error.isAbortRequested(options)) error.RequestAborted else err;
-    const error_message = provider_error.runtimeErrorMessage(effective_err);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = provider_error.runtimeStopReason(effective_err),
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    provider_error.pushTerminalRuntimeError(stream_ptr, message);
 }
 
 pub fn buildRequestPayload(
@@ -938,9 +918,7 @@ fn emitRuntimeFailure(
     err: anyerror,
 ) !void {
     try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn handleOutputItemAdded(

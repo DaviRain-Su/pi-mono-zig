@@ -7,6 +7,7 @@ pub const model_discovery = @import("model_discovery.zig");
 pub const json_parse = @import("json_parse.zig");
 pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
+pub const event_stream_guard = @import("event_stream_guard.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
 
 pub const oauth = struct {
@@ -111,6 +112,7 @@ test {
     _ = @import("model_discovery.zig");
     _ = @import("json_parse.zig");
     _ = @import("stream.zig");
+    _ = @import("event_stream_guard.zig");
     _ = @import("env_api_keys.zig");
     _ = @import("oauth/types.zig");
     _ = @import("oauth/pkce.zig");

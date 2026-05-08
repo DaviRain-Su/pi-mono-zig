@@ -82,9 +82,12 @@ The three `*_responses.zig` files have nearly identical impls.
 Shape: iterate raw response lines, accumulate `event:` + `data:`, dispatch
 on blank line, support abort, finalize on EOF.
 
-Sites: nearly every provider. Sufficient variation per provider that a full
-extraction is risky; instead, extract a small generic line iterator and let
-each provider supply its event-dispatch fn.
+Sites: nearly every provider. Sufficient variation per provider made a full
+parser extraction risky, so the implemented shared surface is a generic line
+iterator with provider-supplied data-line/frame handlers. The legacy OpenAI
+Chat parser now uses that outer iterator for line reading and abort checks
+while keeping Chat Completions delta accumulation and dual-allocation
+compatibility local to `openai_chat_sse.zig`.
 
 ### Cluster D — `mapStopReason`
 
@@ -201,25 +204,26 @@ pub fn finalizeCurrentBlock(
 ) !void;
 ```
 
-### `zig/src/ai/shared/sse_loop.zig` (new)
+### `zig/src/ai/shared/sse_loop.zig`
 
-Generic outer SSE iterator. Provider supplies an event-dispatch closure.
+Generic outer SSE iterator. Providers supply typed handlers for either
+single-line `data:` streams or frame-oriented SSE streams.
 
 ```zig
-pub const SseEventDispatch = fn (
-    ctx: *anyopaque,
-    event_name: []const u8,
-    data: []const u8,
-) anyerror!void;
+pub fn run(
+    comptime Handler: type,
+    handler: *Handler,
+    streaming: *http_client.StreamingResponse,
+    stream_options: ?types.StreamOptions,
+) !LoopResult;
 
-pub fn runSseLoop(
+pub fn runFrames(
     allocator: std.mem.Allocator,
-    response: *http_client.StreamingResponse,
-    abort: ?abort_signal.AbortSignal,
-    accept_compact_data_lines: bool, // true for anthropic/kimi, etc.
-    ctx: *anyopaque,
-    dispatch: SseEventDispatch,
-) !void;
+    comptime Handler: type,
+    handler: *Handler,
+    streaming: *http_client.StreamingResponse,
+    stream_options: ?types.StreamOptions,
+) !LoopResult;
 ```
 
 ### `zig/src/ai/shared/runtime_error.zig` (new — small)
@@ -347,10 +351,17 @@ Order matters. Each step must keep `zig build test` green.
 ### ISS-309 Step 6: extract generic `runSseLoop`
 - 严重度: P2
 - 位置: many — see plan and `zig/src/ai/shared/sse_loop.zig`
-- 建议: The M6 migration is complete for the review-roadmap scope. Preserve provider-local dispatch differences and keep compact-line handling explicit through `accept_compact_data_lines`.
+- 建议: The M6 migration is complete for the review-roadmap scope. Preserve
+  provider-local dispatch/data-line differences. Legacy OpenAI Chat now uses
+  `sse_loop.run` for the outer line loop and abort checks, but keeps compact
+  `data:{...}` tolerance in its `OpenAIChatSseLoopHandler.extractDataLine`
+  implementation rather than broadening generic loop behavior.
 - 状态: done
-- 负责: review-roadmap-documentation-bookkeeping-sync
-- 提交: 3306500c, 902720d3
+- 负责: review-roadmap-documentation-bookkeeping-sync;
+  5efa68c7-6d00-41ab-829c-96d19377c89c verified the pre-existing OpenAI Chat
+  SSE diff
+- 提交: 3306500c, 902720d3; pending mission handoff for OpenAI Chat SSE
+  uncommitted diff
 
 ### ISS-310 Step 7: `emitTerminal` consolidation
 - 严重度: P2

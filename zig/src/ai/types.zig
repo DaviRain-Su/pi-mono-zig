@@ -212,6 +212,12 @@ pub const ToolCall = struct {
     id: []const u8,
     name: []const u8,
     arguments: std.json.Value,
+    /// Optional encrypted/provider-private reasoning associated with this
+    /// executable tool call. Providers that set this field must allocate it
+    /// with the message allocator; `freeToolCall` and clone/deinit helpers own
+    /// freeing it. Same-model replay/conversion may preserve it, while
+    /// cross-model provider-context conversion must drop it because signatures
+    /// are not portable across providers or model families.
     thought_signature: ?[]const u8 = null,
 };
 

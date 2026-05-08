@@ -84,16 +84,21 @@ assistant message. New code that violates these is a regression.
 #### ISS-010 finalizeOutputFromPartials still mixed with happy path
 - 严重度: P2
 - 位置: `zig/src/ai/providers/openai_responses.zig:640-658`
-- 现状: After commit `fde1951f`, `finalizeOutputFromPartials` no longer
-  populates `output.tool_calls`, but the function exists in two different
-  shapes (happy-path and error-path) that share most logic.
-- 问题: Future regressions easy. Prefer extracting a single helper.
-- 建议: Extract the shared core; have happy-path and `emitRuntimeFailure`
-  both call it.
-- 验证: `zig build test-openai-responses-parity`.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by the shared finalize/output and Responses API migration.
+  `openai_responses.zig` aliases `responses_api.finalizeCurrentBlock` and its
+  local `finalizeOutputFromPartials` adapter delegates the ownership transfer,
+  total-token handling, and stop-reason coercion to
+  `ai/shared/finalize.zig::finalizeOutput`.
+- 问题: Closed for this roadmap pass; the remaining local adapter is
+  provider-specific block flushing/error glue, not a retained copy of shared
+  output-transfer logic.
+- 建议: Keep the adapter delegating to `finalize.finalizeOutput` during future
+  Responses refactors.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync;
+  5efa68c7-6d00-41ab-829c-96d19377c89c stale-doc verification
+- 提交: 3306500c, 902720d3
 
 #### ISS-011 Confirm reasoning detail attached to correct tool call when
 multiple tool calls in flight
@@ -116,12 +121,17 @@ multiple tool calls in flight
 #### ISS-020 Same finalize-from-partials extraction as ISS-010
 - 严重度: P2
 - 位置: `zig/src/ai/providers/openai_codex_responses.zig` (finalizeOutputFromPartials)
-- 建议: Once shared layer (see `02_provider_duplication.md`) lands, replace
-  this function body with a call into it.
-- 验证: existing parity tests.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by the shared finalize/output and Responses API migration.
+  `openai_codex_responses.zig` aliases `responses_api.finalizeCurrentBlock`
+  and its local finalization adapter delegates to
+  `ai/shared/finalize.zig::finalizeOutput`.
+- 建议: Keep the provider-local adapter limited to Codex-specific block
+  flushing and terminal-error glue.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync;
+  5efa68c7-6d00-41ab-829c-96d19377c89c stale-doc verification
+- 提交: 3306500c, 902720d3
 
 ---
 
@@ -130,10 +140,17 @@ multiple tool calls in flight
 #### ISS-030 Same finalize-from-partials extraction as ISS-010
 - 严重度: P2
 - 位置: `zig/src/ai/providers/azure_openai_responses.zig`
-- 建议: same as ISS-010/020.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by the shared finalize/output and Responses API migration.
+  `azure_openai_responses.zig` aliases `responses_api.finalizeCurrentBlock`
+  and its local finalization adapter delegates to
+  `ai/shared/finalize.zig::finalizeOutput`.
+- 建议: Keep the provider-local adapter limited to Azure-specific block
+  flushing and terminal-error glue.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: review-roadmap-documentation-bookkeeping-sync;
+  5efa68c7-6d00-41ab-829c-96d19377c89c stale-doc verification
+- 提交: 3306500c, 902720d3
 
 #### ISS-031 Verify Azure-specific header / endpoint handling vs OpenAI
 - 严重度: P2
@@ -155,18 +172,21 @@ multiple tool calls in flight
 double-free path remains
 - 严重度: P1
 - 位置: `zig/src/ai/providers/bedrock.zig:2200-2230`
-- 现状: After commit `fde1951f`, the `.tool_call` branch reuses
-  `final_tool_call` directly in content_blocks (no clone). 
-- 问题: Need to confirm `tool_calls.deinit` does not free strings owned by
-  content_blocks.
-- 建议: Read tool_calls.deinit call site; confirm it only frees the list
-  buffer.
-- 验证: existing `zig build test-bedrock-parity` already passes; add a
-  `defer std.testing.expectEqualStrings(...)` after deinit to prove strings
-  remain valid (in a leak-tracking allocator test).
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by source audit and the provider ownership matrix. Bedrock
+  finalizes tool calls through `finalize.insertInlineToolCall` /
+  `finalize.finalizeOutput`, leaves `AssistantMessage.tool_calls` null, and
+  keeps the local `tool_calls` ArrayList as borrow-only bookkeeping. Existing
+  Bedrock fixtures assert tool-call-only final output has one inline
+  `.tool_call` and null legacy `tool_calls`; terminal-error fixtures also
+  preserve null legacy ownership.
+- 问题: Closed for this backlog pass; future Bedrock parser refactors must keep
+  the inline-only ownership comment and `provider_tool_call_ownership_matrix`
+  row in sync.
+- 建议: Keep Bedrock parser fixtures plus the shared ownership matrix green.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 #### ISS-041 Bedrock-specific stop_reason coercion alignment
 - 严重度: P1
@@ -188,30 +208,38 @@ double-free path remains
 #### ISS-050 Document why `output.tool_calls` is dual-allocated here
 - 严重度: P2
 - 位置: `zig/src/ai/providers/openai_chat_sse.zig:577-666` (finishStreamingBlocks)
-- 现状: Comment explains the dual-allocation; but it is the ONLY exception to
-  the cross-provider invariant.
-- 问题: Anyone normalizing in the future needs to know this. The
-  `tool_calls_transferred` flag invariant should be restated near every
-  consumer site.
-- 建议: Add a doc comment block at the top of the file restating "this is
-  the legacy chat completions path, dual allocation is intentional, see
-  `freeAssistantMessage` for the freeing contract".
-- 验证: docs only.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: The file header now states that OpenAI Chat Completions keeps a custom
+  parser, uses the shared SSE outer iterator only for line/abort handling, and
+  intentionally preserves the separately allocated legacy
+  `AssistantMessage.tool_calls` compatibility copy while inline `.tool_call`
+  content remains canonical. `finishParserState` also repeats the freeing
+  contract at the transfer site.
+- 问题: Closed for this review pass; future normalizations must preserve this
+  documented exception unless the legacy compatibility field is intentionally
+  removed everywhere.
+- 建议: Keep the file-header and transfer-site comments in sync with any future
+  `types.freeAssistantMessage` ownership-contract changes.
+- 验证: static review of `zig/src/ai/providers/openai_chat_sse.zig` header and
+  transfer-site comments; `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: 5efa68c7-6d00-41ab-829c-96d19377c89c
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 #### ISS-051 Compact `data:{...}` SSE line not accepted
 - 严重度: P1
 - 位置: `zig/src/ai/providers/openai_chat_sse.zig:443-450` (parseSseLine)
-- 现状: Only accepts the literal prefix `"data: "` with the trailing space.
-- 问题: Some compatible providers (Anthropic-style) emit `data:{...}` without
-  a space. Anthropic's parser tolerates this; OpenAI chat does not.
-- 建议: Accept both `data:` and `data: `. Mirror anthropic.zig's parsing.
-- 验证: extend openai chat sse test with compact data line fixture.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: `parseSseLine` accepts both `"data: "` and compact `"data:"` prefixes,
+  and `openai_chat_sse accepts compact data lines in chat completions stream`
+  covers compact data after an `event:` control line.
+- 问题: Closed for this review pass; compact Chat Completions data-line
+  tolerance is intentionally local to `openai_chat_sse`'s provider handler and
+  does not broaden canonical generic SSE-loop parsing.
+- 建议: Keep the compact-line fixture whenever the OpenAI Chat SSE parser or
+  shared SSE-loop handler is refactored.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: 5efa68c7-6d00-41ab-829c-96d19377c89c
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 ---
 
@@ -220,29 +248,34 @@ double-free path remains
 #### ISS-060 Verify behavior change after placeholder-text removal
 - 严重度: P0
 - 位置: `zig/src/ai/providers/kimi.zig:841-870` (finishCurrentBlock)
-- 现状: Commit `fde1951f` removed empty placeholder text block when
-  finalizing tool call; tool call now goes directly to content_blocks.
-- 问题: Any consumer that previously skipped empty text blocks may now mis-
-  count or mis-render. Verify on-device or via fixture.
-- 建议: Add a kimi-specific snapshot test that the final content has exactly
-  one `.tool_call` block (no zero-length text).
-- 验证: new test under provider_smoke_test.zig or a kimi test file.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by the Kimi parser fixture
+  `ISS-060 ISS-061 parseSseStream omits placeholder text for tool-call-only
+  response and coerces stop reason`. The fixture finalizes a tool-call-only
+  Kimi stream and asserts the final assistant message contains exactly one
+  inline `.tool_call` block, no zero-length text placeholder, and null legacy
+  `tool_calls`.
+- 问题: Closed for this backlog pass; the intended behavior is no placeholder
+  text block for tool-call-only final content.
+- 建议: Keep the named Kimi fixture with any `finishCurrentBlock` refactor.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 #### ISS-061 Tool-call-only response: stop_reason coercion path
 - 严重度: P1
 - 位置: `zig/src/ai/providers/kimi.zig` (final done emit)
-- 现状: After this round, `had_tool_calls and stop_reason == .stop ->
-  .tool_use` coercion is in place.
-- 问题: Pre-existing kimi tests may or may not cover this; needs a regression.
-- 建议: Add a fixture: stream emits text + tool_use, server-reported
-  stop=stop, expect output.stop_reason==.tool_use.
-- 验证: provider_smoke_test.zig.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by the same ISS-060/061 Kimi fixture. It feeds a provider
+  `finish_reason: "stop"` with finalized tool output and asserts
+  `output.stop_reason == .tool_use`.
+- 问题: Closed for this backlog pass; stop-to-tool-use coercion is provider
+  finalization behavior, not an agent-loop repair.
+- 建议: Keep the fixture and `finalize.finalizeOutput(...,
+  .coerce_stop_reason_for_tool_calls = true)` wiring together.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 ---
 
@@ -251,14 +284,20 @@ double-free path remains
 #### ISS-070 Audit normalize-tool-call invariants
 - 严重度: P1
 - 位置: `zig/src/ai/providers/mistral.zig`
-- 现状: Believed already normalized; not touched in `fde1951f`.
-- 问题: Confirm by reading. Specifically: does mistral leave
-  `output.tool_calls` null? Does it use single-allocation pattern?
-- 建议: Read finalize/SSE-end paths. If anything diverges, file new ISS.
-- 验证: existing tests + add explicit "tool_calls is null" assertion.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by source audit plus `provider_tool_call_ownership_matrix`.
+  Mistral materializes tool calls inline in `content_slots`, leaves
+  `output.tool_calls` null, and uses the `tool_calls` ArrayList only for
+  borrow-only stop-reason bookkeeping. Existing stream fixtures assert
+  content-index stability and stop-to-tool-use coercion; the shared matrix
+  asserts Mistral is normalized inline-only under a debug allocator.
+- 问题: Closed for this backlog pass; no Mistral-specific legacy exception was
+  found.
+- 建议: Keep the Mistral matrix row and parser fixtures with future
+  `active_tool_calls` refactors.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 ---
 
@@ -267,12 +306,21 @@ double-free path remains
 #### ISS-080 Already-normalized assertion + documentation
 - 严重度: P2
 - 位置: `zig/src/ai/providers/google*.zig`
-- 现状: Believed normalized (per oracle survey).
-- 问题: Add an explicit comment "tool calls live inline; legacy field intentionally null" near finalize path so it is greppable like the other normalized providers.
-- 验证: docs only.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by source audit, per-provider assertions, and the ownership
+  matrix. `google.zig`, `google_vertex.zig`, and `google_gemini_cli.zig`
+  append `functionCall` responses as inline `.tool_call` content, use local
+  `tool_calls` arrays only for stop-reason coercion, and leave the legacy
+  `AssistantMessage.tool_calls` field null. The direct Google fixture already
+  asserts null legacy ownership; the shared matrix covers all three Google
+  family APIs under a debug allocator.
+- 问题: Closed for this backlog pass; future Google-family parser work should
+  keep inline ownership comments/fixtures greppable where provider-local
+  finalization differs.
+- 建议: Keep Google-family rows in `provider_tool_call_ownership_matrix_test.zig`.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 ---
 
@@ -312,14 +360,18 @@ double-free path remains
 #### ISS-110 Confirm faux provider mirrors normalized invariants
 - 严重度: P1
 - 位置: `zig/src/ai/providers/faux.zig`
-- 现状: Mock provider used in tests.
-- 问题: If faux uses the OLD shape (with `output.tool_calls` populated), it
-  will mask regressions in tests that rely on it.
-- 建议: Read finalize path; confirm faux emits inline tool_call only.
-- 验证: provider_smoke_test.zig.
-- 状态: open
-- 负责:
-- 提交:
+- 现状: Closed by normalizing the in-memory faux provider and updating its
+  focused fixture. Faux now streams tool-call events from inline content and
+  finalizes `AssistantMessage.tool_calls = null`, matching the normalized
+  provider invariant instead of masking regressions with the old legacy cache.
+  `ISS-110 faux tool-call thought signature stays inline-only` asserts the
+  thought signature survives on the inline block and the legacy field is null.
+- 问题: Closed for this backlog pass; faux is no longer a legacy exception.
+- 建议: Keep faux's own fixture and the shared ownership matrix aligned.
+- 验证: `cd zig && zig build test-ai`.
+- 状态: closed
+- 负责: zrb-01-kimi-placeholder-and-provider-invariant-audit
+- 提交: pending mission handoff (uncommitted by mission rule)
 
 ---
 

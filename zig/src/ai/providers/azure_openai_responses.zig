@@ -883,9 +883,7 @@ fn emitRuntimeFailure(
     err: anyerror,
 ) !void {
     try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn handleOutputItemAdded(
@@ -1202,6 +1200,80 @@ test "buildRequestUrl appends api-version for dated Azure APIs" {
         "https://example.openai.azure.com/openai/v1/responses?api-version=2025-03-01-preview",
         url,
     );
+}
+
+test "ISS-031 Azure request snapshot audits endpoint query and api-key semantics" {
+    const allocator = std.testing.allocator;
+
+    const missing_endpoint_model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    try std.testing.expectError(error.MissingAzureBaseUrl, resolveAzureBaseUrlWithEnv(allocator, missing_endpoint_model, null, null, null));
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://ignored-resource.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Audit Azure request semantics." } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+
+    const snapshot = try buildRequestSnapshotValueWithEnv(
+        allocator,
+        model,
+        context,
+        .{
+            .api_key = "azure-fixture-key",
+            .azure_api_version = "2025-03-01-preview",
+        },
+        .{
+            .azure_resource_name = "semantic-resource",
+            .azure_deployment_name_map = "other=ignored,gpt-4.1=semantic-deployment",
+        },
+        .{
+            .scenario_id = "iss-031-azure-header-endpoint-audit",
+            .provider_family = "azure-openai",
+        },
+    );
+    defer freeJsonValue(allocator, snapshot);
+
+    const object = snapshot.object;
+    try std.testing.expectEqualStrings("https://semantic-resource.openai.azure.com/openai/v1", object.get("baseUrl").?.string);
+    try std.testing.expectEqualStrings("POST", object.get("method").?.string);
+    try std.testing.expectEqualStrings("/openai/v1/responses", object.get("path").?.string);
+    try std.testing.expectEqualStrings(
+        "https://semantic-resource.openai.azure.com/openai/v1/responses?api-version=2025-03-01-preview",
+        object.get("url").?.string,
+    );
+    try std.testing.expectEqualStrings("2025-03-01-preview", object.get("query").?.object.get("api-version").?.string);
+
+    const headers = object.get("headers").?.object;
+    try std.testing.expectEqualStrings("application/json", headers.get("accept").?.string);
+    try std.testing.expectEqualStrings("application/json", headers.get("content-type").?.string);
+    try std.testing.expectEqualStrings("<redacted-present>", headers.get("api-key").?.string);
+    try std.testing.expect(headers.get("authorization") == null);
+
+    const payload = object.get("jsonPayload").?.object;
+    try std.testing.expectEqualStrings("semantic-deployment", payload.get("model").?.string);
+    try std.testing.expectEqualStrings("Audit Azure request semantics.", payload.get("input").?.array.items[0].object.get("content").?.array.items[0].object.get("text").?.string);
 }
 
 test "resolveAuthHeaderValue prefers api-key for plain credentials" {

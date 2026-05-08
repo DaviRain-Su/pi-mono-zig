@@ -162,15 +162,21 @@ small variations.
 `ai/shared/sse_loop.zig`; `902720d3` completed the remaining provider hardening
 and coverage pass across Responses-family, Anthropic/Kimi-compatible, Google,
 Mistral, Bedrock, and legacy OpenAI Chat paths while preserving provider-local
-variation where intentionally required.
+variation where intentionally required. The docs/stale-close follow-up also
+validated the pre-existing uncommitted OpenAI Chat SSE diff: legacy
+`openai_chat_sse.zig` now uses the shared outer line loop for line reading and
+abort checks, while keeping the Chat Completions parser, compact data-line
+tolerance, and legacy dual-allocation compatibility local and documented.
 
 **Tasks**:
 - [x] ISS-309 implement `runSseLoop` in `ai/shared/sse_loop.zig`
-- [x] Add `accept_compact_data_lines` flag (folds in ISS-051)
+- [x] Keep compact data-line handling explicit in provider-local data-line
+  handlers (folds in ISS-051 for OpenAI Chat SSE)
 - [x] Migrate kimi → openai_responses → codex → azure → anthropic →
   google → google_vertex → google_gemini_cli → mistral → bedrock
-- [x] Last: openai (legacy chat) and openai_chat_sse (intentional exception
-  may keep its own)
+- [x] Last: openai (legacy chat) and openai_chat_sse use the shared outer
+  loop while keeping Chat Completions-specific parsing and the documented
+  legacy `output.tool_calls` exception local
 
 **Quality gate**:
 - every provider's existing tests green at each step
@@ -222,27 +228,150 @@ pins this behavior.
 
 ## M9 — Test matrix completion
 
-**Goal**: every cell in `05_test_matrix.md` is ✅ or N/A, or explicitly
-classified with a justified partial/missing marker instead of unknown `?`.
+**Goal**: every cell in `05_test_matrix.md` is ✅, N/A, or explicitly
+classified as Deferred with a justified owner/rationale instead of unknown `?`.
 
-**Status**: complete in `902720d3`. The matrix has zero unknown `?` cells,
-ISS-600 is closed, and ISS-601 closed the M9 priority sweep for S13/S14/S12/S6/S15.
-Remaining ❌ cells are known missing lower-priority coverage, not unknown cells.
+**Status**: M9 complete in `902720d3`; remaining backlog sweep completed by
+`zrb-07-remaining-test-matrix-sweep`. The matrix has zero unknown `?` cells,
+zero unclassified missing/partial cells, ISS-600/ISS-601/ISS-602 are closed,
+and all remaining lower-priority coverage gaps are marked Deferred under ISS-603.
 
 **Tasks**:
 - [x] ISS-600 confirm existing entries
-- [x] ISS-601 fill ❌ in priority order
+- [x] ISS-601 fill missing cells in priority order
+- [x] ISS-602 establish test-add convention
+- [ ] ISS-603 deferred lower-priority provider fixture expansion
 
-**Quality gate**: matrix has zero `?` entries.
+**Quality gate**: matrix has zero `?`, unclassified missing, or unclassified
+partial entries; `zig build test-tidy` statically checks the provider table.
 
 ---
 
-## M10 (post-`ai`/`agent`) — `coding_agent/` review pass
+## M10 (planning-only) — `coding_agent/` review pass
 
-**Out of scope for this round / post-ai-agent.** Listed so we don't forget.
-Likely starts with `interactive_mode.zig` (6331 LOC) and `ts_rpc_mode.zig`
-(6232 LOC) splits. M10 is not claimed as completed by the M1–M9 bookkeeping
-closure.
+**Status**: read-only planning complete. This milestone did not implement
+any code split, move source files, or change production behavior. It records
+the safe future decomposition order for a separate `coding_agent/` review pass
+after M1–M9 provider/agent work is already closed.
+
+**Current hotspot inventory** (2026-05-08 line-count scan):
+
+| LOC | Path | Primary risk |
+|---:|---|---|
+| 6636 | `zig/src/coding_agent/packages/package_manager.zig` | package install/update/remove/config, WASM trust/provenance, settings mutation, external command execution, and tests remain tightly coupled |
+| 6333 | `zig/src/coding_agent/interactive_mode.zig` | bootstrap, terminal lifecycle, missing-cwd prompts, auth polling, prompt-worker lifecycle, extension UI service, and the main render/input loop share one orchestration root |
+| 6242 | `zig/src/coding_agent/modes/ts_rpc_mode.zig` | exact-byte JSONL RPC, command dispatch, prompt/bash concurrency, deferred responses, session replacement, and extension UI protocol are coupled |
+| 5362 | `zig/src/coding_agent/interactive_mode/rendering.zig` | `AppState`, event reducers, snapshot cloning, layout/draw functions, footer/task/chat rendering, extension widgets, images, and bash display state share one render module |
+| 3581 | `zig/src/coding_agent/interactive_mode/input_dispatch.zig` | configurable key resolution, overlay routing, editor submission, queue/dequeue, bash shortcuts, external editor, and app actions remain broad |
+| 2547 | `zig/src/coding_agent/interactive_mode/slash_commands.zig` | command text builders, settings/session/model mutation, copy/share/export/import IO, and UI status side effects are grouped |
+
+**Future implementation milestones** (deferred; do not claim in M10):
+
+1. **Baseline guardrail inventory** — freeze the relevant local/fixture
+   validators and exact-byte fixtures before any split.
+   - Likely files: docs/test harness only.
+   - Gate: `cd zig && zig build test-coding-agent`,
+     `cd zig && zig build test-tui`, and targeted commands below as
+     applicable.
+2. **Package manager pure boundaries** — extract source classification,
+   source normalization, path resolution, version comparison, and settings
+   collection before touching install/update side effects.
+   - Likely files: `packages/package_manager.zig`,
+     `packages/package_command_parser.zig`, `packages/config_selector.zig`,
+     new package helper modules.
+   - Gate: `cd zig && zig build test-coding-agent`.
+3. **Package manager trust/install boundaries** — split WASM validation,
+   provenance snapshot/rollback, lockfile writes, and diagnostics from
+   npm/git/self-update execution while keeping `executePackageCommand` as the
+   facade.
+   - Likely files: `packages/package_manager.zig`,
+     `packages/provenance_lockfile.zig`, extension WASM manifest helpers.
+   - Gate: `cd zig && zig build test-coding-agent`; preserve atomicity and
+     redaction assertions.
+4. **TS-RPC extension UI boundary** — extract pending extension UI request
+   state, timeout/cancel cleanup, host UI request translation, and correlated
+   response forwarding.
+   - Likely files: `modes/ts_rpc_mode.zig`, `modes/ts_rpc_wire.zig`, new
+     `modes/ts_rpc_extension_ui.zig`.
+   - Gate: `cd zig && zig build test-ts-rpc-parity` with a timeout of at
+     least 600 seconds plus `cd zig && zig build test-coding-agent`.
+5. **TS-RPC command-family boundaries** — split prompt/queue, model/thinking,
+   config, session lifecycle, export/stats, and extension command-context
+   handlers after extension UI request correlation is stable.
+   - Likely files: `modes/ts_rpc_mode.zig`, `modes/ts_rpc_state_json.zig`,
+     new command-family helpers.
+   - Gate: `cd zig && zig build test-ts-rpc-parity` and focused golden
+     fixture diffs under `zig/test/golden/ts-rpc/`.
+6. **Rendering state/reducer boundary** — move `AppState` ownership,
+   snapshot cloning, active-operation state, and agent/retry/compaction event
+   reducers away from draw/layout code without changing output bytes.
+   - Likely files: `interactive_mode/rendering.zig`,
+     `interactive_mode/chat_items.zig`,
+     `interactive_mode/active_operation_rendering.zig`, new state/reducer
+     helpers.
+   - Gate: `cd zig && zig build test-tui`,
+     `cd zig && zig build test-vaxis-m8-e2e`.
+7. **Rendering layout/component boundaries** — after state is isolated, split
+   footer, task panel, queued messages, chat viewport, prompt composition, and
+   extension widget drawing into focused modules.
+   - Likely files: `interactive_mode/rendering.zig`,
+     `interactive_mode/chat_rendering.zig`,
+     `interactive_mode/prompt_rendering.zig`,
+     `interactive_mode/render_text.zig`, new layout helpers.
+   - Gate: `cd zig && zig build test-tui`,
+     `cd zig && zig build test-vaxis-m8-e2e`.
+8. **Input action executors** — extract bash shortcut, queue/dequeue,
+   external editor, paste/image, and overlay confirmation side effects while
+   preserving configurable keybinding resolution as the only key source.
+   - Likely files: `interactive_mode/input_dispatch.zig`,
+     `interactive_mode/input_resolution.zig`,
+     `interactive_mode/overlay_input.zig`, new action helpers.
+   - Gate: `cd zig && zig build test-tui`,
+     `cd zig && zig build test-cross-area`,
+     `cd zig && zig build test-missing-cwd-selector`.
+9. **Slash command families** — extract pure help/hotkeys/changelog text
+   builders first, then session/model/settings/copy/share/export/import
+   handlers with explicit mutation boundaries.
+   - Likely files: `interactive_mode/slash_commands.zig`,
+     `interactive_mode/command_router.zig`,
+     `interactive_mode/session_lifecycle.zig`, new command-family helpers.
+   - Gate: `cd zig && zig build test-coding-agent`,
+     `cd zig && zig build test-tui`.
+10. **Interactive main-loop split last** — only after rendering, input,
+    command, session/auth, and extension UI boundaries are stable; keep
+    `runInteractiveMode` as the public facade.
+    - Likely files: `interactive_mode.zig`,
+      `interactive_mode/session_bootstrap.zig`,
+      `interactive_mode/auth_flow.zig`,
+      `interactive_mode/extension_ui_bridge.zig`.
+    - Gate: `cd zig && zig build test-tui`,
+      `cd zig && zig build test-vaxis-m8-e2e`,
+      `cd zig && zig build test-cross-area`,
+      `cd zig && zig build test-missing-cwd-selector`.
+
+**Dependencies and sequencing boundaries**:
+
+- Do not start broad `runInteractiveMode` decomposition before render/input,
+  slash-command, session/auth, and extension UI helpers are stable.
+- Do not move TS-RPC deferred response flushing, prompt-task concurrency, or
+  bash-task ordering until exact-byte TS-RPC parity fixtures cover the target
+  behavior.
+- Do not weaken package provenance rollback, digest-bound trust, policy
+  diagnostics, or redaction behavior while splitting package helpers.
+- Do not introduce hardcoded key checks; app/editor behavior must continue to
+  resolve through configurable keybindings.
+- Do not call real providers, real OAuth flows, or dev servers. Use faux/local
+  fixtures only.
+- Defer extension ABI/protocol redesign, provider parser changes, release
+  packaging behavior changes, and any command semantic changes unless a later
+  approved feature explicitly scopes them.
+
+**M10 quality gate for this planning milestone**:
+
+- Planning/status artifacts only.
+- `git diff --stat`/`git status --porcelain` must show no M10 production-source
+  implementation changes.
+- Feature verification remains `npm run check`.
 
 ---
 
@@ -259,7 +388,7 @@ closure.
 | M7 | +150 | Low | guard tests | complete |
 | M8 | small | Low-Med | snapshot | complete |
 | M9 | only tests/docs | Low | matrix | complete |
-| M10 | TBD | High | TBD | post-ai-agent / out of scope |
+| M10 | docs only | High | none | read-only planning complete; implementation deferred |
 
 **Net (M1–M9)**: ~−550 LOC of duplication, +~700 LOC of shared/tests/docs,
 plus ~30 explicit new invariants pinned by tests or asserts.
@@ -268,6 +397,6 @@ plus ~30 explicit new invariants pinned by tests or asserts.
 
 ## How to claim and track
 
-M1–M9 are closed. Future work should use the remaining open issue entries for
-post-roadmap gaps, and M10 should stay explicitly post-ai-agent until a new
-review pass is assigned.
+M1–M9 are closed. M10 is now only a recorded plan for a future
+`coding_agent/` review pass; implementation must remain deferred until a new
+feature explicitly approves one of the future milestones above.

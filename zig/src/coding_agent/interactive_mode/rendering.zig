@@ -1197,12 +1197,12 @@ pub const AppState = struct {
                         self.last_streaming_thinking_index = null;
 
                         switch (assistant_message.stop_reason) {
+                            .stop, .length, .tool_use => {},
                             .aborted => try self.replaceLabelLocked(&self.status, "interrupted"),
                             .error_reason => try self.replaceLabelLocked(
                                 &self.status,
                                 assistant_message.error_message orelse "error",
                             ),
-                            else => {},
                         }
                     },
                     .tool_result => {},

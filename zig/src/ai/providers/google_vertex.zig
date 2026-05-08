@@ -1521,9 +1521,7 @@ fn emitRuntimeFailure(
     err: anyerror,
 ) !void {
     try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr, model);
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn matchesCurrentBlock(block: CurrentBlock, is_thinking: bool) bool {

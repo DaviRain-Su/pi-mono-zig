@@ -64,10 +64,10 @@ next free number when adding a new finding (don't reuse).
 | 01_provider_layer | M1/M9 synced | roadmap-linked provider invariant, ownership, and matrix items closed; remaining open issues are future/full-pass work |
 | 02_provider_duplication | M6 complete | M3–M6 shared finalize, Responses common surface, and generic SSE-loop work complete; ISS-310 remains follow-up |
 | 03_agent_layer | M7/M8 complete | state-machine doc, hook/allocator guards, reuse/double-finalize guards, and partial-UX policy closed |
-| 04_contracts | M1/M2 complete | INV-1/2/3/4/5 docs/assertions and stop-reason helper closed; EventOrderingGuard remains follow-up |
-| 05_test_matrix | M9 complete | zero unknown `?` cells; priority S13/S14/S12/S6/S15 sweep closed with evidence notes |
+| 04_contracts | M1/M2 + backlog follow-up complete | INV-1/2/3/4/5 docs/assertions, stop-reason helper, EventOrderingGuard, consumer exhaustiveness audit, and thought_signature lifecycle docs closed |
+| 05_test_matrix | M9 + backlog sweep complete | zero unknown, unclassified missing, or partial cells; priority S13/S14/S12/S6/S15 sweep closed and remaining lower-priority gaps marked Deferred with rationale |
 | 06_risk_register | M1–M9 resequenced | top risks annotate completed roadmap items and retained future work |
-| 07_refactor_roadmap | M1–M9 complete | all M1–M9 roadmap checkboxes closed; M10 remains post-ai-agent/out of scope |
+| 07_refactor_roadmap | M1–M10 planning synced | all M1–M9 roadmap checkboxes closed; M10 is read-only planning only and implementation remains deferred |
 
 ## Quality gates per commit
 

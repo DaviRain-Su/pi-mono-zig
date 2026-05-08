@@ -4,6 +4,7 @@ const types = @import("types.zig");
 
 pub const AgentLoopError = error{
     MissingAssistantResult,
+    PartialContentOutOfOrder,
     PartialContentIndexReused,
     ToolCallAlreadyFinalized,
 };
@@ -96,7 +97,14 @@ const PartialAssistantAccumulator = struct {
         self.ended_blocks.deinit(self.allocator);
     }
 
-    fn indexFor(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !usize {
+    // Explicit provider content indices are opened only by *_start events.
+    // Sparse starts are allowed, but *_delta/*_end for an unmapped explicit
+    // index are rejected instead of silently creating phantom content blocks.
+    fn indexFor(
+        self: *PartialAssistantAccumulator,
+        event: ai.AssistantMessageEvent,
+        allow_new_explicit_index: bool,
+    ) !usize {
         if (event.content_index) |content_index| {
             const requested: usize = @intCast(content_index);
             if (requested < self.index_map.items.len) {
@@ -105,6 +113,7 @@ const PartialAssistantAccumulator = struct {
                     return mapped;
                 }
             }
+            if (!allow_new_explicit_index) return AgentLoopError.PartialContentOutOfOrder;
             while (self.index_map.items.len <= requested) {
                 try self.index_map.append(self.allocator, null);
             }
@@ -175,50 +184,50 @@ const PartialAssistantAccumulator = struct {
     fn applyEvent(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !void {
         switch (event.event_type) {
             .text_start => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, true);
                 const text = try self.ensureText(index);
                 text.clearRetainingCapacity();
             },
             .text_delta => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const text = try self.ensureText(index);
                 if (event.delta) |delta| try text.appendSlice(self.allocator, delta);
             },
             .text_end => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const text = try self.ensureText(index);
                 text.clearRetainingCapacity();
                 if (event.content) |content| try text.appendSlice(self.allocator, content);
                 self.markEnded(index);
             },
             .thinking_start => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, true);
                 const thinking = try self.ensureThinking(index);
                 thinking.clearRetainingCapacity();
             },
             .thinking_delta => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const thinking = try self.ensureThinking(index);
                 if (event.delta) |delta| try thinking.appendSlice(self.allocator, delta);
             },
             .thinking_end => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const thinking = try self.ensureThinking(index);
                 thinking.clearRetainingCapacity();
                 if (event.content) |content| try thinking.appendSlice(self.allocator, content);
                 self.markEnded(index);
             },
             .toolcall_start => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, true);
                 _ = try self.ensureToolCall(index);
             },
             .toolcall_delta => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const tool_call = try self.ensureToolCall(index);
                 if (event.delta) |delta| try tool_call.appendDelta(self.allocator, delta);
             },
             .toolcall_end => {
-                const index = try self.indexFor(event);
+                const index = try self.indexFor(event, false);
                 const tool_call = try self.ensureToolCall(index);
                 if (event.tool_call) |final_tool_call| try tool_call.setFinal(self.allocator, final_tool_call);
                 self.markEnded(index);
@@ -1015,7 +1024,7 @@ fn prepareToolCall(
         }, signal) catch |err| {
             deinitJsonValue(allocator, args);
             return .{ .immediate = .{
-                .result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)})),
+                .result = try createErrorToolResult(allocator, @errorName(err)),
                 .is_error = true,
             } };
         };
@@ -1477,12 +1486,30 @@ fn deinitContentBlocks(
     }
 }
 
+/// Tool-call clone ownership audit:
+/// - `PartialToolCallBlock.setFinal` retains at most one cloned final tool call
+///   and releases it on replacement or `PartialToolCallBlock.deinit`.
+/// - `cloneContentBlock` retains cloned inline tool calls inside a cloned
+///   content slice; `deinitContentBlocks` releases those clones.
+/// Keep all future `cloneToolCall` retainers paired with `deinitToolCall`.
 fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
+    const id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+
+    const name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(name);
+
+    const arguments = try cloneJsonValue(allocator, tool_call.arguments);
+    errdefer deinitJsonValue(allocator, arguments);
+
+    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
+    errdefer if (thought_signature) |signature| allocator.free(signature);
+
     return .{
-        .id = try allocator.dupe(u8, tool_call.id),
-        .name = try allocator.dupe(u8, tool_call.name),
-        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
-        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+        .id = id,
+        .name = name,
+        .arguments = arguments,
+        .thought_signature = thought_signature,
     };
 }
 
@@ -2000,6 +2027,11 @@ const StreamingUpdateSnapshotCapture = struct {
     }
 };
 
+const MessageUpdateCountCapture = struct {
+    message_update_count: usize = 0,
+    message_end_count: usize = 0,
+};
+
 fn capturePartialUpdateCrossEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const capture: *PartialUpdateCrossCapture = @ptrCast(@alignCast(context.?));
     if (event.event_type != .message_update) return;
@@ -2065,6 +2097,15 @@ fn captureStreamingUpdateSnapshotEvent(context: ?*anyopaque, event: types.AgentE
     const snapshot = try streamingUpdateSnapshot(capture.allocator, event);
     errdefer capture.allocator.free(snapshot);
     try capture.snapshots.append(capture.allocator, snapshot);
+}
+
+fn countMessageUpdateEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *MessageUpdateCountCapture = @ptrCast(@alignCast(context.?));
+    switch (event.event_type) {
+        .message_update => capture.message_update_count += 1,
+        .message_end => capture.message_end_count += 1,
+        else => {},
+    }
 }
 
 fn streamingUpdateSnapshot(allocator: std.mem.Allocator, event: types.AgentEvent) ![]const u8 {
@@ -2180,6 +2221,72 @@ fn malformedPartialToolCallStreamForAgentLoopTest(
     stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "not-json" });
     stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = tool_call });
     stream.push(.{ .event_type = .done, .message = final_message });
+    return stream;
+}
+
+fn abortedPartialToolCallStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    if (options) |stream_options| {
+        if (stream_options.signal) |signal| @constCast(signal).store(true, .seq_cst);
+    }
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    const final_message = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .aborted,
+        .error_message = "Request was aborted",
+        .timestamp = 2,
+    };
+    const borrowed_final_tool = ai.ToolCall{
+        .id = "abort-tool",
+        .name = "lookup",
+        .arguments = .{ .string = "borrowed final args" },
+        .thought_signature = "borrowed signature",
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    errdefer stream.deinit();
+    stream.push(.{ .event_type = .start, .message = template });
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "partial before abort",
+    });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
+    stream.push(.{
+        .event_type = .toolcall_delta,
+        .content_index = 1,
+        .delta = "{\"query\":\"owned partial\"}",
+    });
+    stream.push(.{
+        .event_type = .toolcall_end,
+        .content_index = 1,
+        .tool_call = borrowed_final_tool,
+    });
+    stream.push(.{
+        .event_type = .error_event,
+        .message = final_message,
+        .error_message = final_message.error_message,
+    });
     return stream;
 }
 
@@ -2376,6 +2483,14 @@ fn blockBeforeToolCall(
     };
 }
 
+fn errorBeforeToolCall(
+    _: std.mem.Allocator,
+    _: types.BeforeToolCallContext,
+    _: ?*const std.atomic.Value(bool),
+) !?types.BeforeToolCallResult {
+    return error.BeforeToolCallFailed;
+}
+
 fn recordAfterToolCallOrder(
     _: std.mem.Allocator,
     context: types.AfterToolCallContext,
@@ -2402,6 +2517,83 @@ fn overrideAfterToolCall(
         .content = content,
         .is_error = false,
     };
+}
+
+const ReentrantToolContext = struct {
+    nested_event_count: usize = 0,
+};
+
+fn countReentrantNestedEvent(context: ?*anyopaque, _: types.AgentEvent) !void {
+    const fixture: *ReentrantToolContext = @ptrCast(@alignCast(context.?));
+    fixture.nested_event_count += 1;
+}
+
+fn reentrantToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const fixture: *ReentrantToolContext = @ptrCast(@alignCast(tool_context orelse return error.MissingReentrantToolContext));
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const nested_model = ai.Model{
+        .id = "nested-model",
+        .name = "Nested Model",
+        .api = "recording:test:reentrant-nested",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const nested_prompts = [_]types.AgentMessage{createUserMessage("nested prompt", 1)};
+    const nested_result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        nested_prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = nested_model,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        fixture,
+        countReentrantNestedEvent,
+        signal,
+        ownedDeltaStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), nested_result.len);
+    try std.testing.expectEqualStrings("streamed response", nested_result[1].assistant.content[0].text.text);
+    return try textToolResult(allocator, "nested: streamed response");
+}
+
+const ReentrantOuterStreamContext = struct {
+    call_count: usize = 0,
+};
+
+fn reentrantOuterStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    context: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const fixture: *ReentrantOuterStreamContext = @ptrCast(@alignCast(stream_context.?));
+    fixture.call_count += 1;
+    if (fixture.call_count == 1) {
+        return try toolCallStreamForAgentLoopTest(allocator, io, model, context, options, null);
+    }
+    return try ownedDeltaStreamForAgentLoopTest(allocator, io, model, context, options, null);
 }
 
 const PendingQueueTestState = struct {
@@ -2681,6 +2873,162 @@ test "runAgentLoop executes a single tool call and appends the tool result to th
     }
     try std.testing.expect(saw_tool_start);
     try std.testing.expect(saw_tool_end);
+}
+
+test "ISS-405 tool execution and result messages follow assistant message_end" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:tool-ordering",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "bash",
+        .description = "Echo command",
+        .label = "Bash",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+    var stream_context = ReentrantOuterStreamContext{};
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .stream_context = &stream_context,
+            .tool_execution = .sequential,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        reentrantOuterStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("tool-1", result[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("streamed response", result[3].assistant.content[0].text.text);
+
+    var assistant_end_index: ?usize = null;
+    var last_update_index: ?usize = null;
+    var tool_start_index: ?usize = null;
+    var tool_end_index: ?usize = null;
+    var tool_result_message_index: ?usize = null;
+
+    for (capture.events.items, 0..) |event, index| {
+        switch (event.event_type) {
+            .message_update => last_update_index = index,
+            .message_end => {
+                if (event.message) |message| switch (message) {
+                    .assistant => |assistant| {
+                        if (assistant.stop_reason == .tool_use and assistant_end_index == null) {
+                            assistant_end_index = index;
+                        }
+                    },
+                    .tool_result => if (tool_result_message_index == null) {
+                        tool_result_message_index = index;
+                    },
+                    else => {},
+                };
+            },
+            .tool_execution_start => {
+                if (tool_start_index == null) tool_start_index = index;
+            },
+            .tool_execution_end => {
+                if (tool_end_index == null) tool_end_index = index;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(last_update_index != null);
+    try std.testing.expect(assistant_end_index != null);
+    try std.testing.expect(tool_start_index != null);
+    try std.testing.expect(tool_end_index != null);
+    try std.testing.expect(tool_result_message_index != null);
+    try std.testing.expect(last_update_index.? < assistant_end_index.?);
+    try std.testing.expect(assistant_end_index.? < tool_start_index.?);
+    try std.testing.expect(tool_start_index.? < tool_end_index.?);
+    try std.testing.expect(tool_end_index.? < tool_result_message_index.?);
+}
+
+test "ISS-408 nested agent loop does not corrupt outer streaming state" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:reentrant-outer",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tool_context = ReentrantToolContext{};
+    const tool = types.AgentTool{
+        .name = "bash",
+        .description = "Runs a nested agent loop",
+        .label = "Nested",
+        .parameters = .null,
+        .execute_context = &tool_context,
+        .execute = reentrantToolExecute,
+    };
+    var stream_context = ReentrantOuterStreamContext{};
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .stream_context = &stream_context,
+            .tool_execution = .sequential,
+        },
+        null,
+        ignoreEvent,
+        null,
+        reentrantOuterStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("tool-1", result[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("nested: streamed response", result[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("streamed response", result[3].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 2), stream_context.call_count);
+    try std.testing.expect(tool_context.nested_event_count > 0);
 }
 
 test "runAgentLoop sends fallback tool arguments through normal validation" {
@@ -2963,6 +3311,92 @@ test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty obj
     try std.testing.expectEqual(@as(usize, 0), assistant.content[1].tool_call.arguments.object.count());
 }
 
+test "ISS-401 aborted stream cleans partial accumulator tool state" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:partial-abort-cleanup",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var aborted = std.atomic.Value(bool).init(false);
+    var capture = MessageUpdateCountCapture{};
+    const assistant = try streamAssistantResponse(
+        std.testing.allocator,
+        std.Io.failing,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = passthroughConvertToLlmForTest,
+        },
+        &capture,
+        countMessageUpdateEvent,
+        &aborted,
+        abortedPartialToolCallStreamForAgentLoopTest,
+    );
+
+    try std.testing.expect(aborted.load(.seq_cst));
+    try std.testing.expectEqual(ai.StopReason.aborted, assistant.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", assistant.error_message.?);
+    try std.testing.expectEqual(@as(usize, 5), capture.message_update_count);
+    try std.testing.expectEqual(@as(usize, 1), capture.message_end_count);
+}
+
+test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
+    const allocator = std.testing.allocator;
+
+    var partial_tool_call = PartialToolCallBlock{};
+    try partial_tool_call.setFinal(allocator, .{
+        .id = "first-tool",
+        .name = "lookup",
+        .arguments = .{ .string = "first args" },
+        .thought_signature = "first signature",
+    });
+    try std.testing.expectEqualStrings("first-tool", partial_tool_call.final_tool_call.?.id);
+
+    try partial_tool_call.setFinal(allocator, .{
+        .id = "second-tool",
+        .name = "lookup",
+        .arguments = .{ .string = "second args" },
+        .thought_signature = "second signature",
+    });
+    try std.testing.expectEqualStrings("second-tool", partial_tool_call.final_tool_call.?.id);
+    try std.testing.expectEqualStrings("second args", partial_tool_call.final_tool_call.?.arguments.string);
+    partial_tool_call.deinit(allocator);
+
+    const source = [_]ai.ContentBlock{.{ .tool_call = .{
+        .id = "content-tool",
+        .name = "lookup",
+        .arguments = .{ .string = "content args" },
+        .thought_signature = "content signature",
+    } }};
+
+    const cloned = try cloneContentBlocks(allocator, source[0..]);
+    defer {
+        deinitContentBlocks(allocator, cloned);
+        allocator.free(cloned);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cloned.len);
+    try std.testing.expect(cloned[0] == .tool_call);
+    try std.testing.expectEqualStrings("content-tool", cloned[0].tool_call.id);
+    try std.testing.expectEqualStrings("lookup", cloned[0].tool_call.name);
+    try std.testing.expectEqualStrings("content args", cloned[0].tool_call.arguments.string);
+    try std.testing.expectEqualStrings("content signature", cloned[0].tool_call.thought_signature.?);
+    try std.testing.expect(cloned[0].tool_call.id.ptr != source[0].tool_call.id.ptr);
+    try std.testing.expect(cloned[0].tool_call.name.ptr != source[0].tool_call.name.ptr);
+    try std.testing.expect(cloned[0].tool_call.arguments.string.ptr != source[0].tool_call.arguments.string.ptr);
+    try std.testing.expect(cloned[0].tool_call.thought_signature.?.ptr != source[0].tool_call.thought_signature.?.ptr);
+}
+
 test "ISS-406 partial accumulator rejects stale explicit content_index reuse after end" {
     var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
@@ -3009,6 +3443,65 @@ test "ISS-406 partial accumulator rejects stale explicit content_index reuse aft
     try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
     try std.testing.expect(partial_message.content[0] == .text);
     try std.testing.expectEqualStrings("final text", partial_message.content[0].text.text);
+}
+
+test "ISS-400 partial accumulator rejects explicit deltas before start" {
+    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
+    defer accumulator.deinit();
+
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        accumulator.applyEvent(.{
+            .event_type = .text_delta,
+            .content_index = 0,
+            .delta = "orphan text",
+        }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        accumulator.applyEvent(.{
+            .event_type = .thinking_delta,
+            .content_index = 1,
+            .delta = "orphan thinking",
+        }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        accumulator.applyEvent(.{
+            .event_type = .toolcall_delta,
+            .content_index = 2,
+            .delta = "{\"value\":\"orphan\"}",
+        }),
+    );
+
+    // Sparse starts remain valid: the policy rejects non-start events for an
+    // unmapped explicit provider index, not sparse provider content indices.
+    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 3 });
+    try accumulator.applyEvent(.{
+        .event_type = .text_delta,
+        .content_index = 3,
+        .delta = "mapped text",
+    });
+    try accumulator.applyEvent(.{
+        .event_type = .text_end,
+        .content_index = 3,
+        .content = "mapped text",
+    });
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-out-of-order",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const partial_message = try accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
+    try std.testing.expectEqualStrings("mapped text", partial_message.content[0].text.text);
 }
 
 test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
@@ -3915,6 +4408,90 @@ test "runAgentLoop lets beforeToolCall block execution" {
     try std.testing.expect(result[2].tool_result.is_error);
     try std.testing.expectEqualStrings("blocked by hook", result[2].tool_result.content[0].text.text);
     try std.testing.expectEqualStrings("continued", result[3].assistant.content[0].text.text);
+}
+
+test "ISS-409 before_tool_call error skips execution and emits cleanup result" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("continued after hook error")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = try buildToolCallAssistantMessage(arena.allocator(), "tool-1", "echo", "hello") },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .before_tool_call = errorBeforeToolCall,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expect(result[2].tool_result.is_error);
+    try std.testing.expectEqualStrings("BeforeToolCallFailed", result[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("continued after hook error", result[3].assistant.content[0].text.text);
+
+    var tool_start_count: usize = 0;
+    var tool_end_count: usize = 0;
+    var tool_result_message_count: usize = 0;
+    for (capture.events.items) |event| {
+        switch (event.event_type) {
+            .tool_execution_start => tool_start_count += 1,
+            .tool_execution_end => {
+                tool_end_count += 1;
+                try std.testing.expectEqual(true, event.is_error.?);
+                try std.testing.expectEqualStrings("BeforeToolCallFailed", event.result.?.content[0].text.text);
+            },
+            .message_end => if (event.message) |message| switch (message) {
+                .tool_result => |tool_result| {
+                    tool_result_message_count += 1;
+                    try std.testing.expect(tool_result.is_error);
+                    try std.testing.expectEqualStrings("BeforeToolCallFailed", tool_result.content[0].text.text);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), tool_start_count);
+    try std.testing.expectEqual(@as(usize, 1), tool_end_count);
+    try std.testing.expectEqual(@as(usize, 1), tool_result_message_count);
 }
 
 test "runAgentLoop lets afterToolCall override the tool result before it enters the transcript" {

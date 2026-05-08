@@ -119,7 +119,7 @@ pub fn finalizeCurrentBlock(
                 const signature = if (maybe_item_value) |item_value| blk: {
                     if (item_value == .object) {
                         if (item_value.object.get("encrypted_content")) |encrypted| {
-                            if (encrypted == .string) break :blk try allocator.dupe(u8, encrypted.string);
+                            if (encrypted == .string) break :blk try std.json.Stringify.valueAlloc(allocator, item_value, .{});
                         }
                     }
                     break :blk null;
@@ -129,7 +129,7 @@ pub fn finalizeCurrentBlock(
                     null;
                 try content_blocks.append(allocator, .{ .thinking = .{
                     .thinking = owned,
-                    .signature = signature,
+                    .thinking_signature = signature,
                     .redacted = false,
                 } });
                 stream_ptr.push(.{

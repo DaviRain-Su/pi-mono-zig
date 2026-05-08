@@ -70,6 +70,30 @@ pub fn runtimeErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+pub fn makeTerminalRuntimeMessage(model: types.Model, err: anyerror) types.AssistantMessage {
+    return .{
+        .role = "assistant",
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = runtimeStopReason(err),
+        .error_message = runtimeErrorMessage(err),
+        .timestamp = 0,
+    };
+}
+
+pub fn emitTerminalRuntimeFailure(
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    output: *types.AssistantMessage,
+    err: anyerror,
+) void {
+    output.stop_reason = runtimeStopReason(err);
+    output.error_message = runtimeErrorMessage(err);
+    pushTerminalRuntimeError(stream_ptr, output.*);
+}
+
 pub fn pushTerminalRuntimeError(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     message: types.AssistantMessage,
@@ -506,6 +530,68 @@ test "HTTP status helper emits one terminal error event with result identity" {
     try std.testing.expectEqualStrings(event.message.?.model, result.model);
     try std.testing.expectEqual(event.message.?.usage.total_tokens, result.usage.total_tokens);
     allocator.free(result.error_message.?);
+}
+
+test "runtime helper emits terminal error and preserves output identity" {
+    const allocator = std.testing.allocator;
+    var stream = event_stream.createAssistantMessageEventStream(allocator, std.Io.failing);
+    defer stream.deinit();
+
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    defer allocator.free(content);
+    content[0] = .{ .text = .{ .text = "partial text" } };
+
+    var output = types.AssistantMessage{
+        .role = "assistant",
+        .content = content,
+        .api = "fixture-api",
+        .provider = "fixture-provider",
+        .model = "fixture-model",
+        .usage = types.Usage{ .input = 2, .output = 3, .total_tokens = 5 },
+        .stop_reason = .stop,
+        .timestamp = 123,
+    };
+
+    emitTerminalRuntimeFailure(&stream, &output, error.RequestAborted);
+
+    const event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("Request was aborted", event.error_message.?);
+    try std.testing.expectEqualStrings(event.error_message.?, event.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.aborted, event.message.?.stop_reason);
+    try std.testing.expectEqual(content.ptr, event.message.?.content.ptr);
+    try std.testing.expectEqual(@as(u32, 5), event.message.?.usage.total_tokens);
+    try std.testing.expect(stream.next() == null);
+
+    const result = stream.result().?;
+    try std.testing.expectEqual(content.ptr, result.content.ptr);
+    try std.testing.expectEqualStrings("fixture-api", result.api);
+    try std.testing.expectEqualStrings("fixture-provider", result.provider);
+    try std.testing.expectEqualStrings("fixture-model", result.model);
+    try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
+    try std.testing.expectEqual(@as(i64, 123), result.timestamp);
+}
+
+test "setup runtime helper message preserves metadata and abort stop reason" {
+    const model = types.Model{
+        .id = "fixture-model",
+        .name = "Fixture Model",
+        .api = "fixture-api",
+        .provider = "fixture-provider",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    const message = makeTerminalRuntimeMessage(model, error.RequestAborted);
+    try std.testing.expectEqualStrings("fixture-api", message.api);
+    try std.testing.expectEqualStrings("fixture-provider", message.provider);
+    try std.testing.expectEqualStrings("fixture-model", message.model);
+    try std.testing.expectEqual(types.StopReason.aborted, message.stop_reason);
+    try std.testing.expectEqualStrings("Request was aborted", message.error_message.?);
 }
 
 test "coerceStopReasonForToolCalls only upgrades stop after tool calls" {

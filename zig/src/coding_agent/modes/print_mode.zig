@@ -213,8 +213,8 @@ fn writeTextOutput(
 
 fn exitCodeForMessage(message: ai.AssistantMessage) u8 {
     return switch (message.stop_reason) {
+        .stop, .length, .tool_use => 0,
         .error_reason, .aborted => 1,
-        else => 0,
     };
 }
 

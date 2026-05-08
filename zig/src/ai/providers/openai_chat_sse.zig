@@ -1,14 +1,14 @@
 //! Legacy OpenAI Chat Completions SSE parser.
 //!
-//! This module intentionally remains custom while most migrated providers use
-//! `ai/shared/sse_loop.zig`: it owns Chat Completions-specific delta
-//! accumulation, mixed text/thinking/tool-call ordering, and the legacy
+//! This module keeps a custom Chat Completions parser while sharing the generic
+//! `ai/shared/sse_loop.zig` outer iterator: it owns Chat Completions-specific
+//! delta accumulation, mixed text/thinking/tool-call ordering, and the legacy
 //! `AssistantMessage.tool_calls` compatibility copy. Inline `.tool_call`
 //! content remains canonical, while `tool_calls` is separately allocated for
 //! consumers that still read the legacy field; see `types.freeAssistantMessage`
 //! for the freeing contract. Compact `data:{...}` SSE lines are accepted here
-//! as a provider-compatible Chat Completions tolerance without broadening the
-//! canonical data-line helper used by migrated generic SSE-loop providers.
+//! through the provider-local data-line parser as a Chat Completions tolerance
+//! without broadening generic SSE-loop provider behavior.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -17,6 +17,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const sse_loop = @import("../shared/sse_loop.zig");
 
 const ActiveTextBlock = struct {
     content_index: usize,
@@ -129,39 +130,54 @@ fn deinitSseParseState(state: *SseParseState) void {
     }
 }
 
+const OpenAIChatSseLoopHandler = struct {
+    allocator: std.mem.Allocator,
+    state: *SseParseState,
+
+    pub fn extractDataLine(_: *OpenAIChatSseLoopHandler, line: []const u8) ?[]const u8 {
+        return parseSseLine(line);
+    }
+
+    pub fn isDoneData(_: *OpenAIChatSseLoopHandler, data: []const u8) bool {
+        return std.mem.eql(u8, data, "[DONE]");
+    }
+
+    pub fn handleData(self: *OpenAIChatSseLoopHandler, data: []const u8) !bool {
+        const chunk = parseChunk(self.allocator, data) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailureState(self.state, err);
+                return false;
+            },
+        };
+        defer if (chunk) |*c| c.deinit();
+        if (chunk) |parsed| try processParsedChunk(self.state, parsed.value);
+        return true;
+    }
+
+    pub fn handleRuntimeFailure(self: *OpenAIChatSseLoopHandler, err: anyerror) !void {
+        try emitRuntimeFailureState(self.state, err);
+    }
+};
+
 pub fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     streaming: *http_client.StreamingResponse,
     model: types.Model,
+    options: ?types.StreamOptions,
 ) !void {
     var state = initSseParseState(allocator, stream_ptr, model);
     defer deinitSseParseState(&state);
 
     stream_ptr.push(.{ .event_type = .start });
 
-    while (true) {
-        const maybe_line = streaming.readLine() catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailureState(&state, err);
-                return;
-            },
-        };
-        const line = maybe_line orelse break;
-        const data = parseSseLine(line) orelse continue;
-        if (std.mem.eql(u8, data, "[DONE]")) break;
-
-        const chunk = parseChunk(allocator, data) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailureState(&state, err);
-                return;
-            },
-        };
-        defer if (chunk) |*c| c.deinit();
-        if (chunk) |parsed| try processParsedChunk(&state, parsed.value);
-    }
+    var handler = OpenAIChatSseLoopHandler{
+        .allocator = allocator,
+        .state = &state,
+    };
+    const loop_result = try sse_loop.run(OpenAIChatSseLoopHandler, &handler, streaming, options);
+    if (loop_result == .stopped) return;
 
     try finishParserState(&state);
 }
@@ -540,9 +556,7 @@ fn emitRuntimeFailure(
         tool_calls_transferred,
         stream_ptr,
     );
-    output.stop_reason = provider_error.runtimeStopReason(err);
-    output.error_message = provider_error.runtimeErrorMessage(err);
-    provider_error.pushTerminalRuntimeError(stream_ptr, output.*);
+    provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn extractToolCallIndex(tool_call_value: std.json.Value) ?usize {
@@ -859,7 +873,7 @@ pub fn parseSseAssistantMessageFromSlice(
     };
     defer streaming.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
     return stream.result() orelse return error.MissingAssistantMessage;
 }
 
@@ -912,6 +926,8 @@ test "openai_chat_sse accepts compact data lines in chat completions stream" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
     const body =
+        "event: message\n" ++
+        "\n" ++
         "data:{\"id\":\"chatcmpl_compact\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"compact\"}}]}\n" ++
         "data:{\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n" ++
         "data:[DONE]\n";
@@ -928,7 +944,7 @@ test "openai_chat_sse accepts compact data lines in chat completions stream" {
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
     while (stream.next()) |event| event.deinitTransient(allocator);
 
     const message = stream.result() orelse return error.MissingAssistantMessage;
@@ -994,7 +1010,7 @@ test "openai_chat_sse keeps interleaved indexed tool arguments separated" {
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
     try std.testing.expectEqual(types.EventType.toolcall_start, stream.next().?.event_type);
@@ -1025,7 +1041,8 @@ test "openai_chat_sse keeps text content indexes stable around tool boundaries" 
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8,
+    const body = try allocator.dupe(
+        u8,
         "data: {\"choices\":[{\"delta\":{\"content\":\"before \"}}]}\n" ++
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_weather\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}]}}]}\n" ++
             "data: {\"choices\":[{\"delta\":{\"content\":\"after\"}}]}\n" ++
@@ -1044,7 +1061,7 @@ test "openai_chat_sse keeps text content indexes stable around tool boundaries" 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
 
     const start = stream.next().?;
     try std.testing.expectEqual(types.EventType.start, start.event_type);
@@ -1112,7 +1129,8 @@ test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8,
+    const body = try allocator.dupe(
+        u8,
         "data: {\"id\":\"chatcmpl_eof\",\"choices\":[{\"delta\":{\"content\":\"before tool\"}}]}\n" ++
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_eof\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"local\\\"}\"}}]}}]}\n",
     );
@@ -1128,7 +1146,7 @@ test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"));
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
     const text_start = stream.next().?;

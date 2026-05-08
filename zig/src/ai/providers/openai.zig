@@ -132,7 +132,7 @@ pub const OpenAIProvider = struct {
         }
 
         // Parse SSE stream incrementally from lines
-        try parseSseStreamLines(allocator, event_stream_instance, &streaming, model);
+        try parseSseStreamLines(allocator, event_stream_instance, &streaming, model, options);
     }
 
     pub fn streamSimple(
@@ -1727,7 +1727,7 @@ test "parseSseStreamLines preserves partial text before malformed event JSON ter
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
-    try parseSseStreamLines(allocator, &stream, &streaming, runtimeFailureTestModel("https://api.openai.com/v1"));
+    try parseSseStreamLines(allocator, &stream, &streaming, runtimeFailureTestModel("https://api.openai.com/v1"), null);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
     try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
@@ -1872,7 +1872,7 @@ test "parseSseStreamLines preserves successful ordered OpenAI-compatible final a
         .max_tokens = 4096,
     };
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
 
@@ -1995,7 +1995,7 @@ test "parseSseStream with tool calls" {
         .max_tokens = 4096,
     };
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
 
     // Should emit start, toolcall_start, toolcall_delta, toolcall_end, done
     const event1 = stream.next().?;
@@ -2061,7 +2061,7 @@ test "parseSseStream keeps interleaved indexed tool arguments separated" {
         .max_tokens = 4096,
     };
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
 
     try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
     const start_unit = stream.next().?;
@@ -2137,7 +2137,7 @@ test "parseSseStream with reasoning content" {
         .max_tokens = 4096,
     };
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
 
     const event1 = stream.next().?;
     defer freeEvent(allocator, event1);
@@ -2191,7 +2191,7 @@ test "parseSseStream with usage" {
         .max_tokens = 4096,
     };
 
-    try parseSseStreamLines(allocator, &stream, &streaming, model);
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
 
     const event1 = stream.next().?;
     defer freeEvent(allocator, event1);

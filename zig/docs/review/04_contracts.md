@@ -106,9 +106,12 @@ changes can't silently break them.
 - 位置: new file `zig/src/ai/event_stream_guard.zig`
 - 建议: Wraps `AssistantMessageEventStream` and tracks per-content_index
   state (start_seen, end_seen). Asserts ordering. Only active in debug.
-- 验证: existing tests run unchanged; new test exercising violations.
-- 状态: open
-- 负责:
+- 验证: `EventOrderingGuard` tests cover valid interleaved provider-style
+  text/thinking/tool-call ordering plus delta-before-start, end-before-start,
+  duplicate start, content-index reuse, kind drift, delta-after-end, terminal
+  with open block, and post-terminal event violations.
+- 状态: closed
+- 负责: zrb-06-event-ordering-guard-and-stopreason-audit
 - 提交:
 
 ### ISS-505 stream.zig vs event_stream.zig responsibility split
@@ -131,9 +134,10 @@ changes can't silently break them.
 - 问题: Cross-provider semantics drift. Document who sets it, who reads it,
   and the freeing rule (allocator.dupe → free in deinitToolCall).
 - 建议: Add a comment block near the field definition.
-- 验证: docs only.
-- 状态: open
-- 负责:
+- 验证: `ToolCall.thought_signature` now documents provider allocation,
+  same-model replay preservation, cross-model dropping, and deinit ownership.
+- 状态: closed
+- 负责: zrb-06-event-ordering-guard-and-stopreason-audit
 - 提交:
 
 ### ISS-507 StopReason exhaustiveness on the consumer side
@@ -141,7 +145,11 @@ changes can't silently break them.
 - 位置: `zig/src/ai/types.zig` (StopReason enum) + agent_loop.zig consumers
 - 建议: Verify every consumer uses an exhaustive switch on `StopReason`
   (no `else =>` arms that would silently absorb a future variant).
-- 验证: code audit.
-- 状态: open
-- 负责:
+- 验证: Consumer audit removed broad `else` arms from user-visible
+  `StopReason` handling in `print_mode.zig`, `provider_config.zig`, and
+  `interactive_mode/rendering.zig`; existing string serializers and session
+  JSONL/RPC helpers were already exhaustive or direct two-terminal-reason
+  predicates.
+- 状态: closed
+- 负责: zrb-06-event-ordering-guard-and-stopreason-audit
 - 提交:

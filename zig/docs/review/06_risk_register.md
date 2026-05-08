@@ -23,8 +23,10 @@ Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/R
 - 描述: Single-allocation rule (content_blocks owns strings, tool_calls is
   borrow-only) is correct only if `tool_calls.deinit` does not free strings.
   An accidental `freeToolCall` over a borrow-only entry would double-free.
-- 修法: ISS-040 (bedrock audit), ISS-403 (clone/deinit pairing audit),
-  ISS-501 (debug-mode assert, closed in `902720d3`).
+- 修法: ISS-040 (Bedrock audit, closed in
+  `zrb-01-kimi-placeholder-and-provider-invariant-audit`), ISS-403
+  (clone/deinit pairing audit), ISS-501 (debug-mode assert, closed in
+  `902720d3`).
 - 大小: S
 
 ### R3 — `content_index` reuse / instability
@@ -32,6 +34,9 @@ Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/R
 - 涉及: any provider that derives index from `active_blocks.len`
 - 描述: Anthropic was just fixed; we must add a regression test (ISS-002)
   and an `EventOrderingGuard` (ISS-504).
+- 修法: ISS-002 content-index fixtures are covered in the provider matrix,
+  and ISS-504 is closed by `zig/src/ai/event_stream_guard.zig` with focused
+  valid/invalid lifecycle tests for `_start -> _delta* -> _end` ordering.
 - 大小: S
 
 ### R4 — Stop-reason coercion drift between providers
@@ -39,7 +44,9 @@ Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/R
 - 涉及: every provider
 - 描述: 5 providers now have `had_tool_calls and stop == .stop -> .tool_use`
   inline; if a 6th provider gets added without it, behavior diverges.
-- 修法: ISS-503 (extract `coerceStopReasonForToolCalls` helper, closed in `c3e7febc`).
+- 修法: ISS-503 (extract `coerceStopReasonForToolCalls` helper, closed in
+  `c3e7febc`) plus ISS-507 consumer-side audit replacing broad
+  `StopReason` `else` arms in user-visible print/faux/rendering paths.
 - 大小: S
 
 ### R5 — Provider duplication accumulating
@@ -64,7 +71,12 @@ Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/R
 - 涉及: `openai_chat_sse.zig`
 - 描述: Only provider that intentionally dual-allocates. Future contributors
   may "normalize" it by accident, breaking compat.
-- 修法: ISS-050 (better doc), ISS-051 (compact data line support).
+- 修法: ISS-050 and ISS-051 are closed in the docs/stale-close follow-up:
+  the file header/transfer-site comments now document the legacy
+  `output.tool_calls` compatibility exception, and compact `data:{...}` Chat
+  Completions SSE lines are covered by a focused fixture. Remaining risk is
+  watchlist-only: preserve those comments and fixtures during future parser
+  refactors.
 - 大小: S
 
 ### R8 — Hook lifecycle ambiguity
@@ -77,20 +89,25 @@ Status after M1–M9: content-index stability, stop-reason coercion, Cluster A/R
 
 ### R9 — `coding_agent/` god-files
 - 严重度: P2
-- 涉及: `interactive_mode.zig` (6331), `ts_rpc_mode.zig` (6232),
-  `package_manager.zig` (5469), `interactive_mode/rendering.zig` (5362)
+- 涉及: `package_manager.zig` (6636), `interactive_mode.zig` (6333),
+  `ts_rpc_mode.zig` (6242), `interactive_mode/rendering.zig` (5362),
+  `input_dispatch.zig` (3581), `slash_commands.zig` (2547)
 - 描述: Out of scope for this review pass, but they will eventually need
-  splitting. Track here so the roadmap doesn't forget.
-- 修法: separate review pass after `ai/` + `agent/` settle.
+  splitting. M10 completed a read-only plan only; no implementation split is
+  claimed. Track here so the roadmap doesn't forget.
+- 修法: separate review pass after `ai/` + `agent/` settle; follow the
+  planning-only M10 sequence in `07_refactor_roadmap.md`.
 - 大小: XL
 
 ### R10 — Test matrix classification drift
 - 严重度: P2
 - 涉及: test suite
 - 描述: M9 removed all unknown `?` cells and closed the S13/S14/S12/S6/S15
-  priority sweep in `902720d3`. Remaining `❌` cells are known lower-priority
-  missing coverage and should not regress back to unknown/unjustified entries.
-- 修法: ISS-600 and ISS-601 are closed; ISS-602 remains open for a test-add convention.
+  priority sweep in `902720d3`. The backlog sweep removed unclassified
+  missing/partial markers from the matrix and converted remaining
+  lower-priority gaps to `Deferred` entries with rationale.
+- 修法: ISS-600, ISS-601, and ISS-602 are closed; ISS-603 tracks deferred
+  local-fixture expansion when provider parser work next touches those areas.
 - 大小: M
 
 ---
