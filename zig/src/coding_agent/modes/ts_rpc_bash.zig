@@ -589,9 +589,12 @@ fn waitDirectBashChild(state: *BashWaitState) void {
 fn readDirectBashOutput(state: *BashOutputReaderState) void {
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const bytes_read = std.posix.read(state.file.handle, &buffer) catch |err| {
-            state.err = err;
-            return;
+        const bytes_read = state.file.readStreaming(state.io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                state.err = err;
+                return;
+            },
         };
         if (bytes_read == 0) return;
         state.appendRaw(buffer[0..bytes_read]) catch |err| {
@@ -601,9 +604,13 @@ fn readDirectBashOutput(state: *BashOutputReaderState) void {
     }
 }
 
-fn killDirectBashProcessGroup(pid: std.posix.pid_t) void {
-    std.posix.kill(-pid, .TERM) catch {};
-    std.posix.kill(-pid, .KILL) catch {};
+fn killDirectBashProcessGroup(pid: std.process.Child.Id) void {
+    if (@import("builtin").os.tag == .windows) {
+        _ = std.os.windows.ntdll.NtTerminateProcess(pid, @enumFromInt(@as(u32, 1)));
+    } else {
+        std.posix.kill(-pid, .TERM) catch {};
+        std.posix.kill(-pid, .KILL) catch {};
+    }
 }
 
 pub fn runDirectBash(
@@ -625,16 +632,29 @@ pub fn runDirectBash(
     };
     defer cwd_dir.close(io);
 
-    const wrapped_command = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{command});
-    defer allocator.free(wrapped_command);
-    const argv = [_][]const u8{ "/bin/sh", "-c", wrapped_command };
+    const builtin = @import("builtin");
+    var argv_buf: [3][]const u8 = undefined;
+    var argv_len: usize = 0;
+    if (builtin.os.tag == .windows) {
+        argv_buf[0] = "bash";
+        argv_buf[1] = "-c";
+        argv_buf[2] = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{command});
+        argv_len = 3;
+    } else {
+        argv_buf[0] = "/bin/sh";
+        argv_buf[1] = "-c";
+        argv_buf[2] = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{command});
+        argv_len = 3;
+    }
+    const argv = argv_buf[0..argv_len];
+    defer allocator.free(argv[2]);
     var child = try std.process.spawn(io, .{
-        .argv = argv[0..],
+        .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = if (builtin.os.tag == .windows) null else 0,
     });
     defer {
         if (child.id != null) child.kill(io);

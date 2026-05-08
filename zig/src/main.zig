@@ -35,7 +35,8 @@ pub fn main(init: std.process.Init) !void {
 
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(init.gpa);
-    var it = init.minimal.args.iterate();
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer it.deinit();
     _ = it.next();
     while (it.next()) |arg| {
         try argv.append(init.gpa, arg);

@@ -172,7 +172,7 @@ fn tryMatchModel(
         }
         if (!containsIgnoreCase(summary.id, pattern) and !containsIgnoreCase(summary.name, pattern)) continue;
 
-        if (best == null or betterFuzzyMatch(summary, best.?, provider == null)) best = summary;
+        if (isBetterFuzzyCandidate(summary, best, provider == null)) best = summary;
     }
 
     return best;
@@ -269,6 +269,45 @@ fn isAlias(id: []const u8) bool {
     return false;
 }
 
+fn isBetterFuzzyCandidate(
+    candidate: ai.model_registry.ModelSummary,
+    current: ?ai.model_registry.ModelSummary,
+    prefer_direct_providers: bool,
+) bool {
+    const existing = current orelse return true;
+
+    if (prefer_direct_providers) {
+        const candidate_rank = fuzzyProviderRank(candidate.provider);
+        const existing_rank = fuzzyProviderRank(existing.provider);
+        if (candidate_rank != existing_rank) return candidate_rank < existing_rank;
+    }
+
+    const candidate_alias = isAlias(candidate.id);
+    const existing_alias = isAlias(existing.id);
+    if (candidate_alias != existing_alias) return candidate_alias;
+
+    return stringGreater(candidate.id, existing.id);
+}
+
+fn fuzzyProviderRank(provider: []const u8) u8 {
+    return if (isAggregatorProvider(provider)) 1 else 0;
+}
+
+fn isAggregatorProvider(provider: []const u8) bool {
+    return std.mem.eql(u8, provider, "amazon-bedrock") or
+        std.mem.eql(u8, provider, "azure-openai-responses") or
+        std.mem.eql(u8, provider, "cloudflare-ai-gateway") or
+        std.mem.eql(u8, provider, "cloudflare-workers-ai") or
+        std.mem.eql(u8, provider, "fireworks") or
+        std.mem.eql(u8, provider, "google-vertex") or
+        std.mem.eql(u8, provider, "github-copilot") or
+        std.mem.eql(u8, provider, "huggingface") or
+        std.mem.eql(u8, provider, "opencode") or
+        std.mem.eql(u8, provider, "opencode-go") or
+        std.mem.eql(u8, provider, "openrouter") or
+        std.mem.eql(u8, provider, "vercel-ai-gateway");
+}
+
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > haystack.len) return false;
@@ -285,35 +324,6 @@ fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
 
 fn stringGreater(lhs: []const u8, rhs: []const u8) bool {
     return std.mem.order(u8, lhs, rhs) == .gt;
-}
-
-fn betterFuzzyMatch(
-    candidate: ai.model_registry.ModelSummary,
-    current: ai.model_registry.ModelSummary,
-    across_providers: bool,
-) bool {
-    if (across_providers) {
-        const candidate_rank = fuzzyProviderRank(candidate.provider);
-        const current_rank = fuzzyProviderRank(current.provider);
-        if (candidate_rank != current_rank) return candidate_rank < current_rank;
-    }
-
-    const candidate_alias = isAlias(candidate.id);
-    const current_alias = isAlias(current.id);
-    if (candidate_alias != current_alias) return candidate_alias;
-    return stringGreater(candidate.id, current.id);
-}
-
-fn fuzzyProviderRank(provider: []const u8) u8 {
-    if (std.ascii.eqlIgnoreCase(provider, "amazon-bedrock")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "azure-openai-responses")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "cloudflare-ai-gateway")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "cloudflare-workers-ai")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "github-copilot")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "google-vertex")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "openrouter")) return 1;
-    if (std.ascii.eqlIgnoreCase(provider, "vercel-ai-gateway")) return 1;
-    return 0;
 }
 
 test "resolveCliModel resolves provider-prefixed model ids" {
@@ -347,14 +357,14 @@ test "resolveCliModel prefers provider split over gateway raw id when provider m
     try std.testing.expectEqualStrings("glm-5.1", result.model_name.?);
 }
 
-test "resolveCliModel falls back to raw slash model id when inferred provider has no match" {
+test "resolveCliModel falls back to exact raw slash model id when inferred provider has no match" {
     const allocator = std.testing.allocator;
-    var result = try resolveCliModel(allocator, null, "openai/gpt-4o-audio-preview");
+    var result = try resolveCliModel(allocator, null, "openai/gpt-oss-120b:free");
     defer result.deinit(allocator);
 
     try std.testing.expect(result.error_message == null);
     try std.testing.expectEqualStrings("openrouter", result.provider_name.?);
-    try std.testing.expectEqualStrings("openai/gpt-4o-audio-preview", result.model_name.?);
+    try std.testing.expectEqualStrings("openai/gpt-oss-120b:free", result.model_name.?);
 }
 
 test "resolveCliModel preserves explicit provider custom model ids" {
