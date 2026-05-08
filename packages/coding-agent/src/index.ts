@@ -47,6 +47,26 @@ export {
 	serializeConversation,
 	shouldCompact,
 } from "./core/compaction/index.js";
+export type {
+	DiagnosticEnvelopeInput,
+	DiagnosticEnvelopeV0,
+	DiagnosticPhase,
+	DiagnosticRuntimeKind,
+	DiagnosticSeverity,
+	ProvenanceDiagnosticInput,
+} from "./core/diagnostics.js";
+export {
+	adaptExtensionErrorToDiagnosticEnvelope,
+	adaptProvenanceDiagnosticToEnvelope,
+	adaptResourceDiagnosticToEnvelope,
+	attachDiagnosticEnvelope,
+	attachResourceDiagnosticEnvelope,
+	createDiagnosticEnvelope,
+	DIAGNOSTIC_ENVELOPE_SCHEMA_VERSION,
+	DIAGNOSTIC_REDACTED_VALUE,
+	redactDiagnosticValue,
+	sanitizeExtensionError,
+} from "./core/diagnostics.js";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.js";
 export type {
 	CanonicalExtensionGrant,

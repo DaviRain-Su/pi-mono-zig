@@ -24,6 +24,7 @@ import {
 } from "./core/agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
+import { attachDiagnosticEnvelope, createDiagnosticEnvelope } from "./core/diagnostics.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
@@ -74,17 +75,30 @@ function collectSettingsDiagnostics(
 	settingsManager: SettingsManager,
 	context: string,
 ): AgentSessionRuntimeDiagnostic[] {
-	return settingsManager.drainErrors().map(({ scope, error }) => ({
-		type: "warning",
-		message: `(${context}, ${scope} settings) ${error.message}`,
-	}));
+	return settingsManager.drainErrors().map(({ scope, error }) => {
+		const message = `(${context}, ${scope} settings) ${error.message}`;
+		const schemaPath = error.message.match(/^(\$[^:]*):/)?.[1];
+		return attachDiagnosticEnvelope(
+			{ type: "warning", message },
+			createDiagnosticEnvelope({
+				severity: "warning",
+				phase: "schema",
+				runtimeKind: "typescript",
+				category: "settings_schema_invalid",
+				message,
+				recoveryHint: "Fix the invalid settings value or remove the unsupported policy field.",
+				source: { scope },
+				path: schemaPath,
+			}),
+		);
+	});
 }
 
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
 	for (const diagnostic of diagnostics) {
 		const color = diagnostic.type === "error" ? chalk.red : diagnostic.type === "warning" ? chalk.yellow : chalk.dim;
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
-		console.error(color(`${prefix}${diagnostic.message}`));
+		console.error(color(`${prefix}${diagnostic.envelope?.message ?? diagnostic.message}`));
 	}
 }
 

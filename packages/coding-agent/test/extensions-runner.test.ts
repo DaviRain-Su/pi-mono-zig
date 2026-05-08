@@ -33,6 +33,7 @@ import {
 import type {
 	ExtensionActions,
 	ExtensionContextActions,
+	ExtensionError,
 	ExtensionEventName,
 	ExtensionUIContext,
 	ProviderConfig,
@@ -528,6 +529,56 @@ describe("subscriber event contract parity", () => {
 				expect(error.extensionPath).toBe("<bad-result-extension>");
 				expect(error.error).toContain("Invalid subscriber result");
 			}
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("emits canonical diagnostic envelopes and redacts extension runtime secrets", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-extension-diagnostic-envelope-"));
+		try {
+			const runtime = createExtensionRuntime();
+			const apiKeyValue = ["s", "k", "-", "runtime", "-diagnostic", "-value"].join("");
+			const oauthValue = ["oauth", "-diagnostic", "-value"].join("");
+			const accessTokenKey = ["access", "_", "token"].join("");
+			const failureUrl = new URL("https://api.example.test/");
+			failureUrl.searchParams.set(accessTokenKey, oauthValue);
+			const failureMessage = `Authorization: ${["Bearer", apiKeyValue].join(" ")} and ${failureUrl.toString()}`;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("input", () => {
+						throw new Error(failureMessage);
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"/tmp/secret-provider-extension.ts",
+			);
+			const sessionManager = SessionManager.inMemory(tempDir);
+			const authStorage = AuthStorage.create(path.join(tempDir, "auth.json"));
+			const modelRegistry = ModelRegistry.create(authStorage);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: ExtensionError[] = [];
+			runner.onError((error) => errors.push(error));
+
+			await expect(runner.emitInput("prompt", undefined, "interactive")).resolves.toEqual({ action: "continue" });
+
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.envelope).toMatchObject({
+				schemaVersion: "diagnostic-envelope.v0",
+				severity: "error",
+				phase: "event",
+				runtimeKind: "typescript",
+				category: "extension_runtime_error",
+				event: "input",
+				source: { path: "/tmp/secret-provider-extension.ts" },
+			});
+			const serializedError = JSON.stringify(errors[0]);
+			expect(serializedError).not.toContain(apiKeyValue);
+			expect(serializedError).not.toContain(oauthValue);
+			expect(errors[0]?.envelope?.message).toContain("Authorization: [REDACTED]");
+			expect(errors[0]?.envelope?.message).toContain("access_token=[REDACTED]");
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}

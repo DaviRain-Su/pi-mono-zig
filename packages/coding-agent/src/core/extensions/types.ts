@@ -43,6 +43,7 @@ import type { Static, TSchema } from "typebox";
 import type { Theme } from "../../modes/interactive/theme/theme.js";
 import type { BashResult } from "../bash-executor.js";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.js";
+import type { DiagnosticEnvelopeV0 } from "../diagnostics.js";
 import type { EventBus } from "../event-bus.js";
 import type { ExecOptions, ExecResult } from "../exec.js";
 import type { ExtensionPolicy, TypeScriptExtensionIdentity } from "../extension-policy.js";
@@ -1718,9 +1719,15 @@ export interface Extension {
 }
 
 /** Result of loading extensions. */
+export interface LoadExtensionError {
+	path: string;
+	error: string;
+	envelope?: DiagnosticEnvelopeV0;
+}
+
 export interface LoadExtensionsResult {
 	extensions: Extension[];
-	errors: Array<{ path: string; error: string }>;
+	errors: LoadExtensionError[];
 	/** Shared runtime - actions are throwing stubs until runner.initialize() */
 	runtime: ExtensionRuntime;
 }
@@ -1742,4 +1749,5 @@ export interface ExtensionError {
 	target?: unknown;
 	principal?: unknown;
 	extensionIdentity?: string;
+	envelope?: DiagnosticEnvelopeV0;
 }

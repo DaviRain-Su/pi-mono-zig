@@ -24,6 +24,7 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.js";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.js";
+import { attachDiagnosticEnvelope, createDiagnosticEnvelope } from "../diagnostics.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
@@ -46,6 +47,7 @@ import type {
 	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
+	LoadExtensionError,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
@@ -504,14 +506,20 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	options?: LoadExtensionOptions,
-): Promise<{ extension: Extension | null; error: string | null }> {
+): Promise<{ extension: Extension | null; error: LoadExtensionError | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 
 	try {
 		const sourceInfo = options?.resolveSourceInfo?.({ configuredPath: extensionPath, resolvedPath });
 		const factory = await loadExtensionModule(resolvedPath);
 		if (!factory) {
-			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
+			return {
+				extension: null,
+				error: createLoadExtensionError(
+					extensionPath,
+					`Extension does not export a valid factory function: ${extensionPath}`,
+				),
+			};
 		}
 		const extension = createExtension(extensionPath, resolvedPath, {
 			sourceInfo,
@@ -525,8 +533,25 @@ async function loadExtension(
 		return { extension, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return {
+			extension: null,
+			error: createLoadExtensionError(extensionPath, `Failed to load extension: ${message}`),
+		};
 	}
+}
+
+function createLoadExtensionError(extensionPath: string, message: string): LoadExtensionError {
+	const envelope = createDiagnosticEnvelope({
+		severity: "error",
+		phase: "load",
+		runtimeKind: "typescript",
+		category: "extension_load_failed",
+		message,
+		recoveryHint: "Fix or remove the extension, then reload extensions.",
+		source: { path: extensionPath },
+		path: extensionPath,
+	});
+	return attachDiagnosticEnvelope({ path: extensionPath, error: envelope.message }, envelope);
 }
 
 /**
@@ -559,7 +584,7 @@ export async function loadExtensions(
 	options?: LoadExtensionOptions,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
-	const errors: Array<{ path: string; error: string }> = [];
+	const errors: LoadExtensionError[] = [];
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
 
@@ -567,7 +592,7 @@ export async function loadExtensions(
 		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime, options);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push(error);
 			continue;
 		}
 

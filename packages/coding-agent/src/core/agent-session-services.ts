@@ -3,6 +3,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AuthStorage } from "./auth-storage.js";
+import { attachDiagnosticEnvelope, createDiagnosticEnvelope, type DiagnosticEnvelopeV0 } from "./diagnostics.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
@@ -20,6 +21,7 @@ import { SettingsManager } from "./settings-manager.js";
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
+	envelope?: DiagnosticEnvelopeV0;
 }
 
 /**
@@ -105,17 +107,41 @@ function applyExtensionFlagValues(
 			extensionsResult.runtime.flagValues.set(name, value);
 			continue;
 		}
-		diagnostics.push({
-			type: "error",
-			message: `Extension flag "--${name}" requires a value`,
-		});
+		const message = `Extension flag "--${name}" requires a value`;
+		diagnostics.push(
+			attachDiagnosticEnvelope(
+				{ type: "error", message },
+				createDiagnosticEnvelope({
+					severity: "error",
+					phase: "load",
+					runtimeKind: "typescript",
+					category: "extension_flag_invalid",
+					message,
+					recoveryHint: "Provide a value for the string extension flag or remove the option.",
+					operation: "extension.flag",
+					target: { flag: name },
+				}),
+			),
+		);
 	}
 
 	if (unknownFlags.length > 0) {
-		diagnostics.push({
-			type: "error",
-			message: `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`,
-		});
+		const message = `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`;
+		diagnostics.push(
+			attachDiagnosticEnvelope(
+				{ type: "error", message },
+				createDiagnosticEnvelope({
+					severity: "error",
+					phase: "load",
+					runtimeKind: "typescript",
+					category: "extension_flag_unknown",
+					message,
+					recoveryHint: "Remove unknown extension flags or enable the extension that registers them.",
+					operation: "extension.flag",
+					target: { flags: unknownFlags },
+				}),
+			),
+		);
 	}
 
 	return diagnostics;
@@ -149,10 +175,26 @@ export async function createAgentSessionServices(
 			modelRegistry.registerProvider(name, config);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
+			const diagnosticMessage = `Extension "${extensionPath}" error: ${message}`;
+			diagnostics.push(
+				attachDiagnosticEnvelope(
+					{
+						type: "error",
+						message: diagnosticMessage,
+					},
+					createDiagnosticEnvelope({
+						severity: "error",
+						phase: "load",
+						runtimeKind: "typescript",
+						category: "provider_registration_failed",
+						message: diagnosticMessage,
+						recoveryHint:
+							"Fix the extension provider registration or disable the extension, then reload extensions.",
+						source: { path: extensionPath },
+						operation: "provider.register",
+					}),
+				),
+			);
 		}
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];

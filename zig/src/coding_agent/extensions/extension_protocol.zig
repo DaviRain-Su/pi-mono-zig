@@ -467,7 +467,7 @@ pub const ProtocolState = struct {
     fn addRegistryDenialDiagnostic(self: *ProtocolState, denial: enforcement.DenyDecision) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.allocator);
         defer envelope.deinit();
-        try envelope.writer.writeAll("{\"category\":");
+        try envelope.writer.writeAll("{\"schemaVersion\":\"diagnostic-envelope.v0\",\"severity\":\"error\",\"runtimeKind\":\"process_jsonl\",\"category\":");
         try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"capability\":");
         try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
@@ -489,20 +489,22 @@ pub const ProtocolState = struct {
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
         if (denial.target.id) |target_id| {
-            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+            try writeRedactedDiagnosticString(&envelope.writer, target_id);
         } else {
             try envelope.writer.writeAll("null");
         }
         try envelope.writer.writeAll("},\"reason\":");
         try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
-        try envelope.writer.writeAll(",\"message\":\"process_jsonl registry frame denied by enforcement substrate\"}");
+        try envelope.writer.writeAll(",\"extensionIdentity\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"recoveryHint\":\"Grant the required extension capability or disable the registry frame.\",\"message\":\"process_jsonl registry frame denied by enforcement substrate\"}");
         try self.addDiagnostic(.host_error, .@"error", envelope.written());
     }
 
     fn addUnsupportedRegistryFrameDiagnostic(self: *ProtocolState, type_name: ?[]const u8) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.allocator);
         defer envelope.deinit();
-        try envelope.writer.writeAll("{\"category\":\"unsupported_message_type\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"message\":\"unsupported registry frame\"");
+        try envelope.writer.writeAll("{\"schemaVersion\":\"diagnostic-envelope.v0\",\"severity\":\"error\",\"category\":\"unsupported_message_type\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"recoveryHint\":\"Remove the unsupported registry frame type or update the host protocol.\",\"message\":\"unsupported registry frame\"");
         if (type_name) |name| {
             try envelope.writer.writeAll(",\"actual\":");
             try std.json.Stringify.value(name, .{}, &envelope.writer);
@@ -514,7 +516,7 @@ pub const ProtocolState = struct {
     fn addMalformedRegistryFrameDiagnostic(self: *ProtocolState, type_name: ?[]const u8) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.allocator);
         defer envelope.deinit();
-        try envelope.writer.writeAll("{\"category\":\"malformed_registry_frame\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"message\":\"malformed registry frame\"");
+        try envelope.writer.writeAll("{\"schemaVersion\":\"diagnostic-envelope.v0\",\"severity\":\"error\",\"category\":\"malformed_registry_frame\",\"phase\":\"call\",\"runtimeKind\":\"process_jsonl\",\"recoveryHint\":\"Fix the malformed registry frame payload before retrying.\",\"message\":\"malformed registry frame\"");
         if (type_name) |name| {
             try envelope.writer.writeAll(",\"actual\":");
             try std.json.Stringify.value(name, .{}, &envelope.writer);
@@ -721,6 +723,43 @@ fn parseSeverity(name: ?[]const u8) ?DiagnosticSeverity {
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
     return line;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isSensitiveDiagnosticString(value: []const u8) bool {
+    const needles = [_][]const u8{
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "token",
+        "oauth",
+        "password",
+        "secret",
+        "credential",
+        "sk-",
+    };
+    for (needles) |needle| {
+        if (containsIgnoreCase(value, needle)) return true;
+    }
+    return false;
+}
+
+fn writeRedactedDiagnosticString(writer: *std.Io.Writer, value: []const u8) !void {
+    if (isSensitiveDiagnosticString(value)) {
+        try std.json.Stringify.value("[REDACTED]", .{}, writer);
+    } else {
+        try std.json.Stringify.value(value, .{}, writer);
+    }
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {

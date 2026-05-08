@@ -11,6 +11,11 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, relative, sep } from "node:path";
+import {
+	adaptProvenanceDiagnosticToEnvelope,
+	attachDiagnosticEnvelope,
+	type DiagnosticEnvelopeV0,
+} from "./diagnostics.js";
 import type { WasmExtensionPackageManifest } from "./wasm-extension-package.js";
 
 export const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
@@ -91,6 +96,7 @@ export interface ExtensionProvenanceDiagnostic {
 	packageRoot?: string;
 	manifestPath?: string;
 	artifactPath?: string;
+	envelope?: DiagnosticEnvelopeV0;
 }
 
 export interface ExtensionProvenanceLoadResult {
@@ -272,7 +278,7 @@ function createDiagnostic(options: {
 	actual?: string;
 	message: string;
 }): ExtensionProvenanceDiagnostic {
-	return {
+	const diagnostic: ExtensionProvenanceDiagnostic = {
 		category: options.category,
 		scope: options.scope,
 		lockfilePath: options.lockfilePath,
@@ -284,6 +290,7 @@ function createDiagnostic(options: {
 		message: options.message,
 		recoveryHint: "Run install or update for the package to refresh trusted extension provenance.",
 	};
+	return attachDiagnosticEnvelope(diagnostic, adaptProvenanceDiagnosticToEnvelope(diagnostic));
 }
 
 export function getExtensionProvenanceLockfilePath(options: {

@@ -8,7 +8,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
-import type { ResourceDiagnostic } from "../diagnostics.js";
+import { attachResourceDiagnosticEnvelope, type ResourceDiagnostic, sanitizeExtensionError } from "../diagnostics.js";
 import {
 	type CanonicalExtensionGrant,
 	createExtensionPolicyDenialError,
@@ -752,7 +752,7 @@ export class ExtensionRunner {
 	}
 
 	getShortcutDiagnostics(): ResourceDiagnostic[] {
-		return this.shortcutDiagnostics;
+		return this.shortcutDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic));
 	}
 
 	invalidate(
@@ -778,8 +778,9 @@ export class ExtensionRunner {
 	}
 
 	emitError(error: ExtensionError): void {
+		const sanitized = sanitizeExtensionError(error);
 		for (const listener of this.errorListeners) {
-			listener(error);
+			listener(sanitized);
 		}
 	}
 
@@ -845,7 +846,7 @@ export class ExtensionRunner {
 	}
 
 	getCommandDiagnostics(): ResourceDiagnostic[] {
-		return this.commandDiagnostics;
+		return this.commandDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic));
 	}
 
 	getCommand(name: string): ResolvedCommand | undefined {

@@ -4,7 +4,12 @@ import { join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.js";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
-import type { ResourceDiagnostic } from "./diagnostics.js";
+import {
+	attachDiagnosticEnvelope,
+	attachResourceDiagnosticEnvelope,
+	createDiagnosticEnvelope,
+	type ResourceDiagnostic,
+} from "./diagnostics.js";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 
@@ -12,7 +17,13 @@ import { canonicalizePath, isLocalPath } from "../utils/paths.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createTypeScriptExtensionIdentity } from "./extension-policy.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
-import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
+import type {
+	Extension,
+	ExtensionFactory,
+	ExtensionRuntime,
+	LoadExtensionError,
+	LoadExtensionsResult,
+} from "./extensions/types.js";
 import { DefaultPackageManager, type PathMetadata, type ResolvedWasmExtensionPackage } from "./package-manager.js";
 import type { PromptTemplate } from "./prompt-templates.js";
 import { loadPromptTemplates } from "./prompt-templates.js";
@@ -264,15 +275,24 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
-		return { skills: this.skills, diagnostics: this.skillDiagnostics };
+		return {
+			skills: this.skills,
+			diagnostics: this.skillDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
+		};
 	}
 
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } {
-		return { prompts: this.prompts, diagnostics: this.promptDiagnostics };
+		return {
+			prompts: this.prompts,
+			diagnostics: this.promptDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
+		};
 	}
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
-		return { themes: this.themes, diagnostics: this.themeDiagnostics };
+		return {
+			themes: this.themes,
+			diagnostics: this.themeDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
+		};
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -792,10 +812,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private async loadExtensionFactories(runtime: ExtensionRuntime): Promise<{
 		extensions: Extension[];
-		errors: Array<{ path: string; error: string }>;
+		errors: LoadExtensionError[];
 	}> {
 		const extensions: Extension[] = [];
-		const errors: Array<{ path: string; error: string }> = [];
+		const errors: LoadExtensionError[] = [];
 
 		for (const [index, factory] of this.extensionFactories.entries()) {
 			const extensionPath = `<inline:${index + 1}>`;
@@ -804,7 +824,17 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extensions.push(extension);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "failed to load extension";
-				errors.push({ path: extensionPath, error: message });
+				const envelope = createDiagnosticEnvelope({
+					severity: "error",
+					phase: "load",
+					runtimeKind: "typescript",
+					category: "extension_load_failed",
+					message,
+					recoveryHint: "Fix or remove the inline extension factory, then reload extensions.",
+					source: { path: extensionPath },
+					path: extensionPath,
+				});
+				errors.push(attachDiagnosticEnvelope({ path: extensionPath, error: envelope.message }, envelope));
 			}
 		}
 

@@ -94,6 +94,39 @@ Skill content here.`,
 			expect(skills.some((s) => s.name === "test-skill")).toBe(true);
 		});
 
+		it("exposes load-time extension failures as canonical redacted diagnostic envelopes", async () => {
+			const extensionPath = join(cwd, "bad-extension.ts");
+			const apiKeyValue = ["s", "k", "-", "load", "-diagnostic", "-value"].join("");
+			const queryValue = ["query", "-diagnostic", "-value"].join("");
+			const queryKey = ["api", "_", "key"].join("");
+			const failureUrl = new URL("https://api.example.test/");
+			failureUrl.searchParams.set(queryKey, queryValue);
+			const failureMessage = `Authorization: ${["Bearer", apiKeyValue].join(" ")} and ${failureUrl.toString()}`;
+			writeFileSync(extensionPath, `export default () => { throw new Error(${JSON.stringify(failureMessage)}); };`);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, additionalExtensionPaths: [extensionPath] });
+			await loader.reload();
+
+			const [error] = loader.getExtensions().errors;
+			expect(error).toMatchObject({
+				path: extensionPath,
+				envelope: {
+					schemaVersion: "diagnostic-envelope.v0",
+					severity: "error",
+					phase: "load",
+					runtimeKind: "typescript",
+					category: "extension_load_failed",
+					source: { path: extensionPath },
+					path: extensionPath,
+				},
+			});
+			const serializedError = JSON.stringify(error);
+			expect(serializedError).not.toContain(apiKeyValue);
+			expect(serializedError).not.toContain(queryValue);
+			expect(error?.envelope?.message).toContain("Authorization: [REDACTED]");
+			expect(error?.envelope?.message).toContain("api_key=[REDACTED]");
+		});
+
 		it("should ignore extra markdown files in auto-discovered skill dirs", async () => {
 			const skillDir = join(agentDir, "skills", "pi-skills", "browser-tools");
 			mkdirSync(skillDir, { recursive: true });

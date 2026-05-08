@@ -199,6 +199,43 @@ fn isPathWithinSandbox(root: []const u8, path: []const u8) bool {
     return path.len > root.len and path[root.len] == std.fs.path.sep;
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isSensitiveDiagnosticString(value: []const u8) bool {
+    const needles = [_][]const u8{
+        "authorization",
+        "bearer",
+        "api_key",
+        "apikey",
+        "token",
+        "oauth",
+        "password",
+        "secret",
+        "credential",
+        "sk-",
+    };
+    for (needles) |needle| {
+        if (containsIgnoreCase(value, needle)) return true;
+    }
+    return false;
+}
+
+fn writeRedactedDiagnosticString(writer: *std.Io.Writer, value: []const u8) !void {
+    if (isSensitiveDiagnosticString(value)) {
+        try std.json.Stringify.value("[REDACTED]", .{}, writer);
+    } else {
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+}
+
 fn nativeResourceLimitsToEnforcement(limits: NativeResourceLimits) enforcement.ResourceLimits {
     return .{
         .max_children = limits.max_children,
@@ -390,7 +427,7 @@ pub const NativeHostApi = struct {
     fn addDenialDiagnostic(self: *NativeHostApi, denial: enforcement.DenyDecision) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.runtime.allocator);
         defer envelope.deinit();
-        try envelope.writer.writeAll("{\"category\":");
+        try envelope.writer.writeAll("{\"schemaVersion\":\"diagnostic-envelope.v0\",\"severity\":\"error\",\"runtimeKind\":\"native\",\"category\":");
         try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"capability\":");
         try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
@@ -416,7 +453,7 @@ pub const NativeHostApi = struct {
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
         if (denial.target.id) |target_id| {
-            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+            try writeRedactedDiagnosticString(&envelope.writer, target_id);
         } else {
             try envelope.writer.writeAll("null");
         }
@@ -429,7 +466,9 @@ pub const NativeHostApi = struct {
             try std.json.Stringify.value(self.runtime.descriptor.tools[0].extension_path, .{}, &envelope.writer);
         }
         try envelope.writer.writeAll("}");
-        try envelope.writer.writeAll(",\"message\":\"native host API operation denied by enforcement substrate\"}");
+        try envelope.writer.writeAll(",\"extensionIdentity\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"recoveryHint\":\"Grant the required native extension capability or disable the operation.\",\"message\":\"native host API operation denied by enforcement substrate\"}");
         try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
     }
 };

@@ -40,6 +40,7 @@ import { CONFIG_DIR_NAME } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
+import { adaptProvenanceDiagnosticToEnvelope, attachDiagnosticEnvelope } from "./diagnostics.js";
 import {
 	createWasmExtensionIdentity,
 	createWasmExtensionLegacyPolicyKey,
@@ -1310,7 +1311,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (packageRoot !== undefined) diagnostic.packageRoot = packageRoot;
 		if (manifestPath !== undefined) diagnostic.manifestPath = manifestPath;
 		if (artifactPath !== undefined) diagnostic.artifactPath = artifactPath;
-		return diagnostic;
+		return attachDiagnosticEnvelope(diagnostic, adaptProvenanceDiagnosticToEnvelope(diagnostic));
 	}
 
 	private writeProvenanceLockForSource(
@@ -2774,7 +2775,7 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 		policyKey: string,
 	): ExtensionProvenanceDiagnostic {
-		return {
+		const diagnostic: ExtensionProvenanceDiagnostic = {
 			category: "policy_digest_mismatch",
 			scope: metadata.scope === "project" ? "project" : "user",
 			lockfilePath: this.getProvenanceLockfilePath(metadata.scope === "project" ? "project" : "user"),
@@ -2789,6 +2790,10 @@ export class DefaultPackageManager implements PackageManager {
 			manifestPath: identity.manifestPath,
 			artifactPath: identity.artifactPath,
 		};
+		return attachDiagnosticEnvelope(
+			diagnostic,
+			adaptProvenanceDiagnosticToEnvelope(diagnostic, identity.runtimeKind),
+		);
 	}
 
 	private collectDefaultResources(
