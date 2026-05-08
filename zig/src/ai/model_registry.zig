@@ -32,6 +32,9 @@ pub const OpenAICompatDefinition = struct {
     supports_developer_role: ?bool = null,
     supports_reasoning_effort: ?bool = null,
     max_tokens_field: ?[]const u8 = null,
+    requires_reasoning_content_on_assistant_messages: ?bool = null,
+    thinking_format: ?[]const u8 = null,
+    zai_tool_stream: ?bool = null,
     supports_strict_mode: ?bool = null,
     send_session_affinity_headers: ?bool = null,
 };
@@ -704,6 +707,9 @@ fn buildOpenAICompatValue(allocator: std.mem.Allocator, compat: OpenAICompatDefi
     try putOptionalCompatBool(allocator, &object, "supportsDeveloperRole", compat.supports_developer_role);
     try putOptionalCompatBool(allocator, &object, "supportsReasoningEffort", compat.supports_reasoning_effort);
     try putOptionalCompatString(allocator, &object, "maxTokensField", compat.max_tokens_field);
+    try putOptionalCompatBool(allocator, &object, "requiresReasoningContentOnAssistantMessages", compat.requires_reasoning_content_on_assistant_messages);
+    try putOptionalCompatString(allocator, &object, "thinkingFormat", compat.thinking_format);
+    try putOptionalCompatBool(allocator, &object, "zaiToolStream", compat.zai_tool_stream);
     try putOptionalCompatBool(allocator, &object, "supportsStrictMode", compat.supports_strict_mode);
     try putOptionalCompatBool(allocator, &object, "sendSessionAffinityHeaders", compat.send_session_affinity_headers);
 
@@ -897,7 +903,7 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "cerebras", .api = "openai-completions", .base_url = "https://api.cerebras.ai/v1", .default_model_id = "zai-glm-4.7" },
     .{ .provider = "openrouter", .api = "openai-completions", .base_url = "https://openrouter.ai/api/v1", .default_model_id = "moonshotai/kimi-k2.6" },
     .{ .provider = "vercel-ai-gateway", .api = "anthropic-messages", .base_url = "https://ai-gateway.vercel.sh", .default_model_id = "zai/glm-5.1" },
-    .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/paas/v4", .default_model_id = "glm-5.1" },
+    .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/coding/paas/v4", .default_model_id = "glm-5.1" },
     .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
     .{ .provider = "minimax-cn", .api = "anthropic-messages", .base_url = "https://api.minimaxi.com/anthropic", .default_model_id = "MiniMax-M2.7" },
     .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
@@ -908,6 +914,7 @@ const BUILT_IN_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "opencode-go", .api = "openai-completions", .base_url = "https://opencode.ai/zen/go/v1", .default_model_id = "kimi-k2.6" },
     .{ .provider = "kimi-coding", .api = "anthropic-messages", .base_url = "https://api.kimi.com/coding", .default_model_id = "kimi-for-coding" },
     .{ .provider = "kimi-code-openai", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .default_model_id = "kimi-for-coding" },
+    .{ .provider = "deepseek", .api = "openai-completions", .base_url = "https://api.deepseek.com", .default_model_id = "deepseek-v4-pro" },
     .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
@@ -920,6 +927,13 @@ const THINKING_MAP_XHIGH_MAX = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "ma
 const THINKING_MAP_XHIGH_XHIGH = types.ThinkingLevelMap{ .xhigh = .{ .mapped = "xhigh" } };
 const THINKING_MAP_OFF_UNSUPPORTED_XHIGH = types.ThinkingLevelMap{ .off = .unsupported, .xhigh = .{ .mapped = "xhigh" } };
 const THINKING_MAP_CODEX_XHIGH = types.ThinkingLevelMap{ .minimal = .{ .mapped = "low" }, .xhigh = .{ .mapped = "xhigh" } };
+const THINKING_MAP_DEEPSEEK_V4 = types.ThinkingLevelMap{
+    .minimal = .unsupported,
+    .low = .unsupported,
+    .medium = .unsupported,
+    .high = .{ .mapped = "high" },
+    .xhigh = .{ .mapped = "max" },
+};
 const OPENAI_COMPAT_MOONSHOT = OpenAICompatDefinition{
     .supports_store = false,
     .supports_developer_role = false,
@@ -929,6 +943,19 @@ const OPENAI_COMPAT_MOONSHOT = OpenAICompatDefinition{
 };
 const OPENAI_COMPAT_CLOUDFLARE_SESSION = OpenAICompatDefinition{
     .send_session_affinity_headers = true,
+};
+const OPENAI_COMPAT_ZAI_CODEPLAN = OpenAICompatDefinition{
+    .supports_developer_role = false,
+    .thinking_format = "zai",
+};
+const OPENAI_COMPAT_ZAI_CODEPLAN_TOOL_STREAM = OpenAICompatDefinition{
+    .supports_developer_role = false,
+    .thinking_format = "zai",
+    .zai_tool_stream = true,
+};
+const OPENAI_COMPAT_DEEPSEEK_V4 = OpenAICompatDefinition{
+    .requires_reasoning_content_on_assistant_messages = true,
+    .thinking_format = "deepseek",
 };
 
 const BUILT_IN_MODELS = [_]ModelDefinition{
@@ -971,8 +998,11 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "openrouter", .id = "openai/gpt-4o:extended", .name = "GPT-4o Extended", .reasoning = false, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 128000, .max_tokens = 4096 },
     .{ .provider = "vercel-ai-gateway", .id = "zai/glm-5.1", .name = "GLM 5.1", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 202800, .max_tokens = 64000 },
 
-    .{ .provider = "zai", .id = "glm-5", .name = "GLM-5", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
-    .{ .provider = "zai", .id = "glm-5.1", .name = "GLM-5.1", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
+    .{ .provider = "zai", .id = "glm-4.5-air", .name = "GLM-4.5-Air", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 131072, .max_tokens = 98304, .openai_compat = OPENAI_COMPAT_ZAI_CODEPLAN },
+    .{ .provider = "zai", .id = "glm-4.7", .name = "GLM-4.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072, .openai_compat = OPENAI_COMPAT_ZAI_CODEPLAN_TOOL_STREAM },
+    .{ .provider = "zai", .id = "glm-5-turbo", .name = "GLM-5-Turbo", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 200000, .max_tokens = 131072, .openai_compat = OPENAI_COMPAT_ZAI_CODEPLAN_TOOL_STREAM },
+    .{ .provider = "zai", .id = "glm-5.1", .name = "GLM-5.1", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 200000, .max_tokens = 131072, .openai_compat = OPENAI_COMPAT_ZAI_CODEPLAN_TOOL_STREAM },
+    .{ .provider = "zai", .id = "glm-5v-turbo", .name = "GLM-5V-Turbo", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 131072, .openai_compat = OPENAI_COMPAT_ZAI_CODEPLAN_TOOL_STREAM },
     .{ .provider = "minimax", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
     .{ .provider = "minimax-cn", .id = "MiniMax-M2.7", .name = "MiniMax-M2.7", .reasoning = true, .input_types = TEXT_INPUTS[0..], .context_window = 204800, .max_tokens = 131072 },
     .{ .provider = "cloudflare-workers-ai", .id = "@cf/moonshotai/kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 256000, .openai_compat = OPENAI_COMPAT_CLOUDFLARE_SESSION },
@@ -985,6 +1015,8 @@ const BUILT_IN_MODELS = [_]ModelDefinition{
     .{ .provider = "opencode-go", .id = "kimi-k2.6", .name = "Kimi K2.6 (3x limits)", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "kimi-coding", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768 },
     .{ .provider = "kimi-code-openai", .id = "kimi-for-coding", .name = "Kimi For Coding", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 262144, .max_tokens = 32768, .openai_compat = OPENAI_COMPAT_MOONSHOT },
+    .{ .provider = "deepseek", .id = "deepseek-v4-flash", .name = "DeepSeek V4 Flash", .reasoning = true, .thinking_level_map = THINKING_MAP_DEEPSEEK_V4, .input_types = TEXT_INPUTS[0..], .cost = .{ .input = 0.14, .output = 0.28, .cache_read = 0.0028 }, .context_window = 1000000, .max_tokens = 384000, .openai_compat = OPENAI_COMPAT_DEEPSEEK_V4 },
+    .{ .provider = "deepseek", .id = "deepseek-v4-pro", .name = "DeepSeek V4 Pro", .reasoning = true, .thinking_level_map = THINKING_MAP_DEEPSEEK_V4, .input_types = TEXT_INPUTS[0..], .cost = .{ .input = 0.435, .output = 0.87, .cache_read = 0.003625 }, .context_window = 1000000, .max_tokens = 384000, .openai_compat = OPENAI_COMPAT_DEEPSEEK_V4 },
     .{ .provider = "xiaomi", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
     .{ .provider = "xiaomi-token-plan-cn", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
     .{ .provider = "xiaomi-token-plan-ams", .id = "mimo-v2.5-pro", .name = "MiMo-V2.5-Pro", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 131072 },
@@ -1009,6 +1041,8 @@ test "built-in models are registered at startup" {
     try std.testing.expect(find("opencode-go", "kimi-k2.6") != null);
     try std.testing.expect(find("kimi-coding", "kimi-for-coding") != null);
     try std.testing.expect(find("kimi-code-openai", "kimi-for-coding") != null);
+    try std.testing.expect(find("deepseek", "deepseek-v4-pro") != null);
+    try std.testing.expect(find("zai", "glm-5.1") != null);
     try std.testing.expect(find("moonshotai", "kimi-k2.6") != null);
     try std.testing.expect(find("moonshotai-cn", "kimi-k2.6") != null);
     try std.testing.expect(find("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6") != null);
@@ -1047,12 +1081,13 @@ test "phase4 provider expansion registers configs and default models" {
         .{ .provider = "cerebras", .api = "openai-completions", .base_url = "https://api.cerebras.ai/v1", .default_model_id = "zai-glm-4.7" },
         .{ .provider = "openrouter", .api = "openai-completions", .base_url = "https://openrouter.ai/api/v1", .default_model_id = "moonshotai/kimi-k2.6" },
         .{ .provider = "vercel-ai-gateway", .api = "anthropic-messages", .base_url = "https://ai-gateway.vercel.sh", .default_model_id = "zai/glm-5.1" },
-        .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/paas/v4", .default_model_id = "glm-5.1" },
+        .{ .provider = "zai", .api = "openai-completions", .base_url = "https://api.z.ai/api/coding/paas/v4", .default_model_id = "glm-5.1" },
         .{ .provider = "minimax", .api = "anthropic-messages", .base_url = "https://api.minimax.io/anthropic", .default_model_id = "MiniMax-M2.7" },
         .{ .provider = "huggingface", .api = "openai-completions", .base_url = "https://router.huggingface.co/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
         .{ .provider = "fireworks", .api = "anthropic-messages", .base_url = "https://api.fireworks.ai/inference", .default_model_id = "accounts/fireworks/models/kimi-k2p6" },
         .{ .provider = "opencode", .api = "openai-completions", .base_url = "https://opencode.ai/zen/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "kimi-code-openai", .api = "openai-completions", .base_url = "https://api.kimi.com/coding/v1", .default_model_id = "kimi-for-coding" },
+        .{ .provider = "deepseek", .api = "openai-completions", .base_url = "https://api.deepseek.com", .default_model_id = "deepseek-v4-pro" },
         .{ .provider = "moonshotai", .api = "openai-completions", .base_url = "https://api.moonshot.ai/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "moonshotai-cn", .api = "openai-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
         .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .base_url = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1", .default_model_id = "@cf/moonshotai/kimi-k2.6" },
@@ -1090,6 +1125,102 @@ test "phase4 provider expansion registers configs and default models" {
     try expectCompatBool(kimi_code_openai, "supportsReasoningEffort", false);
     try expectCompatString(kimi_code_openai, "maxTokensField", "max_tokens");
     try expectCompatBool(kimi_code_openai, "supportsStrictMode", false);
+}
+
+test "zai CodePlan built-ins mirror TypeScript generated metadata" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const provider = getProviderConfig("zai").?;
+    try std.testing.expectEqualStrings("openai-completions", provider.api);
+    try std.testing.expectEqualStrings("https://api.z.ai/api/coding/paas/v4", provider.base_url);
+    try std.testing.expectEqualStrings("glm-5.1", provider.default_model_id.?);
+
+    const cases = [_]struct {
+        id: []const u8,
+        name: []const u8,
+        context_window: u32,
+        max_tokens: u32,
+        supports_images: bool,
+        zai_tool_stream: bool,
+    }{
+        .{ .id = "glm-4.5-air", .name = "GLM-4.5-Air", .context_window = 131072, .max_tokens = 98304, .supports_images = false, .zai_tool_stream = false },
+        .{ .id = "glm-4.7", .name = "GLM-4.7", .context_window = 204800, .max_tokens = 131072, .supports_images = false, .zai_tool_stream = true },
+        .{ .id = "glm-5-turbo", .name = "GLM-5-Turbo", .context_window = 200000, .max_tokens = 131072, .supports_images = false, .zai_tool_stream = true },
+        .{ .id = "glm-5.1", .name = "GLM-5.1", .context_window = 200000, .max_tokens = 131072, .supports_images = false, .zai_tool_stream = true },
+        .{ .id = "glm-5v-turbo", .name = "GLM-5V-Turbo", .context_window = 200000, .max_tokens = 131072, .supports_images = true, .zai_tool_stream = true },
+    };
+
+    for (cases) |case| {
+        const model = find("zai", case.id).?;
+        try std.testing.expectEqualStrings(case.name, model.name);
+        try std.testing.expectEqualStrings("openai-completions", model.api);
+        try std.testing.expectEqualStrings("https://api.z.ai/api/coding/paas/v4", model.base_url);
+        try std.testing.expect(model.reasoning);
+        try std.testing.expectEqual(case.context_window, model.context_window);
+        try std.testing.expectEqual(case.max_tokens, model.max_tokens);
+        try std.testing.expectEqual(@as(usize, if (case.supports_images) 2 else 1), model.input_types.len);
+        try std.testing.expectEqualStrings("text", model.input_types[0]);
+        if (case.supports_images) try std.testing.expectEqualStrings("image", model.input_types[1]);
+        try expectCompatBool(model, "supportsDeveloperRole", false);
+        try expectCompatString(model, "thinkingFormat", "zai");
+        if (case.zai_tool_stream) {
+            try expectCompatBool(model, "zaiToolStream", true);
+        } else {
+            try expectCompatMissing(model, "zaiToolStream");
+        }
+    }
+
+    try std.testing.expect(find("zai", "glm-5") == null);
+}
+
+test "DeepSeek built-ins mirror TypeScript generated metadata" {
+    resetForTesting();
+    defer resetForTesting();
+
+    const provider = getProviderConfig("deepseek").?;
+    try std.testing.expectEqualStrings("openai-completions", provider.api);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", provider.base_url);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", provider.default_model_id.?);
+
+    const cases = [_]struct {
+        id: []const u8,
+        name: []const u8,
+        input_cost: f64,
+        output_cost: f64,
+        cache_read_cost: f64,
+    }{
+        .{ .id = "deepseek-v4-flash", .name = "DeepSeek V4 Flash", .input_cost = 0.14, .output_cost = 0.28, .cache_read_cost = 0.0028 },
+        .{ .id = "deepseek-v4-pro", .name = "DeepSeek V4 Pro", .input_cost = 0.435, .output_cost = 0.87, .cache_read_cost = 0.003625 },
+    };
+
+    for (cases) |case| {
+        const model = find("deepseek", case.id).?;
+        try std.testing.expectEqualStrings(case.name, model.name);
+        try std.testing.expectEqualStrings("openai-completions", model.api);
+        try std.testing.expectEqualStrings("https://api.deepseek.com", model.base_url);
+        try std.testing.expect(model.reasoning);
+        try std.testing.expectEqual(@as(u32, 1000000), model.context_window);
+        try std.testing.expectEqual(@as(u32, 384000), model.max_tokens);
+        try std.testing.expectEqual(@as(usize, 1), model.input_types.len);
+        try std.testing.expectEqualStrings("text", model.input_types[0]);
+        try std.testing.expectEqual(case.input_cost, model.cost.input);
+        try std.testing.expectEqual(case.output_cost, model.cost.output);
+        try std.testing.expectEqual(case.cache_read_cost, model.cost.cache_read);
+        try std.testing.expectEqual(@as(f64, 0), model.cost.cache_write);
+        try expectCompatBool(model, "requiresReasoningContentOnAssistantMessages", true);
+        try expectCompatString(model, "thinkingFormat", "deepseek");
+        try std.testing.expect(!thinkingLevelSupported(model, .minimal));
+        try std.testing.expect(!thinkingLevelSupported(model, .low));
+        try std.testing.expect(!thinkingLevelSupported(model, .medium));
+        try std.testing.expect(thinkingLevelSupported(model, .high));
+        try std.testing.expect(thinkingLevelSupported(model, .xhigh));
+        try std.testing.expectEqualStrings("high", mappedThinkingLevelValue(model, .high).?);
+        try std.testing.expectEqualStrings("max", mappedThinkingLevelValue(model, .xhigh).?);
+    }
+
+    try std.testing.expect(find("deepseek", "deepseek-reasoner") == null);
+    try std.testing.expect(find("deepseek", "deepseek-chat") == null);
 }
 
 test "provider catalog config parity registers Moonshot Cloudflare and Xiaomi providers" {
@@ -1258,6 +1389,12 @@ fn expectCompatString(model: types.Model, key: []const u8, expected: []const u8)
     const value = compat.object.get(key) orelse return error.TestExpectedEqual;
     try std.testing.expect(value == .string);
     try std.testing.expectEqualStrings(expected, value.string);
+}
+
+fn expectCompatMissing(model: types.Model, key: []const u8) !void {
+    const compat = model.compat orelse return;
+    try std.testing.expect(compat == .object);
+    try std.testing.expect(compat.object.get(key) == null);
 }
 
 test "model thinking level map preserves off and xhigh support metadata" {
