@@ -51,6 +51,11 @@ pub fn runtimeStopReason(err: anyerror) types.StopReason {
     };
 }
 
+pub fn coerceStopReasonForToolCalls(reason: types.StopReason, had_tool_calls: bool) types.StopReason {
+    if (had_tool_calls and reason == .stop) return .tool_use;
+    return reason;
+}
+
 /// Returns true when the caller's abort signal is currently set. Mirrors the
 /// TypeScript `options?.signal?.aborted` check that providers use to classify
 /// in-flight failures as aborted rather than generic errors.
@@ -501,4 +506,13 @@ test "HTTP status helper emits one terminal error event with result identity" {
     try std.testing.expectEqualStrings(event.message.?.model, result.model);
     try std.testing.expectEqual(event.message.?.usage.total_tokens, result.usage.total_tokens);
     allocator.free(result.error_message.?);
+}
+
+test "coerceStopReasonForToolCalls only upgrades stop after tool calls" {
+    try std.testing.expectEqual(types.StopReason.tool_use, coerceStopReasonForToolCalls(.stop, true));
+    try std.testing.expectEqual(types.StopReason.stop, coerceStopReasonForToolCalls(.stop, false));
+    try std.testing.expectEqual(types.StopReason.tool_use, coerceStopReasonForToolCalls(.tool_use, true));
+    try std.testing.expectEqual(types.StopReason.length, coerceStopReasonForToolCalls(.length, true));
+    try std.testing.expectEqual(types.StopReason.error_reason, coerceStopReasonForToolCalls(.error_reason, true));
+    try std.testing.expectEqual(types.StopReason.aborted, coerceStopReasonForToolCalls(.aborted, true));
 }

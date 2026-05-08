@@ -703,9 +703,7 @@ fn parseSseStreamLines(
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
 
-    if (had_tool_calls and output.stop_reason == .stop) {
-        output.stop_reason = .tool_use;
-    }
+    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, had_tool_calls);
 
     stream_ptr.push(.{
         .event_type = .done,

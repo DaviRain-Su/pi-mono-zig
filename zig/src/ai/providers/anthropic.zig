@@ -1956,6 +1956,7 @@ fn parseSseStreamLines(
     // Tool calls live inline in output.content; legacy AssistantMessage.tool_calls
     // is intentionally left null. tool_calls ArrayList holds borrow-only copies
     // and tool_calls.deinit only releases its buffer.
+    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
 
     stream_ptr.push(.{
         .event_type = .done,

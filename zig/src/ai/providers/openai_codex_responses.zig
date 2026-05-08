@@ -839,9 +839,7 @@ fn parseSseStreamLines(
     output.content = try content_blocks.toOwnedSlice(allocator);
     // Tool calls live inline in output.content; legacy field intentionally null.
 
-    if (had_tool_calls and output.stop_reason == .stop) {
-        output.stop_reason = .tool_use;
-    }
+    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, had_tool_calls);
     if (output.usage.total_tokens == 0) {
         output.usage.total_tokens = output.usage.input + output.usage.output + output.usage.cache_read + output.usage.cache_write;
     }

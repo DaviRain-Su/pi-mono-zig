@@ -2416,6 +2416,7 @@ fn finalizeOutput(
     }
     output.content = try content_blocks.toOwnedSlice(allocator);
     // Tool calls are emitted inline; legacy field intentionally null.
+    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
     output.usage.total_tokens = if (output.usage.total_tokens > 0) output.usage.total_tokens else output.usage.input + output.usage.output;
 
     stream_ptr.push(.{ .event_type = .done, .message = output.* });

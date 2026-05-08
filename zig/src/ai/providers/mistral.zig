@@ -483,6 +483,7 @@ fn parseSseStreamLines(
 
     calculateCost(model, &output.usage);
     output.content = try materializeContent(allocator, content_slots.items);
+    output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
 
     stream_ptr.push(.{
         .event_type = .done,
