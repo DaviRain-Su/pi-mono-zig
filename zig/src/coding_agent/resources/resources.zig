@@ -1040,7 +1040,9 @@ fn appendLockedWasmPackageIfValid(
 ) !void {
     if (try verifyLockedWasmPackageDetailed(allocator, io, diagnostics, package_root, source, scope, cwd, agent_dir)) |package| {
         for (packages.items) |existing| {
-            if (std.mem.eql(u8, existing.lock_entry.key, package.lock_entry.key)) {
+            if (existing.lock_entry.scope == package.lock_entry.scope and
+                std.mem.eql(u8, existing.lock_entry.key, package.lock_entry.key))
+            {
                 var duplicate = package;
                 duplicate.deinit(allocator);
                 return;
@@ -1094,11 +1096,10 @@ fn verifyLockedWasmPackageForResources(
     for (loaded.entries) |entry| {
         if (!std.mem.eql(u8, entry.key, current_entry.key)) continue;
         if (provenance_lockfile.entriesEqual(entry, current_entry)) return true;
-        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_root_digest_mismatch", "extension provenance drift", package_root));
+        try appendWasmProvenanceMismatchDiagnostic(allocator, diagnostics, entry, current_entry, source, scope, package_root);
         return false;
     }
 
-    _ = source;
     try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lock_entry", "missing extension provenance lock entry", lock_path));
     return false;
 }
@@ -1151,7 +1152,7 @@ fn verifyLockedWasmPackageDetailed(
             matched_entry = entry;
             break;
         }
-        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_root_digest_mismatch", "extension provenance drift", package_root));
+        try appendWasmProvenanceMismatchDiagnostic(allocator, diagnostics, entry, current_entry, source, scope, package_root);
         return null;
     }
 
@@ -1180,6 +1181,63 @@ fn verifyLockedWasmPackageDetailed(
         },
         .manifest = cloned_manifest,
         .lock_entry = cloned_entry,
+    };
+}
+
+fn appendWasmProvenanceMismatchDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(Diagnostic),
+    locked_entry: provenance_lockfile.LockEntry,
+    current_entry: provenance_lockfile.LockEntry,
+    source: []const u8,
+    scope: SourceScope,
+    package_root: []const u8,
+) !void {
+    const scope_name = sourceScopeDiagnosticName(scope);
+    if (!optionalStringEqual(locked_entry.artifact_sha256, current_entry.artifact_sha256)) {
+        const expected = locked_entry.artifact_sha256 orelse "";
+        const actual = current_entry.artifact_sha256 orelse "";
+        const artifact_path = current_entry.artifact_absolute_path orelse locked_entry.artifact_absolute_path orelse "";
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "phase=resolve; source={s}; scope={s}; packageRoot={s}; artifactPath={s}; expected={s}; actual={s}; recovery=run update for the package; extension artifact digest drift",
+            .{ source, scope_name, package_root, artifact_path, expected, actual },
+        );
+        defer allocator.free(message);
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "artifact_digest_mismatch", message, artifact_path));
+        return;
+    }
+    if (!std.mem.eql(u8, locked_entry.package_root_sha256, current_entry.package_root_sha256)) {
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "phase=resolve; source={s}; scope={s}; packageRoot={s}; expected={s}; actual={s}; recovery=run update for the package; extension package-root digest drift",
+            .{ source, scope_name, package_root, locked_entry.package_root_sha256, current_entry.package_root_sha256 },
+        );
+        defer allocator.free(message);
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_root_digest_mismatch", message, package_root));
+        return;
+    }
+
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "phase=resolve; source={s}; scope={s}; packageRoot={s}; recovery=run update for the package; extension provenance lock entry differs from current package identity",
+        .{ source, scope_name, package_root },
+    );
+    defer allocator.free(message);
+    try diagnostics.append(allocator, try makeDiagnostic(allocator, "manifest_identity_mismatch", message, package_root));
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn sourceScopeDiagnosticName(scope: SourceScope) []const u8 {
+    return switch (scope) {
+        .temporary => "temporary",
+        .project => "project",
+        .user => "user",
     };
 }
 

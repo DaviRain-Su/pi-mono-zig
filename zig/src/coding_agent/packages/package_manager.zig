@@ -467,6 +467,7 @@ fn wasmPolicyLookupKeyFromLockEntry(
     const artifact_sha256 = entry.artifact_sha256 orelse "";
     const tool_id = entry.manifest_tool_id orelse "";
     const handoff = extension_runtime.WasmManifestHandoff{
+        .policy_scope = entry.scope.jsonName(),
         .package_root = entry.package_root,
         .manifest_path = entry.manifest_path,
         .schema_version = schema_version,

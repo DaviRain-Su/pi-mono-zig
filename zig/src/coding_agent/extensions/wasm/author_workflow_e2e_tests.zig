@@ -104,7 +104,7 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     defer allocator.free(lock_before_drift);
 
     try appendFile(allocator, initial_manifest.valid.artifact_absolute_path, "\nDRIFT");
-    try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "package_root_digest_mismatch");
+    try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "artifact_digest_mismatch");
     const lock_after_drift = try readFile(allocator, lock_path);
     defer allocator.free(lock_after_drift);
     try std.testing.expectEqualStrings(lock_before_drift, lock_after_drift);
@@ -112,7 +112,7 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     try writeEditedAuthorSource(allocator, package_root);
     try writeEditedAuthorManifest(allocator, package_root);
     try runTemplateBuild(allocator, package_root);
-    try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "package_root_digest_mismatch");
+    try expectRuntimeDenied(allocator, home_dir, agent_dir, project_dir, "artifact_digest_mismatch");
 
     var update_result = try runPackageCommand(allocator, &.{ "update", package_root }, .{
         .cwd = project_dir,
@@ -420,6 +420,167 @@ test "VAL-RUNTIME installed wasm executes through normal session history and err
         .expected_artifact_sha256 = manifest_result.valid.artifact_sha256,
     });
     try std.testing.expectEqual(@as(usize, 0), built_tools.locked_wasm_runtimes.?.entries[0].adapter.pendingCount());
+}
+
+test "VAL-TRUST digest-bound policy and provenance denials fail closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer ai.model_registry.resetForTesting();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+
+    const package_root = try copyTemplateToTmp(allocator, &tmp, "project/digest-policy-plugin");
+    defer allocator.free(package_root);
+    try runTemplateBuild(allocator, package_root);
+
+    var install_result = try runPackageCommand(allocator, &.{ "install", package_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer install_result.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const persisted_source = try installedPackageSource(allocator, settings_path);
+    defer allocator.free(persisted_source);
+    const lock_path = try std.fs.path.join(allocator, &.{ agent_dir, "extensions.lock.json" });
+    defer allocator.free(lock_path);
+
+    var initial_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer initial_manifest.deinit(allocator);
+    try std.testing.expect(initial_manifest == .valid);
+
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{
+        "tool=template.echo",
+        "scope=user",
+        "source=",
+        initial_manifest.valid.package_root_sha256,
+        initial_manifest.valid.artifact_sha256,
+    });
+
+    const legacy_policy_key = try legacyArtifactOnlyPolicyKeyForTest(allocator, &initial_manifest.valid);
+    defer allocator.free(legacy_policy_key);
+    const package_root_only_key = try std.fmt.allocPrint(allocator, "wasm:package-root-only:user:{s}", .{initial_manifest.valid.package_root_sha256});
+    defer allocator.free(package_root_only_key);
+    const wildcard_key = try allocator.dupe(u8, "wasm:*");
+    defer allocator.free(wildcard_key);
+    try writeAuthorSettingsWithPolicies(
+        allocator,
+        settings_path,
+        persisted_source,
+        &.{ legacy_policy_key, package_root_only_key, wildcard_key },
+        "template.echo",
+    );
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{
+        "requiredPolicy=",
+        "scope=user",
+        initial_manifest.valid.package_root_sha256,
+        initial_manifest.valid.artifact_sha256,
+    });
+
+    const exact_user_policy_key = try exactWasmPolicyKeyForTest(allocator, &initial_manifest.valid, "user");
+    defer allocator.free(exact_user_policy_key);
+    try writeAuthorSettingsWithPolicies(allocator, settings_path, persisted_source, &.{exact_user_policy_key}, "template.echo");
+    {
+        var runtime_set = try startAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+        defer runtime_set.deinit();
+        try std.testing.expectEqual(@as(usize, 1), runtime_set.entries.len);
+        try std.testing.expectEqualStrings(exact_user_policy_key, runtime_set.entries[0].policy_lookup_key);
+    }
+
+    const lock_before_artifact_drift = try readFile(allocator, lock_path);
+    defer allocator.free(lock_before_artifact_drift);
+    try appendFile(allocator, initial_manifest.valid.artifact_absolute_path, "\nARTIFACT-DRIFT");
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "artifact_digest_mismatch", &.{
+        initial_manifest.valid.artifact_sha256,
+        "actual=",
+        "scope=user",
+    });
+    const lock_after_artifact_drift = try readFile(allocator, lock_path);
+    defer allocator.free(lock_after_artifact_drift);
+    try std.testing.expectEqualStrings(lock_before_artifact_drift, lock_after_artifact_drift);
+
+    try runTemplateBuild(allocator, package_root);
+    try writeRootOnlyAuthorManifest(allocator, package_root);
+    const artifact_before_root_update = try readFile(allocator, initial_manifest.valid.artifact_absolute_path);
+    defer allocator.free(artifact_before_root_update);
+    var root_only_update = try runPackageCommand(allocator, &.{ "update", package_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    });
+    defer root_only_update.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), root_only_update.exit_code);
+
+    var root_only_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer root_only_manifest.deinit(allocator);
+    try std.testing.expect(root_only_manifest == .valid);
+    try std.testing.expectEqualStrings(initial_manifest.valid.artifact_sha256, root_only_manifest.valid.artifact_sha256);
+    try std.testing.expect(!std.mem.eql(u8, initial_manifest.valid.package_root_sha256, root_only_manifest.valid.package_root_sha256));
+    const artifact_after_root_update = try readFile(allocator, root_only_manifest.valid.artifact_absolute_path);
+    defer allocator.free(artifact_after_root_update);
+    try std.testing.expectEqualStrings(artifact_before_root_update, artifact_after_root_update);
+
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "policy_digest_mismatch", &.{
+        root_only_manifest.valid.package_root_sha256,
+        initial_manifest.valid.package_root_sha256,
+        "requiredPolicy=",
+        "attemptedPolicy=",
+        "scope=user",
+    });
+
+    const exact_user_root_only_policy_key = try exactWasmPolicyKeyForTest(allocator, &root_only_manifest.valid, "user");
+    defer allocator.free(exact_user_root_only_policy_key);
+    try writeAuthorSettingsWithPolicies(allocator, settings_path, persisted_source, &.{exact_user_root_only_policy_key}, "template.echo");
+    {
+        var runtime_set = try startAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+        defer runtime_set.deinit();
+        try std.testing.expectEqual(@as(usize, 1), runtime_set.entries.len);
+        try std.testing.expectEqualStrings(exact_user_root_only_policy_key, runtime_set.entries[0].policy_lookup_key);
+    }
+
+    const lock_before_missing = try readFile(allocator, lock_path);
+    defer allocator.free(lock_before_missing);
+    try tools_common.writeFileAbsolute(std.testing.io, lock_path, "{ malformed", true);
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "malformed_lockfile", &.{
+        "Malformed extension provenance lockfile",
+        "extensions.lock.json",
+    });
+    const lock_after_malformed = try readFile(allocator, lock_path);
+    defer allocator.free(lock_after_malformed);
+    try std.testing.expectEqualStrings("{ malformed", lock_after_malformed);
+    try tools_common.writeFileAbsolute(std.testing.io, lock_path, lock_before_missing, true);
+
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, lock_path);
+    try expectRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "missing_lockfile", &.{
+        "missing extension provenance lockfile",
+        "extensions.lock.json",
+    });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lock_path, .{}));
+    try tools_common.writeFileAbsolute(std.testing.io, lock_path, lock_before_missing, true);
+
+    var project_install = try runPackageCommand(allocator, &.{ "install", package_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_install.exit_code);
+
+    try writeAuthorSettingsWithPolicies(allocator, settings_path, persisted_source, &.{exact_user_root_only_policy_key}, "template.echo");
+    try expectRuntimeDiagnosticWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{
+        "scope=project",
+        root_only_manifest.valid.package_root_sha256,
+        root_only_manifest.valid.artifact_sha256,
+    }, 1);
 }
 
 const CommandCapture = struct {
@@ -813,6 +974,42 @@ fn expectRuntimeDenied(
     try expectNoAuthorTool(allocator, &runtime_set, "template.echo");
 }
 
+fn expectRuntimeDeniedWithFields(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    expected_kind: []const u8,
+    expected_fields: []const []const u8,
+) !void {
+    try expectRuntimeDiagnosticWithFields(allocator, home_dir, agent_dir, project_dir, expected_kind, expected_fields, 0);
+}
+
+fn expectRuntimeDiagnosticWithFields(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    expected_kind: []const u8,
+    expected_fields: []const []const u8,
+    expected_entries: usize,
+) !void {
+    var runtime_set = try startAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+    defer runtime_set.deinit();
+    try std.testing.expectEqual(expected_entries, runtime_set.entries.len);
+    for (runtime_set.diagnostics) |diagnostic| {
+        if (!std.mem.eql(u8, diagnostic.kind, expected_kind)) continue;
+        for (expected_fields) |field| {
+            if (diagnostic.path) |path| {
+                if (std.mem.indexOf(u8, path, field) != null) continue;
+            }
+            try expectContains(diagnostic.message, field);
+        }
+        return;
+    }
+    return error.ExpectedRuntimeDiagnosticMissing;
+}
+
 fn writeAuthorSettings(
     allocator: std.mem.Allocator,
     settings_path: []const u8,
@@ -831,6 +1028,74 @@ fn writeAuthorSettings(
     , .{ source_json, policy_key_json, tool_scope_json });
     defer allocator.free(settings);
     try tools_common.writeFileAbsolute(std.testing.io, settings_path, settings, true);
+}
+
+fn writeAuthorSettingsWithPolicies(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    source: []const u8,
+    policy_keys: []const []const u8,
+    tool_scope: []const u8,
+) !void {
+    const source_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = source }, .{});
+    defer allocator.free(source_json);
+    const tool_scope_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = tool_scope }, .{});
+    defer allocator.free(tool_scope_json);
+
+    var policies: std.Io.Writer.Allocating = .init(allocator);
+    defer policies.deinit();
+    for (policy_keys, 0..) |policy_key, index| {
+        if (index > 0) try policies.writer.writeAll(",");
+        try std.json.Stringify.value(policy_key, .{}, &policies.writer);
+        try policies.writer.print(
+            \\:{{"resourceLimits":{{"toolScopes":[{s}],"outputBytes":65536}}}}
+        , .{tool_scope_json});
+    }
+
+    const settings = try std.fmt.allocPrint(allocator,
+        \\{{"packages":[{{"source":{s}}}],"extensionPolicies":{{{s}}}}}
+    , .{ source_json, policies.written() });
+    defer allocator.free(settings);
+    try tools_common.writeFileAbsolute(std.testing.io, settings_path, settings, true);
+}
+
+fn exactWasmPolicyKeyForTest(
+    allocator: std.mem.Allocator,
+    manifest: *const wasm_manifest.Manifest,
+    scope: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "wasm:locked:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{
+            scope,
+            manifest.schema_version,
+            manifest.id,
+            manifest.version,
+            manifest.package_root_sha256,
+            manifest.artifact_sha256,
+            manifest.manifest_path,
+            manifest.artifact_absolute_path,
+        },
+    );
+}
+
+fn legacyArtifactOnlyPolicyKeyForTest(
+    allocator: std.mem.Allocator,
+    manifest: *const wasm_manifest.Manifest,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "wasm:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{
+            manifest.schema_version,
+            manifest.id,
+            manifest.version,
+            manifest.artifact_sha256,
+            manifest.manifest_path,
+            manifest.artifact_absolute_path,
+        },
+    );
 }
 
 fn installedPackageSource(allocator: std.mem.Allocator, settings_path: []const u8) ![]u8 {
@@ -964,6 +1229,48 @@ fn writeEditedAuthorManifest(allocator: std.mem.Allocator, package_root: []const
         \\        "ok": { "type": "boolean" },
         \\        "tool": { "type": "string" },
         \\        "echo": { "type": "string" }
+        \\      }
+        \\    }
+        \\  },
+        \\  "capabilities": [],
+        \\  "resourceLimits": {
+        \\    "timeoutMs": 1000,
+        \\    "outputBytes": 65536
+        \\  }
+        \\}
+        \\
+    , true);
+}
+
+fn writeRootOnlyAuthorManifest(allocator: std.mem.Allocator, package_root: []const u8) !void {
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    try tools_common.writeFileAbsolute(std.testing.io, manifest_path,
+        \\{
+        \\  "schemaVersion": "pi-extension.v0",
+        \\  "id": "com.pi.template.echo",
+        \\  "name": "Pi Zig Echo Template",
+        \\  "version": "0.1.0",
+        \\  "description": "Root-only metadata change for digest-bound policy validation.",
+        \\  "artifact": {
+        \\    "kind": "wasm-component",
+        \\    "path": "wasm/plugin.wasm"
+        \\  },
+        \\  "tool": {
+        \\    "id": "template.echo",
+        \\    "description": "Echoes a message field from the JSON input.",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "required": ["message"],
+        \\      "properties": {
+        \\        "message": { "type": "string" }
+        \\      }
+        \\    },
+        \\    "outputSchema": {
+        \\      "type": "object",
+        \\      "required": ["message"],
+        \\      "properties": {
+        \\        "message": { "type": "string" }
         \\      }
         \\    }
         \\  },

@@ -245,8 +245,17 @@ pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: WasmManifestH
     defer allocator.free(artifact_absolute_path);
     return std.fmt.allocPrint(
         allocator,
-        "wasm:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{ manifest.schema_version, manifest.id, manifest.version, manifest.artifact_sha256 orelse "", manifest_path, artifact_absolute_path },
+        "wasm:locked:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{
+            manifest.policy_scope,
+            manifest.schema_version,
+            manifest.id,
+            manifest.version,
+            manifest.package_root_sha256 orelse "",
+            manifest.artifact_sha256 orelse "",
+            manifest_path,
+            artifact_absolute_path,
+        },
     );
 }
 
@@ -326,6 +335,7 @@ pub const UnsupportedRuntimeOptions = struct {
 };
 
 pub const WasmManifestHandoff = struct {
+    policy_scope: []const u8 = "user",
     package_root: ?[]const u8 = null,
     manifest_path: ?[]const u8 = null,
     schema_version: []const u8,
@@ -673,18 +683,47 @@ pub fn startLockedWasmPackageRuntimes(
 
     for (resolved.packages) |package| {
         var handoff = WasmManifestHandoff.fromManifest(&package.manifest);
+        handoff.policy_scope = package.lock_entry.scope.jsonName();
         const policy_key = try wasmPolicyLookupKey(allocator, handoff);
         defer allocator.free(policy_key);
         handoff.policy_lookup_key = policy_key;
 
         const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
-            const message = try std.fmt.allocPrint(
-                allocator,
-                "phase=registration; tool={s}; packageRoot={s}; policyLookupKey={s}; missing digest-bound wasm extension policy",
-                .{ package.manifest.tool_id, package.manifest.package_root, policy_key },
-            );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
+            if (try findStaleLockedWasmPolicyKey(allocator, runtime_config, handoff)) |attempted_policy| {
+                defer allocator.free(attempted_policy);
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactSha256={s}; attemptedPolicy={s}; requiredPolicy={s}; stale digest-bound wasm extension policy",
+                    .{
+                        package.manifest.tool_id,
+                        package.source_info.source,
+                        package.lock_entry.scope.jsonName(),
+                        package.manifest.package_root,
+                        package.manifest.package_root_sha256,
+                        package.manifest.artifact_sha256,
+                        attempted_policy,
+                        policy_key,
+                    },
+                );
+                defer allocator.free(message);
+                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "policy_digest_mismatch", message, package.manifest.manifest_path));
+            } else {
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactSha256={s}; requiredPolicy={s}; missing exact digest-bound wasm extension policy",
+                    .{
+                        package.manifest.tool_id,
+                        package.source_info.source,
+                        package.lock_entry.scope.jsonName(),
+                        package.manifest.package_root,
+                        package.manifest.package_root_sha256,
+                        package.manifest.artifact_sha256,
+                        policy_key,
+                    },
+                );
+                defer allocator.free(message);
+                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
+            }
             continue;
         };
         const approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
@@ -734,6 +773,27 @@ pub fn startLockedWasmPackageRuntimes(
         .retired_entries = &.{},
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
+}
+
+fn findStaleLockedWasmPolicyKey(
+    allocator: std.mem.Allocator,
+    runtime_config: *const config_mod.RuntimeConfig,
+    manifest: WasmManifestHandoff,
+) !?[]u8 {
+    var policies = runtime_config.settings.extension_policies orelse return null;
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "wasm:locked:{s}:{s}:{s}:{s}:",
+        .{ manifest.policy_scope, manifest.schema_version, manifest.id, manifest.version },
+    );
+    defer allocator.free(prefix);
+    var iterator = policies.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+            return try allocator.dupe(u8, entry.key_ptr.*);
+        }
+    }
+    return null;
 }
 
 fn deinitLockedWasmRuntimeEntryList(allocator: std.mem.Allocator, entries: *std.ArrayList(LockedWasmRuntimeEntry)) void {
@@ -1826,8 +1886,8 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
     defer allocator.free(wasm_key);
     const expected_wasm_key = try std.fmt.allocPrint(
         allocator,
-        "wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e:{s}:{s}",
-        .{ manifest_result.valid.manifest_path, manifest_result.valid.artifact_absolute_path },
+        "wasm:locked:user:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:{s}:fffac4554b1c0f2e8a8f44372f0766826ba4a06d60a314b67b7e78dca95c952e:{s}:{s}",
+        .{ manifest_result.valid.package_root_sha256, manifest_result.valid.manifest_path, manifest_result.valid.artifact_absolute_path },
     );
     defer allocator.free(expected_wasm_key);
     try std.testing.expectEqualStrings(expected_wasm_key, wasm_key);
@@ -2763,7 +2823,7 @@ test "persisted wasm extension policy resource limits reach tool enforcement dia
     const diagnostic = wasmRuntime(adapter.ptr).state.diagnostics.items[0].message;
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"operation\":\"tool.use\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"tool target is outside toolScopes\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"wasm:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"wasm:locked:user:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"manifestPath\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"toolId\":\"builtin.truncateHead\"") != null);
 }
