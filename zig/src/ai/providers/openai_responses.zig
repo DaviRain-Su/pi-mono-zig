@@ -6,6 +6,7 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const model_registry = @import("../model_registry.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
@@ -962,18 +963,8 @@ fn appendFinalizedToolCallCopies(
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
 ) !void {
-    // Single allocation: clone once, content_blocks owns the strings via the
-    // inline tool_call block; tool_calls retains a borrow-only copy whose
-    // ArrayList.deinit only frees its buffer.
     const owned = try cloneToolCallOwned(allocator, source);
-    var owned_transferred = false;
-    errdefer if (!owned_transferred) freeToolCallOwned(allocator, owned);
-    try tool_calls.append(allocator, owned);
-    errdefer if (!owned_transferred) {
-        _ = tool_calls.pop();
-    };
-    try content_blocks.append(allocator, .{ .tool_call = owned });
-    owned_transferred = true;
+    try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, owned);
 }
 
 fn flushPendingFinalizedToolCalls(
@@ -1079,17 +1070,7 @@ fn finalizeCurrentBlock(
                         .arguments = arguments,
                     };
                 };
-                var stored_tool_call_transferred = false;
-                errdefer if (!stored_tool_call_transferred) freeToolCallOwned(allocator, stored_tool_call);
-                // Single allocation: content_blocks holds the canonical strings;
-                // tool_calls retains a borrow-only copy. tool_calls.deinit only
-                // frees its buffer, so output.content owns the strings exclusively.
-                try tool_calls.append(allocator, stored_tool_call);
-                errdefer if (!stored_tool_call_transferred) {
-                    _ = tool_calls.pop();
-                };
-                try content_blocks.append(allocator, .{ .tool_call = stored_tool_call });
-                stored_tool_call_transferred = true;
+                try finalize.appendInlineToolCall(allocator, content_blocks, tool_calls, stored_tool_call);
                 stream_ptr.push(.{
                     .event_type = .toolcall_end,
                     .content_index = @intCast(tool_call.event_index),
