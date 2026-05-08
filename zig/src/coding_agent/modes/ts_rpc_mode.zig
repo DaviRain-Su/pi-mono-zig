@@ -22,6 +22,7 @@ pub const RunTsRpcModeOptions = struct {
 pub const ExtensionHostOptions = struct {
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
+    extension_path: ?[]const u8 = null,
     marker: []const u8,
     fixture: []const u8,
     ready_timeout_ms: u64 = 1000,
@@ -419,6 +420,7 @@ const TsRpcServer = struct {
         const host = try extension_runtime.startRuntime(self.allocator, self.io, .{ .process_jsonl = .{
             .argv = options.argv,
             .cwd = options.cwd,
+            .extension_path = options.extension_path,
             .initialize = .{
                 .marker = options.marker,
                 .cwd = options.cwd orelse "",
@@ -1770,8 +1772,8 @@ const TsRpcServer = struct {
         if (self.extension_host) |host| {
             switch (event.event_type) {
                 .turn_start => {
-                    self.turn_index += 1;
                     self.emitExtensionTurnStartFrame(host);
+                    self.turn_index += 1;
                 },
                 .turn_end => self.emitExtensionTurnEndFrame(host, line),
                 else => host.sendExtensionEventFrame(line),
@@ -1937,7 +1939,7 @@ const TsRpcServer = struct {
         defer out.deinit();
         out.writer.print("{s},\"turnIndex\":{d}", .{
             base_prefix,
-            self.turn_index,
+            if (self.turn_index == 0) 0 else self.turn_index - 1,
         }) catch return;
         out.writer.writeAll(base_frame[base_prefix.len..]) catch return;
         host.sendExtensionEventFrame(out.written());
@@ -5471,7 +5473,7 @@ test "event_emission: turn_start and turn_end frames contain turnIndex and times
     try server.handleLine("{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"hello\"}");
     try waitForNoInFlightPrompt(&server, 5000);
 
-    // Run second prompt (turn 2) to verify turnIndex increments
+    // Run second prompt (turn 1, zero-based) to verify turnIndex increments
     try server.handleLine("{\"id\":\"p2\",\"type\":\"prompt\",\"message\":\"hello again\"}");
     try waitForNoInFlightPrompt(&server, 5000);
 
@@ -5482,13 +5484,13 @@ test "event_emission: turn_start and turn_end frames contain turnIndex and times
 
     // turn_start frames must include turnIndex and timestamp
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_start\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"timestamp\":") != null);
 
     // turn_end frames include turnIndex but NOT timestamp (TS TurnEndEvent has no timestamp field).
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"turn_end\"") != null);
-    // turn_start for turn 2 should carry turnIndex:2
-    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":2") != null);
+    // turn_start for turn 1 should carry turnIndex:1
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"turnIndex\":1") != null);
     // Verify each turn_end extension event: top-level must have turnIndex, not timestamp.
     // (Nested message objects carry their own timestamp, which is expected.)
     var line_iter = std.mem.tokenizeScalar(u8, capture, '\n');

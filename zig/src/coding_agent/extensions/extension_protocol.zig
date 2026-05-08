@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("ai");
 const common = @import("../tools/common.zig");
 const enforcement = @import("enforcement.zig");
 const extension_events = @import("extension_events.zig");
@@ -15,6 +16,7 @@ pub const DiagnosticCategory = enum {
     startup_failure,
     host_error,
     host_exit,
+    host_stderr,
 
     pub fn jsonName(self: DiagnosticCategory) []const u8 {
         return switch (self) {
@@ -28,6 +30,7 @@ pub const DiagnosticCategory = enum {
             .startup_failure => "startup_failure",
             .host_error => "host_error",
             .host_exit => "host_exit",
+            .host_stderr => "host_stderr",
         };
     }
 };
@@ -102,12 +105,58 @@ pub const RegistryFrame = struct {
     }
 };
 
+pub const ToolExecutionResponse = struct {
+    tool_call_id: []u8,
+    content: []const ai.ContentBlock,
+    details: ?std.json.Value = null,
+    is_error: bool = false,
+
+    pub fn clone(allocator: std.mem.Allocator, response: ToolExecutionResponse) !ToolExecutionResponse {
+        return .{
+            .tool_call_id = try allocator.dupe(u8, response.tool_call_id),
+            .content = try cloneContentBlocks(allocator, response.content),
+            .details = if (response.details) |details| try common.cloneJsonValue(allocator, details) else null,
+            .is_error = response.is_error,
+        };
+    }
+
+    pub fn deinit(self: *ToolExecutionResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        common.deinitContentBlocks(allocator, self.content);
+        if (self.details) |details| common.deinitJsonValue(allocator, details);
+        self.* = undefined;
+    }
+};
+
+pub const ExtensionEventResponse = struct {
+    event_id: []u8,
+    result: ?std.json.Value = null,
+    error_message: ?[]u8 = null,
+
+    pub fn clone(allocator: std.mem.Allocator, response: ExtensionEventResponse) !ExtensionEventResponse {
+        return .{
+            .event_id = try allocator.dupe(u8, response.event_id),
+            .result = if (response.result) |result| try common.cloneJsonValue(allocator, result) else null,
+            .error_message = if (response.error_message) |message| try allocator.dupe(u8, message) else null,
+        };
+    }
+
+    pub fn deinit(self: *ExtensionEventResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_id);
+        if (self.result) |result| common.deinitJsonValue(allocator, result);
+        if (self.error_message) |message| allocator.free(message);
+        self.* = undefined;
+    }
+};
+
 pub const HostMessage = union(enum) {
     ready,
     diagnostic: Diagnostic,
     extension_ui_request: ExtensionUiRequest,
     shutdown_complete,
     error_message: Diagnostic,
+    tool_response: ToolExecutionResponse,
+    extension_event_response: ExtensionEventResponse,
     /// Live Bun-hosted register_tool / register_command /
     /// register_shortcut / register_flag / register_provider /
     /// unregister_provider frame. Routed through `ProtocolState` to
@@ -120,6 +169,8 @@ pub const HostMessage = union(enum) {
             .diagnostic => |*diagnostic| diagnostic.deinit(allocator),
             .extension_ui_request => |*request| request.deinit(allocator),
             .error_message => |*diagnostic| diagnostic.deinit(allocator),
+            .tool_response => |*response| response.deinit(allocator),
+            .extension_event_response => |*response| response.deinit(allocator),
             .registry_frame => |*frame| frame.deinit(allocator),
             else => {},
         }
@@ -137,6 +188,8 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "unregister_provider",
     "register_capability",
     "unregister_capability",
+    "register_hook",
+    "unregister_hook",
     "set_header",
     "clear_header",
     "set_footer",
@@ -170,6 +223,7 @@ pub fn diagnosticCategoryNames() []const []const u8 {
         "startup_failure",
         "host_error",
         "host_exit",
+        "host_stderr",
     };
 }
 
@@ -268,8 +322,11 @@ pub const ProtocolState = struct {
     shutdown_complete_seen: bool = false,
     pending_requests_closed: bool = false,
     pending_request_ids: std.StringHashMap(void),
+    pending_extension_event_ids: std.StringHashMap(void),
     diagnostics: std.ArrayList(Diagnostic) = .empty,
     ui_requests: std.ArrayList(ExtensionUiRequest) = .empty,
+    tool_responses: std.ArrayList(ToolExecutionResponse) = .empty,
+    extension_event_responses: std.ArrayList(ExtensionEventResponse) = .empty,
     /// Live runtime registry populated as register_* JSONL frames
     /// arrive over the host stdout protocol. Mirrors the TypeScript
     /// `runtime.extensionState.registry` shape so CLI / TS-RPC consumers
@@ -291,6 +348,7 @@ pub const ProtocolState = struct {
         return .{
             .allocator = allocator,
             .pending_request_ids = std.StringHashMap(void).init(allocator),
+            .pending_extension_event_ids = std.StringHashMap(void).init(allocator),
             .registry = extension_registry.Registry.init(allocator),
         };
     }
@@ -312,11 +370,20 @@ pub const ProtocolState = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.pending_request_ids.deinit();
+        var pending_extension_iterator = self.pending_extension_event_ids.iterator();
+        while (pending_extension_iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.pending_extension_event_ids.deinit();
 
         for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(self.allocator);
         self.diagnostics.deinit(self.allocator);
         for (self.ui_requests.items) |*request| request.deinit(self.allocator);
         self.ui_requests.deinit(self.allocator);
+        for (self.tool_responses.items) |*response| response.deinit(self.allocator);
+        self.tool_responses.deinit(self.allocator);
+        for (self.extension_event_responses.items) |*response| response.deinit(self.allocator);
+        self.extension_event_responses.deinit(self.allocator);
         self.registry.deinit();
         self.* = undefined;
     }
@@ -332,6 +399,14 @@ pub const ProtocolState = struct {
             },
             .diagnostic => |diagnostic| try self.diagnostics.append(self.allocator, try Diagnostic.clone(self.allocator, diagnostic)),
             .error_message => |diagnostic| try self.diagnostics.append(self.allocator, try Diagnostic.clone(self.allocator, diagnostic)),
+            .tool_response => |response| try self.tool_responses.append(self.allocator, try ToolExecutionResponse.clone(self.allocator, response)),
+            .extension_event_response => |response| {
+                if (self.resolvePendingExtensionEventRequest(response.event_id)) {
+                    try self.extension_event_responses.append(self.allocator, try ExtensionEventResponse.clone(self.allocator, response));
+                } else {
+                    try self.addDiagnostic(.host_error, .warning, "host emitted stale or unknown extension event response");
+                }
+            },
             .extension_ui_request => |request| {
                 if (!self.ready_seen) {
                     try self.addDiagnostic(.host_error, .@"error", "host emitted UI request before readiness");
@@ -359,6 +434,8 @@ pub const ProtocolState = struct {
                     .unregistered_provider,
                     .registered_capability,
                     .unregistered_capability,
+                    .registered_hook,
+                    .unregistered_hook,
                     .set_header_hook,
                     .cleared_header_hook,
                     .set_footer_hook,
@@ -433,6 +510,7 @@ pub const ProtocolState = struct {
 
     pub fn closePendingRequests(self: *ProtocolState) void {
         self.clearPendingRequests();
+        self.clearPendingExtensionEventRequests();
         self.pending_requests_closed = true;
     }
 
@@ -454,6 +532,70 @@ pub const ProtocolState = struct {
             return true;
         }
         return false;
+    }
+
+    pub fn addPendingExtensionEventRequest(self: *ProtocolState, id: []const u8) !void {
+        if (self.pending_extension_event_ids.contains(id)) return;
+        try self.pending_extension_event_ids.put(try self.allocator.dupe(u8, id), {});
+    }
+
+    pub fn resolvePendingExtensionEventRequest(self: *ProtocolState, id: []const u8) bool {
+        if (self.pending_extension_event_ids.fetchRemove(id)) |removed| {
+            self.allocator.free(removed.key);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn clearPendingExtensionEventRequests(self: *ProtocolState) void {
+        var pending_iterator = self.pending_extension_event_ids.iterator();
+        while (pending_iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.pending_extension_event_ids.clearRetainingCapacity();
+    }
+
+    pub fn takeToolResponse(self: *ProtocolState, tool_call_id: []const u8) ?ToolExecutionResponse {
+        for (self.tool_responses.items, 0..) |response, index| {
+            if (std.mem.eql(u8, response.tool_call_id, tool_call_id)) {
+                return self.tool_responses.orderedRemove(index);
+            }
+        }
+        return null;
+    }
+
+    pub fn removeToolResponses(self: *ProtocolState, tool_call_id: []const u8) void {
+        var index: usize = 0;
+        while (index < self.tool_responses.items.len) {
+            if (std.mem.eql(u8, self.tool_responses.items[index].tool_call_id, tool_call_id)) {
+                var response = self.tool_responses.orderedRemove(index);
+                response.deinit(self.allocator);
+                continue;
+            }
+            index += 1;
+        }
+    }
+
+    pub fn takeExtensionEventResponse(self: *ProtocolState, event_id: []const u8) ?ExtensionEventResponse {
+        for (self.extension_event_responses.items, 0..) |response, index| {
+            if (std.mem.eql(u8, response.event_id, event_id)) {
+                return self.extension_event_responses.orderedRemove(index);
+            }
+        }
+        return null;
+    }
+
+    pub fn removeExtensionEventResponses(self: *ProtocolState, event_id: []const u8) void {
+        _ = self.resolvePendingExtensionEventRequest(event_id);
+        var index: usize = 0;
+        while (index < self.extension_event_responses.items.len) {
+            if (std.mem.eql(u8, self.extension_event_responses.items[index].event_id, event_id)) {
+                var response = self.extension_event_responses.orderedRemove(index);
+                response.deinit(self.allocator);
+                continue;
+            }
+            index += 1;
+        }
     }
 
     pub fn addDiagnostic(self: *ProtocolState, category: DiagnosticCategory, severity: DiagnosticSeverity, message: []const u8) !void {
@@ -617,6 +759,35 @@ pub fn writeExtensionUiResponseFrame(allocator: std.mem.Allocator, writer: *std.
     try writer.writeAll("}\n");
 }
 
+pub fn writeToolCallFrame(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args: std.json.Value,
+) !void {
+    try writer.writeAll("{\"type\":\"tool_call\",\"toolCallId\":");
+    try writeJsonString(allocator, writer, tool_call_id);
+    try writer.writeAll(",\"toolName\":");
+    try writeJsonString(allocator, writer, tool_name);
+    try writer.writeAll(",\"input\":");
+    try std.json.Stringify.value(args, .{}, writer);
+    try writer.writeAll("}\n");
+}
+
+pub fn writeExtensionEventRequestFrame(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    event_id: []const u8,
+    event: std.json.Value,
+) !void {
+    try writer.writeAll("{\"type\":\"extension_event\",\"eventId\":");
+    try writeJsonString(allocator, writer, event_id);
+    try writer.writeAll(",\"event\":");
+    try std.json.Stringify.value(event, .{}, writer);
+    try writer.writeAll("}\n");
+}
+
 pub fn writeShutdownFrame(writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"type\":\"shutdown\"}\n");
 }
@@ -630,6 +801,18 @@ fn parseObjectMessage(allocator: std.mem.Allocator, object: std.json.ObjectMap) 
     }
     if (std.mem.eql(u8, type_name, "error")) {
         return .{ .error_message = try parseDiagnostic(allocator, object, .@"error") };
+    }
+    if (std.mem.eql(u8, type_name, "tool_result")) {
+        return .{ .tool_response = try parseToolResult(allocator, object, false) };
+    }
+    if (std.mem.eql(u8, type_name, "tool_error")) {
+        return .{ .tool_response = try parseToolResult(allocator, object, true) };
+    }
+    if (std.mem.eql(u8, type_name, "extension_event_result") or std.mem.eql(u8, type_name, "hook_result")) {
+        return .{ .extension_event_response = try parseExtensionEventResult(allocator, object, false) };
+    }
+    if (std.mem.eql(u8, type_name, "extension_event_error") or std.mem.eql(u8, type_name, "hook_error")) {
+        return .{ .extension_event_response = try parseExtensionEventResult(allocator, object, true) };
     }
     if (std.mem.eql(u8, type_name, "extension_ui_request")) {
         const id = optionalString(object, "id") orelse return error.UnsupportedHostMessageType;
@@ -648,6 +831,199 @@ fn parseObjectMessage(allocator: std.mem.Allocator, object: std.json.ObjectMap) 
         return .{ .registry_frame = .{ .payload = cloned } };
     }
     return error.UnsupportedHostMessageType;
+}
+
+fn parseExtensionEventResult(allocator: std.mem.Allocator, object: std.json.ObjectMap, default_is_error: bool) !ExtensionEventResponse {
+    const event_id = optionalString(object, "eventId") orelse
+        optionalString(object, "event_id") orelse
+        optionalString(object, "id") orelse
+        return error.UnsupportedHostMessageType;
+    const result = if (object.get("result")) |value|
+        try common.cloneJsonValue(allocator, value)
+    else if (object.get("patch")) |value|
+        try common.cloneJsonValue(allocator, value)
+    else
+        null;
+    errdefer if (result) |result_value| common.deinitJsonValue(allocator, result_value);
+    const message = optionalString(object, "message") orelse optionalString(object, "error");
+    return .{
+        .event_id = try allocator.dupe(u8, event_id),
+        .result = result,
+        .error_message = if (default_is_error or message != null)
+            try allocator.dupe(u8, message orelse "extension hook error")
+        else
+            null,
+    };
+}
+
+fn parseToolResult(allocator: std.mem.Allocator, object: std.json.ObjectMap, default_is_error: bool) !ToolExecutionResponse {
+    const tool_call_id = optionalString(object, "toolCallId") orelse
+        optionalString(object, "callId") orelse
+        optionalString(object, "id") orelse
+        return error.UnsupportedHostMessageType;
+    const result_object: ?std.json.ObjectMap = if (object.get("result")) |result| switch (result) {
+        .object => |result_map| result_map,
+        else => null,
+    } else null;
+
+    const content_value = if (result_object) |result| result.get("content") else object.get("content");
+    const content = if (content_value) |value|
+        try parseContentBlocks(allocator, value)
+    else if (default_is_error)
+        try common.makeTextContent(allocator, optionalString(object, "message") orelse "process_jsonl tool error")
+    else
+        return error.UnsupportedHostMessageType;
+    errdefer common.deinitContentBlocks(allocator, content);
+
+    const details_value = if (result_object) |result| result.get("details") else object.get("details");
+    const details = if (details_value) |details|
+        try common.cloneJsonValue(allocator, details)
+    else if (default_is_error)
+        try toolErrorDetails(allocator, object, result_object)
+    else
+        null;
+    errdefer if (details) |details_value_owned| common.deinitJsonValue(allocator, details_value_owned);
+
+    const is_error = optionalBool(object, "isError") orelse
+        optionalBool(object, "is_error") orelse
+        if (result_object) |result| optionalBool(result, "isError") orelse optionalBool(result, "is_error") orelse default_is_error else default_is_error;
+
+    return .{
+        .tool_call_id = try allocator.dupe(u8, tool_call_id),
+        .content = content,
+        .details = details,
+        .is_error = is_error,
+    };
+}
+
+fn toolErrorDetails(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    result_object: ?std.json.ObjectMap,
+) !std.json.Value {
+    var details = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const details_value = std.json.Value{ .object = details };
+        common.deinitJsonValue(allocator, details_value);
+    }
+
+    const code = optionalString(object, "code") orelse
+        if (result_object) |result| optionalString(result, "code") else null;
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "code"),
+        .{ .string = try allocator.dupe(u8, code orelse "process_jsonl_tool_error") },
+    );
+
+    const message = optionalString(object, "message") orelse
+        if (result_object) |result| optionalString(result, "message") else null;
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "message"),
+        .{ .string = try allocator.dupe(u8, message orelse "process_jsonl tool error") },
+    );
+
+    return .{ .object = details };
+}
+
+fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]const ai.ContentBlock {
+    if (value != .array) return error.UnsupportedHostMessageType;
+    const blocks = try allocator.alloc(ai.ContentBlock, value.array.items.len);
+    errdefer allocator.free(blocks);
+    for (value.array.items, 0..) |item, index| {
+        blocks[index] = parseContentBlock(allocator, item) catch |err| {
+            deinitContentBlockFields(allocator, blocks[0..index]);
+            allocator.free(blocks);
+            return err;
+        };
+    }
+    return blocks;
+}
+
+fn parseContentBlock(allocator: std.mem.Allocator, value: std.json.Value) !ai.ContentBlock {
+    if (value != .object) return error.UnsupportedHostMessageType;
+    const block_type = optionalString(value.object, "type") orelse return error.UnsupportedHostMessageType;
+    if (std.mem.eql(u8, block_type, "text")) {
+        const text = optionalString(value.object, "text") orelse return error.UnsupportedHostMessageType;
+        return .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    }
+    if (std.mem.eql(u8, block_type, "image")) {
+        const data = optionalString(value.object, "data") orelse return error.UnsupportedHostMessageType;
+        const mime_type = optionalString(value.object, "mimeType") orelse
+            optionalString(value.object, "mime_type") orelse
+            return error.UnsupportedHostMessageType;
+        const data_dup = try allocator.dupe(u8, data);
+        errdefer allocator.free(data_dup);
+        return .{ .image = .{
+            .data = data_dup,
+            .mime_type = try allocator.dupe(u8, mime_type),
+        } };
+    }
+    return error.UnsupportedHostMessageType;
+}
+
+fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
+    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
+    errdefer allocator.free(cloned);
+    for (blocks, 0..) |block, index| {
+        cloned[index] = cloneContentBlock(allocator, block) catch |err| {
+            deinitContentBlockFields(allocator, cloned[0..index]);
+            allocator.free(cloned);
+            return err;
+        };
+    }
+    return cloned;
+}
+
+fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
+    return switch (block) {
+        .text => |text| .{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
+        .image => |image| .{ .image = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        } },
+        .thinking => |thinking| .{ .thinking = .{
+            .thinking = try allocator.dupe(u8, thinking.thinking),
+            .thinking_signature = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .redacted = thinking.redacted,
+        } },
+        .tool_call => |tool_call| .{ .tool_call = .{
+            .id = try allocator.dupe(u8, tool_call.id),
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments = try common.cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
+    };
+}
+
+fn deinitContentBlockFields(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                if (tool_call.thought_signature) |signature| allocator.free(signature);
+                common.deinitJsonValue(allocator, tool_call.arguments);
+            },
+        }
+    }
 }
 
 fn extensionUiPayloadJson(allocator: std.mem.Allocator, object: std.json.ObjectMap) ![]u8 {
@@ -894,6 +1270,62 @@ test "ProtocolState keeps UI request edge cases stable" {
     try std.testing.expect(!state.resolvePendingRequest("pending"));
 }
 
+test "process_jsonl protocol parses correlated tool results and errors" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"tool_result\",\"toolCallId\":\"call-1\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}],\"details\":{\"ok\":true}}\n" ++
+        "{\"type\":\"tool_error\",\"toolCallId\":\"call-1\",\"message\":\"failed\"}\n" ++
+        "{\"type\":\"tool_result\",\"callId\":\"call-2\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"second\"}],\"isError\":false}}\n";
+    try parser.feed(allocator, frames, &state);
+
+    var first = state.takeToolResponse("call-1").?;
+    defer first.deinit(allocator);
+    try std.testing.expect(!first.is_error);
+    try std.testing.expectEqualStrings("first", first.content[0].text.text);
+    try std.testing.expectEqual(true, first.details.?.object.get("ok").?.bool);
+
+    var repeated = state.takeToolResponse("call-1").?;
+    defer repeated.deinit(allocator);
+    try std.testing.expect(repeated.is_error);
+    try std.testing.expectEqualStrings("failed", repeated.content[0].text.text);
+    try std.testing.expectEqualStrings("process_jsonl_tool_error", repeated.details.?.object.get("code").?.string);
+    try std.testing.expectEqualStrings("failed", repeated.details.?.object.get("message").?.string);
+
+    var second = state.takeToolResponse("call-2").?;
+    defer second.deinit(allocator);
+    try std.testing.expect(!second.is_error);
+    try std.testing.expectEqualStrings("second", second.content[0].text.text);
+    try std.testing.expect(state.takeToolResponse("call-2") == null);
+}
+
+test "process_jsonl protocol accepts only pending extension event responses" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    try parser.feed(allocator, "{\"type\":\"ready\"}\n", &state);
+    try state.addPendingExtensionEventRequest("event-1-message_end");
+    try parser.feed(allocator, "{\"type\":\"extension_event_result\",\"eventId\":\"event-1-message_end\",\"result\":{\"ok\":true}}\n", &state);
+
+    var accepted = state.takeExtensionEventResponse("event-1-message_end").?;
+    defer accepted.deinit(allocator);
+    try std.testing.expectEqualStrings("event-1-message_end", accepted.event_id);
+    try std.testing.expectEqual(true, accepted.result.?.object.get("ok").?.bool);
+
+    try parser.feed(allocator, "{\"type\":\"extension_event_result\",\"eventId\":\"event-1-message_end\",\"result\":{\"late\":true}}\n", &state);
+    try std.testing.expect(state.takeExtensionEventResponse("event-1-message_end") == null);
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqualStrings("host emitted stale or unknown extension event response", state.diagnostics.items[0].message);
+}
+
 test "ProtocolState registry_frames_applied counts only accepted registry outcomes" {
     const allocator = std.testing.allocator;
     var parser = JsonlFrameParser{};
@@ -1090,7 +1522,7 @@ test "sub-agent readiness JSON wire validation accepts valid envelopes and rejec
 
 test "extension protocol ABI conformance helper covers diagnostics registry frames and UI lifecycle" {
     const frame_types = registryFrameTypeNames();
-    try std.testing.expectEqual(@as(usize, 23), frame_types.len);
+    try std.testing.expectEqual(@as(usize, 25), frame_types.len);
     try std.testing.expectEqualStrings("register_tool", frame_types[0]);
     try std.testing.expectEqualStrings("unregister_message_renderer", frame_types[frame_types.len - 1]);
 

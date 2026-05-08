@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const enforcement = @import("enforcement.zig");
 const extension_registry = @import("extension_registry.zig");
 const extension_protocol = @import("extension_protocol.zig");
+const common = @import("../tools/common.zig");
 
 pub const HOST_MARKER_ENV = "PI_M6_EXTENSION_HOST_MARKER";
 
@@ -18,7 +19,12 @@ pub const InitializeFrame = extension_protocol.InitializeFrame;
 pub const startupFailureDiagnostic = extension_protocol.startupFailureDiagnostic;
 pub const writeInitializeFrame = extension_protocol.writeInitializeFrame;
 pub const writeExtensionUiResponseFrame = extension_protocol.writeExtensionUiResponseFrame;
+pub const writeToolCallFrame = extension_protocol.writeToolCallFrame;
+pub const writeExtensionEventRequestFrame = extension_protocol.writeExtensionEventRequestFrame;
 pub const writeShutdownFrame = extension_protocol.writeShutdownFrame;
+
+const MAX_STDERR_DIAGNOSTICS: usize = 32;
+const MAX_STDERR_LINE_BYTES: usize = 512;
 
 pub const HostProcessOptions = struct {
     argv: []const []const u8,
@@ -37,20 +43,28 @@ pub const HostProcess = struct {
     child: std.process.Child,
     stdin_file: ?std.Io.File,
     stdout_file: ?std.Io.File,
+    stderr_file: ?std.Io.File,
     parser: JsonlFrameParser = .{},
     state: ProtocolState,
     mutex: std.Io.Mutex = .init,
     wait_thread: ?std.Thread = null,
     reader_thread: ?std.Thread = null,
+    stderr_thread: ?std.Thread = null,
     wait_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reader_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stderr_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     start_count: usize = 1,
     shutdown_timeout_ms: u64,
     exit_recorded: bool = false,
     wait_err: ?anyerror = null,
     reader_err: ?anyerror = null,
+    stderr_err: ?anyerror = null,
     term: ?std.process.Child.Term = null,
+    diagnostic_source: []u8,
+    stderr_diagnostics_recorded: usize = 0,
+    stderr_diagnostics_truncated: bool = false,
+    extension_event_sequence: usize = 0,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: HostProcessOptions) !*HostProcess {
         const host = try allocator.create(HostProcess);
@@ -61,7 +75,7 @@ pub const HostProcess = struct {
             .cwd = if (options.cwd) |cwd| .{ .path = cwd } else .inherit,
             .stdin = .pipe,
             .stdout = .pipe,
-            .stderr = .ignore,
+            .stderr = .pipe,
             .pgid = if (builtin.os.tag == .windows) null else 0,
         });
         errdefer if (child.id != null) child.kill(io);
@@ -70,6 +84,10 @@ pub const HostProcess = struct {
         child.stdin = null;
         const stdout_file = child.stdout.?;
         child.stdout = null;
+        const stderr_file = child.stderr.?;
+        child.stderr = null;
+        const diagnostic_source = try allocator.dupe(u8, options.extension_path orelse options.initialize.fixture);
+        errdefer allocator.free(diagnostic_source);
 
         host.* = .{
             .allocator = allocator,
@@ -77,6 +95,7 @@ pub const HostProcess = struct {
             .child = child,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
+            .stderr_file = stderr_file,
             .state = ProtocolState.initWithPolicy(
                 allocator,
                 .{
@@ -91,11 +110,13 @@ pub const HostProcess = struct {
                 },
             ),
             .shutdown_timeout_ms = options.shutdown_timeout_ms,
+            .diagnostic_source = diagnostic_source,
         };
 
         try host.sendInitialize(options.initialize);
         host.wait_thread = try std.Thread.spawn(.{}, waitMain, .{host});
         host.reader_thread = try std.Thread.spawn(.{}, readerMain, .{host});
+        host.stderr_thread = try std.Thread.spawn(.{}, stderrMain, .{host});
         return host;
     }
 
@@ -103,6 +124,7 @@ pub const HostProcess = struct {
         self.shutdown() catch {};
         self.parser.deinit(self.allocator);
         self.state.deinit();
+        self.allocator.free(self.diagnostic_source);
         self.allocator.destroy(self);
     }
 
@@ -138,6 +160,10 @@ pub const HostProcess = struct {
             thread.join();
             self.reader_thread = null;
         }
+        if (self.stderr_thread) |thread| {
+            thread.join();
+            self.stderr_thread = null;
+        }
         if (self.stdin_file) |file| {
             file.close(self.io);
             self.stdin_file = null;
@@ -145,6 +171,10 @@ pub const HostProcess = struct {
         if (self.stdout_file) |file| {
             file.close(self.io);
             self.stdout_file = null;
+        }
+        if (self.stderr_file) |file| {
+            file.close(self.io);
+            self.stderr_file = null;
         }
         self.mutex.lockUncancelable(self.io);
         self.state.clearPendingRequests();
@@ -209,6 +239,12 @@ pub const HostProcess = struct {
         return self.state.registry.hasCommandInvocation(name);
     }
 
+    pub fn hasRegisteredHook(self: *HostProcess, event_name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.state.registry.hasHook(event_name);
+    }
+
     /// Render a deterministic JSON snapshot of the runtime registry
     /// the host has accumulated. Caller owns the returned bytes.
     pub fn snapshotRegistryJson(self: *HostProcess, allocator: std.mem.Allocator) ![]u8 {
@@ -269,6 +305,163 @@ pub const HostProcess = struct {
         try file.writeStreamingAll(self.io, out.written());
     }
 
+    pub fn executeTool(
+        self: *HostProcess,
+        allocator: std.mem.Allocator,
+        tool_name: []const u8,
+        tool_call_id: []const u8,
+        args: std.json.Value,
+        timeout_ms: u64,
+    ) !extension_protocol.ToolExecutionResponse {
+        {
+            self.mutex.lockUncancelable(self.io);
+            errdefer self.mutex.unlock(self.io);
+            const file = self.stdin_file orelse {
+                try self.state.addDiagnostic(.host_exit, .@"error", "extension host stdin was closed before tool execution");
+                return error.ExtensionHostClosed;
+            };
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            try writeToolCallFrame(self.allocator, &out.writer, tool_call_id, tool_name, args);
+            try file.writeStreamingAll(self.io, out.written());
+        }
+        self.mutex.unlock(self.io);
+
+        var elapsed: u64 = 0;
+        while (elapsed <= timeout_ms) : (elapsed += 10) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.state.takeToolResponse(tool_call_id)) |response| {
+                self.mutex.unlock(self.io);
+                defer {
+                    var owned_response = response;
+                    owned_response.deinit(self.allocator);
+                }
+                return try extension_protocol.ToolExecutionResponse.clone(allocator, response);
+            }
+            const exited = self.wait_done.load(.seq_cst) and self.reader_done.load(.seq_cst);
+            if (exited) {
+                self.state.removeToolResponses(tool_call_id);
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "extension host closed before process_jsonl tool response source={s} tool={s} toolCallId={s}",
+                    .{ self.diagnostic_source, tool_name, tool_call_id },
+                );
+                defer self.allocator.free(message);
+                try self.state.addDiagnostic(.host_exit, .@"error", message);
+                self.mutex.unlock(self.io);
+                return error.ExtensionHostClosed;
+            }
+            self.mutex.unlock(self.io);
+            std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        }
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.state.removeToolResponses(tool_call_id);
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "process_jsonl tool execution timed out after {d}ms source={s} tool={s} toolCallId={s}",
+                .{ timeout_ms, self.diagnostic_source, tool_name, tool_call_id },
+            );
+            defer self.allocator.free(message);
+            try self.state.addDiagnostic(.host_error, .@"error", message);
+        }
+        self.shutdown() catch {};
+        return error.ToolExecutionTimedOut;
+    }
+
+    pub fn invokeExtensionEvent(
+        self: *HostProcess,
+        allocator: std.mem.Allocator,
+        event_name: []const u8,
+        event: std.json.Value,
+        timeout_ms: u64,
+    ) !?std.json.Value {
+        var event_id_buffer: [96]u8 = undefined;
+        const event_id = blk: {
+            self.mutex.lockUncancelable(self.io);
+            errdefer self.mutex.unlock(self.io);
+            if (!self.state.registry.hasHook(event_name)) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            self.extension_event_sequence += 1;
+            const id = try std.fmt.bufPrint(
+                &event_id_buffer,
+                "event-{d}-{s}",
+                .{ self.extension_event_sequence, event_name },
+            );
+            const file = self.stdin_file orelse {
+                try self.state.addDiagnostic(.host_exit, .@"error", "extension host stdin was closed before event hook dispatch");
+                self.mutex.unlock(self.io);
+                return error.ExtensionHostClosed;
+            };
+            try self.state.addPendingExtensionEventRequest(id);
+            errdefer _ = self.state.resolvePendingExtensionEventRequest(id);
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            try writeExtensionEventRequestFrame(self.allocator, &out.writer, id, event);
+            try file.writeStreamingAll(self.io, out.written());
+            self.mutex.unlock(self.io);
+            break :blk id;
+        };
+
+        var elapsed: u64 = 0;
+        while (elapsed <= timeout_ms) : (elapsed += 10) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.state.takeExtensionEventResponse(event_id)) |response| {
+                self.mutex.unlock(self.io);
+                defer {
+                    var owned_response = response;
+                    owned_response.deinit(self.allocator);
+                }
+                if (response.error_message) |message| {
+                    const diagnostic = try std.fmt.allocPrint(
+                        self.allocator,
+                        "extension hook error source={s} event={s} eventId={s}: {s}",
+                        .{ self.diagnostic_source, event_name, event_id, message },
+                    );
+                    defer self.allocator.free(diagnostic);
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    try self.state.addDiagnostic(.host_error, .warning, diagnostic);
+                    return null;
+                }
+                return if (response.result) |result| try common.cloneJsonValue(allocator, result) else null;
+            }
+            const exited = self.wait_done.load(.seq_cst) and self.reader_done.load(.seq_cst);
+            if (exited) {
+                self.state.removeExtensionEventResponses(event_id);
+                _ = self.state.resolvePendingExtensionEventRequest(event_id);
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "extension host closed before event hook response source={s} event={s} eventId={s}",
+                    .{ self.diagnostic_source, event_name, event_id },
+                );
+                defer self.allocator.free(message);
+                try self.state.addDiagnostic(.host_exit, .@"error", message);
+                self.mutex.unlock(self.io);
+                return error.ExtensionHostClosed;
+            }
+            self.mutex.unlock(self.io);
+            std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        }
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.state.removeExtensionEventResponses(event_id);
+            _ = self.state.resolvePendingExtensionEventRequest(event_id);
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "extension hook dispatch timed out after {d}ms source={s} event={s} eventId={s}",
+                .{ timeout_ms, self.diagnostic_source, event_name, event_id },
+            );
+            defer self.allocator.free(message);
+            try self.state.addDiagnostic(.host_error, .warning, message);
+        }
+        return null;
+    }
+
     /// Send a JSONL extension event frame to the extension host stdin pipe.
     /// Non-blocking: if the pipe is full or unavailable, the event is dropped silently.
     /// Caller passes the JSON frame bytes without a trailing newline; this method adds it.
@@ -309,13 +502,54 @@ pub const HostProcess = struct {
     fn onMessage(self: *HostProcess, message: HostMessage) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        const diagnostic_start = self.state.diagnostics.items.len;
         try self.state.onMessage(message);
+        try self.annotateDiagnosticsFrom(diagnostic_start, "protocol");
     }
 
     fn onDiagnostic(self: *HostProcess, diagnostic: Diagnostic) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.state.onDiagnostic(diagnostic);
+        var owned_diagnostic = diagnostic;
+        defer owned_diagnostic.deinit(self.allocator);
+        var annotated = try self.annotatedDiagnostic(owned_diagnostic, "stdout_parser");
+        errdefer annotated.deinit(self.allocator);
+        try self.state.onDiagnostic(annotated);
+    }
+
+    fn annotateDiagnosticsFrom(self: *HostProcess, start_index: usize, phase: []const u8) !void {
+        var index = start_index;
+        while (index < self.state.diagnostics.items.len) : (index += 1) {
+            try self.annotateStoredDiagnostic(&self.state.diagnostics.items[index], phase);
+        }
+    }
+
+    fn annotateStoredDiagnostic(self: *HostProcess, diagnostic: *Diagnostic, phase: []const u8) !void {
+        const message = try self.formatDiagnosticMessage(diagnostic.*, phase);
+        self.allocator.free(diagnostic.message);
+        diagnostic.message = message;
+    }
+
+    fn annotatedDiagnostic(self: *HostProcess, diagnostic: Diagnostic, phase: []const u8) !Diagnostic {
+        return .{
+            .category = diagnostic.category,
+            .severity = diagnostic.severity,
+            .message = try self.formatDiagnosticMessage(diagnostic, phase),
+        };
+    }
+
+    fn formatDiagnosticMessage(self: *HostProcess, diagnostic: Diagnostic, phase: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "process_jsonl diagnostic source={s} phase={s} severity={s} category={s}: {s}",
+            .{
+                self.diagnostic_source,
+                phase,
+                diagnostic.severity.jsonName(),
+                diagnostic.category.jsonName(),
+                diagnostic.message,
+            },
+        );
     }
 
     fn markExited(self: *HostProcess) void {
@@ -336,6 +570,40 @@ pub const HostProcess = struct {
                 std.posix.kill(-pid, .TERM) catch {};
                 std.posix.kill(-pid, .KILL) catch {};
             }
+        }
+    }
+
+    fn onStderrLine(self: *HostProcess, raw_line: []const u8) !void {
+        const without_cr = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        const line = std.mem.trim(u8, without_cr, " \t");
+        if (line.len == 0) return;
+        const excerpt = line[0..@min(line.len, MAX_STDERR_LINE_BYTES)];
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.stderr_diagnostics_recorded < MAX_STDERR_DIAGNOSTICS) {
+            const suffix = if (line.len > excerpt.len) " [truncated]" else "";
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "host stderr source={s}: {s}{s}",
+                .{ self.diagnostic_source, excerpt, suffix },
+            );
+            defer self.allocator.free(message);
+            try self.state.addDiagnostic(.host_stderr, .warning, message);
+            self.stderr_diagnostics_recorded += 1;
+            return;
+        }
+        if (!self.stderr_diagnostics_truncated) {
+            const message = try std.fmt.allocPrint(
+                self.allocator,
+                "host stderr source={s}: additional stderr diagnostics suppressed after {d} lines",
+                .{ self.diagnostic_source, MAX_STDERR_DIAGNOSTICS },
+            );
+            defer self.allocator.free(message);
+            try self.state.addDiagnostic(.host_stderr, .warning, message);
+            self.stderr_diagnostics_truncated = true;
         }
     }
 };
@@ -387,6 +655,41 @@ fn readerMain(host: *HostProcess) void {
     host.reader_done.store(true, .seq_cst);
 }
 
+fn stderrMain(host: *HostProcess) void {
+    var line_buffer = std.ArrayList(u8).empty;
+    defer line_buffer.deinit(host.allocator);
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const file = host.stderr_file orelse break;
+        const bytes_read = std.posix.read(file.handle, &buffer) catch |err| {
+            host.stderr_err = err;
+            break;
+        };
+        if (bytes_read == 0) break;
+        for (buffer[0..bytes_read]) |byte| {
+            if (byte == '\n') {
+                host.onStderrLine(line_buffer.items) catch |err| {
+                    host.stderr_err = err;
+                    break;
+                };
+                line_buffer.clearRetainingCapacity();
+            } else if (line_buffer.items.len < MAX_STDERR_LINE_BYTES * 2) {
+                line_buffer.append(host.allocator, byte) catch |err| {
+                    host.stderr_err = err;
+                    break;
+                };
+            }
+        }
+        if (host.stderr_err != null) break;
+    }
+    if (line_buffer.items.len > 0) {
+        host.onStderrLine(line_buffer.items) catch |err| {
+            host.stderr_err = err;
+        };
+    }
+    host.stderr_done.store(true, .seq_cst);
+}
+
 test "M6 host lifecycle starts once initializes becomes ready and shuts down" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -428,6 +731,244 @@ test "M6 host lifecycle starts once initializes becomes ready and shuts down" {
         "{\"type\":\"initialize\",\"marker\":\"pi-m6-host-marker-lifecycle\",\"cwd\":\"/tmp\",\"fixture\":\"lifecycle\"}\n{\"type\":\"shutdown\"}\n",
         capture,
     );
+}
+
+test "process_jsonl host executes correlated tool calls and consumes repeated ids" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pi-process-tool-call-capture.jsonl",
+    });
+    defer allocator.free(capture_path);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '{{\"type\":\"ready\"}}\\n'; count=0; while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "*'\"toolCallId\":\"repeat\"'*) count=$((count+1)); printf '{{\"type\":\"tool_result\",\"toolCallId\":\"repeat\",\"content\":[{{\"type\":\"text\",\"text\":\"result-%s\"}}],\"details\":{{\"count\":%s}}}}\\n' \"$count\" \"$count\";; " ++
+            "*'\"toolCallId\":\"fail\"'*) printf '{{\"type\":\"tool_error\",\"toolCallId\":\"fail\",\"message\":\"fixture failure\"}}\\n';; " ++
+            "esac; done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-tool-call" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .initialize = .{
+            .marker = "pi-process-tool-call",
+            .cwd = "/tmp",
+            .fixture = "tool-call",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\"}", .{});
+    defer args.deinit();
+
+    var first = try host.executeTool(allocator, "fixture.tool", "repeat", args.value, 500);
+    defer first.deinit(allocator);
+    try std.testing.expect(!first.is_error);
+    try std.testing.expectEqualStrings("result-1", first.content[0].text.text);
+    try std.testing.expectEqual(@as(i64, 1), first.details.?.object.get("count").?.integer);
+
+    var second = try host.executeTool(allocator, "fixture.tool", "repeat", args.value, 500);
+    defer second.deinit(allocator);
+    try std.testing.expect(!second.is_error);
+    try std.testing.expectEqualStrings("result-2", second.content[0].text.text);
+    try std.testing.expectEqual(@as(i64, 2), second.details.?.object.get("count").?.integer);
+
+    var failed = try host.executeTool(allocator, "fixture.tool", "fail", args.value, 500);
+    defer failed.deinit(allocator);
+    try std.testing.expect(failed.is_error);
+    try std.testing.expectEqualStrings("fixture failure", failed.content[0].text.text);
+
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"toolName\":\"fixture.tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"input\":{\"value\":\"alpha\"}") != null);
+}
+
+test "process_jsonl host keeps stderr and malformed stdout diagnostic-only while preserving tool result" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf 'stderr fixture log before ready\\n' >&2; " ++
+        "printf 'not-json\\n'; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "*'\"toolCallId\":\"robust-ok\"'*) " ++
+        "printf '{\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"missing id must not win\"}]}\\n'; " ++
+        "printf 'stderr fixture log during call\\n' >&2; " ++
+        "printf '{\"type\":\"diagnostic\",\"category\":\"host_error\",\"severity\":\"warning\",\"message\":\"fixture diagnostic frame\"}\\n'; " ++
+        "printf '{\"type\":\"tool_result\",\"toolCallId\":\"robust-ok\",\"content\":[{\"type\":\"text\",\"text\":\"declared result only\"}],\"details\":{\"ok\":true}}\\n';; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-robust-noise" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/noisy-extension.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-robust-noise",
+            .cwd = "/tmp",
+            .fixture = "noisy-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\"}", .{});
+    defer args.deinit();
+
+    var response = try host.executeTool(allocator, "fixture.noisy", "robust-ok", args.value, 500);
+    defer response.deinit(allocator);
+    try std.testing.expect(!response.is_error);
+    try std.testing.expectEqualStrings("declared result only", response.content[0].text.text);
+    try std.testing.expectEqual(true, response.details.?.object.get("ok").?.bool);
+
+    try std.testing.expect(host.diagnosticCategoryCount(.malformed_json) >= 1);
+    try std.testing.expect(host.diagnosticCategoryCount(.unsupported_message_type) >= 1);
+    try std.testing.expect(host.diagnosticCategoryCount(.host_stderr) >= 1);
+    try std.testing.expect(hostDiagnosticContains(host, .malformed_json, "source=fixture/noisy-extension.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .malformed_json, "phase=stdout_parser"));
+    try std.testing.expect(hostDiagnosticContains(host, .malformed_json, "severity=error"));
+    try std.testing.expect(hostDiagnosticContains(host, .malformed_json, "category=malformed_json"));
+    try std.testing.expect(hostDiagnosticContains(host, .unsupported_message_type, "source=fixture/noisy-extension.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .unsupported_message_type, "phase=stdout_parser"));
+    try std.testing.expect(hostDiagnosticContains(host, .unsupported_message_type, "severity=error"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_stderr, "fixture/noisy-extension.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "fixture diagnostic frame"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "source=fixture/noisy-extension.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "phase=protocol"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "severity=warning"));
+
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
+}
+
+test "process_jsonl host times out unresponsive tool call and cleans child process" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "*'\"toolCallId\":\"slow-call\"'*) sleep 5;; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-timeout" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/slow-extension.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-timeout",
+            .cwd = "/tmp",
+            .fixture = "slow-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"slow\"}", .{});
+    defer args.deinit();
+
+    const start_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    try std.testing.expectError(error.ToolExecutionTimedOut, host.executeTool(allocator, "fixture.slow", "slow-call", args.value, 50));
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start_ns, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 1500);
+    try std.testing.expect(host.wait_done.load(.seq_cst));
+    try std.testing.expect(host.reader_done.load(.seq_cst));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "timed out"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "slow-call"));
+}
+
+test "process_jsonl host times out unresponsive extension event hook and rejects late response" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "*'\"extension_event\"'*) sleep 0.2; printf '{\"type\":\"extension_event_result\",\"eventId\":\"event-1-message_end\",\"result\":{\"late\":true}}\\n';; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-hook-timeout" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/slow-hook.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-hook-timeout",
+            .cwd = "/tmp",
+            .fixture = "slow-hook-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    host.mutex.lockUncancelable(std.testing.io);
+    try host.state.registry.registerHook("message_end", "fixture/slow-hook.js");
+    host.mutex.unlock(std.testing.io);
+    try std.testing.expect(host.hasRegisteredHook("message_end"));
+
+    var event = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"message_end\"}", .{});
+    defer event.deinit();
+    const start_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const result = try host.invokeExtensionEvent(allocator, "message_end", event.value, 50);
+    try std.testing.expect(result == null);
+    const elapsed_ms = @divTrunc(std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start_ns, std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ms < 1500);
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "extension hook dispatch timed out"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "message_end"));
+    try std.testing.expectEqual(@as(usize, 0), host.state.pending_extension_event_ids.count());
+    std.Io.sleep(std.testing.io, .fromMilliseconds(300), .awake) catch {};
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "stale or unknown extension event response"));
+}
+
+test "process_jsonl host reports EOF during pending tool call without successful result" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"toolCallId\":\"eof-call\"'*) exit 0;; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-eof" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/eof-extension.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-eof",
+            .cwd = "/tmp",
+            .fixture = "eof-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"eof\"}", .{});
+    defer args.deinit();
+
+    try std.testing.expectError(error.ExtensionHostClosed, host.executeTool(allocator, "fixture.eof", "eof-call", args.value, 500));
+    try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
+    try std.testing.expect(hostDiagnosticContains(host, .host_exit, "eof-call"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_exit, "fixture/eof-extension.js"));
 }
 
 test "M6 host lifecycle contains unexpected exit without respawn and clears pending requests" {
@@ -839,6 +1380,15 @@ test "VAL-REFACTOR-012 deterministic extension host UI protocol fuzz smoke" {
         "{\"type\":\"extension_ui_response\",\"id\":\"select-1\",\"payload\":{\"cancelled\":true}}\n",
         out.written(),
     );
+}
+
+fn hostDiagnosticContains(host: *HostProcess, category: DiagnosticCategory, needle: []const u8) bool {
+    host.mutex.lockUncancelable(host.io);
+    defer host.mutex.unlock(host.io);
+    for (host.state.diagnostics.items) |diagnostic| {
+        if (diagnostic.category == category and std.mem.indexOf(u8, diagnostic.message, needle) != null) return true;
+    }
+    return false;
 }
 
 fn feedExtensionHostFuzzChunks(

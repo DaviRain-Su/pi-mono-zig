@@ -1,7 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const extension_runtime = @import("../extensions/extension_runtime.zig");
 const session_manager = @import("session_manager.zig");
+const tools_common = @import("../tools/common.zig");
 
 pub const CompactionSettings = struct {
     enabled: bool = false,
@@ -105,6 +107,8 @@ pub const AgentSession = struct {
     session_manager: *session_manager.SessionManager,
     subscriber: agent.AgentSubscriber,
     subscribed: bool,
+    extension_event_subscriber: agent.AgentSubscriber,
+    extension_event_subscribed: bool,
     compaction_settings: CompactionSettings,
     retry_settings: RetrySettings,
     retry_attempt: u32,
@@ -114,6 +118,7 @@ pub const AgentSession = struct {
     retry_delay_active: std.atomic.Value(bool),
     overflow_recovery_attempted: bool,
     compaction_active: std.atomic.Value(bool),
+    extension_hook_context: ?*ExtensionHookContext,
 
     pub const CreateOptions = struct {
         cwd: []const u8,
@@ -125,6 +130,8 @@ pub const AgentSession = struct {
         session_dir: ?[]const u8 = null,
         compaction: CompactionSettings = .{},
         retry: RetrySettings = .{},
+        extension_hosts: []const extension_runtime.RuntimeAdapter = &.{},
+        extension_hook_timeout_ms: u64 = 1000,
     };
 
     pub const OpenOptions = struct {
@@ -137,6 +144,8 @@ pub const AgentSession = struct {
         tools: []const agent.AgentTool = &.{},
         compaction: CompactionSettings = .{},
         retry: RetrySettings = .{},
+        extension_hosts: []const extension_runtime.RuntimeAdapter = &.{},
+        extension_hook_timeout_ms: u64 = 1000,
     };
 
     pub const ManagedOptions = struct {
@@ -148,6 +157,8 @@ pub const AgentSession = struct {
         tools: []const agent.AgentTool = &.{},
         compaction: CompactionSettings = .{},
         retry: RetrySettings = .{},
+        extension_hosts: []const extension_runtime.RuntimeAdapter = &.{},
+        extension_hook_timeout_ms: u64 = 1000,
     };
 
     pub fn create(
@@ -174,6 +185,8 @@ pub const AgentSession = struct {
             options.tools,
             options.compaction,
             options.retry,
+            options.extension_hosts,
+            options.extension_hook_timeout_ms,
             manager,
         );
         if (options.model) |model| {
@@ -207,6 +220,8 @@ pub const AgentSession = struct {
             options.tools,
             options.compaction,
             options.retry,
+            options.extension_hosts,
+            options.extension_hook_timeout_ms,
             manager,
         );
     }
@@ -230,6 +245,8 @@ pub const AgentSession = struct {
             options.tools,
             options.compaction,
             options.retry,
+            options.extension_hosts,
+            options.extension_hook_timeout_ms,
             manager,
         );
     }
@@ -239,12 +256,21 @@ pub const AgentSession = struct {
             _ = self.agent.unsubscribe(self.subscriber);
             self.subscribed = false;
         }
+        if (self.extension_event_subscribed) {
+            _ = self.agent.unsubscribe(self.extension_event_subscriber);
+            self.extension_event_subscribed = false;
+        }
         self.agent.deinit();
+        if (self.extension_hook_context) |hook_context| {
+            self.allocator.destroy(hook_context);
+            self.extension_hook_context = null;
+        }
         self.session_manager.deinit();
         self.allocator.destroy(self.session_manager);
     }
 
     pub fn prompt(self: *AgentSession, input: anytype) !void {
+        if (try self.runHookedPrompt(input, null)) return;
         try self.agent.prompt(input);
         try self.runPostPromptMaintenance();
     }
@@ -254,6 +280,7 @@ pub const AgentSession = struct {
         input: anytype,
         accepted_callback: ?agent.PromptAcceptedCallback,
     ) !void {
+        if (try self.runHookedPrompt(input, accepted_callback)) return;
         try self.agent.promptWithAcceptedCallback(input, accepted_callback);
         try self.runPostPromptMaintenance();
     }
@@ -307,6 +334,42 @@ pub const AgentSession = struct {
 
     pub fn clearRetryLifecycleCallback(self: *AgentSession) void {
         self.retry_lifecycle_callback = null;
+    }
+
+    pub fn setExtensionHosts(self: *AgentSession, extension_hosts: []const extension_runtime.RuntimeAdapter, timeout_ms: u64) !void {
+        if (self.extension_event_subscribed) {
+            _ = self.agent.unsubscribe(self.extension_event_subscriber);
+            self.extension_event_subscribed = false;
+        }
+        if (self.extension_hook_context) |hook_context| {
+            self.allocator.destroy(hook_context);
+            self.extension_hook_context = null;
+        }
+        if (extension_hosts.len == 0) {
+            self.agent.transform_context = null;
+            self.agent.transform_context_context = null;
+            self.agent.before_tool_call = null;
+            self.agent.after_tool_call = null;
+            self.agent.extension_hook_context = null;
+            return;
+        }
+        const context = try self.allocator.create(ExtensionHookContext);
+        context.* = .{
+            .hosts = extension_hosts,
+            .timeout_ms = timeout_ms,
+        };
+        self.extension_hook_context = context;
+        self.agent.transform_context = transformContextHook;
+        self.agent.transform_context_context = context;
+        self.agent.before_tool_call = beforeToolCallHook;
+        self.agent.after_tool_call = afterToolCallHook;
+        self.agent.extension_hook_context = context;
+        self.extension_event_subscriber = .{
+            .context = context,
+            .callback = handleExtensionLifecycleEvent,
+        };
+        try self.agent.subscribe(self.extension_event_subscriber);
+        self.extension_event_subscribed = true;
     }
 
     pub fn setCompactionLifecycleCallback(self: *AgentSession, callback: CompactionLifecycleCallback) void {
@@ -602,6 +665,8 @@ pub const AgentSession = struct {
         tools: []const agent.AgentTool,
         compaction_settings: CompactionSettings,
         retry_settings: RetrySettings,
+        extension_hosts: []const extension_runtime.RuntimeAdapter,
+        extension_hook_timeout_ms: u64,
         manager: *session_manager.SessionManager,
     ) !AgentSession {
         var session_context = try manager.buildSessionContext(allocator);
@@ -613,6 +678,16 @@ pub const AgentSession = struct {
         else
             thinking_level;
 
+        const extension_hook_context: ?*ExtensionHookContext = if (extension_hosts.len > 0) blk: {
+            const context = try allocator.create(ExtensionHookContext);
+            context.* = .{
+                .hosts = extension_hosts,
+                .timeout_ms = extension_hook_timeout_ms,
+            };
+            break :blk context;
+        } else null;
+        errdefer if (extension_hook_context) |context| allocator.destroy(context);
+
         var agent_instance = try agent.Agent.init(allocator, .{
             .system_prompt = system_prompt,
             .model = effective_model,
@@ -622,6 +697,11 @@ pub const AgentSession = struct {
             .tools = tools,
             .messages = session_context.messages,
             .io = io,
+            .transform_context = if (extension_hook_context != null) transformContextHook else null,
+            .transform_context_context = if (extension_hook_context) |context| context else null,
+            .before_tool_call = if (extension_hook_context != null) beforeToolCallHook else null,
+            .after_tool_call = if (extension_hook_context != null) afterToolCallHook else null,
+            .extension_hook_context = if (extension_hook_context) |context| context else null,
         });
         errdefer agent_instance.deinit();
 
@@ -637,6 +717,11 @@ pub const AgentSession = struct {
                 .callback = handleSessionManagerEvent,
             },
             .subscribed = false,
+            .extension_event_subscriber = .{
+                .context = extension_hook_context,
+                .callback = handleExtensionLifecycleEvent,
+            },
+            .extension_event_subscribed = false,
             .compaction_settings = compaction_settings,
             .retry_settings = retry_settings,
             .retry_attempt = 0,
@@ -646,10 +731,16 @@ pub const AgentSession = struct {
             .retry_delay_active = std.atomic.Value(bool).init(false),
             .overflow_recovery_attempted = false,
             .compaction_active = std.atomic.Value(bool).init(false),
+            .extension_hook_context = extension_hook_context,
         };
 
         try instance.agent.subscribe(instance.subscriber);
         instance.subscribed = true;
+        if (extension_hook_context) |context| {
+            instance.extension_event_subscriber.context = context;
+            try instance.agent.subscribe(instance.extension_event_subscriber);
+            instance.extension_event_subscribed = true;
+        }
         return instance;
     }
 
@@ -669,7 +760,412 @@ pub const AgentSession = struct {
             self.agent.setModel(current);
         }
     }
+
+    fn runHookedPrompt(
+        self: *AgentSession,
+        input: anytype,
+        accepted_callback: ?agent.PromptAcceptedCallback,
+    ) !bool {
+        if (self.extension_hook_context == null) return false;
+        const Input = @TypeOf(input);
+        if (comptime isStringLike(Input)) {
+            const original_text: []const u8 = input;
+            const hooked_text = try self.runInputHook(original_text) orelse return true;
+            defer self.allocator.free(hooked_text);
+            const prompt_text = try self.runBeforeAgentStartHook(hooked_text) orelse return true;
+            defer self.allocator.free(prompt_text.text);
+            defer if (prompt_text.system_prompt) |system_prompt| self.allocator.free(system_prompt);
+            const previous_system_prompt = self.agent.getSystemPrompt();
+            if (prompt_text.system_prompt) |system_prompt| self.agent.setSystemPrompt(system_prompt);
+            defer self.agent.setSystemPrompt(previous_system_prompt);
+            try self.agent.promptWithAcceptedCallback(prompt_text.text, accepted_callback);
+            try self.runPostPromptMaintenance();
+            return true;
+        }
+        if (comptime isTextWithImagesPrompt(Input)) {
+            const original_text: []const u8 = input.text;
+            const hooked_text = try self.runInputHook(original_text) orelse return true;
+            defer self.allocator.free(hooked_text);
+            const prompt_text = try self.runBeforeAgentStartHook(hooked_text) orelse return true;
+            defer self.allocator.free(prompt_text.text);
+            defer if (prompt_text.system_prompt) |system_prompt| self.allocator.free(system_prompt);
+            const previous_system_prompt = self.agent.getSystemPrompt();
+            if (prompt_text.system_prompt) |system_prompt| self.agent.setSystemPrompt(system_prompt);
+            defer self.agent.setSystemPrompt(previous_system_prompt);
+            try self.agent.promptWithAcceptedCallback(.{ .text = prompt_text.text, .images = input.images }, accepted_callback);
+            try self.runPostPromptMaintenance();
+            return true;
+        }
+        return false;
+    }
+
+    const PromptHookText = struct {
+        text: []u8,
+        system_prompt: ?[]u8 = null,
+    };
+
+    fn runInputHook(self: *AgentSession, text: []const u8) !?[]u8 {
+        const context = self.extension_hook_context orelse return try self.allocator.dupe(u8, text);
+        if (!context.hasHook("input")) return try self.allocator.dupe(u8, text);
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "input");
+        try putString(self.allocator, &event.object, "text", text);
+        try putString(self.allocator, &event.object, "source", "agent_session");
+        const result = try context.invoke(self.allocator, "input", event) orelse return try self.allocator.dupe(u8, text);
+        defer tools_common.deinitJsonValue(self.allocator, result);
+        if (hookHandled(result)) return null;
+        return try self.allocator.dupe(u8, stringField(result, "text") orelse stringField(result, "input") orelse stringField(result, "prompt") orelse text);
+    }
+
+    fn runBeforeAgentStartHook(self: *AgentSession, text: []const u8) !?PromptHookText {
+        const context = self.extension_hook_context orelse return .{ .text = try self.allocator.dupe(u8, text) };
+        if (!context.hasHook("before_agent_start")) return .{ .text = try self.allocator.dupe(u8, text) };
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "before_agent_start");
+        try putString(self.allocator, &event.object, "text", text);
+        try putString(self.allocator, &event.object, "systemPrompt", self.agent.getSystemPrompt());
+        const result = try context.invoke(self.allocator, "before_agent_start", event) orelse return .{ .text = try self.allocator.dupe(u8, text) };
+        defer tools_common.deinitJsonValue(self.allocator, result);
+        if (hookHandled(result)) return null;
+        return .{
+            .text = try self.allocator.dupe(u8, stringField(result, "text") orelse stringField(result, "input") orelse stringField(result, "prompt") orelse text),
+            .system_prompt = if (stringField(result, "systemPrompt") orelse stringField(result, "system_prompt")) |system_prompt| try self.allocator.dupe(u8, system_prompt) else null,
+        };
+    }
 };
+
+const ExtensionHookContext = struct {
+    hosts: []const extension_runtime.RuntimeAdapter,
+    timeout_ms: u64,
+    next_turn_index: usize = 0,
+    active_turn_index: ?usize = null,
+
+    fn hasHook(self: *const ExtensionHookContext, event_name: []const u8) bool {
+        for (self.hosts) |host| {
+            if (host.hasRegisteredHook(event_name)) return true;
+        }
+        return false;
+    }
+
+    fn invoke(self: *const ExtensionHookContext, allocator: std.mem.Allocator, event_name: []const u8, event: std.json.Value) !?std.json.Value {
+        var last_result: ?std.json.Value = null;
+        errdefer if (last_result) |value| tools_common.deinitJsonValue(allocator, value);
+        for (self.hosts) |host| {
+            if (!host.hasRegisteredHook(event_name)) continue;
+            if (try host.invokeExtensionEvent(allocator, event_name, event, self.timeout_ms)) |result| {
+                if (last_result) |old| tools_common.deinitJsonValue(allocator, old);
+                last_result = result;
+            }
+        }
+        return last_result;
+    }
+
+    fn invokeLifecycle(self: *ExtensionHookContext, allocator: std.mem.Allocator, event: agent.AgentEvent) !void {
+        const event_name = switch (event.event_type) {
+            .turn_start => "turn_start",
+            .message_end => "message_end",
+            .turn_end => "turn_end",
+            else => return,
+        };
+        if (!self.hasHook(event_name)) return;
+
+        if (event.event_type == .turn_start) {
+            self.active_turn_index = self.next_turn_index;
+            self.next_turn_index += 1;
+        }
+
+        const payload = try makeLifecycleEventObject(allocator, event_name, event, self.active_turn_index orelse 0);
+        defer tools_common.deinitJsonValue(allocator, payload);
+        const result = try self.invoke(allocator, event_name, payload);
+        if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    }
+};
+
+fn handleExtensionLifecycleEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
+    const hook_context: *ExtensionHookContext = @ptrCast(@alignCast(context orelse return));
+    try hook_context.invokeLifecycle(std.heap.page_allocator, event);
+}
+
+fn transformContextHook(
+    allocator: std.mem.Allocator,
+    messages: []const agent.AgentMessage,
+    signal: ?*const std.atomic.Value(bool),
+    transform_context: ?*anyopaque,
+) ![]agent.AgentMessage {
+    if (signal) |abort_signal| {
+        if (abort_signal.load(.seq_cst)) return @constCast(messages);
+    }
+    const context: *ExtensionHookContext = @ptrCast(@alignCast(transform_context orelse return @constCast(messages)));
+    if (!context.hasHook("context")) return @constCast(messages);
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "context");
+    try putMessagesSummary(allocator, &event.object, messages);
+    const result = try context.invoke(allocator, "context", event) orelse return @constCast(messages);
+    defer tools_common.deinitJsonValue(allocator, result);
+    const extra = try messagesFromHookResult(allocator, result);
+    if (extra.len == 0) {
+        allocator.free(extra);
+        return @constCast(messages);
+    }
+    const output = try allocator.alloc(agent.AgentMessage, messages.len + extra.len);
+    @memcpy(output[0..messages.len], messages);
+    @memcpy(output[messages.len..], extra);
+    allocator.free(extra);
+    return output;
+}
+
+fn beforeToolCallHook(
+    allocator: std.mem.Allocator,
+    before_context: agent.types.BeforeToolCallContext,
+    signal: ?*const std.atomic.Value(bool),
+) !?agent.types.BeforeToolCallResult {
+    if (signal) |abort_signal| {
+        if (abort_signal.load(.seq_cst)) return null;
+    }
+    const context: *ExtensionHookContext = @ptrCast(@alignCast(before_context.context.extension_hook_context orelse return null));
+    if (!context.hasHook("tool_call")) return null;
+    const event = try toolCallEvent(allocator, "tool_call", before_context.tool_call, before_context.args.*);
+    defer tools_common.deinitJsonValue(allocator, event);
+    const result = try context.invoke(allocator, "tool_call", event) orelse return null;
+    defer tools_common.deinitJsonValue(allocator, result);
+    if (objectField(result, "input")) |input| {
+        tools_common.deinitJsonValue(allocator, before_context.args.*);
+        before_context.args.* = try tools_common.cloneJsonValue(allocator, input);
+    }
+    if (hookHandled(result) or boolField(result, "block") orelse false) {
+        return .{
+            .block = true,
+            .reason = try allocator.dupe(u8, stringField(result, "reason") orelse stringField(result, "message") orelse "blocked by extension hook"),
+        };
+    }
+    return null;
+}
+
+fn afterToolCallHook(
+    allocator: std.mem.Allocator,
+    after_context: agent.types.AfterToolCallContext,
+    signal: ?*const std.atomic.Value(bool),
+) !?agent.types.AfterToolCallResult {
+    if (signal) |abort_signal| {
+        if (abort_signal.load(.seq_cst)) return null;
+    }
+    const context: *ExtensionHookContext = @ptrCast(@alignCast(after_context.context.extension_hook_context orelse return null));
+    if (!context.hasHook("tool_result")) return null;
+    var event = try toolCallEvent(allocator, "tool_result", after_context.tool_call, after_context.args);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "toolCallId", after_context.tool_call.id);
+    try putBool(allocator, &event.object, "isError", after_context.is_error);
+    try putToolResultSummary(allocator, &event.object, after_context.result);
+    const result = try context.invoke(allocator, "tool_result", event) orelse return null;
+    defer tools_common.deinitJsonValue(allocator, result);
+    var patch = agent.types.AfterToolCallResult{};
+    if (stringField(result, "content")) |content| {
+        patch.content = try tools_common.makeTextContent(allocator, content);
+    }
+    if (objectField(result, "details")) |details| {
+        patch.details = try tools_common.cloneJsonValue(allocator, details);
+    }
+    if (boolField(result, "isError") orelse boolField(result, "is_error")) |is_error| {
+        patch.is_error = is_error;
+    }
+    if (patch.content == null and patch.details == null and patch.is_error == null) return null;
+    return patch;
+}
+
+fn makeObject(allocator: std.mem.Allocator) !std.json.Value {
+    return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+}
+
+fn putString(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+}
+
+fn putBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .bool = value });
+}
+
+fn putInt(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: i64) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .integer = value });
+}
+
+fn putValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    try object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn putMessageSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, message: agent.AgentMessage) !void {
+    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = entry });
+    switch (message) {
+        .user => |user| {
+            try putString(allocator, &entry, "role", "user");
+            try putString(allocator, &entry, "content", firstText(user.content) orelse "");
+        },
+        .assistant => |assistant| {
+            try putString(allocator, &entry, "role", "assistant");
+            try putString(allocator, &entry, "content", firstText(assistant.content) orelse "");
+        },
+        .tool_result => |tool| {
+            try putString(allocator, &entry, "role", "tool");
+            try putString(allocator, &entry, "content", firstText(tool.content) orelse "");
+        },
+    }
+    try putValue(allocator, object, "message", .{ .object = entry });
+}
+
+fn putMessagesSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, messages: []const agent.AgentMessage) !void {
+    var array = std.json.Array.init(allocator);
+    for (messages) |message| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        switch (message) {
+            .user => |user| {
+                try putString(allocator, &entry, "role", "user");
+                try putString(allocator, &entry, "content", firstText(user.content) orelse "");
+            },
+            .assistant => |assistant| {
+                try putString(allocator, &entry, "role", "assistant");
+                try putString(allocator, &entry, "content", firstText(assistant.content) orelse "");
+            },
+            .tool_result => |tool| {
+                try putString(allocator, &entry, "role", "tool");
+                try putString(allocator, &entry, "content", firstText(tool.content) orelse "");
+            },
+        }
+        try array.append(.{ .object = entry });
+    }
+    try putValue(allocator, object, "messages", .{ .array = array });
+}
+
+fn makeLifecycleEventObject(
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    event: agent.AgentEvent,
+    turn_index: usize,
+) !std.json.Value {
+    var payload = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, payload);
+    try putString(allocator, &payload.object, "type", event_name);
+    try putInt(allocator, &payload.object, "turnIndex", @intCast(turn_index));
+    if (event.message) |message| try putMessageSummary(allocator, &payload.object, message);
+    if (event.messages) |messages| try putMessagesSummary(allocator, &payload.object, messages);
+    if (event.tool_results) |tool_results| {
+        var array = std.json.Array.init(allocator);
+        for (tool_results) |tool_result| {
+            var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+            try putString(allocator, &entry, "toolCallId", tool_result.tool_call_id);
+            try putString(allocator, &entry, "toolName", tool_result.tool_name);
+            try putString(allocator, &entry, "content", firstText(tool_result.content) orelse "");
+            try putBool(allocator, &entry, "isError", tool_result.is_error);
+            try array.append(.{ .object = entry });
+        }
+        try putValue(allocator, &payload.object, "toolResults", .{ .array = array });
+    }
+    return payload;
+}
+
+fn toolCallEvent(allocator: std.mem.Allocator, event_name: []const u8, tool_call: ai.ToolCall, args: std.json.Value) !std.json.Value {
+    var event = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", event_name);
+    try putString(allocator, &event.object, "name", tool_call.name);
+    try putString(allocator, &event.object, "id", tool_call.id);
+    try putValue(allocator, &event.object, "input", try tools_common.cloneJsonValue(allocator, args));
+    return event;
+}
+
+fn putToolResultSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, result: agent.types.AgentToolResult) !void {
+    try putString(allocator, object, "content", firstText(result.content) orelse "");
+    if (result.details) |details| try putValue(allocator, object, "details", try tools_common.cloneJsonValue(allocator, details));
+}
+
+fn firstText(content: []const ai.ContentBlock) ?[]const u8 {
+    for (content) |block| switch (block) {
+        .text => |text| return text.text,
+        else => {},
+    };
+    return null;
+}
+
+fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    return value.object.get(key);
+}
+
+fn stringField(value: std.json.Value, key: []const u8) ?[]const u8 {
+    const field = objectField(value, key) orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn boolField(value: std.json.Value, key: []const u8) ?bool {
+    const field = objectField(value, key) orelse return null;
+    return switch (field) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn hookHandled(value: std.json.Value) bool {
+    if (boolField(value, "handled") orelse false) return true;
+    if (boolField(value, "block") orelse false) return true;
+    if (stringField(value, "action")) |action| {
+        return std.mem.eql(u8, action, "handled") or std.mem.eql(u8, action, "block") or std.mem.eql(u8, action, "deny");
+    }
+    return false;
+}
+
+fn messagesFromHookResult(allocator: std.mem.Allocator, result: std.json.Value) ![]agent.AgentMessage {
+    const messages_value = objectField(result, "messages") orelse return allocator.alloc(agent.AgentMessage, 0);
+    if (messages_value != .array) return allocator.alloc(agent.AgentMessage, 0);
+    var output = std.ArrayList(agent.AgentMessage).empty;
+    errdefer {
+        agent.deinitMessageSlice(allocator, output.items);
+        output.deinit(allocator);
+    }
+    for (messages_value.array.items) |message_value| {
+        if (message_value == .string) {
+            try output.append(allocator, try hookUserMessage(allocator, message_value.string));
+        } else if (message_value == .object) {
+            const content = stringField(message_value, "content") orelse stringField(message_value, "text") orelse continue;
+            try output.append(allocator, try hookUserMessage(allocator, content));
+        }
+    }
+    return try output.toOwnedSlice(allocator);
+}
+
+fn hookUserMessage(allocator: std.mem.Allocator, text: []const u8) !agent.AgentMessage {
+    const content = try tools_common.makeTextContent(allocator, text);
+    return .{ .user = .{
+        .content = content,
+        .timestamp = agent.types.nowMilliseconds(),
+    } };
+}
+
+fn isStringLike(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => pointer.child == u8,
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| array.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |array| array.child == u8,
+        else => false,
+    };
+}
+
+fn isTextWithImagesPrompt(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasField(T, "text") and @hasField(T, "images"),
+        else => false,
+    };
+}
 
 fn queuedUserMessage(
     allocator: std.mem.Allocator,
@@ -1285,6 +1781,8 @@ test "agent session navigation switches visible branch transcript" {
         &.{},
         .{},
         .{},
+        &.{},
+        1000,
         manager,
     );
     manager_transferred = true;
@@ -1347,6 +1845,8 @@ test "agent session tree navigation matches user parentage and summary attachmen
         &.{},
         .{},
         .{},
+        &.{},
+        1000,
         manager,
     );
     manager_transferred = true;
@@ -1412,6 +1912,8 @@ test "VAL-CROSS-006 session reload keeps errored partial assistant inert" {
         &.{},
         .{},
         .{},
+        &.{},
+        1000,
         manager,
     );
     manager_transferred = true;
@@ -1704,4 +2206,382 @@ fn makeErroredPartialAssistantMessage(model: ai.Model, timestamp: i64) !agent.Ag
         .error_message = try std.testing.allocator.dupe(u8, "provider failed after partials"),
         .timestamp = timestamp,
     } };
+}
+
+const TestHookHost = struct {
+    input: bool = false,
+    before_agent_start: bool = false,
+    context: bool = false,
+    turn_start: bool = false,
+    message_end: bool = false,
+    turn_end: bool = false,
+    tool_call: bool = false,
+    tool_result: bool = false,
+    label: []const u8 = "",
+    order_log: ?*std.ArrayList([]const u8) = null,
+    order_allocator: ?std.mem.Allocator = null,
+    input_calls: usize = 0,
+    before_calls: usize = 0,
+    context_calls: usize = 0,
+    turn_start_calls: usize = 0,
+    message_end_calls: usize = 0,
+    turn_end_calls: usize = 0,
+    tool_call_calls: usize = 0,
+    tool_result_calls: usize = 0,
+
+    fn adapter(self: *TestHookHost) extension_runtime.RuntimeAdapter {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &test_hook_vtable,
+            .kind = .process_jsonl,
+        };
+    }
+};
+
+fn testHookHost(ptr: *anyopaque) *TestHookHost {
+    return @ptrCast(@alignCast(ptr));
+}
+
+fn testHookWait(ptr: *anyopaque, timeout_ms: u64) !void {
+    _ = ptr;
+    _ = timeout_ms;
+}
+fn testHookZero(ptr: *anyopaque) usize {
+    _ = ptr;
+    return 0;
+}
+fn testHookFalse(ptr: *anyopaque) bool {
+    _ = ptr;
+    return false;
+}
+fn testHookCategoryCount(ptr: *anyopaque, category: extension_runtime.DiagnosticCategory) usize {
+    _ = ptr;
+    _ = category;
+    return 0;
+}
+fn testHookHasCommand(ptr: *anyopaque, name: []const u8) bool {
+    _ = ptr;
+    _ = name;
+    return false;
+}
+fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
+    const host = testHookHost(ptr);
+    if (std.mem.eql(u8, event_name, "input")) return host.input;
+    if (std.mem.eql(u8, event_name, "before_agent_start")) return host.before_agent_start;
+    if (std.mem.eql(u8, event_name, "context")) return host.context;
+    if (std.mem.eql(u8, event_name, "turn_start")) return host.turn_start;
+    if (std.mem.eql(u8, event_name, "message_end")) return host.message_end;
+    if (std.mem.eql(u8, event_name, "turn_end")) return host.turn_end;
+    if (std.mem.eql(u8, event_name, "tool_call")) return host.tool_call;
+    if (std.mem.eql(u8, event_name, "tool_result")) return host.tool_result;
+    return false;
+}
+fn testHookSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+    _ = ptr;
+    return try allocator.dupe(u8, "{}");
+}
+fn testHookWithRegistry(ptr: *anyopaque, context: ?*anyopaque, callback: extension_runtime.RegistryCallback) !void {
+    _ = ptr;
+    _ = context;
+    _ = callback;
+}
+fn testHookApplyFlags(ptr: *anyopaque, entries: []const @import("../extensions/extension_registry.zig").ParsedCliFlag) !void {
+    _ = ptr;
+    _ = entries;
+}
+fn testHookAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+    _ = ptr;
+    _ = allocator;
+    _ = name;
+    return null;
+}
+fn testHookUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]extension_runtime.ExtensionUiRequest {
+    _ = ptr;
+    return try allocator.alloc(extension_runtime.ExtensionUiRequest, 0);
+}
+fn testHookUiResponse(ptr: *anyopaque, id: []const u8, payload_json: []const u8) !void {
+    _ = ptr;
+    _ = id;
+    _ = payload_json;
+}
+fn testHookEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
+    _ = ptr;
+    _ = frame_json;
+}
+fn testHookInvoke(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    event: std.json.Value,
+    timeout_ms: u64,
+) !?std.json.Value {
+    _ = event;
+    _ = timeout_ms;
+    const host = testHookHost(ptr);
+    if (host.order_log) |log| {
+        const name = if (host.label.len > 0) host.label else event_name;
+        try log.append(host.order_allocator orelse allocator, name);
+    }
+    var result = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, result);
+    if (std.mem.eql(u8, event_name, "input")) {
+        host.input_calls += 1;
+        try putString(allocator, &result.object, "text", "hooked input");
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "before_agent_start")) {
+        host.before_calls += 1;
+        try putString(allocator, &result.object, "text", "hooked before");
+        try putString(allocator, &result.object, "systemPrompt", "hook system");
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "context")) {
+        host.context_calls += 1;
+        var messages = std.json.Array.init(allocator);
+        try messages.append(.{ .string = try allocator.dupe(u8, "hook context") });
+        try putValue(allocator, &result.object, "messages", .{ .array = messages });
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "turn_start")) {
+        host.turn_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "message_end")) {
+        host.message_end_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "turn_end")) {
+        host.turn_end_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_call")) {
+        host.tool_call_calls += 1;
+        var input = try makeObject(allocator);
+        try putString(allocator, &input.object, "value", "mutated");
+        try putValue(allocator, &result.object, "input", input);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_result")) {
+        host.tool_result_calls += 1;
+        try putString(allocator, &result.object, "content", "patched result");
+        try putBool(allocator, &result.object, "isError", false);
+        return result;
+    }
+    return result;
+}
+fn testHookShutdown(ptr: *anyopaque) !void {
+    _ = ptr;
+}
+fn testHookDeinit(ptr: *anyopaque) void {
+    _ = ptr;
+}
+
+const test_hook_vtable: extension_runtime.RuntimeAdapter.VTable = .{
+    .wait_for_ready = testHookWait,
+    .pending_count = testHookZero,
+    .diagnostic_count = testHookZero,
+    .diagnostic_category_count = testHookCategoryCount,
+    .has_shutdown_complete = testHookFalse,
+    .registry_frames_applied = testHookZero,
+    .has_registered_command = testHookHasCommand,
+    .has_registered_hook = testHookHasHook,
+    .snapshot_registry_json = testHookSnapshot,
+    .with_registry = testHookWithRegistry,
+    .apply_cli_flag_values = testHookApplyFlags,
+    .agent_tool = testHookAgentTool,
+    .take_ui_requests = testHookUiRequests,
+    .send_extension_ui_response = testHookUiResponse,
+    .send_extension_event_frame = testHookEventFrame,
+    .invoke_extension_event = testHookInvoke,
+    .shutdown = testHookShutdown,
+    .deinit = testHookDeinit,
+};
+
+test "extension event hooks mutate input before start and context during session prompt" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("reply")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .input = true,
+        .before_agent_start = true,
+        .context = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/project",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("original");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.input_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.before_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.context_calls);
+    try std.testing.expectEqualStrings("system", session.agent.getSystemPrompt());
+    try std.testing.expectEqualStrings("hooked before", session.agent.getMessages()[0].user.content[0].text.text);
+}
+
+test "extension tool hooks mutate arguments and patch results" {
+    var fixture = TestHookHost{
+        .tool_call = true,
+        .tool_result = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    const hook_context = ExtensionHookContext{
+        .hosts = adapters[0..],
+        .timeout_ms = 1000,
+    };
+    var args = try makeObject(std.testing.allocator);
+    defer tools_common.deinitJsonValue(std.testing.allocator, args);
+    try putString(std.testing.allocator, &args.object, "value", "original");
+    const tool_call = ai.ToolCall{
+        .id = "tool-1",
+        .name = "fixture-tool",
+        .arguments = .null,
+    };
+    const agent_context = agent.AgentContext{
+        .system_prompt = "system",
+        .messages = &.{},
+        .tools = &.{},
+        .extension_hook_context = @constCast(&hook_context),
+    };
+    _ = try beforeToolCallHook(std.testing.allocator, .{
+        .assistant_message = .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        },
+        .tool_call = tool_call,
+        .args = &args,
+        .context = agent_context,
+    }, null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_call_calls);
+    try std.testing.expectEqualStrings("mutated", args.object.get("value").?.string);
+
+    const raw_content = try tools_common.makeTextContent(std.testing.allocator, "raw result");
+    defer {
+        std.testing.allocator.free(raw_content[0].text.text);
+        std.testing.allocator.free(raw_content);
+    }
+    const patch = (try afterToolCallHook(std.testing.allocator, .{
+        .assistant_message = .{
+            .content = &.{},
+            .api = "faux",
+            .provider = "faux",
+            .model = "faux-1",
+            .usage = ai.Usage.init(),
+            .stop_reason = .stop,
+            .timestamp = 1,
+        },
+        .tool_call = tool_call,
+        .args = args,
+        .result = .{ .content = raw_content },
+        .is_error = false,
+        .context = agent_context,
+    }, null)).?;
+    defer if (patch.content) |content| {
+        std.testing.allocator.free(content[0].text.text);
+        std.testing.allocator.free(content);
+    };
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_result_calls);
+    try std.testing.expectEqualStrings("patched result", patch.content.?[0].text.text);
+    try std.testing.expectEqual(false, patch.is_error.?);
+}
+
+test "extension lifecycle hooks fire once per turn and message in agent order" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("lifecycle reply")}, .{}) },
+    });
+
+    var order_log = std.ArrayList([]const u8).empty;
+    defer order_log.deinit(std.testing.allocator);
+    var fixture = TestHookHost{
+        .turn_start = true,
+        .message_end = true,
+        .turn_end = true,
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/lifecycle-hooks",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("hello lifecycle");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.turn_start_calls);
+    try std.testing.expectEqual(@as(usize, 2), fixture.message_end_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.turn_end_calls);
+    try std.testing.expect(order_log.items.len >= 4);
+    try std.testing.expectEqualStrings("turn_start", order_log.items[0]);
+    try std.testing.expectEqualStrings("message_end", order_log.items[1]);
+    try std.testing.expectEqualStrings("message_end", order_log.items[2]);
+    try std.testing.expectEqualStrings("turn_end", order_log.items[3]);
+}
+
+test "extension lifecycle hooks run deterministically by host order" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("ordered reply")}, .{}) },
+    });
+
+    var order_log = std.ArrayList([]const u8).empty;
+    defer order_log.deinit(std.testing.allocator);
+    var first = TestHookHost{
+        .turn_start = true,
+        .label = "first",
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+    };
+    var second = TestHookHost{
+        .turn_start = true,
+        .label = "second",
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{ first.adapter(), second.adapter() };
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/lifecycle-hook-order",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("hello ordering");
+
+    try std.testing.expect(order_log.items.len >= 2);
+    try std.testing.expectEqualStrings("first", order_log.items[0]);
+    try std.testing.expectEqualStrings("second", order_log.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), first.turn_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), second.turn_start_calls);
 }
