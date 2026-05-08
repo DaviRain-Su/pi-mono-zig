@@ -187,10 +187,8 @@ pub fn Loop(comptime T: type) type {
                                     if (raw_debug_path) |path| {
                                         writeRawInputDebugParseError(self.io, path, buf[seq_start], err) catch {};
                                     }
-                                    log.warn("failed to parse tty input byte 0x{x}: {s}", .{
-                                        buf[seq_start],
-                                        @errorName(err),
-                                    });
+                                    // Silently skip unparseable input bytes to avoid
+                                    // corrupting the TUI with stderr output.
                                     seq_start += 1;
                                     read_start = 0;
                                     continue;

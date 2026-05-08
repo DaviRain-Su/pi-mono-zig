@@ -484,8 +484,6 @@ pub const WindowsTty = struct {
                     0xdd => ']',
                     0xde => '\'',
                     else => {
-                        const log = std.log.scoped(.vaxis);
-                        log.warn("unknown wVirtualKeyCode: 0x{x}", .{event.wVirtualKeyCode});
                         return null;
                     },
                 };
@@ -587,7 +585,6 @@ pub const WindowsTty = struct {
                         break :blk .button_9;
                     },
                     else => {
-                        std.log.warn("unknown mouse event: {}", .{event});
                         return null;
                     },
                 };
