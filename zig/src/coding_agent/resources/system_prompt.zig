@@ -1,6 +1,8 @@
 const std = @import("std");
+const agent = @import("agent");
 const context_files_mod = @import("context_files.zig");
 const resources_mod = @import("resources.zig");
+const tool_selection_mod = @import("../tool_selection.zig");
 
 const BUILTIN_TOOLS = [_]ToolInfo{
     .{ .name = "read", .description = "Read file contents" },
@@ -22,12 +24,20 @@ pub const BuildSystemPromptOptions = struct {
     current_date: []const u8,
     custom_prompt: ?[]const u8 = null,
     append_prompts: []const []const u8 = &.{},
+    tool_selection: tool_selection_mod.ToolSelection = .{},
+    /// Active tool metadata constructed for the session. When present this is
+    /// authoritative for prompt-visible non-builtin tools, including
+    /// extension descriptions and JSON schemas.
+    active_tools: []const agent.AgentTool = &.{},
+    /// Compatibility field for unit tests and legacy call sites. When set,
+    /// it is interpreted as the normal allowlist with builtin tools enabled.
     selected_tools: ?[]const []const u8 = null,
     context_files: []const context_files_mod.ContextFile = &.{},
     skills: []const resources_mod.Skill = &.{},
 };
 
 pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromptOptions) ![]u8 {
+    const selection = effectiveToolSelection(options);
     var prompt = std.ArrayList(u8).empty;
     defer prompt.deinit(allocator);
 
@@ -36,9 +46,9 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromp
     } else {
         try prompt.appendSlice(allocator, "You are an expert coding assistant operating inside pi, a coding agent harness.\n\n");
         try prompt.appendSlice(allocator, "Available tools:\n");
-        try appendToolSection(allocator, &prompt, options.selected_tools);
+        try appendToolSection(allocator, &prompt, selection, options.active_tools);
         try prompt.appendSlice(allocator, "\n\nGuidelines:\n");
-        try appendGuidelines(allocator, &prompt, options.selected_tools);
+        try appendGuidelines(allocator, &prompt, selection);
     }
 
     for (options.append_prompts) |append_prompt| {
@@ -50,7 +60,7 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromp
         try appendContextFiles(allocator, &prompt, options.context_files);
     }
 
-    if (hasTool(options.selected_tools, "read") and options.skills.len > 0) {
+    if (hasTool(selection, "read") and options.skills.len > 0) {
         const skills_text = try resources_mod.formatSkillsForPrompt(allocator, options.skills);
         defer allocator.free(skills_text);
         if (skills_text.len > 0) {
@@ -69,22 +79,55 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromp
 fn appendToolSection(
     allocator: std.mem.Allocator,
     prompt: *std.ArrayList(u8),
-    selected_tools: ?[]const []const u8,
+    selection: tool_selection_mod.ToolSelection,
+    active_tools: []const agent.AgentTool,
 ) !void {
-    if (selected_tools) |tools| {
-        if (tools.len == 0) {
-            try prompt.appendSlice(allocator, "(none)");
-            return;
-        }
-
-        for (tools, 0..) |tool_name, index| {
-            if (index > 0) try prompt.appendSlice(allocator, "\n");
-            const info = findTool(tool_name) orelse ToolInfo{
+    if (selection.allowlist) |tools| {
+        var appended: usize = 0;
+        for (tools) |tool_name| {
+            if (findAllowedActiveTool(active_tools, tool_name, selection)) |active_tool| {
+                if (appended > 0) try prompt.appendSlice(allocator, "\n");
+                try appendActiveToolLine(allocator, prompt, active_tool);
+                appended += 1;
+                continue;
+            }
+            const info = findTool(tool_name);
+            if (info != null and !selection.allowsBuiltin(tool_name)) continue;
+            if (info == null and !selection.allowsExtension(tool_name)) continue;
+            if (appended > 0) try prompt.appendSlice(allocator, "\n");
+            try appendToolLine(allocator, prompt, info orelse ToolInfo{
                 .name = tool_name,
                 .description = "Custom tool available in this environment",
-            };
-            try appendToolLine(allocator, prompt, info);
+            });
+            appended += 1;
         }
+        if (appended == 0) {
+            try prompt.appendSlice(allocator, "(none)");
+        }
+        return;
+    }
+
+    if (selection.disable_all) {
+        try prompt.appendSlice(allocator, "(none)");
+        return;
+    }
+
+    if (active_tools.len > 0) {
+        var appended: usize = 0;
+        for (active_tools) |tool| {
+            if (!selectionAllowsActiveTool(selection, tool)) continue;
+            if (appended > 0) try prompt.appendSlice(allocator, "\n");
+            try appendActiveToolLine(allocator, prompt, tool);
+            appended += 1;
+        }
+        if (appended == 0) {
+            try prompt.appendSlice(allocator, "(none)");
+        }
+        return;
+    }
+
+    if (!selection.include_builtins) {
+        try prompt.appendSlice(allocator, "(none)");
         return;
     }
 
@@ -101,16 +144,38 @@ fn appendToolLine(allocator: std.mem.Allocator, prompt: *std.ArrayList(u8), info
     try prompt.appendSlice(allocator, info.description);
 }
 
+fn appendActiveToolLine(allocator: std.mem.Allocator, prompt: *std.ArrayList(u8), tool: agent.AgentTool) !void {
+    try appendToolLine(allocator, prompt, .{
+        .name = tool.name,
+        .description = tool.description,
+    });
+    if (tool.source != .builtin) {
+        try prompt.appendSlice(allocator, "\n  schema: ");
+        try appendJsonValue(allocator, prompt, tool.parameters);
+    }
+}
+
+fn appendJsonValue(
+    allocator: std.mem.Allocator,
+    prompt: *std.ArrayList(u8),
+    value: std.json.Value,
+) !void {
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try std.json.Stringify.value(value, .{}, &buffer.writer);
+    try prompt.appendSlice(allocator, buffer.written());
+}
+
 fn appendGuidelines(
     allocator: std.mem.Allocator,
     prompt: *std.ArrayList(u8),
-    selected_tools: ?[]const []const u8,
+    selection: tool_selection_mod.ToolSelection,
 ) !void {
     try prompt.appendSlice(allocator, "- Use the available tools when they help answer the user's request.\n");
 
-    if (hasAnyTool(selected_tools, &.{ "grep", "find", "ls" })) {
+    if (hasAnyTool(selection, &.{ "grep", "find", "ls" })) {
         try prompt.appendSlice(allocator, "- Prefer grep/find/ls over bash for repository exploration when those tools are available.\n");
-    } else if (hasTool(selected_tools, "bash")) {
+    } else if (hasTool(selection, "bash")) {
         try prompt.appendSlice(allocator, "- Use bash for repository exploration when dedicated search tools are unavailable.\n");
     }
 
@@ -134,31 +199,15 @@ fn appendContextFiles(
     }
 }
 
-fn hasAnyTool(selected_tools: ?[]const []const u8, names: []const []const u8) bool {
+fn hasAnyTool(selection: tool_selection_mod.ToolSelection, names: []const []const u8) bool {
     for (names) |name| {
-        if (hasTool(selected_tools, name)) return true;
+        if (hasTool(selection, name)) return true;
     }
     return false;
 }
 
-fn hasTool(selected_tools: ?[]const []const u8, name: []const u8) bool {
-    const tools = selected_tools orelse builtinToolNames();
-    for (tools) |tool_name| {
-        if (std.mem.eql(u8, tool_name, name)) return true;
-    }
-    return false;
-}
-
-fn builtinToolNames() []const []const u8 {
-    return &.{
-        "read",
-        "bash",
-        "edit",
-        "write",
-        "grep",
-        "find",
-        "ls",
-    };
+fn hasTool(selection: tool_selection_mod.ToolSelection, name: []const u8) bool {
+    return selection.allowsBuiltin(name) and findTool(name) != null;
 }
 
 fn findTool(name: []const u8) ?ToolInfo {
@@ -166,6 +215,31 @@ fn findTool(name: []const u8) ?ToolInfo {
         if (std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
+}
+
+fn findAllowedActiveTool(
+    active_tools: []const agent.AgentTool,
+    name: []const u8,
+    selection: tool_selection_mod.ToolSelection,
+) ?agent.AgentTool {
+    for (active_tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name) and selectionAllowsActiveTool(selection, tool)) return tool;
+    }
+    return null;
+}
+
+fn selectionAllowsActiveTool(selection: tool_selection_mod.ToolSelection, tool: agent.AgentTool) bool {
+    return switch (tool.source) {
+        .builtin => selection.allowsBuiltin(tool.name),
+        .extension, .custom => selection.allowsExtension(tool.name),
+    };
+}
+
+fn effectiveToolSelection(options: BuildSystemPromptOptions) tool_selection_mod.ToolSelection {
+    if (options.selected_tools) |selected_tools| {
+        return tool_selection_mod.ToolSelection.fromAllowlist(selected_tools);
+    }
+    return options.tool_selection;
 }
 
 test "default system prompt includes tools, guidelines, date, and cwd" {
@@ -234,6 +308,68 @@ test "selected tools limit the visible tool list" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- ls: List directory contents") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- bash: Execute shell commands") == null);
 }
+
+test "tool selection distinguishes no-tools and no-builtin-tools in prompt" {
+    const allocator = std.testing.allocator;
+
+    const colliding_extension_tool = agent.AgentTool{
+        .name = "read",
+        .description = "Extension read implementation",
+        .label = "Extension Read",
+        .parameters = .null,
+        .source = .extension,
+    };
+    const builtin_read_tool = agent.AgentTool{
+        .name = "read",
+        .description = "Read file contents",
+        .label = "read",
+        .parameters = .null,
+        .source = .builtin,
+    };
+
+    const no_tools_prompt = try buildSystemPrompt(allocator, .{
+        .cwd = "/tmp/project",
+        .tool_selection = tool_selection_mod.ToolSelection.fromCli(true, false, null),
+        .active_tools = &.{colliding_extension_tool},
+        .current_date = "2026-04-24",
+    });
+    defer allocator.free(no_tools_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, no_tools_prompt, "Available tools:\n(none)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_tools_prompt, "- read: Read file contents") == null);
+    try std.testing.expect(std.mem.indexOf(u8, no_tools_prompt, "- read: Extension read implementation") == null);
+
+    const no_builtin_prompt = try buildSystemPrompt(allocator, .{
+        .cwd = "/tmp/project",
+        .tool_selection = tool_selection_mod.ToolSelection.fromCli(false, true, &.{"ext-echo"}),
+        .current_date = "2026-04-24",
+    });
+    defer allocator.free(no_builtin_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, no_builtin_prompt, "- ext-echo: Custom tool available in this environment") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_builtin_prompt, "- read: Read file contents") == null);
+
+    const colliding_no_builtin_prompt = try buildSystemPrompt(allocator, .{
+        .cwd = "/tmp/project",
+        .tool_selection = tool_selection_mod.ToolSelection.fromCli(false, true, null),
+        .active_tools = &.{ colliding_extension_tool, builtin_read_tool },
+        .current_date = "2026-04-24",
+    });
+    defer allocator.free(colliding_no_builtin_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_no_builtin_prompt, "- read: Extension read implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_no_builtin_prompt, "schema: null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_no_builtin_prompt, "- read: Read file contents") == null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_no_builtin_prompt, "Available tools:\n(none)") == null);
+
+    const colliding_allowlist_prompt = try buildSystemPrompt(allocator, .{
+        .cwd = "/tmp/project",
+        .tool_selection = tool_selection_mod.ToolSelection.fromCli(false, true, &.{"read"}),
+        .active_tools = &.{ colliding_extension_tool, builtin_read_tool },
+        .current_date = "2026-04-24",
+    });
+    defer allocator.free(colliding_allowlist_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_allowlist_prompt, "- read: Extension read implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, colliding_allowlist_prompt, "- read: Read file contents") == null);
+}
+
 
 test "system prompt appends project context files and skills when read is available" {
     const allocator = std.testing.allocator;

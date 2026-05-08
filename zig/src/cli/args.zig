@@ -338,6 +338,16 @@ pub const ExtensionFlagInfo = struct {
     extension_path: []const u8 = "",
 };
 
+pub const ExtensionFlagDiagnosticInfo = struct {
+    severity: []const u8,
+    code: []const u8,
+    owner: []const u8,
+    source: []const u8,
+    flag_name: []const u8,
+    reason: []const u8,
+    message: []const u8,
+};
+
 pub fn helpText(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
     return helpTextWithExtensions(allocator, version, &.{});
 }
@@ -347,8 +357,17 @@ pub fn helpTextWithExtensions(
     version: []const u8,
     extension_flags: []const ExtensionFlagInfo,
 ) ![]u8 {
+    return helpTextWithExtensionDiagnostics(allocator, version, extension_flags, &.{});
+}
+
+pub fn helpTextWithExtensionDiagnostics(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    extension_flags: []const ExtensionFlagInfo,
+    extension_flag_diagnostics: []const ExtensionFlagDiagnosticInfo,
+) ![]u8 {
     const base = try renderBaseHelp(allocator, version);
-    if (extension_flags.len == 0) return base;
+    if (extension_flags.len == 0 and extension_flag_diagnostics.len == 0) return base;
     defer allocator.free(base);
 
     var buffer = std.ArrayList(u8).empty;
@@ -379,6 +398,26 @@ pub fn helpTextWithExtensions(
         }
         try buffer.appendSlice(allocator, description);
         try buffer.append(allocator, '\n');
+    }
+    if (extension_flag_diagnostics.len > 0) {
+        try buffer.appendSlice(allocator, "Extension CLI Flag Diagnostics:\n");
+        for (extension_flag_diagnostics) |diagnostic| {
+            const diagnostic_line = try std.fmt.allocPrint(
+                allocator,
+                "  [{s}] {s} owner={s} source={s} flag=--{s} reason={s}: {s}\n",
+                .{
+                    diagnostic.severity,
+                    diagnostic.code,
+                    diagnostic.owner,
+                    diagnostic.source,
+                    diagnostic.flag_name,
+                    diagnostic.reason,
+                    diagnostic.message,
+                },
+            );
+            defer allocator.free(diagnostic_line);
+            try buffer.appendSlice(allocator, diagnostic_line);
+        }
     }
 
     return buffer.toOwnedSlice(allocator);
@@ -717,6 +756,28 @@ test "helpTextWithExtensions includes registered extension flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "Enable plan mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--model-alias <value>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "/tmp/alias.ts") != null);
+}
+
+test "helpTextWithExtensionDiagnostics includes rejected extension flag diagnostics" {
+    const allocator = std.testing.allocator;
+    const diagnostics = [_]ExtensionFlagDiagnosticInfo{.{
+        .severity = "error",
+        .code = "extension_flag.builtin_collision",
+        .owner = "/tmp/ext.ts",
+        .source = "/tmp/ext.ts",
+        .flag_name = "model",
+        .reason = "collides with built-in option",
+        .message = "Extension flag \"--model\" from /tmp/ext.ts collides with a built-in option",
+    }};
+    const help = try helpTextWithExtensionDiagnostics(allocator, "0.1.0", &.{}, &diagnostics);
+    defer allocator.free(help);
+
+    try std.testing.expect(std.mem.indexOf(u8, help, "Extension CLI Flag Diagnostics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "extension_flag.builtin_collision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "owner=/tmp/ext.ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "source=/tmp/ext.ts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "flag=--model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "reason=collides with built-in option") != null);
 }
 
 test "parse args supports help and version" {

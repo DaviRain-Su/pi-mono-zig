@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("args.zig");
 const bootstrap = @import("bootstrap.zig");
@@ -6,13 +7,17 @@ const model_resolver = @import("model_resolver.zig");
 const config_mod = @import("../coding_agent/config/config.zig");
 const context_files_mod = @import("../coding_agent/resources/context_files.zig");
 const resources_mod = @import("../coding_agent/resources/resources.zig");
+const extension_runtime = @import("../coding_agent/extensions/extension_runtime.zig");
 const coding_agent = @import("../coding_agent/root.zig");
+const tool_adapters = @import("../coding_agent/interactive_mode/tool_adapters.zig");
+const tool_selection = @import("../coding_agent/tool_selection.zig");
 
 pub const PreparedCliRuntime = struct {
     runtime_config: config_mod.RuntimeConfig,
     resource_bundle: resources_mod.ResourceBundle,
     context_files: []context_files_mod.ContextFile,
     system_prompt: []u8,
+    current_date: []u8,
     session_dir: []u8,
     expanded_messages: []const []const u8,
     provider_name: []const u8,
@@ -21,8 +26,10 @@ pub const PreparedCliRuntime = struct {
     model_warning: ?[]u8 = null,
     model_error: ?[]u8 = null,
     thinking_level: agent.ThinkingLevel,
+    extension_contributions: ?tool_adapters.ExtensionBootstrapContributions = null,
 
     pub fn deinit(self: *PreparedCliRuntime, allocator: std.mem.Allocator) void {
+        if (self.extension_contributions) |*contributions| contributions.deinit();
         for (self.expanded_messages) |message| allocator.free(message);
         if (self.expanded_messages.len > 0) allocator.free(self.expanded_messages);
         if (self.model_name_owned and self.model_name != null) allocator.free(self.model_name.?);
@@ -30,6 +37,7 @@ pub const PreparedCliRuntime = struct {
         if (self.model_error) |message| allocator.free(message);
         allocator.free(self.session_dir);
         allocator.free(self.system_prompt);
+        allocator.free(self.current_date);
         context_files_mod.deinitContextFiles(allocator, self.context_files);
         self.resource_bundle.deinit(allocator);
         self.runtime_config.deinit();
@@ -43,7 +51,7 @@ pub fn prepareCliRuntime(
     env_map: *const std.process.Environ.Map,
     cwd: []const u8,
     options: *const cli.Args,
-    selected_tools: ?[]const []const u8,
+    selected_tools: tool_selection.ToolSelection,
 ) !PreparedCliRuntime {
     var runtime_config = try config_mod.loadRuntimeConfigWithOptions(
         allocator,
@@ -71,6 +79,39 @@ pub fn prepareCliRuntime(
     });
     errdefer resource_bundle.deinit(allocator);
 
+    var extension_contributions = try collectExtensionBootstrapContributions(
+        allocator,
+        io,
+        env_map,
+        cwd,
+        &runtime_config,
+        resource_bundle.extensions,
+        selected_tools,
+    );
+    errdefer extension_contributions.deinit();
+
+    if (extension_contributions.resource_discoveries.len > 0) {
+        const discovered_bundle = try resources_mod.loadResourceBundle(allocator, io, .{
+            .cwd = cwd,
+            .agent_dir = runtime_config.agent_dir,
+            .global = settingsResources(runtime_config.global_settings),
+            .project = settingsResources(runtime_config.project_settings),
+            .cli_extensions = options.extensions orelse &.{},
+            .cli_skills = options.skills orelse &.{},
+            .cli_prompts = options.prompt_templates orelse &.{},
+            .cli_themes = options.themes orelse &.{},
+            .env_map = env_map,
+            .include_default_extensions = !options.no_extensions,
+            .include_default_skills = !options.no_skills,
+            .include_default_prompts = !options.no_prompt_templates,
+            .include_default_themes = !options.no_themes,
+            .extension_discoveries = extension_contributions.resource_discoveries,
+        });
+        resource_bundle.deinit(allocator);
+        resource_bundle = discovered_bundle;
+    }
+    try appendProviderDiagnosticsToResourceBundle(allocator, &resource_bundle, extension_contributions.provider_diagnostics);
+
     const context_files = if (options.no_context_files)
         try allocator.dupe(context_files_mod.ContextFile, &.{})
     else
@@ -78,7 +119,7 @@ pub fn prepareCliRuntime(
     errdefer context_files_mod.deinitContextFiles(allocator, context_files);
 
     const current_date = try currentDateString(allocator, io);
-    defer allocator.free(current_date);
+    errdefer allocator.free(current_date);
 
     const initial_model = try selectInitialModel(allocator, env_map, &runtime_config, options);
     const provider_name = initial_model.provider_name;
@@ -93,7 +134,7 @@ pub fn prepareCliRuntime(
         .current_date = current_date,
         .custom_prompt = options.system_prompt,
         .append_prompts = options.append_system_prompt orelse &.{},
-        .selected_tools = selected_tools,
+        .tool_selection = selected_tools,
         .context_files = context_files,
         .skills = resource_bundle.skills,
     });
@@ -116,6 +157,7 @@ pub fn prepareCliRuntime(
         .resource_bundle = resource_bundle,
         .context_files = context_files,
         .system_prompt = system_prompt,
+        .current_date = current_date,
         .session_dir = session_dir,
         .expanded_messages = expanded_messages,
         .provider_name = provider_name,
@@ -124,7 +166,111 @@ pub fn prepareCliRuntime(
         .model_warning = initial_model.warning,
         .model_error = initial_model.error_message,
         .thinking_level = thinking_level,
+        .extension_contributions = extension_contributions,
     };
+}
+
+fn collectExtensionBootstrapContributions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    runtime_config: *const config_mod.RuntimeConfig,
+    extensions: []const resources_mod.LoadedExtension,
+    selected_tools: tool_selection.ToolSelection,
+) !tool_adapters.ExtensionBootstrapContributions {
+    if (extensions.len == 0) {
+        return .{ .allocator = allocator };
+    }
+
+    var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
+    var built_tools = try tool_adapters.buildAgentToolsWithExtensionsSelection(allocator, &app_context, selected_tools, .{
+        .extensions = extensions,
+        .env_map = env_map,
+        .cwd = cwd,
+        .io = io,
+        .runtime_config = runtime_config,
+        .start_without_tools = true,
+    });
+    defer built_tools.deinit();
+
+    return try tool_adapters.registerExtensionProvidersAndCollectResources(allocator, &built_tools, extensions);
+}
+
+fn appendProviderDiagnosticsToResourceBundle(
+    allocator: std.mem.Allocator,
+    resource_bundle: *resources_mod.ResourceBundle,
+    provider_diagnostics: []const tool_adapters.ProviderCollisionDiagnostic,
+) !void {
+    if (provider_diagnostics.len == 0) return;
+
+    const existing_len = resource_bundle.diagnostics.len;
+    const diagnostics = try allocator.alloc(resources_mod.Diagnostic, existing_len + provider_diagnostics.len);
+    @memcpy(diagnostics[0..existing_len], resource_bundle.diagnostics);
+    var initialized = existing_len;
+    errdefer {
+        for (diagnostics[existing_len..initialized]) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(diagnostics);
+    }
+
+    for (provider_diagnostics) |diagnostic| {
+        diagnostics[initialized] = try providerCollisionResourceDiagnostic(allocator, diagnostic);
+        initialized += 1;
+    }
+
+    allocator.free(resource_bundle.diagnostics);
+    resource_bundle.diagnostics = diagnostics;
+}
+
+fn providerCollisionResourceDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostic: tool_adapters.ProviderCollisionDiagnostic,
+) !resources_mod.Diagnostic {
+    const kind = try allocator.dupe(u8, diagnostic.code);
+    errdefer allocator.free(kind);
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "extension provider diagnostic code={s} severity={s} extensionId={s} source={s} providerId={s} conflictKind={s} conflictWith={s}: {s}",
+        .{
+            diagnostic.code,
+            diagnostic.severity,
+            diagnostic.source_path,
+            diagnostic.source_path,
+            diagnostic.provider_id,
+            diagnostic.conflict_kind,
+            diagnostic.conflict_with,
+            diagnostic.message,
+        },
+    );
+    errdefer allocator.free(message);
+    const path = try allocator.dupe(u8, diagnostic.extension_path);
+    return .{
+        .kind = kind,
+        .message = message,
+        .path = path,
+    };
+}
+
+pub fn refreshSystemPromptWithActiveTools(
+    allocator: std.mem.Allocator,
+    prepared: *PreparedCliRuntime,
+    cwd: []const u8,
+    options: *const cli.Args,
+    selected_tools: tool_selection.ToolSelection,
+    active_tools: []const agent.AgentTool,
+) !void {
+    const next_system_prompt = try coding_agent.buildSystemPrompt(allocator, .{
+        .cwd = cwd,
+        .current_date = prepared.current_date,
+        .custom_prompt = options.system_prompt,
+        .append_prompts = options.append_system_prompt orelse &.{},
+        .tool_selection = selected_tools,
+        .active_tools = active_tools,
+        .context_files = prepared.context_files,
+        .skills = prepared.resource_bundle.skills,
+    });
+    allocator.free(prepared.system_prompt);
+    prepared.system_prompt = next_system_prompt;
 }
 
 pub fn runtimeConfigLoadOptions(
@@ -360,13 +506,58 @@ test "prepareCliRuntime resolves provider-prefixed CLI model and thinking suffix
     var args = try cli.parseArgs(allocator, &.{ "--model", "faux/faux-1:high" });
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, .{});
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqualStrings("faux", prepared.provider_name);
     try std.testing.expectEqualStrings("faux-1", prepared.model_name.?);
     try std.testing.expectEqual(agent.ThinkingLevel.high, prepared.thinking_level);
     try std.testing.expect(prepared.model_error == null);
+}
+
+test "refreshSystemPromptWithActiveTools advertises no-builtin extension tools" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var args = try cli.parseArgs(allocator, &.{"--no-builtin-tools"});
+    defer args.deinit(allocator);
+
+    const selected_tools = tool_selection.ToolSelection.fromCli(false, true, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, selected_tools);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Available tools:\n(none)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "- read: Read file contents") == null);
+
+    var schema = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"]}",
+        .{},
+    );
+    defer schema.deinit();
+    const active_tool = agent.AgentTool{
+        .name = "ext-echo",
+        .description = "Process echo",
+        .label = "Ext Echo",
+        .parameters = schema.value,
+    };
+
+    try refreshSystemPromptWithActiveTools(
+        allocator,
+        &prepared,
+        "/tmp/project",
+        &args,
+        selected_tools,
+        &.{active_tool},
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "- ext-echo: Process echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "\"value\":{\"type\":\"string\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "- read: Read file contents") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prepared.system_prompt, "Available tools:\n(none)") == null);
 }
 
 test "prepareCliRuntime reports missing CLI model without provider" {
@@ -378,9 +569,156 @@ test "prepareCliRuntime reports missing CLI model without provider" {
     var args = try cli.parseArgs(allocator, &.{ "--model", "definitely-not-a-real-model" });
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, .{});
     defer prepared.deinit(allocator);
 
     try std.testing.expect(prepared.model_error != null);
     try std.testing.expect(std.mem.indexOf(u8, prepared.model_error.?, "not found") != null);
+}
+
+test "prepareCliRuntime surfaces extension provider collision diagnostics through resource diagnostics" {
+    const allocator = std.testing.allocator;
+    defer ai.model_registry.resetForTesting();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+
+    const valid_path = try makeRuntimePrepTestPath(allocator, tmp, "valid-provider.sh");
+    defer allocator.free(valid_path);
+    const duplicate_a_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-a-provider.sh");
+    defer allocator.free(duplicate_a_path);
+    const duplicate_b_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-b-provider.sh");
+    defer allocator.free(duplicate_b_path);
+    const builtin_path = try makeRuntimePrepTestPath(allocator, tmp, "builtin-provider.sh");
+    defer allocator.free(builtin_path);
+
+    try writeRuntimePrepProviderScript(&tmp, allocator, "valid-provider.sh", valid_path, "ext-valid-provider", "Valid Provider", "valid-model", "Valid Model", "http://localhost:4521/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-a-provider.sh", duplicate_a_path, "ext-colliding-provider", "Duplicate A", "dup-a-model", "Duplicate A Model", "http://localhost:4522/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-b-provider.sh", duplicate_b_path, "ext-colliding-provider", "Duplicate B", "dup-b-model", "Duplicate B Model", "http://localhost:4523/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "builtin-provider.sh", builtin_path, "openai", "Builtin Collision", "shadow-gpt", "Shadow GPT", "http://localhost:4524/v1");
+
+    const project_dir = try makeRuntimePrepTestPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try makeRuntimePrepTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+
+    const valid_key = try temporaryRuntimePrepPolicyKey(allocator, valid_path);
+    defer allocator.free(valid_key);
+    const duplicate_a_key = try temporaryRuntimePrepPolicyKey(allocator, duplicate_a_path);
+    defer allocator.free(duplicate_a_key);
+    const duplicate_b_key = try temporaryRuntimePrepPolicyKey(allocator, duplicate_b_path);
+    defer allocator.free(duplicate_b_key);
+    const builtin_key = try temporaryRuntimePrepPolicyKey(allocator, builtin_path);
+    defer allocator.free(builtin_key);
+
+    var settings_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer settings_writer.deinit();
+    try settings_writer.writer.print(
+        "{{\n" ++
+            "  \"defaultProvider\": \"faux\",\n" ++
+            "  \"defaultModel\": \"faux-1\",\n" ++
+            "  \"extensionPolicies\": {{\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"] }},\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"] }},\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"] }},\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"] }}\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{ valid_key, duplicate_a_key, duplicate_b_key, builtin_key },
+    );
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/settings.json", .data = settings_writer.written() });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("PI_M1_EXTENSION_HOST_RUNTIME", "/bin/sh");
+    try env_map.put("PI_M1_EXTENSION_DRAIN_TIMEOUT_MS", "1000");
+    try env_map.put("PI_M2_EXTENSION_STARTUP_TIMEOUT_MS", "500");
+
+    var args = try cli.parseArgs(allocator, &.{
+        "--offline",
+        "--extension",
+        valid_path,
+        "--extension",
+        duplicate_a_path,
+        "--extension",
+        duplicate_b_path,
+        "--extension",
+        builtin_path,
+    });
+    defer args.deinit(allocator);
+
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, project_dir, &args, .{});
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), prepared.extension_contributions.?.provider_names.len);
+    try std.testing.expectEqualStrings("ext-valid-provider", prepared.extension_contributions.?.provider_names[0]);
+    try std.testing.expectEqual(@as(usize, 3), prepared.extension_contributions.?.provider_diagnostics.len);
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.duplicate_id", "providerId=ext-colliding-provider"));
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.builtin_collision", "providerId=openai"));
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.duplicate_id", "extensionId="));
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.duplicate_id", "source="));
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.duplicate_id", "conflictKind=duplicate_extension_provider"));
+    try std.testing.expect(providerDiagnosticResourceContains(prepared.resource_bundle.diagnostics, "extension_provider.builtin_collision", "conflictKind=builtin_provider"));
+}
+
+fn providerDiagnosticResourceContains(diagnostics: []const resources_mod.Diagnostic, kind: []const u8, needle: []const u8) bool {
+    for (diagnostics) |diagnostic| {
+        if (!std.mem.eql(u8, diagnostic.kind, kind)) continue;
+        if (std.mem.indexOf(u8, diagnostic.message, needle) != null) return true;
+    }
+    return false;
+}
+
+fn makeRuntimePrepTestPath(
+    allocator: std.mem.Allocator,
+    tmp: std.testing.TmpDir,
+    sub_path: []const u8,
+) ![]u8 {
+    const base = try tmp.dir.realpathAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(base);
+    if (std.mem.eql(u8, sub_path, ".")) return try allocator.dupe(u8, base);
+    return try std.fs.path.join(allocator, &.{ base, sub_path });
+}
+
+fn writeRuntimePrepProviderScript(
+    tmp: *std.testing.TmpDir,
+    allocator: std.mem.Allocator,
+    sub_path: []const u8,
+    extension_path: []const u8,
+    provider_id: []const u8,
+    display_name: []const u8,
+    model_id: []const u8,
+    model_name: []const u8,
+    base_url: []const u8,
+) !void {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init\n" ++
+            "printf '{{\"type\":\"ready\"}}\\n'\n" ++
+            "printf '{{\"type\":\"register_provider\",\"name\":\"{s}\",\"displayName\":\"{s}\",\"api\":\"openai-completions\",\"baseUrl\":\"{s}\",\"models\":[{{\"id\":\"{s}\",\"name\":\"{s}\"}}],\"extensionPath\":\"{s}\"}}\\n'\n" ++
+            "while IFS= read -r line; do\n" ++
+            "  case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac\n" ++
+            "done\n",
+        .{ provider_id, display_name, base_url, model_id, model_name, extension_path },
+    );
+    defer allocator.free(script);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = script });
+}
+
+fn temporaryRuntimePrepPolicyKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const source_info = resources_mod.SourceInfo{
+        .path = @constCast(path),
+        .source = @constCast("local"),
+        .scope = .temporary,
+        .origin = .top_level,
+        .base_dir = @constCast(std.fs.path.dirname(path) orelse "."),
+    };
+    return extension_runtime.typeScriptPolicyLookupKey(allocator, .{
+        .configured_path = path,
+        .resolved_path = path,
+        .source_info = source_info,
+    });
 }

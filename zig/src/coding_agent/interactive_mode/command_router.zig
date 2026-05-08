@@ -242,7 +242,7 @@ pub fn handleSlashCommand(
         },
         .reload => {
             if (try blockDuringActivePrompt(prompt_worker_active, app_state, "wait for the current response to finish before reloading resources")) return;
-            try slash_commands.handleReloadSlashCommand(allocator, io, env_map, options.cwd, app_state, live_resources);
+            try slash_commands.handleReloadSlashCommand(allocator, io, env_map, options.cwd, session, app_state, live_resources);
         },
         .@"export" => {
             if (try blockDuringActivePrompt(prompt_worker_active, app_state, "wait for the current response to finish before exporting the session")) return;

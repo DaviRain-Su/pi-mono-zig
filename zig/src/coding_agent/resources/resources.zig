@@ -16,6 +16,33 @@ pub const SourceOrigin = enum {
     package,
 };
 
+pub const SourceProvenanceBinding = struct {
+    lock_entry_key: []u8,
+    source_identity: []u8,
+    package_root: []u8,
+    package_root_sha256: []u8,
+    artifact_sha256: ?[]u8 = null,
+
+    pub fn clone(self: SourceProvenanceBinding, allocator: std.mem.Allocator) !SourceProvenanceBinding {
+        return .{
+            .lock_entry_key = try allocator.dupe(u8, self.lock_entry_key),
+            .source_identity = try allocator.dupe(u8, self.source_identity),
+            .package_root = try allocator.dupe(u8, self.package_root),
+            .package_root_sha256 = try allocator.dupe(u8, self.package_root_sha256),
+            .artifact_sha256 = if (self.artifact_sha256) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+
+    pub fn deinit(self: *SourceProvenanceBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.lock_entry_key);
+        allocator.free(self.source_identity);
+        allocator.free(self.package_root);
+        allocator.free(self.package_root_sha256);
+        if (self.artifact_sha256) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const ResourceKind = enum {
     extension,
     skill,
@@ -69,6 +96,7 @@ pub const SourceInfo = struct {
     scope: SourceScope,
     origin: SourceOrigin,
     base_dir: ?[]u8 = null,
+    provenance: ?SourceProvenanceBinding = null,
 
     pub fn clone(self: SourceInfo, allocator: std.mem.Allocator) !SourceInfo {
         return .{
@@ -77,6 +105,7 @@ pub const SourceInfo = struct {
             .scope = self.scope,
             .origin = self.origin,
             .base_dir = if (self.base_dir) |value| try allocator.dupe(u8, value) else null,
+            .provenance = if (self.provenance) |value| try value.clone(allocator) else null,
         };
     }
 
@@ -84,6 +113,7 @@ pub const SourceInfo = struct {
         allocator.free(self.path);
         allocator.free(self.source);
         if (self.base_dir) |value| allocator.free(value);
+        if (self.provenance) |*value| value.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -92,6 +122,7 @@ pub const ResolvedResource = struct {
     path: []u8,
     enabled: bool,
     source_info: SourceInfo,
+    discovery_index: usize = 0,
 
     pub fn deinit(self: *ResolvedResource, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -178,6 +209,14 @@ pub const SettingsResources = struct {
     prompts: ?[]const []const u8 = null,
     themes: ?[]const []const u8 = null,
     theme: ?[]const u8 = null,
+};
+
+pub const ExtensionDiscoveredResources = struct {
+    extension_path: []const u8,
+    source_info: SourceInfo,
+    skill_paths: []const []const u8 = &.{},
+    prompt_paths: []const []const u8 = &.{},
+    theme_paths: []const []const u8 = &.{},
 };
 
 pub const LoadedExtension = struct {
@@ -280,6 +319,7 @@ pub const ResolveResourcesOptions = struct {
     include_default_skills: bool = true,
     include_default_prompts: bool = true,
     include_default_themes: bool = true,
+    extension_discoveries: []const ExtensionDiscoveredResources = &.{},
 };
 
 pub fn resolveConfiguredResources(
@@ -367,6 +407,8 @@ pub fn resolveConfiguredResources(
     if (options.include_default_prompts) try addAutoDiscovered(allocator, io, &prompts, &diagnostics, .prompt, .user, options.agent_dir);
     if (options.include_default_themes) try addAutoDiscovered(allocator, io, &themes, &diagnostics, .theme, .user, options.agent_dir);
 
+    try addExtensionDiscoveredResources(allocator, io, &skills, &prompts, &themes, &diagnostics, options.extension_discoveries);
+
     try addLocalEntries(allocator, io, &extensions, &diagnostics, if (options.cli_extensions.len > 0) options.cli_extensions else null, .extension, .{
         .source = "local",
         .scope = .temporary,
@@ -432,6 +474,29 @@ pub fn resolveConfiguredLockedWasmPackages(
         .packages = try packages.toOwnedSlice(allocator),
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
+}
+
+fn addExtensionDiscoveredResources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    skills: *std.ArrayList(ResolvedResource),
+    prompts: *std.ArrayList(ResolvedResource),
+    themes: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    discoveries: []const ExtensionDiscoveredResources,
+) !void {
+    for (discoveries) |discovery| {
+        const base_dir = discovery.source_info.base_dir orelse std.fs.path.dirname(discovery.extension_path) orelse ".";
+        const seed = MetadataSeed{
+            .source = "extension",
+            .scope = discovery.source_info.scope,
+            .origin = discovery.source_info.origin,
+            .base_dir = base_dir,
+        };
+        try collectEntriesFromBase(allocator, io, skills, diagnostics, discovery.skill_paths, .skill, seed);
+        try collectEntriesFromBase(allocator, io, prompts, diagnostics, discovery.prompt_paths, .prompt, seed);
+        try collectEntriesFromBase(allocator, io, themes, diagnostics, discovery.theme_paths, .theme, seed);
+    }
 }
 
 pub fn loadResourceBundle(
@@ -906,6 +971,12 @@ const MetadataSeed = struct {
     scope: SourceScope,
     origin: SourceOrigin,
     base_dir: []const u8,
+    provenance: ?SourceProvenanceBinding = null,
+
+    fn deinit(self: *MetadataSeed, allocator: std.mem.Allocator) void {
+        if (self.provenance) |*value| value.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 fn addPackageSources(
@@ -941,12 +1012,15 @@ fn addPackageSources(
                 const resolved = try resolvePath(allocator, base_dir, local.path);
                 defer allocator.free(resolved);
                 if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, resolved, pkg.source, scope, cwd, agent_dir)) continue;
-                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, resolved, filter, .{
+                var seed = MetadataSeed{
                     .source = pkg.source,
                     .scope = scope,
                     .origin = .package,
                     .base_dir = resolved,
-                });
+                    .provenance = try readPackageProvenanceBinding(allocator, io, scope, cwd, agent_dir, pkg.source, resolved),
+                };
+                defer seed.deinit(allocator);
+                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, resolved, filter, seed);
             },
             .npm => |npm| {
                 const install_path = try npmInstallPath(allocator, scope, cwd, agent_dir, npm.name);
@@ -956,12 +1030,15 @@ fn addPackageSources(
                     continue;
                 }
                 if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, install_path, pkg.source, scope, cwd, agent_dir)) continue;
-                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, .{
+                var seed = MetadataSeed{
                     .source = pkg.source,
                     .scope = scope,
                     .origin = .package,
                     .base_dir = install_path,
-                });
+                    .provenance = try readPackageProvenanceBinding(allocator, io, scope, cwd, agent_dir, pkg.source, install_path),
+                };
+                defer seed.deinit(allocator);
+                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, seed);
             },
             .git => |git| {
                 const install_path = try gitInstallPath(allocator, scope, cwd, agent_dir, git.normalized);
@@ -971,12 +1048,15 @@ fn addPackageSources(
                     continue;
                 }
                 if (!try verifyLockedWasmPackageForResources(allocator, io, diagnostics, install_path, pkg.source, scope, cwd, agent_dir)) continue;
-                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, .{
+                var seed = MetadataSeed{
                     .source = pkg.source,
                     .scope = scope,
                     .origin = .package,
                     .base_dir = install_path,
-                });
+                    .provenance = try readPackageProvenanceBinding(allocator, io, scope, cwd, agent_dir, pkg.source, install_path),
+                };
+                defer seed.deinit(allocator);
+                try collectPackageResourceRoot(allocator, io, extensions, skills, prompts, themes, diagnostics, install_path, filter, seed);
             },
         }
     }
@@ -1303,6 +1383,99 @@ fn collectPackageResourceRoot(
     try collectKindFromPackage(allocator, io, themes, diagnostics, package_root, .theme, filter.forKind(.theme), manifest.theme_entries, seed);
 }
 
+const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
+
+fn readPackageProvenanceBinding(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+    source: []const u8,
+    package_root: []const u8,
+) !?SourceProvenanceBinding {
+    if (scope == .temporary) return null;
+    const lock_path = try extensionProvenanceLockfilePath(allocator, scope, cwd, agent_dir);
+    defer allocator.free(lock_path);
+    const lock_text = std.Io.Dir.readFileAlloc(.cwd(), io, lock_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(lock_text);
+
+    const key = try provenanceEntryKeyForSource(allocator, source, package_root);
+    defer allocator.free(key);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, lock_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const entries = parsed.value.object.get("entries") orelse return null;
+    if (entries != .array) return null;
+    for (entries.array.items) |entry| {
+        if (entry != .object) continue;
+        const entry_key = jsonStringField(entry.object, "key") orelse continue;
+        if (!std.mem.eql(u8, entry_key, key)) continue;
+        const source_object = entry.object.get("source") orelse continue;
+        if (source_object != .object) continue;
+        const source_identity = jsonStringField(source_object.object, "identity") orelse continue;
+        const entry_package_root = jsonStringField(entry.object, "packageRoot") orelse package_root;
+        const digests = entry.object.get("digests") orelse continue;
+        if (digests != .object) continue;
+        const package_root_sha256 = jsonStringField(digests.object, "packageRootSha256") orelse continue;
+        const artifact_sha256 = if (entry.object.get("artifact")) |artifact| blk: {
+            if (artifact != .object) break :blk null;
+            break :blk jsonStringField(artifact.object, "sha256");
+        } else null;
+        return .{
+            .lock_entry_key = try allocator.dupe(u8, entry_key),
+            .source_identity = try allocator.dupe(u8, source_identity),
+            .package_root = try allocator.dupe(u8, entry_package_root),
+            .package_root_sha256 = try allocator.dupe(u8, package_root_sha256),
+            .artifact_sha256 = if (artifact_sha256) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+    return null;
+}
+
+fn extensionProvenanceLockfilePath(
+    allocator: std.mem.Allocator,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) ![]u8 {
+    return switch (scope) {
+        .project => std.fs.path.join(allocator, &.{ cwd, ".pi", EXTENSION_PROVENANCE_LOCKFILE_NAME }),
+        .user => std.fs.path.join(allocator, &.{ agent_dir, EXTENSION_PROVENANCE_LOCKFILE_NAME }),
+        .temporary => std.fs.path.join(allocator, &.{ cwd, ".pi", "tmp", EXTENSION_PROVENANCE_LOCKFILE_NAME }),
+    };
+}
+
+fn provenanceEntryKeyForSource(allocator: std.mem.Allocator, source: []const u8, package_root: []const u8) ![]u8 {
+    return switch (parseSource(source)) {
+        .npm => |npm| std.fmt.allocPrint(allocator, "npm:{s}", .{npm.name}),
+        .git => |git| std.fmt.allocPrint(allocator, "git:{s}", .{git.normalized}),
+        .local => {
+            const identity = realpathAlloc(allocator, package_root) catch try allocator.dupe(u8, package_root);
+            defer allocator.free(identity);
+            return std.fmt.allocPrint(allocator, "local:{s}", .{identity});
+        },
+    };
+}
+
+fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return error.FileNotFound;
+    return allocator.dupe(u8, std.mem.span(resolved));
+}
+
+fn jsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
 fn collectKindFromPackage(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1440,6 +1613,11 @@ fn collectEntriesFromBase(
     kind: ResourceKind,
     seed: MetadataSeed,
 ) !void {
+    if (isExplicitCliResource(kind, seed)) {
+        try collectExplicitExtensionEntries(allocator, io, target, diagnostics, entries, seed);
+        return;
+    }
+
     for (entries) |entry| {
         const resolved = try resolvePath(allocator, seed.base_dir, entry);
         defer allocator.free(resolved);
@@ -1448,6 +1626,51 @@ fn collectEntriesFromBase(
             continue;
         }
         try collectPaths(allocator, io, target, diagnostics, resolved, kind, true, seed);
+    }
+}
+
+fn collectExplicitExtensionEntries(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: *std.ArrayList(ResolvedResource),
+    diagnostics: *std.ArrayList(Diagnostic),
+    entries: []const []const u8,
+    seed: MetadataSeed,
+) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var iterator = seen.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.key_ptr.*);
+        seen.deinit();
+    }
+
+    for (entries) |entry| {
+        const resolved = try resolvePath(allocator, seed.base_dir, entry);
+        defer allocator.free(resolved);
+
+        if (seen.contains(resolved)) {
+            try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "duplicate explicit --extension path skipped", resolved));
+            continue;
+        }
+        const seen_key = try allocator.dupe(u8, resolved);
+        errdefer allocator.free(seen_key);
+        try seen.put(seen_key, {});
+
+        if (!pathExists(io, resolved)) {
+            try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "explicit --extension path does not exist", resolved));
+            continue;
+        }
+
+        const stat = std.Io.Dir.statFile(.cwd(), io, resolved, .{}) catch {
+            try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "failed to stat explicit --extension path", resolved));
+            continue;
+        };
+        if (stat.kind != .directory and (stat.kind != .file or !hasSupportedExtensionFile(resolved))) {
+            try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "explicit --extension path is not a supported extension file or directory", resolved));
+            continue;
+        }
+
+        try collectPaths(allocator, io, target, diagnostics, resolved, .extension, true, seed);
     }
 }
 
@@ -1614,7 +1837,9 @@ fn appendResolvedResource(
             .scope = seed.scope,
             .origin = seed.origin,
             .base_dir = try allocator.dupe(u8, seed.base_dir),
+            .provenance = if (seed.provenance) |value| try value.clone(allocator) else null,
         },
+        .discovery_index = target.items.len,
     });
 }
 
@@ -1635,9 +1860,25 @@ fn sortResolved(items: []ResolvedResource) void {
             const left_rank = precedence(lhs);
             const right_rank = precedence(rhs);
             if (left_rank != right_rank) return left_rank < right_rank;
+            if (isExplicitCliResolvedResource(lhs) and isExplicitCliResolvedResource(rhs)) {
+                return lhs.discovery_index < rhs.discovery_index;
+            }
             return std.mem.lessThan(u8, lhs.path, rhs.path);
         }
     }.lessThan);
+}
+
+fn isExplicitCliResource(kind: ResourceKind, seed: MetadataSeed) bool {
+    return kind == .extension and
+        seed.scope == .temporary and
+        seed.origin == .top_level and
+        std.mem.eql(u8, seed.source, "local");
+}
+
+fn isExplicitCliResolvedResource(resource: ResolvedResource) bool {
+    return resource.source_info.scope == .temporary and
+        resource.source_info.origin == .top_level and
+        std.mem.eql(u8, resource.source_info.source, "local");
 }
 
 const Manifest = struct {
@@ -2626,6 +2867,54 @@ fn findResolvedResource(items: []const ResolvedResource, path: []const u8) ?Reso
     return null;
 }
 
+test "explicit extension paths preserve order and diagnose invalid entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/first");
+    try tmp.dir.createDirPath(std.testing.io, "repo/second");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/first/index.js", .data = "export default {};\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/second/index.js", .data = "export default {};\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/not-extension.txt", .data = "nope\n" });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const first = try makeTmpPath(allocator, tmp, "repo/first");
+    defer allocator.free(first);
+    const second = try makeTmpPath(allocator, tmp, "repo/second");
+    defer allocator.free(second);
+    const missing = try makeTmpPath(allocator, tmp, "repo/missing");
+    defer allocator.free(missing);
+    const invalid_file = try makeTmpPath(allocator, tmp, "repo/not-extension.txt");
+    defer allocator.free(invalid_file);
+
+    var resolved = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = cwd,
+        .cli_extensions = &.{ second, missing, first, second, invalid_file },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), resolved.extensions.len);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.extensions[0].path, "second/index.js"));
+    try std.testing.expect(std.mem.endsWith(u8, resolved.extensions[1].path, "first/index.js"));
+    try std.testing.expect(resourceDiagnosticContains(resolved.diagnostics, "explicit --extension path does not exist"));
+    try std.testing.expect(resourceDiagnosticContains(resolved.diagnostics, "duplicate explicit --extension path skipped"));
+    try std.testing.expect(resourceDiagnosticContains(resolved.diagnostics, "explicit --extension path is not a supported extension file or directory"));
+}
+
+fn resourceDiagnosticContains(diagnostics: []const Diagnostic, needle: []const u8) bool {
+    for (diagnostics) |diagnostic| {
+        if (std.mem.indexOf(u8, diagnostic.message, needle) != null) return true;
+    }
+    return false;
+}
+
 test "resolveConfiguredResources loads local, npm, and git resource sources" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3174,6 +3463,82 @@ test "loadResourceBundle exposes built-in dark light and codex themes" {
     try std.testing.expect(findThemeIndex(bundle.themes, "dark") != null);
     try std.testing.expect(findThemeIndex(bundle.themes, "light") != null);
     try std.testing.expect(findThemeIndex(bundle.themes, "codex") != null);
+}
+
+test "loadResourceBundle merges extension discovered skills prompts and themes with normal lookup" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/ext-skills/review");
+    try tmp.dir.createDirPath(std.testing.io, "repo/ext-prompts");
+    try tmp.dir.createDirPath(std.testing.io, "repo/ext-themes");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/ext-skills/review/SKILL.md",
+        .data =
+        \\---
+        \\name: ext-review
+        \\description: Extension review skill
+        \\---
+        \\Use extension review instructions.
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/ext-prompts/ext-review.md",
+        .data = "Run the extension review prompt.",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/ext-themes/ext-theme.json",
+        .data =
+        \\{
+        \\  "name": "ext-theme",
+        \\  "base": "dark",
+        \\  "colors": { "primary": "#abcdef" }
+        \\}
+        ,
+    });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const extension_path = try makeTmpPath(allocator, tmp, "repo/extensions/discoverer.js");
+    defer allocator.free(extension_path);
+    var source_info = SourceInfo{
+        .path = try allocator.dupe(u8, extension_path),
+        .source = try allocator.dupe(u8, "extension"),
+        .scope = .project,
+        .origin = .top_level,
+        .base_dir = try allocator.dupe(u8, cwd),
+    };
+    defer source_info.deinit(allocator);
+
+    const discovery = ExtensionDiscoveredResources{
+        .extension_path = extension_path,
+        .source_info = source_info,
+        .skill_paths = &.{"ext-skills"},
+        .prompt_paths = &.{"ext-prompts"},
+        .theme_paths = &.{"ext-themes"},
+    };
+
+    var bundle = try loadResourceBundle(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .runtime_theme = "ext-theme",
+        .extension_discoveries = &.{discovery},
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer bundle.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), bundle.skills.len);
+    try std.testing.expectEqualStrings("ext-review", bundle.skills[0].name);
+    try std.testing.expectEqualStrings("Extension review skill", bundle.skills[0].description);
+    try std.testing.expectEqual(@as(usize, 1), bundle.prompt_templates.len);
+    try std.testing.expectEqualStrings("ext-review", bundle.prompt_templates[0].name);
+    try std.testing.expectEqualStrings("ext-theme", bundle.selectedTheme().name);
+    try std.testing.expectEqualStrings("#abcdef", bundle.selectedTheme().colors.primary.?);
 }
 
 test "loadResourceBundle collects malformed theme config errors" {

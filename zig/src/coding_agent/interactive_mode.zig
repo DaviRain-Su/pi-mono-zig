@@ -25,10 +25,12 @@ const slash_commands = @import("interactive_mode/slash_commands.zig");
 const auth_flow_mod = @import("interactive_mode/auth_flow.zig");
 const session_lifecycle = @import("interactive_mode/session_lifecycle.zig");
 const input_dispatch = @import("interactive_mode/input_dispatch.zig");
+const system_prompt_mod = @import("resources/system_prompt.zig");
 const clipboard_image = @import("interactive_mode/clipboard_image.zig");
 const tool_adapters = @import("interactive_mode/tool_adapters.zig");
 const session_bootstrap = @import("interactive_mode/session_bootstrap.zig");
 const extension_ui_bridge = @import("interactive_mode/extension_ui_bridge.zig");
+const extension_runtime = @import("extensions/extension_runtime.zig");
 
 pub const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 pub const LiveResources = shared.LiveResources;
@@ -133,6 +135,10 @@ pub const BuiltTools = tool_adapters.BuiltTools;
 pub const ToolBuildOptions = tool_adapters.ToolBuildOptions;
 pub const buildAgentTools = tool_adapters.buildAgentTools;
 pub const buildAgentToolsWithOptions = tool_adapters.buildAgentToolsWithOptions;
+pub const buildAgentToolsWithSelection = tool_adapters.buildAgentToolsWithSelection;
+pub const buildAgentToolsWithExtensions = tool_adapters.buildAgentToolsWithExtensions;
+pub const buildAgentToolsWithExtensionsSelection = tool_adapters.buildAgentToolsWithExtensionsSelection;
+pub const writeStartupDiagnostics = tool_adapters.writeStartupDiagnostics;
 pub const InteractiveBootstrap = session_bootstrap.InteractiveBootstrap;
 pub const bootstrapInteractiveState = session_bootstrap.bootstrapInteractiveState;
 pub const bootstrapInteractiveStateWithMissingCwd = session_bootstrap.bootstrapInteractiveStateWithMissingCwd;
@@ -163,6 +169,84 @@ pub const handleNameSlashCommand = slash_commands.handleNameSlashCommand;
 pub const handleLabelSlashCommand = slash_commands.handleLabelSlashCommand;
 pub const resolveCurrentLabelTargetId = slash_commands.resolveCurrentLabelTargetId;
 pub const handleCompactSlashCommand = slash_commands.handleCompactSlashCommand;
+
+const ReloadExtensionToolsContext = struct {
+    bootstrap: *session_bootstrap.InteractiveBootstrap,
+    app_context: *AppContext,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+};
+
+fn reloadExtensionToolsForInteractiveMode(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    cwd: []const u8,
+    session: *session_mod.AgentSession,
+    live_resources: *LiveResources,
+) !void {
+    const reload_context: *ReloadExtensionToolsContext = @ptrCast(@alignCast(context.?));
+    const extensions = if (live_resources.owned_resource_bundle) |*bundle| bundle.extensions else &.{};
+    try tool_adapters.replaceAgentToolsForReload(
+        allocator,
+        reload_context.app_context,
+        session,
+        &reload_context.bootstrap.built_tools,
+        reload_context.options.selected_tools,
+        .{
+            .extensions = extensions,
+            .env_map = env_map,
+            .cwd = cwd,
+            .io = io,
+            .runtime_config = live_resources.runtime_config,
+        },
+    );
+
+    if (reload_context.options.current_date.len > 0) {
+        const next_system_prompt = try system_prompt_mod.buildSystemPrompt(allocator, .{
+            .cwd = cwd,
+            .current_date = reload_context.options.current_date,
+            .custom_prompt = reload_context.options.custom_prompt,
+            .append_prompts = reload_context.options.append_prompts,
+            .tool_selection = reload_context.options.selected_tools,
+            .active_tools = reload_context.bootstrap.built_tools.items,
+            .context_files = reload_context.options.context_files,
+            .skills = live_resources.skills,
+        });
+        errdefer allocator.free(next_system_prompt);
+        if (reload_context.bootstrap.owned_system_prompt) |previous| allocator.free(previous);
+        reload_context.bootstrap.owned_system_prompt = next_system_prompt;
+        session.agent.setSystemPrompt(next_system_prompt);
+    } else {
+        session.agent.setSystemPrompt(reload_context.options.system_prompt);
+    }
+
+    for (reload_context.bootstrap.built_tools.startup_diagnostics) |diagnostic| {
+        const message = try std.fmt.allocPrint(allocator, "Reload {s}", .{diagnostic.message});
+        defer allocator.free(message);
+        switch (diagnostic.severity) {
+            .info => try reload_context.app_state.appendInfo(message),
+            .warning, .@"error" => try reload_context.app_state.appendError(message),
+        }
+    }
+}
+
+fn appendExtensionStartupDiagnosticsToAppState(
+    allocator: std.mem.Allocator,
+    diagnostics: []const tool_adapters.ExtensionStartupDiagnostic,
+    app_state: *AppState,
+) !void {
+    for (diagnostics) |diagnostic| {
+        const message = try std.fmt.allocPrint(allocator, "Startup {s}", .{diagnostic.message});
+        defer allocator.free(message);
+        switch (diagnostic.severity) {
+            .info => try app_state.appendInfo(message),
+            .warning, .@"error" => try app_state.appendError(message),
+        }
+    }
+}
+
 pub const handleLoginSlashCommand = auth_flow_mod.handleLoginSlashCommand;
 pub const beginLoginFlow = auth_flow_mod.beginLoginFlow;
 pub const cancelAuthFlow = auth_flow_mod.cancelAuthFlow;
@@ -249,6 +333,12 @@ pub fn runInteractiveMode(
     };
     defer bootstrap.deinit();
 
+    if (bootstrap.built_tools.required_startup_failed) {
+        try tool_adapters.writeStartupDiagnostics(stderr_writer, bootstrap.built_tools.startup_diagnostics);
+        try stderr_writer.flush();
+        return 1;
+    }
+
     var app_state = try AppState.init(allocator, io);
     defer app_state.deinit();
     app_state.setToolOutputExpanded(options.verbose);
@@ -264,6 +354,7 @@ pub fn runInteractiveMode(
     defer clearSessionUiCallbacks(&bootstrap.session);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
+    try appendExtensionStartupDiagnosticsToAppState(allocator, bootstrap.built_tools.startup_diagnostics, &app_state);
     if (live_resources.runtime_config) |runtime_config| {
         try app_state.setThinkingBlockVisibility(runtime_config.hideThinkingBlock());
     }
@@ -338,6 +429,16 @@ pub fn runInteractiveMode(
     var extension_bridge = ExtensionUiBridge.init(allocator, io);
     defer extension_bridge.deinit();
     live_resources.extension_command_sink = extension_bridge.commandSink();
+    var reload_tools_context = ReloadExtensionToolsContext{
+        .bootstrap = &bootstrap,
+        .app_context = &app_context,
+        .options = options,
+        .app_state = &app_state,
+    };
+    live_resources.reload_extension_tools_sink = .{
+        .context = &reload_tools_context,
+        .callback = reloadExtensionToolsForInteractiveMode,
+    };
 
     var prompt_worker: PromptWorker = undefined;
     var prompt_worker_active = false;
@@ -4375,7 +4476,13 @@ test "reload slash command refreshes the selected theme from disk" {
         ,
     });
 
-    try handleReloadSlashCommand(allocator, std.testing.io, &env_map, cwd, &state, &live_resources);
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .system_prompt = "sys",
+    });
+    defer session.deinit();
+
+    try handleReloadSlashCommand(allocator, std.testing.io, &env_map, cwd, &session, &state, &live_resources);
 
     const reloaded_prompt = try live_resources.theme.?.applyAlloc(allocator, .prompt, "Input:");
     defer allocator.free(reloaded_prompt);
@@ -4383,7 +4490,197 @@ test "reload slash command refreshes the selected theme from disk" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("Reloaded keybindings, skills, prompts, and themes", state.status);
+    try std.testing.expectEqualStrings("Reloaded keybindings, extensions, skills, prompts, and themes", state.status);
+}
+
+test "reload preserves startup explicit extension sources" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "agent/settings.json",
+        .data =
+        \\{
+        \\  "defaultProvider": "faux",
+        \\  "defaultModel": "faux-1"
+        \\}
+        ,
+    });
+    try writeInteractiveRegisteringExtensionScript(&tmp, "explicit.js", "explicit-tool", "Explicit Tool");
+
+    const cwd = try makeInteractiveTestPath(allocator, tmp, ".");
+    defer allocator.free(cwd);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const explicit_path = try makeInteractiveTestPath(allocator, tmp, "explicit.js");
+    defer allocator.free(explicit_path);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, cwd);
+    defer runtime_config.deinit();
+
+    var live_resources = LiveResources.init(.{
+        .cwd = cwd,
+        .system_prompt = "sys",
+        .session_dir = agent_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+        .startup_cli_extensions = &.{explicit_path},
+        .include_default_extensions = false,
+    });
+    defer live_resources.deinit(allocator);
+
+    _ = try live_resources.reload(allocator, std.testing.io, &env_map, cwd);
+
+    const bundle = &live_resources.owned_resource_bundle.?;
+    try std.testing.expectEqual(@as(usize, 1), bundle.extensions.len);
+    try std.testing.expectEqualStrings(explicit_path, bundle.extensions[0].path);
+    try std.testing.expectEqual(resources_mod.SourceScope.temporary, bundle.extensions[0].source_info.scope);
+}
+
+test "reload slash command renders structured extension diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const parse_script =
+        "IFS= read -r init\n" ++
+        "printf '{\"type\":\"ready\"}\\n'\n" ++
+        "printf 'not-json\\n'\n" ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parse.js", .data = parse_script });
+    const runtime_script =
+        "IFS= read -r init\n" ++
+        "printf '{\"type\":\"ready\"}\\n'\n" ++
+        "printf '{\"type\":\"diagnostic\",\"category\":\"host_error\",\"severity\":\"error\",\"message\":\"runtime failed\"}\\n'\n" ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "runtime.js", .data = runtime_script });
+    try writeInteractiveRegisteringExtensionScript(&tmp, "denied.js", "denied-tool", "Denied Tool");
+
+    const cwd = try makeInteractiveTestPath(allocator, tmp, "project");
+    defer allocator.free(cwd);
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const parse_path = try makeInteractiveTestPath(allocator, tmp, "parse.js");
+    defer allocator.free(parse_path);
+    const runtime_path = try makeInteractiveTestPath(allocator, tmp, "runtime.js");
+    defer allocator.free(runtime_path);
+    const denied_path = try makeInteractiveTestPath(allocator, tmp, "denied.js");
+    defer allocator.free(denied_path);
+
+    const parse_key = try temporaryTypeScriptPolicyKey(allocator, parse_path);
+    defer allocator.free(parse_key);
+    const runtime_key = try temporaryTypeScriptPolicyKey(allocator, runtime_path);
+    defer allocator.free(runtime_key);
+    const denied_key = try temporaryTypeScriptPolicyKey(allocator, denied_path);
+    defer allocator.free(denied_key);
+    var settings_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer settings_writer.deinit();
+    try settings_writer.writer.print(
+        "{{\n" ++
+            "  \"defaultProvider\": \"faux\",\n" ++
+            "  \"defaultModel\": \"faux-1\",\n" ++
+            "  \"extensionPolicies\": {{\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"], \"required\": true }},\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [\"tool.use\"], \"required\": true }},\n" ++
+            "    \"{s}\": {{ \"approvedGrants\": [], \"required\": true }}\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{ parse_key, runtime_key, denied_key },
+    );
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "agent/settings.json", .data = settings_writer.written() });
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("PI_M1_EXTENSION_HOST_RUNTIME", "/bin/sh");
+    try env_map.put("PI_M1_EXTENSION_DRAIN_TIMEOUT_MS", "1000");
+    try env_map.put("PI_M2_EXTENSION_STARTUP_TIMEOUT_MS", "500");
+
+    var runtime_config = try config_mod.loadRuntimeConfig(allocator, std.testing.io, &env_map, cwd);
+    defer runtime_config.deinit();
+
+    var app_context = AppContext.init(cwd, std.testing.io);
+    var initial_tools = try buildAgentToolsWithExtensionsSelection(allocator, &app_context, .{}, .{
+        .extensions = &.{},
+        .env_map = &env_map,
+        .cwd = cwd,
+        .io = std.testing.io,
+        .runtime_config = &runtime_config,
+    });
+    errdefer initial_tools.deinit();
+
+    var current_provider = try provider_config.resolveProviderConfig(allocator, std.testing.io, &env_map, "faux", null, null, null);
+    errdefer current_provider.deinit(allocator);
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .system_prompt = "sys",
+        .model = current_provider.model,
+        .api_key = current_provider.api_key,
+        .tools = initial_tools.items,
+    });
+    errdefer session.deinit();
+
+    var bootstrap = session_bootstrap.InteractiveBootstrap{
+        .allocator = allocator,
+        .current_provider = current_provider,
+        .built_tools = initial_tools,
+        .session = session,
+    };
+    defer bootstrap.deinit();
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+    var live_resources = LiveResources.init(.{
+        .cwd = cwd,
+        .system_prompt = "sys",
+        .session_dir = agent_dir,
+        .provider = "faux",
+        .runtime_config = &runtime_config,
+        .startup_cli_extensions = &.{ parse_path, denied_path, runtime_path },
+        .include_default_extensions = false,
+    });
+    defer live_resources.deinit(allocator);
+
+    var reload_tools_context = ReloadExtensionToolsContext{
+        .bootstrap = &bootstrap,
+        .app_context = &app_context,
+        .options = .{
+            .cwd = cwd,
+            .system_prompt = "sys",
+            .session_dir = agent_dir,
+            .provider = "faux",
+            .selected_tools = .{},
+        },
+        .app_state = &state,
+    };
+    live_resources.reload_extension_tools_sink = .{
+        .context = &reload_tools_context,
+        .callback = reloadExtensionToolsForInteractiveMode,
+    };
+
+    try handleReloadSlashCommand(allocator, std.testing.io, &env_map, cwd, &bootstrap.session, &state, &live_resources);
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "Reload extension lifecycle"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "phase=parse"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "category=malformed_json"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "phase=policy"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "required=true"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "phase=runtime"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "category=host_error"));
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expectEqualStrings("Reloaded keybindings, extensions, skills, prompts, and themes", state.status);
 }
 
 test "handleInputKey shows session stats for slash session command" {
@@ -6174,6 +6471,46 @@ test "handleLogoutSlashCommand removes stored auth for the current provider" {
     const auth_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, auth_path, allocator, .limited(1024 * 1024));
     defer allocator.free(auth_bytes);
     try std.testing.expect(std.mem.indexOf(u8, auth_bytes, "openai") == null);
+}
+
+fn appStateSnapshotContains(items: []const ChatItem, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.indexOf(u8, item.text, needle) != null) return true;
+        if (item.expanded_text) |expanded_text| {
+            if (std.mem.indexOf(u8, expanded_text, needle) != null) return true;
+        }
+    }
+    return false;
+}
+
+fn temporaryTypeScriptPolicyKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const source_info = resources_mod.SourceInfo{
+        .path = @constCast(path),
+        .source = @constCast("local"),
+        .scope = .temporary,
+        .origin = .top_level,
+        .base_dir = @constCast(std.fs.path.dirname(path) orelse "."),
+    };
+    return extension_runtime.typeScriptPolicyLookupKey(allocator, .{
+        .configured_path = path,
+        .resolved_path = path,
+        .source_info = source_info,
+    });
+}
+
+fn writeInteractiveRegisteringExtensionScript(tmp: anytype, sub_path: []const u8, tool_name: []const u8, label: []const u8) !void {
+    var script: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer script.deinit();
+    try script.writer.print(
+        "IFS= read -r init\n" ++
+            "printf '{{\"type\":\"ready\"}}\\n'\n" ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"{s}\",\"label\":\"{s}\",\"description\":\"{s} description\",\"parameters\":{{\"type\":\"object\",\"properties\":{{}}}},\"extensionPath\":\"{s}\"}}\\n'\n" ++
+            "while IFS= read -r line; do\n" ++
+            "  case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac\n" ++
+            "done\n",
+        .{ tool_name, label, label, sub_path },
+    );
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = script.written() });
 }
 
 fn makeInteractiveTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {

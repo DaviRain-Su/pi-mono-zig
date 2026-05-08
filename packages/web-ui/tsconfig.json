@@ -11,11 +11,7 @@
       "@earendil-works/pi-agent-core": ["./types/pi-agent-core.d.ts"],
       "@earendil-works/pi-ai": ["./types/pi-ai.d.ts"],
       "@earendil-works/pi-tui": ["../tui/src/index.ts"],
-      "@earendil-works/pi-tui/*": ["../tui/src/*"],
-      "@mariozechner/pi-agent-core": ["./types/pi-agent-core.d.ts"],
-      "@mariozechner/pi-ai": ["./types/pi-ai.d.ts"],
-      "@mariozechner/pi-tui": ["../tui/src/index.ts"],
-      "@mariozechner/pi-tui/*": ["../tui/src/*"]
+      "@earendil-works/pi-tui/*": ["../tui/src/*"]
     }
   },
   "include": ["src/**/*"]

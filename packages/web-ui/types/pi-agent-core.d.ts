@@ -11,7 +11,7 @@ import type {
 	ToolResultMessage,
 	Transport,
 	streamSimple,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 
 export type StreamFn = (

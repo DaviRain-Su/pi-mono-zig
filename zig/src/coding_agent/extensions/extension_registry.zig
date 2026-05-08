@@ -179,6 +179,29 @@ pub const ShortcutDiagnostic = struct {
     }
 };
 
+pub const WorkflowSurfaceDiagnostic = struct {
+    code: []u8,
+    severity: []u8,
+    workflow_id: []u8,
+    surface: []u8,
+    name: ?[]u8,
+    extension_path: []u8,
+    path: []u8,
+    message: []u8,
+
+    pub fn deinit(self: *WorkflowSurfaceDiagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.severity);
+        allocator.free(self.workflow_id);
+        allocator.free(self.surface);
+        if (self.name) |name| allocator.free(name);
+        allocator.free(self.extension_path);
+        allocator.free(self.path);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
 pub const BuiltinShortcutBinding = struct {
     shortcut: []const u8,
     keybinding: []const u8,
@@ -213,6 +236,44 @@ pub const ExtensionCapability = struct {
         allocator.free(self.description);
         if (self.command) |command| allocator.free(command);
         if (self.resource_path) |path| allocator.free(path);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
+pub const ExtensionWorkflow = struct {
+    id: []u8,
+    description: []u8,
+    input_schema: std.json.Value,
+    output_schema: std.json.Value,
+    execution_mode: []u8,
+    permissions: std.json.Value,
+    dependencies: std.json.Value,
+    timeout_ms: u64,
+    cancellation: std.json.Value,
+    replay: std.json.Value,
+    child_agent_limits: std.json.Value,
+    steps: std.json.Value,
+    command_name: ?[]u8,
+    tool_name: ?[]u8,
+    preset_id: ?[]u8,
+    extension_path: []u8,
+
+    pub fn deinit(self: *ExtensionWorkflow, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.description);
+        common.deinitJsonValue(allocator, self.input_schema);
+        common.deinitJsonValue(allocator, self.output_schema);
+        allocator.free(self.execution_mode);
+        common.deinitJsonValue(allocator, self.permissions);
+        common.deinitJsonValue(allocator, self.dependencies);
+        common.deinitJsonValue(allocator, self.cancellation);
+        common.deinitJsonValue(allocator, self.replay);
+        common.deinitJsonValue(allocator, self.child_agent_limits);
+        common.deinitJsonValue(allocator, self.steps);
+        if (self.command_name) |value| allocator.free(value);
+        if (self.tool_name) |value| allocator.free(value);
+        if (self.preset_id) |value| allocator.free(value);
         allocator.free(self.extension_path);
         self.* = undefined;
     }
@@ -344,6 +405,36 @@ pub const MessageRenderer = struct {
     }
 };
 
+pub const HookErrorPolicy = enum {
+    @"continue",
+    fatal,
+
+    pub fn jsonName(self: HookErrorPolicy) []const u8 {
+        return switch (self) {
+            .@"continue" => "continue",
+            .fatal => "fatal",
+        };
+    }
+};
+
+/// Event hook subscription captured from a live extension host.
+/// Process JSONL hosts emit this when an extension registers an event
+/// interceptor. The runtime uses this registry surface to avoid sending
+/// correlated interception requests to hosts that cannot answer them.
+pub const ExtensionHook = struct {
+    event_name: []u8,
+    extension_path: []u8,
+    priority: i64 = 0,
+    declaration_order: usize = 0,
+    error_policy: HookErrorPolicy = .@"continue",
+
+    pub fn deinit(self: *ExtensionHook, allocator: std.mem.Allocator) void {
+        allocator.free(self.event_name);
+        allocator.free(self.extension_path);
+        self.* = undefined;
+    }
+};
+
 /// Widget placement options
 pub const WidgetPlacement = enum {
     above_editor,
@@ -400,6 +491,8 @@ pub const Registry = struct {
     commands: std.ArrayList(ExtensionCommand) = .empty,
     shortcuts: std.ArrayList(ExtensionShortcut) = .empty,
     capabilities: std.ArrayList(ExtensionCapability) = .empty,
+    workflows: std.ArrayList(ExtensionWorkflow) = .empty,
+    workflow_surface_diagnostics: std.ArrayList(WorkflowSurfaceDiagnostic) = .empty,
     providers: std.ArrayList(ExtensionProvider) = .empty,
     /// Captured `extension_ui_request` ids in arrival order. Mirrors the
     /// host-side bridge log so UI bridge correlation can be asserted by
@@ -426,6 +519,10 @@ pub const Registry = struct {
     /// Message renderers registered via `registerMessageRenderer`. Keyed by
     /// customType; re-registering the same customType replaces the entry.
     message_renderers: std.ArrayList(MessageRenderer) = .empty,
+    /// Event interception hooks registered by extensions. Kept in registration
+    /// order so dispatch can follow deterministic extension composition order.
+    hooks: std.ArrayList(ExtensionHook) = .empty,
+    next_hook_declaration_order: usize = 0,
     /// Event bus for extension event handling
     event_bus: extension_events.EventBus,
 
@@ -447,6 +544,10 @@ pub const Registry = struct {
         self.shortcuts.deinit(self.allocator);
         for (self.capabilities.items) |*capability| capability.deinit(self.allocator);
         self.capabilities.deinit(self.allocator);
+        for (self.workflows.items) |*workflow| workflow.deinit(self.allocator);
+        self.workflows.deinit(self.allocator);
+        for (self.workflow_surface_diagnostics.items) |*diagnostic| diagnostic.deinit(self.allocator);
+        self.workflow_surface_diagnostics.deinit(self.allocator);
         for (self.providers.items) |*p| p.deinit(self.allocator);
         self.providers.deinit(self.allocator);
         for (self.ui_request_ids.items) |id| self.allocator.free(id);
@@ -462,6 +563,8 @@ pub const Registry = struct {
         self.widgets.deinit(self.allocator);
         for (self.message_renderers.items) |*mr| mr.deinit(self.allocator);
         self.message_renderers.deinit(self.allocator);
+        for (self.hooks.items) |*hook| hook.deinit(self.allocator);
+        self.hooks.deinit(self.allocator);
         self.event_bus.deinit();
         self.* = undefined;
     }
@@ -508,6 +611,75 @@ pub const Registry = struct {
         return null;
     }
 
+    fn findWorkflowIndex(self: *const Registry, id: []const u8) ?usize {
+        for (self.workflows.items, 0..) |workflow, idx| {
+            if (std.mem.eql(u8, workflow.id, id)) return idx;
+        }
+        return null;
+    }
+
+    pub fn workflowForId(self: *const Registry, id: []const u8) ?*const ExtensionWorkflow {
+        const idx = self.findWorkflowIndex(id) orelse return null;
+        return &self.workflows.items[idx];
+    }
+
+    pub fn workflowForCommandName(self: *const Registry, name: []const u8) ?*const ExtensionWorkflow {
+        for (self.workflows.items) |*workflow| {
+            const command_name = workflow.command_name orelse continue;
+            if (std.mem.eql(u8, command_name, name)) return workflow;
+        }
+        return null;
+    }
+
+    fn clearWorkflowSurfaceDiagnostics(self: *Registry, id: []const u8, extension_path: []const u8) void {
+        var index = self.workflow_surface_diagnostics.items.len;
+        while (index > 0) {
+            index -= 1;
+            const diagnostic = self.workflow_surface_diagnostics.items[index];
+            if (std.mem.eql(u8, diagnostic.workflow_id, id) and std.mem.eql(u8, diagnostic.extension_path, extension_path)) {
+                var removed = self.workflow_surface_diagnostics.orderedRemove(index);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
+    fn appendWorkflowSurfaceDiagnostic(
+        self: *Registry,
+        id: []const u8,
+        surface: []const u8,
+        name: ?[]const u8,
+        extension_path: []const u8,
+        path: []const u8,
+        message: []const u8,
+    ) !void {
+        try self.workflow_surface_diagnostics.append(self.allocator, .{
+            .code = try self.allocator.dupe(u8, "workflow.surface_denied"),
+            .severity = try self.allocator.dupe(u8, "warning"),
+            .workflow_id = try self.allocator.dupe(u8, id),
+            .surface = try self.allocator.dupe(u8, surface),
+            .name = if (name) |value| try self.allocator.dupe(u8, value) else null,
+            .extension_path = try self.allocator.dupe(u8, extension_path),
+            .path = try self.allocator.dupe(u8, path),
+            .message = try self.allocator.dupe(u8, message),
+        });
+    }
+
+    pub fn workflowForToolName(self: *const Registry, name: []const u8) ?*const ExtensionWorkflow {
+        for (self.workflows.items) |*workflow| {
+            const tool_name = workflow.tool_name orelse continue;
+            if (std.mem.eql(u8, tool_name, name)) return workflow;
+        }
+        return null;
+    }
+
+    pub fn workflowForPresetId(self: *const Registry, id: []const u8) ?*const ExtensionWorkflow {
+        for (self.workflows.items) |*workflow| {
+            const preset_id = workflow.preset_id orelse continue;
+            if (std.mem.eql(u8, preset_id, id)) return workflow;
+        }
+        return null;
+    }
+
     fn findFlagIndex(self: *const Registry, name: []const u8) ?usize {
         for (self.flags.items, 0..) |flag, idx| {
             if (std.mem.eql(u8, flag.name, name)) return idx;
@@ -527,6 +699,63 @@ pub const Registry = struct {
             if (std.mem.eql(u8, mr.custom_type, custom_type)) return idx;
         }
         return null;
+    }
+
+    fn findHookIndex(self: *const Registry, event_name: []const u8, extension_path: []const u8) ?usize {
+        for (self.hooks.items, 0..) |hook, idx| {
+            if (std.mem.eql(u8, hook.event_name, event_name) and std.mem.eql(u8, hook.extension_path, extension_path)) return idx;
+        }
+        return null;
+    }
+
+    pub fn registerHook(self: *Registry, event_name: []const u8, extension_path: []const u8) !void {
+        try self.registerHookFull(event_name, extension_path, 0, null, .@"continue");
+    }
+
+    pub fn registerHookFull(
+        self: *Registry,
+        event_name: []const u8,
+        extension_path: []const u8,
+        priority: i64,
+        declaration_order: ?usize,
+        error_policy: HookErrorPolicy,
+    ) !void {
+        if (event_name.len == 0) return;
+        if (self.findHookIndex(event_name, extension_path)) |_| return;
+        const assigned_order = declaration_order orelse self.next_hook_declaration_order;
+        self.next_hook_declaration_order += 1;
+        try self.hooks.append(self.allocator, .{
+            .event_name = try self.allocator.dupe(u8, event_name),
+            .extension_path = try self.allocator.dupe(u8, extension_path),
+            .priority = priority,
+            .declaration_order = assigned_order,
+            .error_policy = error_policy,
+        });
+    }
+
+    pub fn unregisterHook(self: *Registry, event_name: []const u8, extension_path: []const u8) bool {
+        const idx = self.findHookIndex(event_name, extension_path) orelse return false;
+        var removed = self.hooks.orderedRemove(idx);
+        removed.deinit(self.allocator);
+        return true;
+    }
+
+    pub fn hasHook(self: *const Registry, event_name: []const u8) bool {
+        for (self.hooks.items) |hook| {
+            if (std.mem.eql(u8, hook.event_name, event_name)) return true;
+        }
+        return false;
+    }
+
+    pub fn hookForEvent(self: *const Registry, event_name: []const u8) ?*const ExtensionHook {
+        for (self.hooks.items) |*hook| {
+            if (std.mem.eql(u8, hook.event_name, event_name)) return hook;
+        }
+        return null;
+    }
+
+    pub fn hookErrorPolicyForEvent(self: *const Registry, event_name: []const u8) HookErrorPolicy {
+        return if (self.hookForEvent(event_name)) |hook| hook.error_policy else .@"continue";
     }
 
     pub fn registerMessageRenderer(
@@ -803,6 +1032,106 @@ pub const Registry = struct {
         return false;
     }
 
+    pub fn registerWorkflowFull(
+        self: *Registry,
+        id: []const u8,
+        description: []const u8,
+        input_schema: std.json.Value,
+        output_schema: std.json.Value,
+        execution_mode: []const u8,
+        permissions: std.json.Value,
+        dependencies: std.json.Value,
+        timeout_ms: u64,
+        cancellation: std.json.Value,
+        replay: std.json.Value,
+        child_agent_limits: std.json.Value,
+        steps: std.json.Value,
+        command_name: ?[]const u8,
+        tool_name: ?[]const u8,
+        preset_id: ?[]const u8,
+        extension_path: []const u8,
+    ) !void {
+        if (self.findWorkflowIndex(id)) |idx| {
+            try self.clearWorkflowDerivedSurfaces(self.workflows.items[idx]);
+            self.workflows.items[idx].deinit(self.allocator);
+            self.workflows.items[idx] = try makeWorkflow(
+                self.allocator,
+                id,
+                description,
+                input_schema,
+                output_schema,
+                execution_mode,
+                permissions,
+                dependencies,
+                timeout_ms,
+                cancellation,
+                replay,
+                child_agent_limits,
+                steps,
+                command_name,
+                tool_name,
+                preset_id,
+                extension_path,
+            );
+        } else {
+            const workflow = try makeWorkflow(
+                self.allocator,
+                id,
+                description,
+                input_schema,
+                output_schema,
+                execution_mode,
+                permissions,
+                dependencies,
+                timeout_ms,
+                cancellation,
+                replay,
+                child_agent_limits,
+                steps,
+                command_name,
+                tool_name,
+                preset_id,
+                extension_path,
+            );
+            try self.workflows.append(self.allocator, workflow);
+        }
+
+        const workflow = self.workflows.items[self.findWorkflowIndex(id).?];
+        try self.registerCapability(workflow.id, "workflow", workflow.id, workflow.description, workflow.command_name, null, workflow.extension_path);
+        if (workflow.command_name) |name| try self.registerCommand(name, workflow.description, workflow.extension_path);
+        if (workflow.tool_name) |name| {
+            try self.registerToolFull(
+                name,
+                name,
+                workflow.description,
+                workflow.input_schema,
+                "sequential",
+                null,
+                workflow.extension_path,
+            );
+        }
+    }
+
+    fn clearWorkflowDerivedSurfaces(self: *Registry, workflow: ExtensionWorkflow) !void {
+        _ = self.unregisterCapability(workflow.id);
+        if (workflow.tool_name) |name| _ = self.unregisterTool(name);
+        if (workflow.command_name) |name| {
+            if (self.findCommandForExtensionIndex(name, workflow.extension_path)) |idx| {
+                var removed = self.commands.orderedRemove(idx);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
+    pub fn unregisterWorkflow(self: *Registry, id: []const u8) bool {
+        const idx = self.findWorkflowIndex(id) orelse return false;
+        self.clearWorkflowSurfaceDiagnostics(self.workflows.items[idx].id, self.workflows.items[idx].extension_path);
+        self.clearWorkflowDerivedSurfaces(self.workflows.items[idx]) catch {};
+        var removed = self.workflows.orderedRemove(idx);
+        removed.deinit(self.allocator);
+        return true;
+    }
+
     /// Register a flag with an optional default. Strings are borrowed;
     /// the registry always clones what it needs.
     pub fn registerFlag(
@@ -981,11 +1310,39 @@ pub const Registry = struct {
             }
         }
 
+        var workflow_index = self.workflows.items.len;
+        while (workflow_index > 0) {
+            workflow_index -= 1;
+            if (std.mem.eql(u8, self.workflows.items[workflow_index].extension_path, extension_path)) {
+                self.clearWorkflowSurfaceDiagnostics(self.workflows.items[workflow_index].id, extension_path);
+                var removed = self.workflows.orderedRemove(workflow_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var workflow_diagnostic_index = self.workflow_surface_diagnostics.items.len;
+        while (workflow_diagnostic_index > 0) {
+            workflow_diagnostic_index -= 1;
+            if (std.mem.eql(u8, self.workflow_surface_diagnostics.items[workflow_diagnostic_index].extension_path, extension_path)) {
+                var removed = self.workflow_surface_diagnostics.orderedRemove(workflow_diagnostic_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
         var renderer_index = self.message_renderers.items.len;
         while (renderer_index > 0) {
             renderer_index -= 1;
             if (std.mem.eql(u8, self.message_renderers.items[renderer_index].extension_path, extension_path)) {
                 var removed = self.message_renderers.orderedRemove(renderer_index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        var hook_index = self.hooks.items.len;
+        while (hook_index > 0) {
+            hook_index -= 1;
+            if (std.mem.eql(u8, self.hooks.items[hook_index].extension_path, extension_path)) {
+                var removed = self.hooks.orderedRemove(hook_index);
                 removed.deinit(self.allocator);
             }
         }
@@ -1281,12 +1638,14 @@ pub const RegistrySurfaceCounts = struct {
     flags: usize,
     providers: usize,
     capabilities: usize,
+    workflows: usize,
     resource_discoveries: usize,
     header_hooks: usize,
     footer_hooks: usize,
     terminal_input_subscriptions: usize,
     editor_component_hooks: usize,
     widgets: usize,
+    hooks: usize,
     message_renderers: usize,
     ui_request_ids: usize,
 };
@@ -1310,12 +1669,14 @@ pub fn registrySurfaceNames() []const []const u8 {
         "flags",
         "providers",
         "capabilities",
+        "workflows",
         "resourceDiscoveries",
         "headerHook",
         "footerHook",
         "terminalInputSubscriptions",
         "editorComponentHook",
         "widgets",
+        "hooks",
         "messageRenderers",
         "uiRequestIds",
     };
@@ -1329,12 +1690,14 @@ pub fn registrySurfaceCounts(registry: *const Registry) RegistrySurfaceCounts {
         .flags = registry.flags.items.len,
         .providers = registry.providers.items.len,
         .capabilities = registry.capabilities.items.len,
+        .workflows = registry.workflows.items.len,
         .resource_discoveries = registry.resource_discoveries.items.len,
         .header_hooks = if (registry.header_hook != null) 1 else 0,
         .footer_hooks = if (registry.footer_hook != null) 1 else 0,
         .terminal_input_subscriptions = registry.terminal_input_subs.items.len,
         .editor_component_hooks = if (registry.editor_component_hook != null) 1 else 0,
         .widgets = registry.widgets.items.len,
+        .hooks = registry.hooks.items.len,
         .message_renderers = registry.message_renderers.items.len,
         .ui_request_ids = registry.ui_request_ids.items.len,
     };
@@ -1535,6 +1898,75 @@ fn makeCapability(
     };
 }
 
+fn makeWorkflow(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    description: []const u8,
+    input_schema: std.json.Value,
+    output_schema: std.json.Value,
+    execution_mode: []const u8,
+    permissions: std.json.Value,
+    dependencies: std.json.Value,
+    timeout_ms: u64,
+    cancellation: std.json.Value,
+    replay: std.json.Value,
+    child_agent_limits: std.json.Value,
+    steps: std.json.Value,
+    command_name: ?[]const u8,
+    tool_name: ?[]const u8,
+    preset_id: ?[]const u8,
+    extension_path: []const u8,
+) !ExtensionWorkflow {
+    const id_dup = try allocator.dupe(u8, id);
+    errdefer allocator.free(id_dup);
+    const description_dup = try allocator.dupe(u8, description);
+    errdefer allocator.free(description_dup);
+    const input_schema_dup = try common.cloneJsonValue(allocator, input_schema);
+    errdefer common.deinitJsonValue(allocator, input_schema_dup);
+    const output_schema_dup = try common.cloneJsonValue(allocator, output_schema);
+    errdefer common.deinitJsonValue(allocator, output_schema_dup);
+    const execution_mode_dup = try allocator.dupe(u8, execution_mode);
+    errdefer allocator.free(execution_mode_dup);
+    const permissions_dup = try common.cloneJsonValue(allocator, permissions);
+    errdefer common.deinitJsonValue(allocator, permissions_dup);
+    const dependencies_dup = try common.cloneJsonValue(allocator, dependencies);
+    errdefer common.deinitJsonValue(allocator, dependencies_dup);
+    const cancellation_dup = try common.cloneJsonValue(allocator, cancellation);
+    errdefer common.deinitJsonValue(allocator, cancellation_dup);
+    const replay_dup = try common.cloneJsonValue(allocator, replay);
+    errdefer common.deinitJsonValue(allocator, replay_dup);
+    const child_agent_limits_dup = try common.cloneJsonValue(allocator, child_agent_limits);
+    errdefer common.deinitJsonValue(allocator, child_agent_limits_dup);
+    const steps_dup = try common.cloneJsonValue(allocator, steps);
+    errdefer common.deinitJsonValue(allocator, steps_dup);
+    const command_name_dup = if (command_name) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (command_name_dup) |value| allocator.free(value);
+    const tool_name_dup = if (tool_name) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (tool_name_dup) |value| allocator.free(value);
+    const preset_id_dup = if (preset_id) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (preset_id_dup) |value| allocator.free(value);
+    const extension_path_dup = try allocator.dupe(u8, extension_path);
+
+    return .{
+        .id = id_dup,
+        .description = description_dup,
+        .input_schema = input_schema_dup,
+        .output_schema = output_schema_dup,
+        .execution_mode = execution_mode_dup,
+        .permissions = permissions_dup,
+        .dependencies = dependencies_dup,
+        .timeout_ms = timeout_ms,
+        .cancellation = cancellation_dup,
+        .replay = replay_dup,
+        .child_agent_limits = child_agent_limits_dup,
+        .steps = steps_dup,
+        .command_name = command_name_dup,
+        .tool_name = tool_name_dup,
+        .preset_id = preset_id_dup,
+        .extension_path = extension_path_dup,
+    };
+}
+
 fn makeFlag(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -1592,6 +2024,10 @@ pub const FrameOutcome = enum {
     unregistered_provider,
     registered_capability,
     unregistered_capability,
+    registered_workflow,
+    unregistered_workflow,
+    registered_hook,
+    unregistered_hook,
     resources_discovered,
     set_header_hook,
     cleared_header_hook,
@@ -1636,6 +2072,10 @@ pub fn applyHostFrame(
     if (std.mem.eql(u8, type_name, "unregister_provider")) return applyUnregisterProviderFrame(registry, object);
     if (std.mem.eql(u8, type_name, "register_capability")) return try applyRegisterCapabilityFrame(registry, object, extension_path);
     if (std.mem.eql(u8, type_name, "unregister_capability")) return applyUnregisterCapabilityFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "register_workflow")) return try applyRegisterWorkflowFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_workflow")) return applyUnregisterWorkflowFrame(registry, object);
+    if (std.mem.eql(u8, type_name, "register_hook")) return try applyRegisterHookFrame(registry, object, extension_path);
+    if (std.mem.eql(u8, type_name, "unregister_hook")) return applyUnregisterHookFrame(registry, object, extension_path);
     if (std.mem.eql(u8, type_name, "resources_discover")) return try applyResourcesDiscoverFrame(registry, object, extension_path);
     if (std.mem.eql(u8, type_name, "extension_ui_request")) return try applyExtensionUiRequestFrame(registry, object);
     if (std.mem.eql(u8, type_name, "set_header")) return try applySetHeaderFrame(registry, object, extension_path);
@@ -1794,6 +2234,77 @@ fn applyUnregisterCapabilityFrame(registry: *Registry, object: std.json.ObjectMa
     return .unregistered_capability;
 }
 
+fn applyRegisterWorkflowFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    const description = optionalString(object, "description") orelse "";
+    const input_schema = optionalObjectValue(object, "inputSchema") orelse optionalObjectValue(object, "parameters") orelse try emptyObjectJsonValue(registry.allocator);
+    defer if (object.get("inputSchema") == null and object.get("parameters") == null) common.deinitJsonValue(registry.allocator, input_schema);
+    const output_schema = optionalObjectValue(object, "outputSchema") orelse try emptyObjectJsonValue(registry.allocator);
+    defer if (object.get("outputSchema") == null) common.deinitJsonValue(registry.allocator, output_schema);
+    const execution_mode = optionalString(object, "executionMode") orelse "agent";
+    const timeout_ms = optionalUnsigned64(object, "timeoutMs") orelse 30000;
+    const permissions = optionalArrayValue(object, "permissions") orelse try emptyArrayJsonValue(registry.allocator);
+    defer if (object.get("permissions") == null) common.deinitJsonValue(registry.allocator, permissions);
+    const dependencies = optionalArrayValue(object, "dependencies") orelse try emptyArrayJsonValue(registry.allocator);
+    defer if (object.get("dependencies") == null) common.deinitJsonValue(registry.allocator, dependencies);
+    const cancellation = optionalObjectValue(object, "cancellation") orelse try defaultCancellationJsonValue(registry.allocator);
+    defer if (object.get("cancellation") == null) common.deinitJsonValue(registry.allocator, cancellation);
+    const replay = optionalObjectValue(object, "replay") orelse try defaultReplayJsonValue(registry.allocator);
+    defer if (object.get("replay") == null) common.deinitJsonValue(registry.allocator, replay);
+    const child_agent_limits = optionalObjectValue(object, "childAgentLimits") orelse try defaultChildAgentLimitsJsonValue(registry.allocator, timeout_ms);
+    defer if (object.get("childAgentLimits") == null) common.deinitJsonValue(registry.allocator, child_agent_limits);
+    const steps = optionalArrayValue(object, "steps") orelse try emptyArrayJsonValue(registry.allocator);
+    defer if (object.get("steps") == null) common.deinitJsonValue(registry.allocator, steps);
+    const exposure = object.get("exposure");
+
+    registry.clearWorkflowSurfaceDiagnostics(id, extension_path);
+    const workflow_denial = workflowPolicyDenial(object);
+    const command_name = try resolveWorkflowSurfaceName(registry, object, exposure, workflow_denial, id, "command", "commandName", id, extension_path);
+    const tool_name = try resolveWorkflowSurfaceName(registry, object, exposure, workflow_denial, id, "tool", "toolName", id, extension_path);
+    const preset_id = try resolveWorkflowSurfaceName(registry, object, exposure, workflow_denial, id, "subAgentPreset", "presetId", id, extension_path);
+
+    try registry.registerWorkflowFull(
+        id,
+        description,
+        input_schema,
+        output_schema,
+        execution_mode,
+        permissions,
+        dependencies,
+        timeout_ms,
+        cancellation,
+        replay,
+        child_agent_limits,
+        steps,
+        command_name,
+        tool_name,
+        preset_id,
+        extension_path,
+    );
+    return .registered_workflow;
+}
+
+fn applyUnregisterWorkflowFrame(registry: *Registry, object: std.json.ObjectMap) FrameOutcome {
+    const id = optionalString(object, "id") orelse return .ignored_malformed;
+    _ = registry.unregisterWorkflow(id);
+    return .unregistered_workflow;
+}
+
+fn applyRegisterHookFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
+    const event_name = optionalString(object, "event") orelse optionalString(object, "eventName") orelse return .ignored_malformed;
+    const priority = optionalInteger(object, "priority") orelse optionalInteger(object, "order") orelse 0;
+    const declaration_order = optionalUnsigned(object, "declarationOrder") orelse optionalUnsigned(object, "declaration_order");
+    const error_policy = parseHookErrorPolicy(object);
+    try registry.registerHookFull(event_name, extension_path, priority, declaration_order, error_policy);
+    return .registered_hook;
+}
+
+fn applyUnregisterHookFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) FrameOutcome {
+    const event_name = optionalString(object, "event") orelse optionalString(object, "eventName") orelse return .ignored_malformed;
+    _ = registry.unregisterHook(event_name, extension_path);
+    return .unregistered_hook;
+}
+
 fn applyResourcesDiscoverFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     var discovery = ResourceDiscovery{
         .extension_path = try registry.allocator.dupe(u8, extension_path),
@@ -1931,6 +2442,220 @@ fn optionalBool(object: std.json.ObjectMap, field: []const u8) ?bool {
         .bool => |b| b,
         else => null,
     };
+}
+
+fn optionalObjectValue(object: std.json.ObjectMap, field: []const u8) ?std.json.Value {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .object => value,
+        else => null,
+    };
+}
+
+fn optionalArrayValue(object: std.json.ObjectMap, field: []const u8) ?std.json.Value {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .array => value,
+        else => null,
+    };
+}
+
+fn optionalInteger(object: std.json.ObjectMap, field: []const u8) ?i64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .integer => |number| number,
+        else => null,
+    };
+}
+
+fn optionalUnsigned(object: std.json.ObjectMap, field: []const u8) ?usize {
+    const number = optionalInteger(object, field) orelse return null;
+    if (number < 0) return null;
+    return @intCast(number);
+}
+
+fn optionalUnsigned64(object: std.json.ObjectMap, field: []const u8) ?u64 {
+    const number = optionalInteger(object, field) orelse return null;
+    if (number < 0) return null;
+    return @intCast(number);
+}
+
+const WorkflowDenial = struct {
+    path: []const u8,
+    message: []const u8,
+};
+
+fn resolveWorkflowSurfaceName(
+    registry: *Registry,
+    object: std.json.ObjectMap,
+    maybe_exposure: ?std.json.Value,
+    workflow_denial: ?WorkflowDenial,
+    workflow_id: []const u8,
+    exposure_field: []const u8,
+    direct_field: []const u8,
+    default_name: []const u8,
+    extension_path: []const u8,
+) !?[]const u8 {
+    const direct_name = optionalString(object, direct_field);
+    const exposure = maybe_exposure orelse {
+        if (workflow_denial) |denial| {
+            if (direct_name) |name| try registry.appendWorkflowSurfaceDiagnostic(workflow_id, exposure_field, name, extension_path, denial.path, denial.message);
+            return null;
+        }
+        return direct_name;
+    };
+    if (exposure != .object) {
+        if (workflow_denial) |denial| {
+            if (direct_name) |name| try registry.appendWorkflowSurfaceDiagnostic(workflow_id, exposure_field, name, extension_path, denial.path, denial.message);
+            return null;
+        }
+        return direct_name;
+    }
+    const surface = exposure.object.get(exposure_field) orelse {
+        if (workflow_denial) |denial| {
+            if (direct_name) |name| try registry.appendWorkflowSurfaceDiagnostic(workflow_id, exposure_field, name, extension_path, denial.path, denial.message);
+            return null;
+        }
+        return direct_name;
+    };
+    const requested_name = direct_name orelse surfaceNameForDiagnostic(surface, default_name);
+    if (workflow_denial) |denial| {
+        if (requested_name) |name| try registry.appendWorkflowSurfaceDiagnostic(workflow_id, exposure_field, name, extension_path, denial.path, denial.message);
+        return null;
+    }
+    if (surfacePolicyDenial(surface, exposure_field)) |denial| {
+        if (requested_name) |name| try registry.appendWorkflowSurfaceDiagnostic(workflow_id, exposure_field, name, extension_path, denial.path, denial.message);
+        return null;
+    }
+    if (direct_name) |name| return name;
+    return surfaceNameFromExposure(surface, default_name);
+}
+
+fn surfaceNameFromExposure(surface: std.json.Value, default_name: []const u8) ?[]const u8 {
+    return switch (surface) {
+        .bool => |enabled| if (enabled) default_name else null,
+        .string => |name| name,
+        .object => |surface_object| blk: {
+            if (entryPolicyDenied(.{ .object = surface_object })) break :blk null;
+            break :blk optionalString(surface_object, "name") orelse optionalString(surface_object, "id") orelse default_name;
+        },
+        else => null,
+    };
+}
+
+fn surfaceNameForDiagnostic(surface: std.json.Value, default_name: []const u8) ?[]const u8 {
+    return switch (surface) {
+        .bool => |enabled| if (enabled) default_name else null,
+        .string => |name| name,
+        .object => |surface_object| optionalString(surface_object, "name") orelse optionalString(surface_object, "id") orelse default_name,
+        else => null,
+    };
+}
+
+fn workflowPolicyDenial(object: std.json.ObjectMap) ?WorkflowDenial {
+    if (entryPolicyDenied(.{ .object = object })) return .{
+        .path = "$.policy",
+        .message = "workflow exposure denied by workflow policy",
+    };
+    if (object.get("permissions")) |permissions| {
+        switch (permissions) {
+            .object => |permission_object| if (entryPolicyDenied(.{ .object = permission_object })) return .{
+                .path = "$.permissions",
+                .message = "workflow exposure denied by workflow permission policy",
+            },
+            .array => |permission_array| {
+                for (permission_array.items) |permission| {
+                    if (entryPolicyDenied(permission)) return .{
+                        .path = "$.permissions",
+                        .message = "workflow exposure denied by workflow permission policy",
+                    };
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn surfacePolicyDenial(surface: std.json.Value, exposure_field: []const u8) ?WorkflowDenial {
+    return switch (surface) {
+        .bool => |enabled| if (!enabled) .{
+            .path = surfacePolicyPath(exposure_field),
+            .message = "workflow surface disabled by exposure policy",
+        } else null,
+        .object => |surface_object| if (entryPolicyDenied(.{ .object = surface_object })) .{
+            .path = surfacePolicyPath(exposure_field),
+            .message = "workflow surface denied by exposure policy",
+        } else null,
+        else => null,
+    };
+}
+
+fn surfacePolicyPath(exposure_field: []const u8) []const u8 {
+    if (std.mem.eql(u8, exposure_field, "command")) return "$.exposure.command";
+    if (std.mem.eql(u8, exposure_field, "tool")) return "$.exposure.tool";
+    if (std.mem.eql(u8, exposure_field, "subAgentPreset")) return "$.exposure.subAgentPreset";
+    return "$.exposure";
+}
+
+fn entryPolicyDenied(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (optionalBool(value.object, "denied") orelse false) return true;
+    if (optionalBool(value.object, "policyDenied") orelse false) return true;
+    const policy = value.object.get("policy") orelse return false;
+    if (policy != .object) return false;
+    if (policy.object.get("approved")) |approved| {
+        if (approved == .bool and !approved.bool) return true;
+    }
+    if (policy.object.get("decision")) |decision| {
+        if (decision == .string and (std.mem.eql(u8, decision.string, "deny") or std.mem.eql(u8, decision.string, "denied"))) return true;
+    }
+    return false;
+}
+
+fn emptyObjectJsonValue(allocator: std.mem.Allocator) !std.json.Value {
+    return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+}
+
+fn emptyArrayJsonValue(allocator: std.mem.Allocator) !std.json.Value {
+    return .{ .array = std.json.Array.init(allocator) };
+}
+
+fn defaultCancellationJsonValue(allocator: std.mem.Allocator) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "propagate"), .{ .bool = true });
+    return .{ .object = object };
+}
+
+fn defaultReplayJsonValue(allocator: std.mem.Allocator) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "enabled"), .{ .bool = true });
+    try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "recorded") });
+    return .{ .object = object };
+}
+
+fn defaultChildAgentLimitsJsonValue(allocator: std.mem.Allocator, timeout_ms: u64) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "maxChildren"), .{ .integer = 1 });
+    try object.put(allocator, try allocator.dupe(u8, "maxTurns"), .{ .integer = 1 });
+    try object.put(allocator, try allocator.dupe(u8, "maxToolCalls"), .{ .integer = 0 });
+    try object.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = 0 });
+    try object.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = @intCast(timeout_ms) });
+    return .{ .object = object };
+}
+
+fn parseHookErrorPolicy(object: std.json.ObjectMap) HookErrorPolicy {
+    if (optionalBool(object, "fatal") orelse false) return .fatal;
+    const policy = optionalString(object, "errorPolicy") orelse
+        optionalString(object, "error_policy") orelse
+        optionalString(object, "onError") orelse
+        optionalString(object, "on_error") orelse
+        return .@"continue";
+    if (std.mem.eql(u8, policy, "fatal") or std.mem.eql(u8, policy, "abort") or std.mem.eql(u8, policy, "fail")) return .fatal;
+    return .@"continue";
 }
 
 fn optionalLinesArray(allocator: std.mem.Allocator, object: std.json.ObjectMap, field: []const u8) ![][]const u8 {
@@ -3059,7 +3784,7 @@ test "extension registry conformance helper snapshots every supported surface" {
     defer registry.deinit();
 
     const surface_names = registrySurfaceNames();
-    try std.testing.expectEqual(@as(usize, 14), surface_names.len);
+    try std.testing.expectEqual(@as(usize, 16), surface_names.len);
     try std.testing.expectEqualStrings("tools", surface_names[0]);
     try std.testing.expectEqualStrings("uiRequestIds", surface_names[surface_names.len - 1]);
 
@@ -3070,31 +3795,35 @@ test "extension registry conformance helper snapshots every supported surface" {
         \\{ "type": "register_flag", "name": "flag", "valueType": "string", "default": "default", "extensionPath": "/tmp/full.ts" }
         \\{ "type": "register_provider", "name": "provider", "models": [{ "id": "model", "name": "Model" }], "extensionPath": "/tmp/full.ts" }
         \\{ "type": "register_capability", "id": "capability", "kind": "workflow", "title": "Capability", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_workflow", "id": "review-flow", "description": "Review workflow", "inputSchema": { "type": "object" }, "outputSchema": { "type": "object" }, "exposure": { "command": { "name": "review-flow" }, "tool": { "name": "workflow.review" }, "subAgentPreset": { "id": "review-agent" } }, "childAgentLimits": { "maxChildren": 1, "maxTurns": 2, "timeoutMs": 1000 }, "extensionPath": "/tmp/full.ts" }
         \\{ "type": "resources_discover", "skillPaths": ["/skills"], "promptPaths": ["/prompts"], "themePaths": ["/themes"], "extensionPath": "/tmp/full.ts" }
         \\{ "type": "set_header", "lines": ["Header"], "extensionPath": "/tmp/full.ts" }
         \\{ "type": "set_footer", "lines": ["Footer"], "extensionPath": "/tmp/full.ts" }
         \\{ "type": "register_terminal_input", "id": "terminal", "consume": false, "transformTo": "rewritten", "extensionPath": "/tmp/full.ts" }
         \\{ "type": "set_editor_component", "label": "Editor", "extensionPath": "/tmp/full.ts" }
         \\{ "type": "set_widget", "key": "widget", "lines": ["Widget"], "placement": "belowEditor", "extensionPath": "/tmp/full.ts" }
+        \\{ "type": "register_hook", "event": "before_agent_start", "priority": -10, "declarationOrder": 7, "errorPolicy": "fatal", "extensionPath": "/tmp/full.ts" }
         \\{ "type": "register_message_renderer", "customType": "custom", "extensionPath": "/tmp/full.ts" }
         \\{ "type": "extension_ui_request", "id": "ui-request" }
         \\
     ;
-    try std.testing.expectEqual(@as(usize, 13), try applyHostFrameStream(&registry, frames));
+    try std.testing.expectEqual(@as(usize, 15), try applyHostFrameStream(&registry, frames));
 
     const counts = registrySurfaceCounts(&registry);
-    try std.testing.expectEqual(@as(usize, 1), counts.tools);
-    try std.testing.expectEqual(@as(usize, 1), counts.commands);
+    try std.testing.expectEqual(@as(usize, 2), counts.tools);
+    try std.testing.expectEqual(@as(usize, 2), counts.commands);
     try std.testing.expectEqual(@as(usize, 1), counts.shortcuts);
     try std.testing.expectEqual(@as(usize, 1), counts.flags);
     try std.testing.expectEqual(@as(usize, 1), counts.providers);
-    try std.testing.expectEqual(@as(usize, 1), counts.capabilities);
+    try std.testing.expectEqual(@as(usize, 2), counts.capabilities);
+    try std.testing.expectEqual(@as(usize, 1), counts.workflows);
     try std.testing.expectEqual(@as(usize, 1), counts.resource_discoveries);
     try std.testing.expectEqual(@as(usize, 1), counts.header_hooks);
     try std.testing.expectEqual(@as(usize, 1), counts.footer_hooks);
     try std.testing.expectEqual(@as(usize, 1), counts.terminal_input_subscriptions);
     try std.testing.expectEqual(@as(usize, 1), counts.editor_component_hooks);
     try std.testing.expectEqual(@as(usize, 1), counts.widgets);
+    try std.testing.expectEqual(@as(usize, 1), counts.hooks);
     try std.testing.expectEqual(@as(usize, 1), counts.message_renderers);
     try std.testing.expectEqual(@as(usize, 1), counts.ui_request_ids);
 
@@ -3104,9 +3833,120 @@ test "extension registry conformance helper snapshots every supported surface" {
     try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
     const snapshot = out.written();
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"resourceDiscoveries\":[{\"extensionPath\":\"/tmp/full.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"workflows\":[{\"id\":\"review-flow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"subAgentPresets\":[{\"id\":\"review-agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"workflow.review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"widgets\":[{\"key\":\"widget\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"placement\":\"belowEditor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"hooks\":[{\"eventName\":\"before_agent_start\",\"extensionPath\":\"/tmp/full.ts\",\"priority\":-10,\"declarationOrder\":7,\"errorPolicy\":\"fatal\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"value\":\"cli\"") != null);
+}
+
+test "workflow registry surfaces expose validated commands tools and sub-agent presets" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_workflow", "id": "triage", "description": "Triage issue", "inputSchema": { "type": "object", "properties": { "issue": { "type": "string" } }, "required": ["issue"] }, "outputSchema": { "type": "object" }, "permissions": ["session.read"], "dependencies": [{ "id": "cap.issue" }], "timeoutMs": 1500, "replay": { "enabled": true, "mode": "recorded" }, "childAgentLimits": { "maxChildren": 1, "maxTurns": 3, "maxToolCalls": 2, "timeoutMs": 1500 }, "exposure": { "command": { "name": "triage" }, "tool": { "name": "workflow.triage" }, "subAgentPreset": { "id": "triage-agent" } }, "extensionPath": "/tmp/workflows.ts" }
+        \\{ "type": "register_workflow", "id": "denied", "description": "Denied", "exposure": { "command": { "name": "denied", "policy": { "approved": false } }, "tool": false, "subAgentPreset": false }, "extensionPath": "/tmp/workflows.ts" }
+        \\{ "type": "register_workflow", "id": "denied-direct", "description": "Denied direct", "denied": true, "commandName": "denied-direct", "toolName": "workflow.denied-direct", "presetId": "denied-direct-agent", "extensionPath": "/tmp/workflows.ts" }
+        \\{ "type": "register_workflow", "id": "permission-denied", "description": "Permission denied", "permissions": [{ "id": "session.write", "policy": { "approved": false } }], "commandName": "permission-denied", "toolName": "workflow.permission-denied", "presetId": "permission-denied-agent", "extensionPath": "/tmp/workflows.ts" }
+        \\{ "type": "register_workflow", "id": "direct-surface-denied", "description": "Direct surface denied", "commandName": "direct-command", "toolName": "workflow.direct-tool", "presetId": "direct-preset", "exposure": { "command": { "policy": { "decision": "deny" } }, "tool": { "policyDenied": true }, "subAgentPreset": false }, "extensionPath": "/tmp/workflows.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 5), try applyHostFrameStream(&registry, frames));
+
+    try std.testing.expectEqual(@as(usize, 5), registry.workflows.items.len);
+    try std.testing.expect(registry.hasCommandInvocation("triage"));
+    try std.testing.expect(!registry.hasCommandInvocation("denied"));
+    try std.testing.expect(!registry.hasCommandInvocation("denied-direct"));
+    try std.testing.expect(!registry.hasCommandInvocation("permission-denied"));
+    try std.testing.expect(!registry.hasCommandInvocation("direct-command"));
+    try std.testing.expectEqual(@as(?usize, 0), registry.findCapabilityIndex("triage"));
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("workflow.triage", registry.tools.items[0].name);
+    try std.testing.expectEqualStrings("issue", registry.tools.items[0].parameters.object.get("required").?.array.items[0].string);
+    try std.testing.expect(registry.workflowForCommandName("triage") != null);
+    try std.testing.expect(registry.workflowForToolName("workflow.triage") != null);
+    try std.testing.expect(registry.workflowForPresetId("triage-agent") != null);
+    try std.testing.expect(registry.workflowForCommandName("denied-direct") == null);
+    try std.testing.expect(registry.workflowForToolName("workflow.denied-direct") == null);
+    try std.testing.expect(registry.workflowForPresetId("permission-denied-agent") == null);
+    try std.testing.expect(registry.workflowForCommandName("direct-command") == null);
+    try std.testing.expect(registry.workflowForToolName("workflow.direct-tool") == null);
+    try std.testing.expect(registry.workflowForPresetId("direct-preset") == null);
+    try std.testing.expect(registry.workflow_surface_diagnostics.items.len >= 6);
+    try std.testing.expectEqualStrings("workflow.surface_denied", registry.workflow_surface_diagnostics.items[0].code);
+    try std.testing.expectEqualStrings("denied", registry.workflow_surface_diagnostics.items[0].workflow_id);
+    try std.testing.expectEqualStrings("command", registry.workflow_surface_diagnostics.items[0].surface);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"workflows\":[{\"id\":\"triage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"commandName\":\"triage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"toolName\":\"workflow.triage\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"subAgentPresets\":[{\"id\":\"triage-agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"maxTurns\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"commandName\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"toolName\":\"workflow.denied-direct\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"presetId\":\"permission-denied-agent\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"toolName\":\"workflow.direct-tool\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"workflowDiagnostics\":[{\"code\":\"workflow.surface_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"workflowId\":\"direct-surface-denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"surface\":\"tool\"") != null);
+
+    const unregister_denied =
+        \\{ "type": "unregister_workflow", "id": "denied" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try applyHostFrameStream(&registry, unregister_denied));
+    for (registry.workflow_surface_diagnostics.items) |diagnostic| {
+        try std.testing.expect(!std.mem.eql(u8, diagnostic.workflow_id, "denied"));
+    }
+}
+
+test "register_hook metadata preserves ordering and error policy" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_hook", "event": "message_end", "priority": 20, "declarationOrder": 4, "errorPolicy": "continue", "extensionPath": "/tmp/later.ts" }
+        \\{ "type": "register_hook", "eventName": "before_agent_start", "priority": -1, "declaration_order": 2, "fatal": true, "extensionPath": "/tmp/startup.ts" }
+        \\{ "type": "register_hook", "event": "turn_end", "extensionPath": "/tmp/default.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 3), try applyHostFrameStream(&registry, frames));
+    try std.testing.expectEqual(@as(usize, 3), registry.hooks.items.len);
+
+    try std.testing.expectEqualStrings("message_end", registry.hooks.items[0].event_name);
+    try std.testing.expectEqual(@as(i64, 20), registry.hooks.items[0].priority);
+    try std.testing.expectEqual(@as(usize, 4), registry.hooks.items[0].declaration_order);
+    try std.testing.expectEqual(HookErrorPolicy.@"continue", registry.hooks.items[0].error_policy);
+
+    try std.testing.expectEqualStrings("before_agent_start", registry.hooks.items[1].event_name);
+    try std.testing.expectEqual(@as(i64, -1), registry.hooks.items[1].priority);
+    try std.testing.expectEqual(@as(usize, 2), registry.hooks.items[1].declaration_order);
+    try std.testing.expectEqual(HookErrorPolicy.fatal, registry.hooks.items[1].error_policy);
+    try std.testing.expectEqual(HookErrorPolicy.fatal, registry.hookErrorPolicyForEvent("before_agent_start"));
+
+    try std.testing.expectEqualStrings("turn_end", registry.hooks.items[2].event_name);
+    try std.testing.expectEqual(@as(i64, 0), registry.hooks.items[2].priority);
+    try std.testing.expectEqual(@as(usize, 2), registry.hooks.items[2].declaration_order);
+    try std.testing.expectEqual(HookErrorPolicy.@"continue", registry.hooks.items[2].error_policy);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"eventName\":\"message_end\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"priority\":20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"declarationOrder\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"errorPolicy\":\"continue\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"errorPolicy\":\"fatal\"") != null);
 }
 
 // --------------------------------------------------------------------------

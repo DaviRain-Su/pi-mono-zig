@@ -46,3 +46,5 @@ zig/zig-out/
 
 # agent
 .factory
+zig/.pi/
+validation/

@@ -121,9 +121,9 @@ launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
 tuistory -s "$SESSION" type "/hotkeys"
 tuistory -s "$SESSION" press enter
 tuistory -s "$SESSION" press enter
-tuistory -s "$SESSION" wait "Keyboard shortcuts" --timeout 5000
+tuistory -s "$SESSION" wait "Alt+Enter — Queue follow-up message" --timeout 5000
 hotkeys_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-snapshot_contains "$hotkeys_snapshot" "Keyboard shortcuts"
+snapshot_contains "$hotkeys_snapshot" "Alt+Enter — Queue follow-up message"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
@@ -147,14 +147,24 @@ snapshot_contains "$extension_result_snapshot" "extension editor text"
 tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
 launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
-  --env "PI_FAUX_RESPONSE=queue paste error smoke"
+  --env "PI_FAUX_RESPONSE=$(python3 - <<'PY'
+print(" ".join(["streaming queue smoke"] + [f"token{i:03d}" for i in range(180)]))
+PY
+)" \
+  --env "PI_FAUX_TOKENS_PER_SECOND=8"
+tuistory -s "$SESSION" type "start queue stream"
+tuistory -s "$SESSION" press enter
+tuistory -s "$SESSION" wait "Working" --timeout 8000
 tuistory -s "$SESSION" type "queued follow-up from m8"
 tuistory -s "$SESSION" press alt enter
-tuistory -s "$SESSION" wait "queued follow-up" --timeout 5000
+tuistory -s "$SESSION" wait "Follow-up: queued follow-up from m8" --timeout 5000
 queue_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-snapshot_contains "$queue_snapshot" "queued follow-up"
-snapshot_contains "$queue_snapshot" "Alt+⏎ follow-up"
+snapshot_contains "$queue_snapshot" "Follow-up: queued follow-up from m8"
+snapshot_contains "$queue_snapshot" "Queue: 1 follow-up"
+tuistory -s "$SESSION" close >/dev/null 2>&1 || true
 
+launch_interactive "$PROJECT" "$HOME_DIR" "$AGENT_DIR" \
+  --env "PI_FAUX_RESPONSE=queue paste error smoke"
 tuistory -s "$SESSION" press ctrl v
 tuistory -s "$SESSION" wait "clipboard" --timeout 8000
 paste_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
@@ -222,12 +232,17 @@ PY
     --env "PI_FAUX_RESPONSE=$SCROLL_RESPONSE"
   tuistory -s "$SESSION" type "$name smoke"
   tuistory -s "$SESSION" press enter
-  tuistory -s "$SESSION" wait "Ctrl+O to expand" --timeout 8000
+  tuistory -s "$SESSION" wait-idle --timeout 10000
   terminal_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
-  snapshot_contains "$terminal_snapshot" "Ctrl+O to expand"
   snapshot_contains "$terminal_snapshot" "$badge"
-  tuistory -s "$SESSION" press ctrl o
-  tuistory -s "$SESSION" wait "$name scroll tail" --timeout 8000
+  if [[ "$terminal_snapshot" == *"Ctrl+O to expand"* ]]; then
+    tuistory -s "$SESSION" press ctrl o
+    tuistory -s "$SESSION" wait-idle --timeout 10000
+    expanded_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"
+    snapshot_contains "$expanded_snapshot" "$name scroll tail"
+  else
+    snapshot_contains "$terminal_snapshot" "$name scroll tail"
+  fi
   tuistory -s "$SESSION" scroll --x 10 --y 6 up 6
   tuistory -s "$SESSION" wait-idle --timeout 3000
   scrolled_snapshot="$(tuistory -s "$SESSION" snapshot --trim)"

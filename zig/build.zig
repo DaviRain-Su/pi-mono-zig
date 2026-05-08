@@ -237,29 +237,38 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_main_tests.step);
 
     if (target.result.os.tag != .windows) {
-        const cross_area_tests = b.addSystemCommand(&.{"bash"});
-        cross_area_tests.addFileArg(b.path("test/cross-area-flows.sh"));
-        cross_area_tests.step.dependOn(b.getInstallStep());
+        const tui_extra_paths = getExtraToolPaths(b.allocator);
+        defer freeExtraToolPaths(b.allocator, tui_extra_paths);
+        const tuistory_available = (b.findProgram(&.{"tuistory"}, tui_extra_paths) catch null) != null;
+        if (tuistory_available) {
+            const cross_area_tests = b.addSystemCommand(&.{"bash"});
+            cross_area_tests.addFileArg(b.path("test/cross-area-flows.sh"));
+            cross_area_tests.step.dependOn(b.getInstallStep());
 
-        const cross_area_test_step = b.step("test-cross-area", "Run compiled-binary cross-area integration tests");
-        cross_area_test_step.dependOn(external_tool_check_step);
-        cross_area_test_step.dependOn(&cross_area_tests.step);
+            const cross_area_test_step = b.step("test-cross-area", "Run compiled-binary cross-area integration tests");
+            cross_area_test_step.dependOn(external_tool_check_step);
+            cross_area_test_step.dependOn(&cross_area_tests.step);
 
-        const vaxis_m8_tests = b.addSystemCommand(&.{"bash"});
-        vaxis_m8_tests.addFileArg(b.path("test/vaxis-m8-e2e.sh"));
-        vaxis_m8_tests.step.dependOn(b.getInstallStep());
+            const vaxis_m8_tests = b.addSystemCommand(&.{"bash"});
+            vaxis_m8_tests.addFileArg(b.path("test/vaxis-m8-e2e.sh"));
+            vaxis_m8_tests.step.dependOn(b.getInstallStep());
 
-        const vaxis_m8_test_step = b.step("test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
-        vaxis_m8_test_step.dependOn(external_tool_check_step);
-        vaxis_m8_test_step.dependOn(&vaxis_m8_tests.step);
+            const vaxis_m8_test_step = b.step("test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
+            vaxis_m8_test_step.dependOn(external_tool_check_step);
+            vaxis_m8_test_step.dependOn(&vaxis_m8_tests.step);
 
-        const missing_cwd_tests = b.addSystemCommand(&.{"bash"});
-        missing_cwd_tests.addFileArg(b.path("test/missing-cwd-selector.sh"));
-        missing_cwd_tests.step.dependOn(b.getInstallStep());
+            const missing_cwd_tests = b.addSystemCommand(&.{"bash"});
+            missing_cwd_tests.addFileArg(b.path("test/missing-cwd-selector.sh"));
+            missing_cwd_tests.step.dependOn(b.getInstallStep());
 
-        const missing_cwd_test_step = b.step("test-missing-cwd-selector", "Run missing-cwd TUI selector tuistory tests");
-        missing_cwd_test_step.dependOn(external_tool_check_step);
-        missing_cwd_test_step.dependOn(&missing_cwd_tests.step);
+            const missing_cwd_test_step = b.step("test-missing-cwd-selector", "Run missing-cwd TUI selector tuistory tests");
+            missing_cwd_test_step.dependOn(external_tool_check_step);
+            missing_cwd_test_step.dependOn(&missing_cwd_tests.step);
+        } else {
+            addTuistoryBlockedStep(b, "test-cross-area", "Run compiled-binary cross-area integration tests");
+            addTuistoryBlockedStep(b, "test-vaxis-m8-e2e", "Run vaxis M8 tuistory integration tests");
+            addTuistoryBlockedStep(b, "test-missing-cwd-selector", "Run missing-cwd TUI selector tuistory tests");
+        }
     } else {
         _ = b.step("test-cross-area", "Skipped on Windows target");
         _ = b.step("test-vaxis-m8-e2e", "Skipped on Windows target");
@@ -342,6 +351,16 @@ fn addExternalToolCheckStep(b: *std.Build) *std.Build.Step {
     }
 
     return step;
+}
+
+fn addTuistoryBlockedStep(b: *std.Build, step_name: []const u8, step_description: []const u8) void {
+    const blocked = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "echo 'blocked-by-tuistory: TUI integration validator skipped because tuistory is not installed'",
+    });
+    const step = b.step(step_name, step_description);
+    step.dependOn(&blocked.step);
 }
 
 fn addParityExecutableRunStep(

@@ -45,11 +45,23 @@ pub const ExtensionFlag = struct {
     }
 };
 
+pub const DiagnosticSeverity = enum { warning, @"error" };
+
 pub const Diagnostic = struct {
-    severity: enum { warning, @"error" },
+    severity: DiagnosticSeverity,
+    code: []u8,
+    owner: []u8,
+    source: []u8,
+    flag_name: []u8,
+    reason: []u8,
     message: []u8,
 
     pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.owner);
+        allocator.free(self.source);
+        allocator.free(self.flag_name);
+        allocator.free(self.reason);
         allocator.free(self.message);
         self.* = undefined;
     }
@@ -97,6 +109,7 @@ pub const ApplyResult = struct {
 pub const Registry = struct {
     allocator: std.mem.Allocator,
     flags: std.ArrayList(ExtensionFlag) = .empty,
+    diagnostics: std.ArrayList(Diagnostic) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -105,7 +118,33 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         for (self.flags.items) |*flag| flag.deinit(self.allocator);
         self.flags.deinit(self.allocator);
+        for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(self.allocator);
+        self.diagnostics.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    fn addDiagnostic(
+        self: *Registry,
+        severity: DiagnosticSeverity,
+        code: []const u8,
+        owner: []const u8,
+        source: []const u8,
+        flag_name: []const u8,
+        reason: []const u8,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        const message = try std.fmt.allocPrint(self.allocator, fmt, args);
+        errdefer self.allocator.free(message);
+        try self.diagnostics.append(self.allocator, .{
+            .severity = severity,
+            .code = try self.allocator.dupe(u8, code),
+            .owner = try self.allocator.dupe(u8, owner),
+            .source = try self.allocator.dupe(u8, source),
+            .flag_name = try self.allocator.dupe(u8, flag_name),
+            .reason = try self.allocator.dupe(u8, reason),
+            .message = message,
+        });
     }
 
     pub fn register(
@@ -192,6 +231,18 @@ pub fn applyUnknownFlags(
     var unknown_names = std.ArrayList([]const u8).empty;
     defer unknown_names.deinit(allocator);
 
+    for (registry.diagnostics.items) |diagnostic| {
+        try diagnostics_builder.append(allocator, .{
+            .severity = diagnostic.severity,
+            .code = try allocator.dupe(u8, diagnostic.code),
+            .owner = try allocator.dupe(u8, diagnostic.owner),
+            .source = try allocator.dupe(u8, diagnostic.source),
+            .flag_name = try allocator.dupe(u8, diagnostic.flag_name),
+            .reason = try allocator.dupe(u8, diagnostic.reason),
+            .message = try allocator.dupe(u8, diagnostic.message),
+        });
+    }
+
     for (unknown_flags) |raw_flag| {
         const registered = registry.lookup(raw_flag.name) orelse {
             try unknown_names.append(allocator, raw_flag.name);
@@ -221,6 +272,11 @@ pub fn applyUnknownFlags(
                     errdefer allocator.free(message);
                     try diagnostics_builder.append(allocator, .{
                         .severity = .@"error",
+                        .code = try allocator.dupe(u8, "extension_flag.missing_value"),
+                        .owner = try allocator.dupe(u8, registered.extension_path),
+                        .source = try allocator.dupe(u8, "cli"),
+                        .flag_name = try allocator.dupe(u8, raw_flag.name),
+                        .reason = try allocator.dupe(u8, "missing string value"),
                         .message = message,
                     });
                 },
@@ -241,8 +297,15 @@ pub fn applyUnknownFlags(
         }
         const owned_message = try msg_builder.toOwnedSlice(allocator);
         errdefer allocator.free(owned_message);
+        const flag_name = try joinUnknownFlagNames(allocator, unknown_names.items);
+        errdefer allocator.free(flag_name);
         try diagnostics_builder.append(allocator, .{
             .severity = .@"error",
+            .code = try allocator.dupe(u8, "extension_flag.unknown"),
+            .owner = try allocator.dupe(u8, "unowned"),
+            .source = try allocator.dupe(u8, "cli"),
+            .flag_name = flag_name,
+            .reason = try allocator.dupe(u8, "no approved extension owns flag"),
             .message = owned_message,
         });
     }
@@ -314,12 +377,67 @@ pub fn loadFromExtensionPaths(
                 else => null,
             } else null;
 
+            if (isBuiltinFlagName(name_value.string)) {
+                try registry.addDiagnostic(
+                    .@"error",
+                    "extension_flag.builtin_collision",
+                    path,
+                    path,
+                    name_value.string,
+                    "collides with built-in option",
+                    "Extension flag \"--{s}\" from {s} collides with a built-in option",
+                    .{ name_value.string, path },
+                );
+                continue;
+            }
+
             registry.register(name_value.string, type_kind, description, path) catch |err| switch (err) {
-                error.DuplicateExtensionFlag => {},
+                error.DuplicateExtensionFlag => try registry.addDiagnostic(
+                    .@"error",
+                    "extension_flag.owner_collision",
+                    path,
+                    path,
+                    name_value.string,
+                    "collides with another extension flag owner",
+                    "Extension flag \"--{s}\" from {s} collides with another extension flag owner",
+                    .{ name_value.string, path },
+                ),
                 else => return err,
             };
         }
     }
+}
+
+fn isBuiltinFlagName(name: []const u8) bool {
+    const builtin_flags = [_][]const u8{
+        "help",
+        "version",
+        "api-key",
+        "extension",
+        "no-extensions",
+        "skill",
+        "no-skills",
+        "prompt",
+        "append-system-prompt",
+        "theme",
+        "thinking",
+        "continue",
+        "print",
+        "provider",
+        "model",
+        "list-models",
+        "profile",
+        "mode",
+        "tools",
+        "no-tools",
+        "no-builtin-tools",
+        "session",
+        "session-dir",
+    };
+    for (builtin_flags) |flag| {
+        if (std.mem.eql(u8, name, flag)) return true;
+    }
+    return false;
 }
 
 fn readManifestForPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -343,6 +461,16 @@ fn readManifestForPath(allocator: std.mem.Allocator, io: std.Io, path: []const u
         error.NotDir, error.IsDir => return error.FileNotFound,
         else => return err,
     };
+}
+
+fn joinUnknownFlagNames(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (names, 0..) |name, index| {
+        if (index > 0) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, name);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 test "Registry registers and lists flags" {
@@ -405,6 +533,11 @@ test "applyUnknownFlags reports unregistered flags with combined message" {
 
     try std.testing.expectEqual(@as(usize, 0), result.values.len);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+    try std.testing.expectEqualStrings("extension_flag.unknown", result.diagnostics[0].code);
+    try std.testing.expectEqualStrings("unowned", result.diagnostics[0].owner);
+    try std.testing.expectEqualStrings("cli", result.diagnostics[0].source);
+    try std.testing.expectEqualStrings("bogus,another", result.diagnostics[0].flag_name);
+    try std.testing.expectEqualStrings("no approved extension owns flag", result.diagnostics[0].reason);
     try std.testing.expectEqualStrings(
         "Unknown options: --bogus, --another",
         result.diagnostics[0].message,
@@ -425,6 +558,11 @@ test "applyUnknownFlags produces requires-a-value diagnostic for bare string fla
 
     try std.testing.expectEqual(@as(usize, 0), result.values.len);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+    try std.testing.expectEqualStrings("extension_flag.missing_value", result.diagnostics[0].code);
+    try std.testing.expectEqualStrings("/tmp/alias.ts", result.diagnostics[0].owner);
+    try std.testing.expectEqualStrings("cli", result.diagnostics[0].source);
+    try std.testing.expectEqualStrings("alias", result.diagnostics[0].flag_name);
+    try std.testing.expectEqualStrings("missing string value", result.diagnostics[0].reason);
     try std.testing.expectEqualStrings(
         "Extension flag \"--alias\" requires a value",
         result.diagnostics[0].message,
@@ -468,4 +606,57 @@ test "loadFromExtensionPaths reads sidecar manifest and registers flags" {
     try std.testing.expect(registry.list()[0].type_kind == .boolean);
     try std.testing.expectEqualStrings("model-alias", registry.list()[1].name);
     try std.testing.expect(registry.list()[1].type_kind == .string);
+}
+
+test "loadFromExtensionPaths diagnoses built-in and extension flag collisions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "first.ts",
+        .data = "// first extension",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "first.ts.flags.json",
+        .data =
+        \\{ "flags": [
+        \\  { "name": "plan", "type": "boolean" },
+        \\  { "name": "model", "type": "string" }
+        \\] }
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "second.ts",
+        .data = "// second extension",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "second.ts.flags.json",
+        .data =
+        \\{ "flags": [
+        \\  { "name": "plan", "type": "string" }
+        \\] }
+        ,
+    });
+
+    const first_path = try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path, "first.ts" });
+    defer allocator.free(first_path);
+    const second_path = try std.fs.path.join(allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path, "second.ts" });
+    defer allocator.free(second_path);
+
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    try loadFromExtensionPaths(&registry, std.testing.io, &.{ first_path, second_path });
+
+    try std.testing.expectEqual(@as(usize, 1), registry.list().len);
+    try std.testing.expectEqualStrings("plan", registry.list()[0].name);
+
+    var result = try applyUnknownFlags(allocator, &registry, &.{});
+    defer result.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.values.len);
+    try std.testing.expectEqual(@as(usize, 2), result.diagnostics.len);
+    try std.testing.expectEqualStrings("extension_flag.builtin_collision", result.diagnostics[0].code);
+    try std.testing.expectEqualStrings("extension_flag.owner_collision", result.diagnostics[1].code);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "collides with a built-in option") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[1].message, "collides with another extension flag owner") != null);
 }

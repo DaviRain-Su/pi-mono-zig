@@ -32,7 +32,7 @@ pub const HostProcessOptions = struct {
     extension_path: ?[]const u8 = null,
     initialize: InitializeFrame,
     shutdown_timeout_ms: u64 = 1000,
-    approved_capabilities: []const enforcement.Grant = &.{},
+    approved_capabilities: []const enforcement.Grant = enforcement.CANONICAL_GRANTS[0..],
     resource_limits: enforcement.ResourceLimits = .{},
     policy_lookup_key: ?[]const u8 = null,
 };
@@ -62,6 +62,8 @@ pub const HostProcess = struct {
     stderr_err: ?anyerror = null,
     term: ?std.process.Child.Term = null,
     diagnostic_source: []u8,
+    approved_capabilities: []enforcement.Grant,
+    policy_lookup_key: ?[]u8,
     stderr_diagnostics_recorded: usize = 0,
     stderr_diagnostics_truncated: bool = false,
     extension_event_sequence: usize = 0,
@@ -88,6 +90,10 @@ pub const HostProcess = struct {
         child.stderr = null;
         const diagnostic_source = try allocator.dupe(u8, options.extension_path orelse options.initialize.fixture);
         errdefer allocator.free(diagnostic_source);
+        const approved_capabilities = try allocator.dupe(enforcement.Grant, options.approved_capabilities);
+        errdefer allocator.free(approved_capabilities);
+        const policy_lookup_key = if (options.policy_lookup_key) |policy_key| try allocator.dupe(u8, policy_key) else null;
+        errdefer if (policy_lookup_key) |policy_key| allocator.free(policy_key);
 
         host.* = .{
             .allocator = allocator,
@@ -99,18 +105,20 @@ pub const HostProcess = struct {
             .state = ProtocolState.initWithPolicy(
                 allocator,
                 .{
-                    .approved_grants = options.approved_capabilities,
+                    .approved_grants = approved_capabilities,
                     .resource_limits = options.resource_limits,
                 },
                 .{
                     .runtime_kind = "process_jsonl",
                     .extension_id = options.extension_path orelse options.argv[0],
-                    .policy_lookup_key = options.policy_lookup_key,
+                    .policy_lookup_key = policy_lookup_key,
                     .package_root = options.cwd,
                 },
             ),
             .shutdown_timeout_ms = options.shutdown_timeout_ms,
             .diagnostic_source = diagnostic_source,
+            .approved_capabilities = approved_capabilities,
+            .policy_lookup_key = policy_lookup_key,
         };
 
         try host.sendInitialize(options.initialize);
@@ -125,6 +133,8 @@ pub const HostProcess = struct {
         self.parser.deinit(self.allocator);
         self.state.deinit();
         self.allocator.free(self.diagnostic_source);
+        self.allocator.free(self.approved_capabilities);
+        if (self.policy_lookup_key) |policy_key| self.allocator.free(policy_key);
         self.allocator.destroy(self);
     }
 
@@ -178,6 +188,8 @@ pub const HostProcess = struct {
         }
         self.mutex.lockUncancelable(self.io);
         self.state.clearPendingRequests();
+        self.state.registry.deinit();
+        self.state.registry = extension_registry.Registry.init(self.allocator);
         self.mutex.unlock(self.io);
         if (shutdown_write_err) |err| return err;
     }
@@ -381,7 +393,7 @@ pub const HostProcess = struct {
         const event_id = blk: {
             self.mutex.lockUncancelable(self.io);
             errdefer self.mutex.unlock(self.io);
-            if (!self.state.registry.hasHook(event_name)) {
+            if (!self.state.registry.hasHook(event_name) and !self.eventTargetsRegisteredCommandLocked(event_name, event)) {
                 self.mutex.unlock(self.io);
                 return null;
             }
@@ -416,18 +428,29 @@ pub const HostProcess = struct {
                     owned_response.deinit(self.allocator);
                 }
                 if (response.error_message) |message| {
+                    const fatal = response.fatal or self.hookErrorPolicyIsFatal(event_name);
+                    const policy: []const u8 = if (fatal) "fatal" else "continue";
+                    const decision: []const u8 = if (fatal and isStartupFatalHookEvent(event_name)) "abort" else "continue";
+                    const severity: DiagnosticSeverity = if (std.mem.eql(u8, decision, "abort")) .@"error" else .warning;
                     const diagnostic = try std.fmt.allocPrint(
                         self.allocator,
-                        "extension hook error source={s} event={s} eventId={s}: {s}",
-                        .{ self.diagnostic_source, event_name, event_id, message },
+                        "extension hook error source={s} event={s} eventId={s} policy={s} decision={s}: {s}",
+                        .{ self.diagnostic_source, event_name, event_id, policy, decision, message },
                     );
                     defer self.allocator.free(diagnostic);
-                    self.mutex.lockUncancelable(self.io);
-                    defer self.mutex.unlock(self.io);
-                    try self.state.addDiagnostic(.host_error, .warning, diagnostic);
+                    {
+                        self.mutex.lockUncancelable(self.io);
+                        defer self.mutex.unlock(self.io);
+                        try self.state.addDiagnostic(.host_error, severity, diagnostic);
+                    }
+                    if (std.mem.eql(u8, decision, "abort")) return error.FatalExtensionHook;
                     return null;
                 }
-                return if (response.result) |result| try common.cloneJsonValue(allocator, result) else null;
+                if (response.result) |result| {
+                    if (!try self.validateExtensionEventResult(event_name, result)) return null;
+                    return try common.cloneJsonValue(allocator, result);
+                }
+                return null;
             }
             const exited = self.wait_done.load(.seq_cst) and self.reader_done.load(.seq_cst);
             if (exited) {
@@ -460,6 +483,91 @@ pub const HostProcess = struct {
             try self.state.addDiagnostic(.host_error, .warning, message);
         }
         return null;
+    }
+
+    fn eventTargetsRegisteredCommandLocked(self: *HostProcess, event_name: []const u8, event: std.json.Value) bool {
+        if (!std.mem.eql(u8, event_name, "command")) return false;
+        if (event != .object) return false;
+        const name_value = event.object.get("name") orelse return false;
+        if (name_value != .string) return false;
+        return self.state.registry.hasCommandInvocation(name_value.string);
+    }
+
+    fn validateExtensionEventResult(self: *HostProcess, event_name: []const u8, result: std.json.Value) !bool {
+        if (std.mem.eql(u8, event_name, "context")) {
+            if (try self.contextResultDiagnostic(result)) |diagnostic| {
+                defer self.allocator.free(diagnostic);
+                try self.state.addDiagnostic(.host_error, .warning, diagnostic);
+                return false;
+            }
+            return true;
+        }
+
+        if ((std.mem.eql(u8, event_name, "input") or std.mem.eql(u8, event_name, "before_agent_start")) and hookResultSuppressesTurn(result)) {
+            const reason = hookResultReason(result);
+            const diagnostic = try std.fmt.allocPrint(
+                self.allocator,
+                "extension hook suppressed turn extensionId={s} hook={s} reason={s}",
+                .{ self.diagnostic_source, event_name, reason },
+            );
+            defer self.allocator.free(diagnostic);
+            try self.state.addDiagnostic(.host_error, .warning, diagnostic);
+        }
+        return true;
+    }
+
+    fn contextResultDiagnostic(self: *HostProcess, result: std.json.Value) !?[]u8 {
+        if (result != .object) {
+            return try self.formatContextHookDiagnostic("$", "expected object result");
+        }
+        const messages = result.object.get("messages") orelse return null;
+        if (messages != .array) {
+            return try self.formatContextHookDiagnostic("$.messages", "expected array");
+        }
+        for (messages.array.items, 0..) |message, index| {
+            switch (message) {
+                .string => {},
+                .object => |object| {
+                    if (object.get("content")) |content| {
+                        if (content != .string) {
+                            const path = try std.fmt.allocPrint(self.allocator, "$.messages[{d}].content", .{index});
+                            defer self.allocator.free(path);
+                            return try self.formatContextHookDiagnostic(path, "expected string");
+                        }
+                    } else if (object.get("text")) |text| {
+                        if (text != .string) {
+                            const path = try std.fmt.allocPrint(self.allocator, "$.messages[{d}].text", .{index});
+                            defer self.allocator.free(path);
+                            return try self.formatContextHookDiagnostic(path, "expected string");
+                        }
+                    } else {
+                        const path = try std.fmt.allocPrint(self.allocator, "$.messages[{d}]", .{index});
+                        defer self.allocator.free(path);
+                        return try self.formatContextHookDiagnostic(path, "missing string content or text field");
+                    }
+                },
+                else => {
+                    const path = try std.fmt.allocPrint(self.allocator, "$.messages[{d}]", .{index});
+                    defer self.allocator.free(path);
+                    return try self.formatContextHookDiagnostic(path, "expected string or object");
+                },
+            }
+        }
+        return null;
+    }
+
+    fn formatContextHookDiagnostic(self: *HostProcess, path: []const u8, message: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "invalid extension context hook contribution extensionId={s} hook=context path={s}: {s}",
+            .{ self.diagnostic_source, path, message },
+        );
+    }
+
+    fn hookErrorPolicyIsFatal(self: *HostProcess, event_name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.state.registry.hookErrorPolicyForEvent(event_name) == .fatal;
     }
 
     /// Send a JSONL extension event frame to the extension host stdin pipe.
@@ -939,6 +1047,155 @@ test "process_jsonl host times out unresponsive extension event hook and rejects
     try std.testing.expect(hostDiagnosticContains(host, .host_error, "stale or unknown extension event response"));
 }
 
+test "process_jsonl host diagnoses handled input hook before returning suppression" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"extension_event\"'*) printf '{\"type\":\"extension_event_result\",\"eventId\":\"event-1-input\",\"result\":{\"action\":\"handled\",\"reason\":\"policy denied input\"}}\\n';; " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-input-deny" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/deny-input.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-input-deny",
+            .cwd = "/tmp",
+            .fixture = "deny-input-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    host.mutex.lockUncancelable(std.testing.io);
+    try host.state.registry.registerHook("input", "fixture/deny-input.js");
+    host.mutex.unlock(std.testing.io);
+
+    var event = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"input\",\"text\":\"hello\"}", .{});
+    defer event.deinit();
+    var result = (try host.invokeExtensionEvent(allocator, "input", event.value, 500)).?;
+    defer common.deinitJsonValue(allocator, result);
+    try std.testing.expectEqualStrings("handled", result.object.get("action").?.string);
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "extensionId=fixture/deny-input.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "hook=input"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "reason=policy denied input"));
+}
+
+test "process_jsonl host rejects invalid context hook contribution with field path" {
+    const allocator = std.testing.allocator;
+    const script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"extension_event\"'*) printf '{\"type\":\"extension_event_result\",\"eventId\":\"event-1-context\",\"result\":{\"messages\":[{\"role\":\"user\"}]}}\\n';; " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "esac; done";
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-jsonl-invalid-context" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/invalid-context.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-invalid-context",
+            .cwd = "/tmp",
+            .fixture = "invalid-context-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    host.mutex.lockUncancelable(std.testing.io);
+    try host.state.registry.registerHook("context", "fixture/invalid-context.js");
+    host.mutex.unlock(std.testing.io);
+
+    var event = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"context\",\"messages\":[]}", .{});
+    defer event.deinit();
+    const result = try host.invokeExtensionEvent(allocator, "context", event.value, 500);
+    try std.testing.expect(result == null);
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "extensionId=fixture/invalid-context.js"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "hook=context"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "path=$.messages[0]"));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "missing string content or text field"));
+}
+
+test "process_jsonl host enforces fatal and non-fatal hook error policy" {
+    const allocator = std.testing.allocator;
+    const nonfatal_script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_hook\",\"event\":\"before_agent_start\",\"errorPolicy\":\"continue\",\"extensionPath\":\"fixture/nonfatal-hook.js\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"extension_event\"'*) printf '{\"type\":\"hook_error\",\"eventId\":\"event-1-before_agent_start\",\"message\":\"nonfatal startup failure\",\"errorPolicy\":\"continue\"}\\n';; " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "esac; done";
+    const nonfatal_argv = [_][]const u8{ "/bin/sh", "-c", nonfatal_script, "pi-process-jsonl-nonfatal-hook-error" };
+    var nonfatal = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &nonfatal_argv,
+        .extension_path = "fixture/nonfatal-hook.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-nonfatal-hook-error",
+            .cwd = "/tmp",
+            .fixture = "nonfatal-hook-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer nonfatal.deinit();
+
+    try nonfatal.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (nonfatal.registryFramesApplied() < 1 and elapsed <= 500) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), nonfatal.registryFramesApplied());
+
+    var event = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"before_agent_start\"}", .{});
+    defer event.deinit();
+    const nonfatal_result = try nonfatal.invokeExtensionEvent(allocator, "before_agent_start", event.value, 500);
+    try std.testing.expect(nonfatal_result == null);
+    try std.testing.expect(hostDiagnosticContains(nonfatal, .host_error, "nonfatal startup failure"));
+    try std.testing.expect(hostDiagnosticContains(nonfatal, .host_error, "policy=continue"));
+    try std.testing.expect(hostDiagnosticContains(nonfatal, .host_error, "decision=continue"));
+
+    const fatal_script =
+        "IFS= read -r init; " ++
+        "printf '{\"type\":\"ready\"}\\n'; " ++
+        "printf '{\"type\":\"register_hook\",\"event\":\"before_agent_start\",\"priority\":-5,\"declarationOrder\":1,\"errorPolicy\":\"fatal\",\"extensionPath\":\"fixture/fatal-hook.js\"}\\n'; " ++
+        "while IFS= read -r line; do " ++
+        "case \"$line\" in " ++
+        "*'\"extension_event\"'*) printf '{\"type\":\"extension_event_error\",\"eventId\":\"event-1-before_agent_start\",\"message\":\"fatal startup failure\"}\\n';; " ++
+        "*'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; " ++
+        "esac; done";
+    const fatal_argv = [_][]const u8{ "/bin/sh", "-c", fatal_script, "pi-process-jsonl-fatal-hook-error" };
+    var fatal = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &fatal_argv,
+        .extension_path = "fixture/fatal-hook.js",
+        .initialize = .{
+            .marker = "pi-process-jsonl-fatal-hook-error",
+            .cwd = "/tmp",
+            .fixture = "fatal-hook-fixture",
+        },
+        .shutdown_timeout_ms = 50,
+    });
+    defer fatal.deinit();
+
+    try fatal.waitForReady(500);
+    elapsed = 0;
+    while (fatal.registryFramesApplied() < 1 and elapsed <= 500) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), fatal.registryFramesApplied());
+    try std.testing.expectError(error.FatalExtensionHook, fatal.invokeExtensionEvent(allocator, "before_agent_start", event.value, 500));
+    try std.testing.expect(hostDiagnosticContains(fatal, .host_error, "fatal startup failure"));
+    try std.testing.expect(hostDiagnosticContains(fatal, .host_error, "policy=fatal"));
+    try std.testing.expect(hostDiagnosticContains(fatal, .host_error, "decision=abort"));
+}
+
 test "process_jsonl host reports EOF during pending tool call without successful result" {
     const allocator = std.testing.allocator;
     const script =
@@ -1380,6 +1637,49 @@ test "VAL-REFACTOR-012 deterministic extension host UI protocol fuzz smoke" {
         "{\"type\":\"extension_ui_response\",\"id\":\"select-1\",\"payload\":{\"cancelled\":true}}\n",
         out.written(),
     );
+}
+
+fn hookResultSuppressesTurn(value: std.json.Value) bool {
+    if (jsonBoolField(value, "handled") orelse false) return true;
+    if (jsonBoolField(value, "block") orelse false) return true;
+    if (jsonStringField(value, "action")) |action| {
+        return std.mem.eql(u8, action, "handled") or
+            std.mem.eql(u8, action, "block") or
+            std.mem.eql(u8, action, "deny");
+    }
+    return false;
+}
+
+fn hookResultReason(value: std.json.Value) []const u8 {
+    return jsonStringField(value, "reason") orelse
+        jsonStringField(value, "message") orelse
+        jsonStringField(value, "error") orelse
+        jsonStringField(value, "action") orelse
+        if (jsonBoolField(value, "handled") orelse false) "handled" else "blocked";
+}
+
+fn isStartupFatalHookEvent(event_name: []const u8) bool {
+    return std.mem.eql(u8, event_name, "before_agent_start") or
+        std.mem.eql(u8, event_name, "startup") or
+        std.mem.eql(u8, event_name, "session_start");
+}
+
+fn jsonStringField(value: std.json.Value, key: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBoolField(value: std.json.Value, key: []const u8) ?bool {
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .bool => |flag| flag,
+        else => null,
+    };
 }
 
 fn hostDiagnosticContains(host: *HostProcess, category: DiagnosticCategory, needle: []const u8) bool {

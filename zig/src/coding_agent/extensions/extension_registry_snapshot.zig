@@ -25,6 +25,9 @@ pub fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: anytype) !
     try putCommands(allocator, &root, registry);
     try putShortcuts(allocator, &root, registry);
     try putCapabilities(allocator, &root, registry);
+    try putWorkflows(allocator, &root, registry);
+    try putWorkflowDiagnostics(allocator, &root, registry);
+    try putSubAgentPresets(allocator, &root, registry);
     try putFlags(allocator, &root, registry);
     try putProviders(allocator, &root, registry);
     try putResourceDiscoveries(allocator, &root, registry);
@@ -33,6 +36,7 @@ pub fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: anytype) !
     try putTerminalInputSubscriptions(allocator, &root, registry);
     try putEditorComponentHook(allocator, &root, registry);
     try putWidgets(allocator, &root, registry);
+    try putHooks(allocator, &root, registry);
     try putMessageRenderers(allocator, &root, registry);
 
     return .{ .object = root };
@@ -96,6 +100,65 @@ fn putCapabilities(allocator: std.mem.Allocator, root: *std.json.ObjectMap, regi
         try capabilities_array.append(.{ .object = entry });
     }
     try root.put(allocator, try allocator.dupe(u8, "capabilities"), .{ .array = capabilities_array });
+}
+
+fn putWorkflows(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
+    var workflows_array = std.json.Array.init(allocator);
+    for (registry.workflows.items) |workflow| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, workflow.id) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, workflow.description) });
+        try entry.put(allocator, try allocator.dupe(u8, "inputSchema"), try common.cloneJsonValue(allocator, workflow.input_schema));
+        try entry.put(allocator, try allocator.dupe(u8, "outputSchema"), try common.cloneJsonValue(allocator, workflow.output_schema));
+        try entry.put(allocator, try allocator.dupe(u8, "executionMode"), .{ .string = try allocator.dupe(u8, workflow.execution_mode) });
+        try entry.put(allocator, try allocator.dupe(u8, "permissions"), try common.cloneJsonValue(allocator, workflow.permissions));
+        try entry.put(allocator, try allocator.dupe(u8, "dependencies"), try common.cloneJsonValue(allocator, workflow.dependencies));
+        try entry.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = @intCast(workflow.timeout_ms) });
+        try entry.put(allocator, try allocator.dupe(u8, "cancellation"), try common.cloneJsonValue(allocator, workflow.cancellation));
+        try entry.put(allocator, try allocator.dupe(u8, "replay"), try common.cloneJsonValue(allocator, workflow.replay));
+        try entry.put(allocator, try allocator.dupe(u8, "childAgentLimits"), try common.cloneJsonValue(allocator, workflow.child_agent_limits));
+        try entry.put(allocator, try allocator.dupe(u8, "commandName"), try optionalStringJson(allocator, workflow.command_name));
+        try entry.put(allocator, try allocator.dupe(u8, "toolName"), try optionalStringJson(allocator, workflow.tool_name));
+        try entry.put(allocator, try allocator.dupe(u8, "presetId"), try optionalStringJson(allocator, workflow.preset_id));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, workflow.extension_path) });
+        try workflows_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "workflows"), .{ .array = workflows_array });
+}
+
+fn putSubAgentPresets(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
+    var presets_array = std.json.Array.init(allocator);
+    for (registry.workflows.items) |workflow| {
+        const preset_id = workflow.preset_id orelse continue;
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, preset_id) });
+        try entry.put(allocator, try allocator.dupe(u8, "workflowId"), .{ .string = try allocator.dupe(u8, workflow.id) });
+        try entry.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, workflow.description) });
+        try entry.put(allocator, try allocator.dupe(u8, "permissions"), try common.cloneJsonValue(allocator, workflow.permissions));
+        try entry.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = @intCast(workflow.timeout_ms) });
+        try entry.put(allocator, try allocator.dupe(u8, "childAgentLimits"), try common.cloneJsonValue(allocator, workflow.child_agent_limits));
+        try entry.put(allocator, try allocator.dupe(u8, "replay"), try common.cloneJsonValue(allocator, workflow.replay));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, workflow.extension_path) });
+        try presets_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "subAgentPresets"), .{ .array = presets_array });
+}
+
+fn putWorkflowDiagnostics(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
+    var diagnostics_array = std.json.Array.init(allocator);
+    for (registry.workflow_surface_diagnostics.items) |diagnostic| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, diagnostic.code) });
+        try entry.put(allocator, try allocator.dupe(u8, "severity"), .{ .string = try allocator.dupe(u8, diagnostic.severity) });
+        try entry.put(allocator, try allocator.dupe(u8, "workflowId"), .{ .string = try allocator.dupe(u8, diagnostic.workflow_id) });
+        try entry.put(allocator, try allocator.dupe(u8, "surface"), .{ .string = try allocator.dupe(u8, diagnostic.surface) });
+        try entry.put(allocator, try allocator.dupe(u8, "name"), try optionalStringJson(allocator, diagnostic.name));
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, diagnostic.extension_path) });
+        try entry.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, diagnostic.path) });
+        try entry.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, diagnostic.message) });
+        try diagnostics_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "workflowDiagnostics"), .{ .array = diagnostics_array });
 }
 
 fn putFlags(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
@@ -247,6 +310,20 @@ fn putMessageRenderers(allocator: std.mem.Allocator, root: *std.json.ObjectMap, 
         try mr_array.append(.{ .object = entry });
     }
     try root.put(allocator, try allocator.dupe(u8, "messageRenderers"), .{ .array = mr_array });
+}
+
+fn putHooks(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
+    var hooks_array = std.json.Array.init(allocator);
+    for (registry.hooks.items) |hook| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "eventName"), .{ .string = try allocator.dupe(u8, hook.event_name) });
+        try entry.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, hook.extension_path) });
+        try entry.put(allocator, try allocator.dupe(u8, "priority"), .{ .integer = hook.priority });
+        try entry.put(allocator, try allocator.dupe(u8, "declarationOrder"), .{ .integer = @intCast(hook.declaration_order) });
+        try entry.put(allocator, try allocator.dupe(u8, "errorPolicy"), .{ .string = try allocator.dupe(u8, hook.error_policy.jsonName()) });
+        try hooks_array.append(.{ .object = entry });
+    }
+    try root.put(allocator, try allocator.dupe(u8, "hooks"), .{ .array = hooks_array });
 }
 
 fn injectionHookJson(allocator: std.mem.Allocator, hook: anytype) !std.json.Value {

@@ -56,6 +56,12 @@ pub const AgentToolResult = struct {
     is_error: bool = false,
 };
 
+pub const AgentToolSource = enum {
+    builtin,
+    extension,
+    custom,
+};
+
 pub const AgentToolUpdateCallback = *const fn (
     context: ?*anyopaque,
     // Borrowed for the duration of the callback. Clone any owned fields before retaining them.
@@ -67,6 +73,20 @@ pub const PrepareArgumentsFn = *const fn (
     args: std.json.Value,
 ) anyerror!std.json.Value;
 
+pub const ToolArgumentValidationFailure = struct {
+    code: []const u8,
+    message: []const u8,
+    path: []const u8,
+};
+
+pub const InvalidArgumentsResultFn = *const fn (
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    failure: ToolArgumentValidationFailure,
+) anyerror!AgentToolResult;
+
 pub const ExecuteToolFn = *const fn (
     allocator: std.mem.Allocator,
     tool_call_id: []const u8,
@@ -76,6 +96,11 @@ pub const ExecuteToolFn = *const fn (
     on_update_context: ?*anyopaque,
     on_update: ?AgentToolUpdateCallback,
 ) anyerror!AgentToolResult;
+
+pub const DeinitToolContextFn = *const fn (
+    allocator: std.mem.Allocator,
+    tool_context: ?*anyopaque,
+) void;
 
 pub const BeforeToolCallContext = struct {
     assistant_message: ai.AssistantMessage,
@@ -110,9 +135,12 @@ pub const AgentTool = struct {
     description: []const u8,
     label: []const u8,
     parameters: std.json.Value,
+    source: AgentToolSource = .custom,
     prepare_arguments: ?PrepareArgumentsFn = null,
+    invalid_arguments_result: ?InvalidArgumentsResultFn = null,
     execute: ?ExecuteToolFn = null,
     execute_context: ?*anyopaque = null,
+    deinit_execute_context: ?DeinitToolContextFn = null,
     execution_mode: ?ToolExecutionMode = null,
 };
 
@@ -132,6 +160,7 @@ pub const AgentContext = struct {
     system_prompt: []const u8,
     messages: []const AgentMessage,
     tools: []const AgentTool = &.{},
+    extension_hook_context: ?*anyopaque = null,
 };
 
 pub const StreamFn = *const fn (
@@ -178,6 +207,7 @@ pub const AgentLoopConfig = struct {
     convert_to_llm_context: ?*anyopaque = null,
     transform_context: ?TransformContextFn = null,
     transform_context_context: ?*anyopaque = null,
+    extension_hook_context: ?*anyopaque = null,
     stream_context: ?*anyopaque = null,
     get_steering_messages_context: ?*anyopaque = null,
     get_steering_messages: ?PendingMessagesFn = null,

@@ -53,6 +53,7 @@ const DeferredResponsePriority = enum(u8) {
 
 const DEFERRED_RESPONSE_FLUSH_INTERVAL_MS = 50;
 const EXTENSION_HOST_EVENT_LOOP_TICK_MS = 10;
+const EXTENSION_COMMAND_ACK_TIMEOUT_MS = 1000;
 
 pub const command_types = ts_rpc_wire.command_types;
 pub const isKnownCommandType = ts_rpc_wire.isKnownCommandType;
@@ -417,7 +418,7 @@ const TsRpcServer = struct {
 
     fn startExtensionHost(self: *TsRpcServer, options: ExtensionHostOptions) !void {
         if (self.extension_host != null) return error.ExtensionHostAlreadyStarted;
-        const host = try extension_runtime.startRuntime(self.allocator, self.io, .{ .process_jsonl = .{
+        const host = try extension_runtime.startRuntimeAdapter(self.allocator, self.io, .{ .process_jsonl = .{
             .argv = options.argv,
             .cwd = options.cwd,
             .extension_path = options.extension_path,
@@ -845,6 +846,10 @@ const TsRpcServer = struct {
                 return;
             };
 
+            if (try self.tryDispatchExtensionPromptCommand(id, command, message)) {
+                return;
+            }
+
             // Emit input extension event before agent processes the message
             if (self.extension_host) |host| self.emitExtensionInputEvent(host, message, "rpc");
 
@@ -1271,7 +1276,9 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "get_commands")) {
-            try self.writeSuccessResponseRawData(id, command, "{\"commands\":[]}");
+            const data = try self.buildCommandsJson();
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, command, data);
             return;
         }
 
@@ -1326,6 +1333,87 @@ const TsRpcServer = struct {
         try self.writeErrorResponse(id, command, message);
     }
 
+    fn buildCommandsJson(self: *TsRpcServer) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"commands\":[");
+        if (self.extension_host) |host| {
+            var context = ExtensionCommandsJsonContext{
+                .allocator = self.allocator,
+                .writer = &out.writer,
+            };
+            try host.withRegistry(&context, writeExtensionCommandsJsonCallback);
+        }
+        try out.writer.writeAll("]}");
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn tryDispatchExtensionPromptCommand(
+        self: *TsRpcServer,
+        id: ?[]const u8,
+        response_command: []const u8,
+        message: []const u8,
+    ) !bool {
+        const host = self.extension_host orelse return false;
+        const invocation = parseSlashCommandInvocation(message) orelse return false;
+        if (!host.hasRegisteredCommand(invocation.name)) return false;
+
+        if (try self.tryExecuteRegisteredWorkflowCommand(host, invocation.name, invocation.argument)) |workflow_response| {
+            defer workflow_response.deinit(self.allocator);
+            if (workflow_response.success) {
+                try self.writeSuccessResponseRawData(id, response_command, workflow_response.data_json);
+            } else {
+                const failure_message = try std.fmt.allocPrint(self.allocator, "Workflow command failed: {s}", .{workflow_response.state});
+                defer self.allocator.free(failure_message);
+                try self.writeFailureResponseRawData(id, response_command, failure_message, workflow_response.data_json);
+            }
+            return true;
+        }
+
+        const event = try extensionCommandEventValue(self.allocator, invocation.name, invocation.argument);
+        defer common.deinitJsonValue(self.allocator, event);
+        const result = host.invokeExtensionEvent(self.allocator, "command", event, EXTENSION_COMMAND_ACK_TIMEOUT_MS) catch |err| {
+            try self.writeCommandError(id, response_command, err);
+            try self.drainExtensionHostUiRequests(50);
+            return true;
+        };
+        defer if (result) |value| common.deinitJsonValue(self.allocator, value);
+        if (result) |value| {
+            const data = try extensionCommandResultDataJson(self.allocator, invocation.name, value);
+            defer self.allocator.free(data);
+            try self.writeSuccessResponseRawData(id, response_command, data);
+        } else {
+            const failure_message = try std.fmt.allocPrint(self.allocator, "Extension command did not acknowledge: {s}", .{invocation.name});
+            defer self.allocator.free(failure_message);
+            try self.writeErrorResponse(id, response_command, failure_message);
+        }
+        try self.drainExtensionHostUiRequests(50);
+        return true;
+    }
+
+    fn tryExecuteRegisteredWorkflowCommand(
+        self: *TsRpcServer,
+        host: extension_runtime.RuntimeAdapter,
+        command_name: []const u8,
+        argument: []const u8,
+    ) !?WorkflowCommandResponse {
+        var input = try workflowCommandInput(self.allocator, argument);
+        defer input.deinit();
+        var context = WorkflowCommandDispatchContext{
+            .allocator = self.allocator,
+            .command_name = command_name,
+            .input = input.value,
+            .dispatch_context = .{ .adapter = host },
+        };
+        try host.withRegistry(&context, executeWorkflowCommandCallback);
+        if (!context.handled) return null;
+        return .{
+            .success = context.success,
+            .state = context.state orelse "unknown",
+            .data_json = context.result_json orelse try self.allocator.dupe(u8, "{\"kind\":\"workflow\",\"state\":\"unknown\",\"diagnostics\":[]}"),
+        };
+    }
+
     fn parseErrorMessage(self: *TsRpcServer, line: []const u8) ![]u8 {
         const detail = try ts_rpc_wire.jsonParseErrorDetail(self.allocator, line);
         defer self.allocator.free(detail);
@@ -1361,6 +1449,28 @@ const TsRpcServer = struct {
         defer self.output_mutex.unlock(self.io);
 
         try ts_rpc_wire.writeErrorResponse(self.allocator, self.stdout_writer, id, command, message);
+        try self.stdout_writer.flush();
+    }
+
+    fn writeFailureResponseRawData(
+        self: *TsRpcServer,
+        id: ?[]const u8,
+        command: []const u8,
+        message: []const u8,
+        data_json: []const u8,
+    ) !void {
+        self.output_mutex.lockUncancelable(self.io);
+        defer self.output_mutex.unlock(self.io);
+
+        try self.stdout_writer.writeAll("{");
+        try ts_rpc_wire.writeIdField(self.allocator, self.stdout_writer, id);
+        try self.stdout_writer.writeAll("\"type\":\"response\",\"command\":");
+        try writeJsonString(self.allocator, self.stdout_writer, command);
+        try self.stdout_writer.writeAll(",\"success\":false,\"error\":");
+        try writeJsonString(self.allocator, self.stdout_writer, message);
+        try self.stdout_writer.writeAll(",\"data\":");
+        try self.stdout_writer.writeAll(data_json);
+        try self.stdout_writer.writeAll("}\n");
         try self.stdout_writer.flush();
     }
 
@@ -2216,6 +2326,138 @@ const TsRpcServer = struct {
         }
     }
 };
+
+const SlashCommandInvocation = struct {
+    name: []const u8,
+    argument: []const u8,
+};
+
+const ExtensionCommandsJsonContext = struct {
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    wrote_command: bool = false,
+};
+
+const WorkflowCommandDispatchContext = struct {
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    input: std.json.Value,
+    dispatch_context: extension_runtime.SingleRuntimeWorkflowCapabilityDispatchContext,
+    handled: bool = false,
+    success: bool = false,
+    state: ?[]const u8 = null,
+    result_json: ?[]u8 = null,
+};
+
+const WorkflowCommandResponse = struct {
+    success: bool,
+    state: []const u8,
+    data_json: []u8,
+
+    fn deinit(self: WorkflowCommandResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.data_json);
+    }
+};
+
+fn writeExtensionCommandsJsonCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const json_context: *ExtensionCommandsJsonContext = @ptrCast(@alignCast(context.?));
+    const commands = try registry.resolveCommands(json_context.allocator);
+    defer {
+        for (commands) |command| json_context.allocator.free(command.invocation_name);
+        json_context.allocator.free(commands);
+    }
+
+    for (commands) |command| {
+        if (json_context.wrote_command) try json_context.writer.writeAll(",");
+        json_context.wrote_command = true;
+        try json_context.writer.writeAll("{\"name\":");
+        try writeJsonString(json_context.allocator, json_context.writer, command.invocation_name);
+        if (command.description) |description| {
+            try json_context.writer.writeAll(",\"description\":");
+            try writeJsonString(json_context.allocator, json_context.writer, description);
+        }
+        try json_context.writer.writeAll(",\"source\":\"extension\",\"sourceInfo\":");
+        try writeExtensionCommandSourceInfo(json_context.allocator, json_context.writer, command.extension_path);
+        try json_context.writer.writeAll("}");
+    }
+}
+
+fn writeExtensionCommandSourceInfo(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    extension_path: []const u8,
+) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(allocator, writer, extension_path);
+    try writer.writeAll(",\"source\":\"local\",\"scope\":\"temporary\",\"origin\":\"top_level\"}");
+}
+
+fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
+    if (message.len == 0 or message[0] != '/') return null;
+    const trimmed = std.mem.trim(u8, message[1..], " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const name_end = std.mem.indexOfAny(u8, trimmed, " \t\r\n") orelse trimmed.len;
+    return .{
+        .name = trimmed[0..name_end],
+        .argument = std.mem.trim(u8, trimmed[name_end..], " \t\r\n"),
+    };
+}
+
+fn executeWorkflowCommandCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const workflow_context: *WorkflowCommandDispatchContext = @ptrCast(@alignCast(context.?));
+    var result = (try extension_runtime.executeRegisteredWorkflowSurface(
+        workflow_context.allocator,
+        registry,
+        .command,
+        workflow_context.command_name,
+        workflow_context.input,
+        .{
+            .capability_dispatch = extension_runtime.dispatchWorkflowCapabilityFromAdapter,
+            .capability_dispatch_context = &workflow_context.dispatch_context,
+        },
+    )) orelse return;
+    defer result.deinit(workflow_context.allocator);
+    workflow_context.handled = true;
+    workflow_context.success = result.state == .completed;
+    workflow_context.state = result.state.jsonName();
+    workflow_context.result_json = try extension_runtime.workflowExecutionResultDataJson(workflow_context.allocator, result);
+}
+
+fn workflowCommandInput(allocator: std.mem.Allocator, argument: []const u8) !std.json.Parsed(std.json.Value) {
+    if (argument.len == 0) return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    if (std.mem.startsWith(u8, std.mem.trim(u8, argument, " \t\r\n"), "{")) {
+        if (std.json.parseFromSlice(std.json.Value, allocator, argument, .{})) |parsed| return parsed else |_| {}
+    }
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"argument\":");
+    try writeJsonString(allocator, &out.writer, argument);
+    try out.writer.writeAll("}");
+    return try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
+}
+
+fn extensionCommandEventValue(allocator: std.mem.Allocator, name: []const u8, argument: []const u8) !std.json.Value {
+    var event = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer common.deinitJsonValue(allocator, event);
+    try event.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "command") });
+    try event.object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
+    if (argument.len > 0) {
+        try event.object.put(allocator, try allocator.dupe(u8, "argument"), .{ .string = try allocator.dupe(u8, argument) });
+    }
+    try event.object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, "rpc") });
+    return event;
+}
+
+fn extensionCommandResultDataJson(allocator: std.mem.Allocator, name: []const u8, result: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"kind\":\"extension_command\",\"name\":");
+    try writeJsonString(allocator, &out.writer, name);
+    try out.writer.writeAll(",\"result\":");
+    try std.json.Stringify.value(result, .{}, &out.writer);
+    try out.writer.writeAll("}");
+    return try allocator.dupe(u8, out.written());
+}
 
 fn deferredFlushMain(server: *TsRpcServer) void {
     while (!server.deferred_flush_stop.load(.seq_cst)) {
@@ -5214,6 +5456,160 @@ test "M6 extension UI bridge serializes host requests and forwards responses exa
     try expectContains(capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_editor\",\"payload\":{\"value\":\"edited text\"}}\n");
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_missing\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, capture, "{\"type\":\"extension_ui_response\",\"id\":\"ui_confirm\",\"payload\":{\"confirmed\":false}}\n") == null);
+}
+
+test "M7 TS RPC lists extension commands and dispatches slash command without agent prompt" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-m7-extension-command-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_command\",\"name\":\"m7.echo\",\"description\":\"Echo through M7 command\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_shortcut\",\"shortcut\":\"ctrl+e\",\"description\":\"Run M7 echo\",\"command\":\"m7.echo\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_message_renderer\",\"customType\":\"m7.message\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"type\":\"extension_event\"'*) printf '{{\"type\":\"extension_ui_request\",\"id\":\"m7_command_status\",\"method\":\"setStatus\",\"payload\":{{\"statusKey\":\"m7\",\"statusText\":\"command dispatched\"}}}}\\n'; printf '{{\"type\":\"extension_event_result\",\"eventId\":\"event-1-command\",\"result\":{{\"handled\":true,\"command\":\"m7.echo\"}}}}\\n';; " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m7-extension-command" };
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m7-command",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-m7-extension-command",
+        .fixture = "m7-command-shortcut-renderer",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    var registry_elapsed: u64 = 0;
+    while (!server.extension_host.?.hasRegisteredCommand("m7.echo") and registry_elapsed < 500) : (registry_elapsed += 5) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    try std.testing.expect(server.extension_host.?.hasRegisteredCommand("m7.echo"));
+
+    try server.handleLine("{\"id\":\"commands\",\"type\":\"get_commands\"}");
+    try expectContains(
+        stdout_capture.writer.buffered(),
+        "{\"id\":\"commands\",\"type\":\"response\",\"command\":\"get_commands\",\"success\":true,\"data\":{\"commands\":[{\"name\":\"m7.echo\",\"description\":\"Echo through M7 command\",\"source\":\"extension\",\"sourceInfo\":{\"path\":\"fixture/m7.ts\",\"source\":\"local\",\"scope\":\"temporary\",\"origin\":\"top_level\"}}]}}\n",
+    );
+
+    try server.handleLine("{\"id\":\"slash\",\"type\":\"prompt\",\"message\":\"/m7.echo hello from rpc\"}");
+    const status_request = "{\"type\":\"extension_ui_request\",\"id\":\"m7_command_status\",\"method\":\"setStatus\",\"statusKey\":\"m7\",\"statusText\":\"command dispatched\"}\n";
+    var event_elapsed: u64 = 0;
+    while (std.mem.indexOf(u8, stdout_capture.writer.buffered(), status_request) == null and event_elapsed < 500) : (event_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+        try server.serviceExtensionHostIdleTick(10);
+    }
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"slash\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"kind\":\"extension_command\",\"name\":\"m7.echo\",\"result\":{\"handled\":true,\"command\":\"m7.echo\"}}}\n");
+    try expectContains(stdout_capture.writer.buffered(), status_request);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "\"type\":\"agent_start\"") == null);
+
+    const snapshot = try server.extension_host.?.snapshotRegistryJson(allocator);
+    defer allocator.free(snapshot);
+    try expectContains(snapshot, "\"shortcuts\":[{\"shortcut\":\"ctrl+e\",\"description\":\"Run M7 echo\",\"command\":\"m7.echo\"");
+    try expectContains(snapshot, "\"messageRenderers\":[{\"customType\":\"m7.message\",\"extensionPath\":\"fixture/m7.ts\"}]");
+
+    try server.finish();
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try expectContains(capture, "{\"type\":\"extension_event\",\"eventId\":\"event-1-command\",\"event\":{\"type\":\"command\",\"name\":\"m7.echo\",\"argument\":\"hello from rpc\",\"source\":\"rpc\"}}\n");
+}
+
+test "M7 TS RPC reports extension command delivery and workflow execution failures" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-m7-extension-command-result-capture.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_command\",\"name\":\"m7.ack\",\"description\":\"Ack command\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_command\",\"name\":\"m7.crash\",\"description\":\"Crash command\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"m7-success\",\"description\":\"M7 success workflow\",\"inputSchema\":{{\"type\":\"object\",\"required\":[\"issue\"],\"properties\":{{\"issue\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"required\":[\"summary\"],\"properties\":{{\"summary\":{{\"type\":\"string\"}}}}}},\"commandName\":\"m7.workflow\",\"steps\":[{{\"id\":\"produce\",\"output\":{{\"summary\":\"done\"}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"m7-timeout\",\"description\":\"M7 timeout workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"timeoutMs\":5,\"commandName\":\"m7.timeout\",\"steps\":[{{\"id\":\"slow\",\"elapsedMs\":10,\"runtimeWork\":true,\"output\":{{}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"m7-replay\",\"description\":\"M7 replay workflow\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"__workflowReplay\":{{\"type\":\"boolean\"}}}}}},\"outputSchema\":{{}},\"commandName\":\"m7.replay\",\"steps\":[{{\"id\":\"side\",\"kind\":\"side_effect\",\"replayMode\":\"blocked\",\"selectedCapability\":\"shell.run\"}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"name\":\"m7.ack\"'*) printf '{{\"type\":\"extension_event_result\",\"eventId\":\"event-1-command\",\"result\":{{\"ok\":true}}}}\\n';; " ++
+            "*'\"name\":\"m7.crash\"'*) exit 7;; " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-m7-extension-command-results" };
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/ts-rpc-m7-command-results",
+        .system_prompt = "system",
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-m7-extension-command-results",
+        .fixture = "m7-command-results",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    var registry_elapsed: u64 = 0;
+    while (server.extension_host.?.registryFramesApplied() < 5 and registry_elapsed < 1000) : (registry_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 5), server.extension_host.?.registryFramesApplied());
+
+    try server.handleLine("{\"id\":\"ack\",\"type\":\"prompt\",\"message\":\"/m7.ack\"}");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"ack\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"kind\":\"extension_command\",\"name\":\"m7.ack\",\"result\":{\"ok\":true}}}\n");
+
+    try server.handleLine("{\"id\":\"wf-ok\",\"type\":\"prompt\",\"message\":\"/m7.workflow {\\\"issue\\\":\\\"bug\\\"}\"}");
+    try expectContains(stdout_capture.writer.buffered(), "\"id\":\"wf-ok\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"kind\":\"workflow\",\"state\":\"completed\",\"output\":{\"summary\":\"done\"}");
+
+    try server.handleLine("{\"id\":\"wf-invalid\",\"type\":\"prompt\",\"message\":\"/m7.workflow {}\"}");
+    try expectContains(stdout_capture.writer.buffered(), "\"id\":\"wf-invalid\",\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"Workflow command failed: failed\",\"data\":{\"kind\":\"workflow\",\"state\":\"failed\"");
+    try expectContains(stdout_capture.writer.buffered(), "\"code\":\"workflow.input_schema_invalid\"");
+
+    try server.handleLine("{\"id\":\"wf-timeout\",\"type\":\"prompt\",\"message\":\"/m7.timeout {}\"}");
+    try expectContains(stdout_capture.writer.buffered(), "\"id\":\"wf-timeout\",\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"Workflow command failed: timed_out\",\"data\":{\"kind\":\"workflow\",\"state\":\"timed_out\"");
+    try expectContains(stdout_capture.writer.buffered(), "\"code\":\"workflow.timeout\"");
+
+    try server.handleLine("{\"id\":\"wf-replay\",\"type\":\"prompt\",\"message\":\"/m7.replay {\\\"__workflowReplay\\\":true}\"}");
+    try expectContains(stdout_capture.writer.buffered(), "\"id\":\"wf-replay\",\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"Workflow command failed: replay_blocked\",\"data\":{\"kind\":\"workflow\",\"state\":\"replay_blocked\"");
+    try expectContains(stdout_capture.writer.buffered(), "\"code\":\"workflow.replay_side_effect_blocked\"");
+    try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "\"type\":\"agent_start\"") == null);
+
+    try server.handleLine("{\"id\":\"closed\",\"type\":\"prompt\",\"message\":\"/m7.crash\"}");
+    try expectContains(stdout_capture.writer.buffered(), "{\"id\":\"closed\",\"type\":\"response\",\"command\":\"prompt\",\"success\":false,\"error\":\"ExtensionHostClosed\"}\n");
 }
 
 test "M6 extension UI bridge forwards timeout defaults to host" {

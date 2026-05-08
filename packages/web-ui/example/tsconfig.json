@@ -6,8 +6,8 @@
 		"moduleResolution": "bundler",
 		"paths": {
 			"*": ["./*"],
-			"@earendil-works/pi-agent-core": ["../../agent/dist/index.d.ts"],
-			"@earendil-works/pi-ai": ["../../ai/dist/index.d.ts"],
+			"@earendil-works/pi-agent-core": ["../types/pi-agent-core.d.ts"],
+			"@earendil-works/pi-ai": ["../types/pi-ai.d.ts"],
 			"@earendil-works/pi-tui": ["../../tui/src/index.ts"],
 			"@earendil-works/pi-tui/*": ["../../tui/src/*"],
 			"@earendil-works/pi-web-ui": ["../src/index.ts"],

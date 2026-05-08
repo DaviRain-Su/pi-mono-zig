@@ -24,6 +24,14 @@ pub const NativeToolDefinition = struct {
     execute: ?NativeToolExecute = null,
 };
 
+pub const NativeHookDefinition = struct {
+    event_name: []const u8,
+    extension_path: []const u8,
+    priority: i64 = 0,
+    declaration_order: ?usize = null,
+    error_policy: extension_registry.HookErrorPolicy = .@"continue",
+};
+
 pub const NativeStartFn = *const fn (api: *NativeHostApi) anyerror!void;
 
 pub const NativeResourceLimits = struct {
@@ -54,6 +62,7 @@ pub const NativeDescriptor = struct {
     version: []const u8,
     description: []const u8,
     tools: []const NativeToolDefinition = &.{},
+    hooks: []const NativeHookDefinition = &.{},
     requested_capabilities: []const wasm_manifest.Capability = &.{},
     resource_limits: NativeResourceLimits = .{},
     library_path: ?[]const u8 = null,
@@ -97,6 +106,10 @@ pub const NativeDescriptor = struct {
             for (self.tools[index + 1 ..]) |candidate| {
                 if (std.mem.eql(u8, tool.name, candidate.name)) return error.InvalidRuntimeOptions;
             }
+        }
+        for (self.hooks) |hook| {
+            if (hook.event_name.len == 0) return error.InvalidRuntimeOptions;
+            if (hook.extension_path.len == 0) return error.InvalidRuntimeOptions;
         }
     }
 
@@ -195,8 +208,22 @@ fn isPathWithinSandbox(root: []const u8, path: []const u8) bool {
     if (root.len == 0) return false;
     if (std.mem.eql(u8, root, path)) return true;
     if (!std.mem.startsWith(u8, path, root)) return false;
-    if (root[root.len - 1] == std.fs.path.sep) return true;
-    return path.len > root.len and path[root.len] == std.fs.path.sep;
+    const suffix_start = if (root[root.len - 1] == std.fs.path.sep)
+        root.len
+    else blk: {
+        if (path.len <= root.len or path[root.len] != std.fs.path.sep) return false;
+        break :blk root.len + 1;
+    };
+    return isSafeRelativePathSuffix(path[suffix_start..]);
+}
+
+fn isSafeRelativePathSuffix(suffix: []const u8) bool {
+    var components = std.mem.splitScalar(u8, suffix, std.fs.path.sep);
+    while (components.next()) |component| {
+        if (component.len == 0) return false;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -279,6 +306,21 @@ pub const NativeHostApi = struct {
         self.runtime.state.registry_frames_applied += 1;
     }
 
+    pub fn registerHook(self: *NativeHostApi, hook: NativeHookDefinition) !void {
+        if (!self.runtime.state.ready_seen) {
+            try self.runtime.state.addDiagnostic(.host_error, .@"error", "native module registered hook before readiness");
+            return;
+        }
+        try self.runtime.state.registry.registerHookFull(
+            hook.event_name,
+            hook.extension_path,
+            hook.priority,
+            hook.declaration_order,
+            hook.error_policy,
+        );
+        self.runtime.state.registry_frames_applied += 1;
+    }
+
     pub fn requestUi(
         self: *NativeHostApi,
         id: []const u8,
@@ -315,13 +357,29 @@ pub const NativeHostApi = struct {
 
     pub fn readFile(self: *NativeHostApi, path: []const u8) !void {
         try self.enforceOperation(.file_read, .{ .id = path }, .initialize, "native/host-api", .{});
-        if (self.runtime.host_effects) |effects| try effects.recordFileRead(path);
+        if (self.runtime.host_effects) |effects| {
+            effects.recordFileRead(path) catch |err| switch (err) {
+                error.NativeHostSandboxDenied => {
+                    self.runtime.accounting.recordDenied();
+                    try self.addSandboxDenialDiagnostic(.file_read, path, effects.sandbox_root);
+                    return err;
+                },
+            };
+        }
     }
 
     pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
         _ = contents;
         try self.enforceOperation(.file_write, .{ .id = path }, .initialize, "native/host-api", .{});
-        if (self.runtime.host_effects) |effects| try effects.recordFileWrite(path);
+        if (self.runtime.host_effects) |effects| {
+            effects.recordFileWrite(path) catch |err| switch (err) {
+                error.NativeHostSandboxDenied => {
+                    self.runtime.accounting.recordDenied();
+                    try self.addSandboxDenialDiagnostic(.file_write, path, effects.sandbox_root);
+                    return err;
+                },
+            };
+        }
     }
 
     pub fn requestNetwork(self: *NativeHostApi, url: []const u8) !void {
@@ -452,13 +510,20 @@ pub const NativeHostApi = struct {
         try envelope.writer.writeAll("},\"operation\":");
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
-        if (denial.target.id) |target_id| {
+        if (enforcement.diagnosticTargetId(denial.operation, denial.target)) |target_id| {
             try writeRedactedDiagnosticString(&envelope.writer, target_id);
         } else {
             try envelope.writer.writeAll("null");
         }
         try envelope.writer.writeAll("},\"reason\":");
         try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        if (denial.limit_name) |limit_name| {
+            try envelope.writer.writeAll(",\"limit\":{\"name\":");
+            try std.json.Stringify.value(limit_name, .{}, &envelope.writer);
+            try envelope.writer.writeAll(",\"configuredValue\":");
+            try envelope.writer.print("{}", .{denial.limit_value orelse 0});
+            try envelope.writer.writeAll("}");
+        }
         try envelope.writer.writeAll(",\"source\":{\"runtimeKind\":\"native\",\"descriptorId\":");
         try std.json.Stringify.value(self.runtime.descriptor.id, .{}, &envelope.writer);
         if (self.runtime.descriptor.tools.len > 0) {
@@ -469,6 +534,57 @@ pub const NativeHostApi = struct {
         try envelope.writer.writeAll(",\"extensionIdentity\":");
         try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"recoveryHint\":\"Grant the required native extension capability or disable the operation.\",\"message\":\"native host API operation denied by enforcement substrate\"}");
+        try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
+    }
+
+    fn addSandboxDenialDiagnostic(
+        self: *NativeHostApi,
+        operation: enforcement.Operation,
+        path: []const u8,
+        sandbox_root: ?[]const u8,
+    ) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.runtime.allocator);
+        defer envelope.deinit();
+        const capability = operation.requiredGrant();
+        try envelope.writer.writeAll("{\"category\":\"sandbox_path_denied\",\"capability\":");
+        try std.json.Stringify.value(capability.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"branch\":");
+        try std.json.Stringify.value(capability.enforcementBranch().jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"phase\":\"initialize\",\"mode\":\"native/host-api\"");
+        try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":\"native\",\"extensionId\":");
+        try std.json.Stringify.value(self.runtime.descriptor.id, .{}, &envelope.writer);
+        if (self.runtime.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll(",\"packageRoot\":\"native://static\"}");
+        try envelope.writer.writeAll(",\"operation\":");
+        try std.json.Stringify.value(operation.jsonName(), .{}, &envelope.writer);
+        const diagnostic_path = enforcement.diagnosticTargetId(operation, .{ .id = path }) orelse path;
+        try envelope.writer.writeAll(",\"target\":{\"id\":");
+        try std.json.Stringify.value(diagnostic_path, .{}, &envelope.writer);
+        try envelope.writer.writeAll("},\"path\":");
+        try std.json.Stringify.value(diagnostic_path, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"policy\":{\"source\":\"native.host_effects.sandbox_root\",\"decision\":\"deny\"");
+        if (self.runtime.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("},\"sandbox\":{\"root\":");
+        if (sandbox_root) |root| {
+            try std.json.Stringify.value(root, .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll("},\"reason\":\"path is outside native sandbox root\"");
+        try envelope.writer.writeAll(",\"source\":{\"runtimeKind\":\"native\",\"descriptorId\":");
+        try std.json.Stringify.value(self.runtime.descriptor.id, .{}, &envelope.writer);
+        if (self.runtime.descriptor.tools.len > 0) {
+            try envelope.writer.writeAll(",\"extensionPath\":");
+            try std.json.Stringify.value(self.runtime.descriptor.tools[0].extension_path, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("}");
+        try envelope.writer.writeAll(",\"message\":\"native sandbox denied filesystem path outside approved root\"}");
         try self.runtime.state.addDiagnostic(.host_error, .@"error", envelope.written());
     }
 };
@@ -570,6 +686,12 @@ pub const NativeRuntime = struct {
         return self.state.registry.hasCommandInvocation(name);
     }
 
+    pub fn hasRegisteredHook(self: *NativeRuntime, event_name: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.state.registry.hasHook(event_name);
+    }
+
     pub fn snapshotRegistryJson(self: *NativeRuntime, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -606,6 +728,7 @@ pub const NativeRuntime = struct {
                     .description = tool.description,
                     .label = tool.label,
                     .parameters = try tools_common.cloneJsonValue(allocator, tool.parameters),
+                    .source = .extension,
                     .execute = nativeAgentToolExecute,
                     .execute_context = binding,
                 };
@@ -640,6 +763,28 @@ pub const NativeRuntime = struct {
         defer self.mutex.unlock(self.io);
     }
 
+    pub fn invokeExtensionEvent(
+        self: *NativeRuntime,
+        allocator: std.mem.Allocator,
+        event_name: []const u8,
+        event: std.json.Value,
+        timeout_ms: u64,
+    ) !?std.json.Value {
+        _ = timeout_ms;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.unloaded) {
+            try self.state.addDiagnostic(.host_error, .warning, "native stale hook invocation rejected after runtime unload");
+            return null;
+        }
+        if (!self.state.registry.hasHook(event_name)) return null;
+        if (eventFailsRuntime(event, "native")) {
+            try self.state.addDiagnostic(.host_error, .warning, "native hook returned configured non-fatal error");
+            return null;
+        }
+        return try runtimeHookMutationResult(allocator, "native", self.descriptor.id, event);
+    }
+
     pub fn shutdown(self: *NativeRuntime) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -659,6 +804,9 @@ pub const NativeRuntime = struct {
         for (self.descriptor.tools) |tool| {
             _ = self.state.registry.unregisterTool(tool.name);
         }
+        for (self.descriptor.hooks) |hook| {
+            _ = self.state.registry.unregisterHook(hook.event_name, hook.extension_path);
+        }
         self.unloaded = true;
     }
 };
@@ -668,6 +816,35 @@ fn defaultNativeStart(api: *NativeHostApi) !void {
     for (api.runtime.descriptor.tools) |tool| {
         try api.registerTool(tool);
     }
+    for (api.runtime.descriptor.hooks) |hook| {
+        try api.registerHook(hook);
+    }
+}
+
+fn eventFailsRuntime(event: std.json.Value, runtime_name: []const u8) bool {
+    if (event != .object) return false;
+    const value = event.object.get("failRuntime") orelse event.object.get("fail_runtime") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, runtime_name);
+}
+
+fn runtimeHookMutationResult(
+    allocator: std.mem.Allocator,
+    runtime_name: []const u8,
+    extension_id: []const u8,
+    event: std.json.Value,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
+    const input_text = if (event == .object) blk: {
+        const value = event.object.get("text") orelse break :blk "";
+        break :blk if (value == .string) value.string else "";
+    } else "";
+    const mutated = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ input_text, runtime_name });
+    errdefer allocator.free(mutated);
+    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = mutated });
+    try object.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, runtime_name) });
+    try object.put(allocator, try allocator.dupe(u8, "extensionId"), .{ .string = try allocator.dupe(u8, extension_id) });
+    return .{ .object = object };
 }
 
 fn nativeAgentToolExecute(
@@ -775,6 +952,20 @@ fn nativeAllowedOperationMatrixStart(api: *NativeHostApi) !void {
     try api.delegateAgent("{\"task\":\"allowed\"}");
 }
 
+fn nativeSandboxDenialStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_enforcement_matrix_tool);
+
+    const sandbox_root = (api.runtime.host_effects orelse return error.NativeHostSandboxDenied).sandbox_root orelse return error.NativeHostSandboxDenied;
+    const escaped_read_path = try std.fmt.allocPrint(api.runtime.allocator, "{s}/../outside.txt", .{sandbox_root});
+    defer api.runtime.allocator.free(escaped_read_path);
+    const sibling_write_path = try std.fmt.allocPrint(api.runtime.allocator, "{s}-sibling/write.txt", .{sandbox_root});
+    defer api.runtime.allocator.free(sibling_write_path);
+
+    try std.testing.expectError(error.NativeHostSandboxDenied, api.readFile(escaped_read_path));
+    try std.testing.expectError(error.NativeHostSandboxDenied, api.writeFile(sibling_write_path, "blocked"));
+}
+
 fn nativeAgentLimitBoundaryStart(api: *NativeHostApi) !void {
     try api.ready();
     try api.registerTool(native_enforcement_matrix_tool);
@@ -815,6 +1006,16 @@ const native_allowed_operation_matrix_descriptor: NativeDescriptor = .{
     .start = nativeAllowedOperationMatrixStart,
 };
 
+const native_sandbox_denial_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-sandbox-denial",
+    .name = "Native Sandbox Denial",
+    .version = "0.1.0",
+    .description = "Exercises approved native filesystem operations denied by sandbox path policy.",
+    .tools = &.{native_enforcement_matrix_tool},
+    .requested_capabilities = &.{ .file_read, .file_write },
+    .start = nativeSandboxDenialStart,
+};
+
 const native_agent_limit_boundary_descriptor: NativeDescriptor = .{
     .id = "com.pi.native-agent-limit-boundaries",
     .name = "Native Agent Limit Boundaries",
@@ -839,6 +1040,22 @@ fn makeNativeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relati
         &tmp.sub_path,
         relative_path,
     });
+}
+
+test "native sandbox boundary rejects lexical escapes and sibling prefixes" {
+    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox"));
+    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/read.txt"));
+    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox/", "/tmp/native-sandbox/read.txt"));
+    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/../outside.txt"));
+    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/sub/../../outside.txt"));
+    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/./inside.txt"));
+    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox-sibling/read.txt"));
+    try std.testing.expect(!isPathWithinSandbox("", "/tmp/native-sandbox/read.txt"));
+
+    var effects = NativeHostEffects{ .sandbox_root = "/tmp/native-sandbox" };
+    try effects.recordFileRead("/tmp/native-sandbox/read.txt");
+    try std.testing.expectError(error.NativeHostSandboxDenied, effects.recordFileRead("/tmp/native-sandbox/../outside.txt"));
+    try std.testing.expectEqual(@as(u64, 1), effects.file_reads);
 }
 
 test "native host operation gates deny side effects through enforcement matrix" {
@@ -938,6 +1155,61 @@ test "native host operation gates allow only fake and sandbox side effects" {
     try std.testing.expectEqual(@as(u64, 3), runtime.accounting.turns);
     try std.testing.expect(runtime.accounting.output_bytes > 0);
     try std.testing.expectEqual(@as(u64, 1), runtime.accounting.children_started);
+}
+
+test "native sandbox path denials emit auditable diagnostics" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(std.testing.io, "sandbox", .default_dir);
+    const sandbox_root = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox");
+    defer allocator.free(sandbox_root);
+
+    var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &native_sandbox_denial_descriptor,
+        .approved_capabilities = &.{ .file_read, .file_write },
+        .policy_lookup_key = "native:test-policy:sandbox",
+        .host_effects = &effects,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 2), runtime.diagnosticCount());
+    try std.testing.expectEqual(@as(usize, 2), runtime.diagnosticCategoryCount(.host_error));
+    try std.testing.expectEqual(@as(u64, 0), effects.file_reads);
+    try std.testing.expectEqual(@as(u64, 0), effects.file_writes);
+
+    const expected = [_]struct {
+        capability: []const u8,
+        operation: []const u8,
+        path_fragment: []const u8,
+    }{
+        .{ .capability = "file.read", .operation = "file.read", .path_fragment = "/../outside.txt" },
+        .{ .capability = "file.write", .operation = "file.write", .path_fragment = "-sibling/write.txt" },
+    };
+
+    for (expected) |entry| {
+        var found = false;
+        for (runtime.state.diagnostics.items) |diagnostic| {
+            if (std.mem.indexOf(u8, diagnostic.message, "\"category\":\"sandbox_path_denied\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"runtimeKind\":\"native\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"extensionId\":\"com.pi.native-sandbox-denial\"") != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.capability) != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.operation) != null and
+                std.mem.indexOf(u8, diagnostic.message, entry.path_fragment) != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"sandbox\":{\"root\":") != null and
+                std.mem.indexOf(u8, diagnostic.message, sandbox_root) != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"policy\":{\"source\":\"native.host_effects.sandbox_root\",\"decision\":\"deny\",\"policyLookupKey\":\"native:test-policy:sandbox\"}") != null and
+                std.mem.indexOf(u8, diagnostic.message, "\"reason\":\"path is outside native sandbox root\"") != null)
+            {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "native agent host operation gates enforce exact and exceeded resource boundaries" {

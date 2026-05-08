@@ -314,6 +314,22 @@ pub const ModelRegistry = struct {
         }
     }
 
+    pub fn unregisterProvider(self: *ModelRegistry, provider: []const u8) void {
+        var index = self.models.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (std.mem.eql(u8, self.models.items[index].model.provider, provider)) {
+                var removed = self.models.orderedRemove(index);
+                removed.deinit(self.allocator);
+            }
+        }
+
+        if (self.providers.fetchRemove(provider)) |entry| {
+            var removed = entry.value;
+            removed.deinit(self.allocator);
+        }
+    }
+
     pub fn count(self: *const ModelRegistry) usize {
         return self.models.items.len;
     }
@@ -449,6 +465,10 @@ pub fn setModelLoaded(provider: []const u8, model_id: []const u8, loaded: bool) 
 
 pub fn clearLoadedForProvider(provider: []const u8) void {
     getDefault().clearLoadedForProvider(provider);
+}
+
+pub fn unregisterProvider(provider: []const u8) void {
+    getDefault().unregisterProvider(provider);
 }
 
 pub fn builtInProviderConfigs() []const ProviderConfig {

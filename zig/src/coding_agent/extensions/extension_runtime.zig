@@ -1,10 +1,13 @@
 const std = @import("std");
 const agent = @import("agent");
+const ai = @import("ai");
 const config_mod = @import("../config/config.zig");
 const enforcement = @import("enforcement.zig");
 const extension_events = @import("extension_events.zig");
 const extension_host = @import("extension_host.zig");
+const extension_manifest = @import("extension_manifest.zig");
 const extension_registry = @import("extension_registry.zig");
+const workflow_execution = @import("workflow_execution.zig");
 const native_runtime = @import("native_runtime.zig");
 const resources_mod = @import("../resources/resources.zig");
 const tools_common = @import("../tools/common.zig");
@@ -22,6 +25,7 @@ pub const NativeDescriptor = native_runtime.NativeDescriptor;
 pub const NativeHostApi = native_runtime.NativeHostApi;
 pub const NativeOptions = native_runtime.NativeOptions;
 pub const NativeResourceLimits = native_runtime.NativeResourceLimits;
+pub const NativeHookDefinition = native_runtime.NativeHookDefinition;
 pub const NativeToolDefinition = native_runtime.NativeToolDefinition;
 
 pub const RuntimeKind = enum {
@@ -352,6 +356,7 @@ pub const WasmManifestHandoff = struct {
     tool_description: []const u8,
     input_schema_json: []const u8,
     output_schema_json: []const u8,
+    hooks: []const RuntimeHookDefinition = &.{},
     requested_capabilities: []const wasm_manifest.Capability = &.{},
     approved_capabilities: []const wasm_manifest.Capability = &.{},
     resource_limits: enforcement.ResourceLimits = .{},
@@ -414,6 +419,14 @@ pub const WasmManifestHandoff = struct {
     }
 };
 
+pub const RuntimeHookDefinition = struct {
+    event_name: []const u8,
+    extension_path: []const u8,
+    priority: i64 = 0,
+    declaration_order: ?usize = null,
+    error_policy: extension_registry.HookErrorPolicy = .@"continue",
+};
+
 pub const WasmOptions = struct {
     manifest: WasmManifestHandoff,
 };
@@ -424,6 +437,82 @@ pub const RuntimeOptions = union(RuntimeKind) {
     native: NativeOptions,
     remote: UnsupportedRuntimeOptions,
 };
+
+pub const RuntimeSetupErrorEvent = struct {
+    runtime_kind: RuntimeKind,
+    extension_id: []const u8,
+    error_name: []const u8,
+    message: []const u8,
+    stop_reason: []const u8 = "error_reason",
+};
+
+pub const RuntimeSetupEvent = union(enum) {
+    ready: RuntimeAdapter,
+    error_event: RuntimeSetupErrorEvent,
+};
+
+pub const RuntimeSetupEventStream = struct {
+    event: ?RuntimeSetupEvent,
+
+    pub fn next(self: *RuntimeSetupEventStream) ?RuntimeSetupEvent {
+        const event = self.event orelse return null;
+        self.event = null;
+        return event;
+    }
+
+    pub fn deinit(self: *RuntimeSetupEventStream) void {
+        if (self.event) |event| {
+            switch (event) {
+                .ready => |adapter| adapter.deinit(),
+                .error_event => {},
+            }
+            self.event = null;
+        }
+    }
+};
+
+pub fn startRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: RuntimeOptions,
+) !RuntimeSetupEventStream {
+    const adapter = startRuntimeAdapter(allocator, io, options) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .event = .{ .error_event = .{
+            .runtime_kind = runtimeSetupKind(options),
+            .extension_id = runtimeSetupExtensionId(options),
+            .error_name = @errorName(err),
+            .message = "runtime setup failed before extension activation completed",
+        } } },
+    };
+    return .{ .event = .{ .ready = adapter } };
+}
+
+pub fn streamRuntimeSetup(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: RuntimeOptions,
+) !RuntimeSetupEventStream {
+    return try startRuntime(allocator, io, options);
+}
+
+fn runtimeSetupKind(options: RuntimeOptions) RuntimeKind {
+    return switch (options) {
+        .process_jsonl => .process_jsonl,
+        .wasm => .wasm,
+        .native => .native,
+        .remote => .remote,
+    };
+}
+
+fn runtimeSetupExtensionId(options: RuntimeOptions) []const u8 {
+    return switch (options) {
+        .process_jsonl => |process_options| process_options.extension_path orelse "process_jsonl",
+        .wasm => |wasm_options| wasm_options.manifest.id,
+        .native => |native_options| native_options.descriptor.id,
+        .remote => |remote_options| remote_options.label orelse "remote",
+    };
+}
 
 pub const RuntimeAdapter = struct {
     ptr: *anyopaque,
@@ -438,6 +527,7 @@ pub const RuntimeAdapter = struct {
         has_shutdown_complete: *const fn (*anyopaque) bool,
         registry_frames_applied: *const fn (*anyopaque) usize,
         has_registered_command: *const fn (*anyopaque, []const u8) bool,
+        has_registered_hook: *const fn (*anyopaque, []const u8) bool,
         snapshot_registry_json: *const fn (*anyopaque, std.mem.Allocator) anyerror![]u8,
         with_registry: *const fn (*anyopaque, ?*anyopaque, RegistryCallback) anyerror!void,
         apply_cli_flag_values: *const fn (*anyopaque, []const extension_registry.ParsedCliFlag) anyerror!void,
@@ -445,6 +535,7 @@ pub const RuntimeAdapter = struct {
         take_ui_requests: *const fn (*anyopaque, std.mem.Allocator) anyerror![]ExtensionUiRequest,
         send_extension_ui_response: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         send_extension_event_frame: *const fn (*anyopaque, []const u8) void,
+        invoke_extension_event: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value, u64) anyerror!?std.json.Value,
         shutdown: *const fn (*anyopaque) anyerror!void,
         deinit: *const fn (*anyopaque) void,
     };
@@ -477,6 +568,10 @@ pub const RuntimeAdapter = struct {
         return self.vtable.has_registered_command(self.ptr, name);
     }
 
+    pub fn hasRegisteredHook(self: RuntimeAdapter, event_name: []const u8) bool {
+        return self.vtable.has_registered_hook(self.ptr, event_name);
+    }
+
     pub fn snapshotRegistryJson(self: RuntimeAdapter, allocator: std.mem.Allocator) ![]u8 {
         return try self.vtable.snapshot_registry_json(self.ptr, allocator);
     }
@@ -503,6 +598,16 @@ pub const RuntimeAdapter = struct {
 
     pub fn sendExtensionEventFrame(self: RuntimeAdapter, frame_json: []const u8) void {
         self.vtable.send_extension_event_frame(self.ptr, frame_json);
+    }
+
+    pub fn invokeExtensionEvent(
+        self: RuntimeAdapter,
+        allocator: std.mem.Allocator,
+        event_name: []const u8,
+        event: std.json.Value,
+        timeout_ms: u64,
+    ) !?std.json.Value {
+        return try self.vtable.invoke_extension_event(self.ptr, allocator, event_name, event, timeout_ms);
     }
 
     pub fn shutdown(self: RuntimeAdapter) !void {
@@ -570,10 +675,11 @@ fn narrowOptionalLimit(policy_limit: ?u64, descriptor_limit: ?u64) ?u64 {
 
 pub fn deinitAgentTool(allocator: std.mem.Allocator, tool: *agent.AgentTool) void {
     tools_common.deinitJsonValue(allocator, tool.parameters);
+    if (tool.deinit_execute_context) |deinit_context| deinit_context(allocator, tool.execute_context);
     tool.* = undefined;
 }
 
-pub fn startRuntime(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOptions) !RuntimeAdapter {
+pub fn startRuntimeAdapter(allocator: std.mem.Allocator, io: std.Io, options: RuntimeOptions) !RuntimeAdapter {
     return switch (options) {
         .process_jsonl => |process_options| try startProcessJsonl(allocator, io, process_options),
         .wasm => |wasm_options| try startWasm(allocator, io, wasm_options),
@@ -770,7 +876,7 @@ pub fn startLockedWasmPackageRuntimes(
             continue;
         }
 
-        const adapter = startRuntime(allocator, io, .{ .wasm = .{ .manifest = handoff } }) catch |err| {
+        const adapter = startRuntimeAdapter(allocator, io, .{ .wasm = .{ .manifest = handoff } }) catch |err| {
             _ = seen_tools.remove(package.manifest.tool_id);
             const message = try std.fmt.allocPrint(
                 allocator,
@@ -911,6 +1017,10 @@ fn processHasRegisteredCommand(ptr: *anyopaque, name: []const u8) bool {
     return processHost(ptr).hasRegisteredCommand(name);
 }
 
+fn processHasRegisteredHook(ptr: *anyopaque, event_name: []const u8) bool {
+    return processHost(ptr).hasRegisteredHook(event_name);
+}
+
 fn processSnapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
     return try processHost(ptr).snapshotRegistryJson(allocator);
 }
@@ -923,11 +1033,1064 @@ fn processApplyCliFlagValues(ptr: *anyopaque, entries: []const extension_registr
     try processHost(ptr).applyCliFlagValues(entries);
 }
 
+const ProcessAgentToolContext = struct {
+    host: *extension_host.HostProcess,
+    tool_name: []u8,
+    extension_path: []u8,
+    workflow_id: ?[]u8 = null,
+    dispatch_adapters: []RuntimeAdapter = &.{},
+
+    fn deinit(self: *ProcessAgentToolContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        allocator.free(self.extension_path);
+        if (self.workflow_id) |workflow_id| allocator.free(workflow_id);
+        if (self.dispatch_adapters.len > 0) allocator.free(self.dispatch_adapters);
+        allocator.destroy(self);
+    }
+};
+
+pub fn attachWorkflowDispatchAdapters(
+    allocator: std.mem.Allocator,
+    tools: []agent.AgentTool,
+    adapters: []const RuntimeAdapter,
+) !void {
+    for (tools) |tool| {
+        if (tool.source != .extension) continue;
+        if (tool.execute == null or tool.execute.? != processAgentToolExecute) continue;
+        const context: *ProcessAgentToolContext = @ptrCast(@alignCast(tool.execute_context orelse continue));
+        if (context.workflow_id == null) continue;
+        if (context.dispatch_adapters.len > 0) allocator.free(context.dispatch_adapters);
+        context.dispatch_adapters = try allocator.dupe(RuntimeAdapter, adapters);
+    }
+}
+
 fn processAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
-    _ = ptr;
-    _ = allocator;
-    _ = name;
+    const host = processHost(ptr);
+    host.mutex.lockUncancelable(host.io);
+    defer host.mutex.unlock(host.io);
+    for (host.state.registry.tools.items) |tool| {
+        if (!std.mem.eql(u8, tool.name, name)) continue;
+        const context = try allocator.create(ProcessAgentToolContext);
+        errdefer allocator.destroy(context);
+        context.* = .{
+            .host = host,
+            .tool_name = try allocator.dupe(u8, tool.name),
+            .extension_path = try allocator.dupe(u8, tool.extension_path),
+            .workflow_id = if (host.state.registry.workflowForToolName(tool.name)) |workflow| try allocator.dupe(u8, workflow.id) else null,
+        };
+        errdefer allocator.free(context.tool_name);
+        errdefer allocator.free(context.extension_path);
+        errdefer if (context.workflow_id) |workflow_id| allocator.free(workflow_id);
+        return .{
+            .name = tool.name,
+            .description = tool.description,
+            .label = tool.label,
+            .parameters = try tools_common.cloneJsonValue(allocator, tool.parameters),
+            .source = .extension,
+            .invalid_arguments_result = processAgentToolInvalidArguments,
+            .execute = processAgentToolExecute,
+            .execute_context = context,
+            .deinit_execute_context = deinitProcessAgentToolContext,
+            .execution_mode = parseExecutionMode(tool.execution_mode),
+        };
+    }
     return null;
+}
+
+fn processAgentToolInvalidArguments(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    failure: agent.types.ToolArgumentValidationFailure,
+) !agent.AgentToolResult {
+    const context: *ProcessAgentToolContext = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
+    return try processToolValidationErrorResultWithContext(
+        allocator,
+        context,
+        tool_call_id,
+        params,
+        failure,
+    );
+}
+
+fn deinitProcessAgentToolContext(allocator: std.mem.Allocator, tool_context: ?*anyopaque) void {
+    const context: *ProcessAgentToolContext = @ptrCast(@alignCast(tool_context orelse return));
+    context.deinit(allocator);
+}
+
+fn parseExecutionMode(mode: ?[]const u8) ?agent.types.ToolExecutionMode {
+    const value = mode orelse return null;
+    if (std.mem.eql(u8, value, "sequential")) return .sequential;
+    if (std.mem.eql(u8, value, "parallel")) return .parallel;
+    return null;
+}
+
+fn processAgentToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    _ = on_update_context;
+    _ = on_update;
+    const context: *ProcessAgentToolContext = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
+    if (context.workflow_id != null) {
+        return try processWorkflowToolExecute(allocator, context, tool_call_id, params, signal);
+    }
+    validateProcessToolArguments(context.host, context.tool_name, params) catch |err| {
+        return processToolErrorResultWithContext(allocator, context, tool_call_id, params, @errorName(err), @errorName(err));
+    };
+    const response = context.host.executeTool(
+        allocator,
+        context.tool_name,
+        tool_call_id,
+        params,
+        30_000,
+    ) catch |err| {
+        return processToolErrorResultWithContext(allocator, context, tool_call_id, params, @errorName(err), @errorName(err));
+    };
+    defer {
+        var owned_response = response;
+        owned_response.deinit(allocator);
+    }
+    return .{
+        .content = try cloneAgentContentBlocks(allocator, response.content),
+        .details = try processToolResultDetails(
+            allocator,
+            context,
+            tool_call_id,
+            params,
+            response.details,
+        ),
+        .is_error = response.is_error,
+    };
+}
+
+pub const WorkflowSurfaceKind = enum {
+    command,
+    tool,
+    preset,
+};
+
+pub const WorkflowSurfaceExecutionOptions = struct {
+    cancel_signal: ?*const std.atomic.Value(bool) = null,
+    capability_dispatch: ?workflow_execution.CapabilityDispatchFn = null,
+    capability_dispatch_context: ?*anyopaque = null,
+};
+
+pub const WorkflowCapabilityDispatchContext = struct {
+    adapters: []const RuntimeAdapter,
+    timeout_ms: u64 = 30_000,
+};
+
+pub const SingleRuntimeWorkflowCapabilityDispatchContext = struct {
+    adapter: RuntimeAdapter,
+    timeout_ms: u64 = 30_000,
+};
+
+pub fn dispatchWorkflowCapabilityFromAdapters(
+    allocator: std.mem.Allocator,
+    capability_id: []const u8,
+    input: std.json.Value,
+    context: ?*anyopaque,
+) !std.json.Value {
+    const dispatch_context: *WorkflowCapabilityDispatchContext = @ptrCast(@alignCast(context orelse return error.InvalidWorkflowCapabilityDispatchContext));
+    for (dispatch_context.adapters) |adapter| {
+        const maybe_output = dispatchWorkflowCapabilityFromAdapterValue(allocator, adapter, capability_id, input, dispatch_context.timeout_ms) catch |err| switch (err) {
+            error.WorkflowCapabilityNotRegistered => continue,
+            else => return err,
+        };
+        if (maybe_output) |output| {
+            return output;
+        }
+    }
+    return error.WorkflowCapabilityNotRegistered;
+}
+
+pub fn dispatchWorkflowCapabilityFromAdapter(
+    allocator: std.mem.Allocator,
+    capability_id: []const u8,
+    input: std.json.Value,
+    context: ?*anyopaque,
+) !std.json.Value {
+    const dispatch_context: *SingleRuntimeWorkflowCapabilityDispatchContext = @ptrCast(@alignCast(context orelse return error.InvalidWorkflowCapabilityDispatchContext));
+    return try dispatchWorkflowCapabilityFromAdapterValue(
+        allocator,
+        dispatch_context.adapter,
+        capability_id,
+        input,
+        dispatch_context.timeout_ms,
+    ) orelse error.WorkflowCapabilityNotRegistered;
+}
+
+fn dispatchWorkflowCapabilityFromAdapterValue(
+    allocator: std.mem.Allocator,
+    adapter: RuntimeAdapter,
+    capability_id: []const u8,
+    input: std.json.Value,
+    timeout_ms: u64,
+) !?std.json.Value {
+    if (adapter.kind == .process_jsonl) {
+        const host = processHost(adapter.ptr);
+        validateProcessToolArguments(host, capability_id, input) catch |err| switch (err) {
+            error.ToolNotRegistered => return null,
+            else => return err,
+        };
+        const tool_call_id = try std.fmt.allocPrint(allocator, "workflow-{s}", .{capability_id});
+        defer allocator.free(tool_call_id);
+        const response = try host.executeTool(allocator, capability_id, tool_call_id, input, timeout_ms);
+        defer {
+            var owned_response = response;
+            owned_response.deinit(allocator);
+        }
+        return try workflowCapabilityJsonFromResponse(allocator, response.content, response.details, response.is_error);
+    }
+
+    var tool = (try adapter.agentTool(allocator, capability_id)) orelse return null;
+    defer deinitAgentTool(allocator, &tool);
+    const result = try tool.execute.?(allocator, capability_id, input, tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, result.content);
+    defer if (result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    return try workflowCapabilityJsonFromResponse(allocator, result.content, result.details, result.is_error);
+}
+
+fn workflowCapabilityJsonFromResponse(
+    allocator: std.mem.Allocator,
+    content: []const ai.ContentBlock,
+    details: ?std.json.Value,
+    is_error: ?bool,
+) !std.json.Value {
+    if (is_error orelse false) return error.WorkflowCapabilityExecutionFailed;
+    if (content.len > 0 and content[0] == .text) {
+        if (std.json.parseFromSlice(std.json.Value, allocator, content[0].text.text, .{})) |parsed| {
+            defer parsed.deinit();
+            return try tools_common.cloneJsonValue(allocator, parsed.value);
+        } else |_| {
+            if (details) |value| return try tools_common.cloneJsonValue(allocator, value);
+            var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+            errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
+            try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, content[0].text.text) });
+            return .{ .object = object };
+        }
+    }
+    if (details) |value| return try tools_common.cloneJsonValue(allocator, value);
+    return try tools_common.cloneJsonValue(allocator, .null);
+}
+
+pub fn executeRegisteredWorkflowSurface(
+    allocator: std.mem.Allocator,
+    registry: *const Registry,
+    kind: WorkflowSurfaceKind,
+    name: []const u8,
+    input: std.json.Value,
+    options: WorkflowSurfaceExecutionOptions,
+) !?workflow_execution.ExecutionResult {
+    const workflow = switch (kind) {
+        .command => registry.workflowForCommandName(name),
+        .tool => registry.workflowForToolName(name),
+        .preset => registry.workflowForPresetId(name),
+    } orelse return null;
+
+    const descriptor_id = try allocator.dupe(u8, workflow.id);
+    defer allocator.free(descriptor_id);
+    const descriptor_extension_path = try allocator.dupe(u8, workflow.extension_path);
+    defer allocator.free(descriptor_extension_path);
+    const descriptor_input_schema = try tools_common.cloneJsonValue(allocator, workflow.input_schema);
+    defer tools_common.deinitJsonValue(allocator, descriptor_input_schema);
+    const descriptor_output_schema = try tools_common.cloneJsonValue(allocator, workflow.output_schema);
+    defer tools_common.deinitJsonValue(allocator, descriptor_output_schema);
+    const descriptor_permissions = try tools_common.cloneJsonValue(allocator, workflow.permissions);
+    defer tools_common.deinitJsonValue(allocator, descriptor_permissions);
+    var descriptor_child_agent_limits = workflow_execution.ChildAgentLimits.fromJson(workflow.child_agent_limits);
+    descriptor_child_agent_limits.workflow_permissions_json = descriptor_permissions;
+    const descriptor = workflow_execution.WorkflowDescriptor{
+        .id = descriptor_id,
+        .extension_path = descriptor_extension_path,
+        .input_schema = descriptor_input_schema,
+        .output_schema = descriptor_output_schema,
+        .permissions = descriptor_permissions,
+        .timeout_ms = workflow.timeout_ms,
+        .child_agent_limits = descriptor_child_agent_limits,
+    };
+    var steps = try workflowStepsFromJson(allocator, workflow.steps);
+    defer steps.deinit(allocator);
+    var replay_metadata = try workflowReplayMetadataFromInput(allocator, input);
+    defer replay_metadata.deinit(allocator);
+    return try workflow_execution.executeWorkflow(
+        allocator,
+        descriptor,
+        input,
+        steps.items,
+        .{
+            .cancel_signal = options.cancel_signal,
+            .replay = replay_metadata.replay,
+            .recorded_steps = replay_metadata.recorded_steps,
+            .recorded_terminal_state = replay_metadata.terminal_state,
+            .recorded_permissions = replay_metadata.permissions,
+            .recorded_child_agent_limits = replay_metadata.child_agent_limits,
+            .capability_dispatch = options.capability_dispatch,
+            .capability_dispatch_context = options.capability_dispatch_context,
+        },
+    );
+}
+
+fn processWorkflowToolExecute(
+    allocator: std.mem.Allocator,
+    context: *ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    signal: ?*const std.atomic.Value(bool),
+) !agent.AgentToolResult {
+    const self_adapter = RuntimeAdapter{
+        .ptr = @ptrCast(context.host),
+        .vtable = &process_jsonl_vtable,
+        .kind = .process_jsonl,
+    };
+    var dispatch_context = WorkflowCapabilityDispatchContext{
+        .adapters = if (context.dispatch_adapters.len > 0) context.dispatch_adapters else @as([]const RuntimeAdapter, &.{self_adapter}),
+    };
+    var fallback_dispatch_context = SingleRuntimeWorkflowCapabilityDispatchContext{
+        .adapter = .{
+            .ptr = @ptrCast(context.host),
+            .vtable = &process_jsonl_vtable,
+            .kind = .process_jsonl,
+        },
+    };
+
+    var result = (try executeRegisteredWorkflowSurface(
+        allocator,
+        &context.host.state.registry,
+        .tool,
+        context.tool_name,
+        params,
+        .{
+            .cancel_signal = signal,
+            .capability_dispatch = if (context.dispatch_adapters.len > 0) dispatchWorkflowCapabilityFromAdapters else dispatchWorkflowCapabilityFromAdapter,
+            .capability_dispatch_context = if (context.dispatch_adapters.len > 0) @as(?*anyopaque, &dispatch_context) else @as(?*anyopaque, &fallback_dispatch_context),
+        },
+    )) orelse return try processToolErrorResultWithContext(
+        allocator,
+        context,
+        tool_call_id,
+        params,
+        "workflow.not_registered",
+        "workflow tool is no longer registered",
+    );
+    defer result.deinit(allocator);
+
+    return try workflowToolResult(allocator, context, tool_call_id, params, result);
+}
+
+const WorkflowSteps = struct {
+    items: []workflow_execution.StepSpec,
+    runtime_work: []workflow_execution.ActiveRuntimeWork,
+
+    fn deinit(self: *WorkflowSteps, allocator: std.mem.Allocator) void {
+        for (self.items) |*item| {
+            allocator.free(@constCast(item.id));
+            tools_common.deinitJsonValue(allocator, item.input);
+            tools_common.deinitJsonValue(allocator, item.output);
+            if (item.selected_capability) |selected_capability| allocator.free(@constCast(selected_capability));
+            if (item.child_delta.permission) |permission| allocator.free(@constCast(permission));
+        }
+        allocator.free(self.items);
+        allocator.free(self.runtime_work);
+        self.* = undefined;
+    }
+};
+
+fn workflowStepsFromJson(allocator: std.mem.Allocator, value: std.json.Value) !WorkflowSteps {
+    if (value != .array or value.array.items.len == 0) {
+        return .{
+            .items = try allocator.alloc(workflow_execution.StepSpec, 0),
+            .runtime_work = try allocator.alloc(workflow_execution.ActiveRuntimeWork, 0),
+        };
+    }
+
+    var runtime_work_count: usize = 0;
+    for (value.array.items) |item| {
+        if (item == .object and (jsonBool(item.object, "runtimeWork") orelse false)) runtime_work_count += 1;
+    }
+
+    var items = try allocator.alloc(workflow_execution.StepSpec, value.array.items.len);
+    errdefer allocator.free(items);
+    var runtime_work = try allocator.alloc(workflow_execution.ActiveRuntimeWork, runtime_work_count);
+    errdefer allocator.free(runtime_work);
+    for (runtime_work) |*work| work.* = .{};
+
+    var runtime_index: usize = 0;
+    for (value.array.items, 0..) |item, index| {
+        if (item != .object) {
+            items[index] = .{
+                .id = try allocator.dupe(u8, ""),
+                .input = try tools_common.cloneJsonValue(allocator, .null),
+                .output = try tools_common.cloneJsonValue(allocator, .null),
+            };
+            continue;
+        }
+        const object = item.object;
+        var child_delta = parseWorkflowChildDelta(object.get("childDelta") orelse object.get("child_delta") orelse .null);
+        if (child_delta.permission) |permission| child_delta.permission = try allocator.dupe(u8, permission);
+        items[index] = .{
+            .id = try allocator.dupe(u8, jsonString(object, "id") orelse "step"),
+            .kind = parseWorkflowStepKind(jsonString(object, "kind")),
+            .input = try tools_common.cloneJsonValue(allocator, object.get("input") orelse .null),
+            .output = try tools_common.cloneJsonValue(allocator, object.get("output") orelse .null),
+            .elapsed_ms = jsonU64(object, "elapsedMs") orelse jsonU64(object, "elapsed_ms") orelse 0,
+            .replay_mode = parseWorkflowReplayMode(jsonString(object, "replayMode") orelse jsonString(object, "replay_mode")),
+            .selected_capability = if (jsonString(object, "selectedCapability") orelse jsonString(object, "selected_capability")) |selected_capability| try allocator.dupe(u8, selected_capability) else null,
+            .child_delta = child_delta,
+            .runtime_work = if (jsonBool(object, "runtimeWork") orelse false) blk: {
+                const work = &runtime_work[runtime_index];
+                runtime_index += 1;
+                break :blk work;
+            } else null,
+            .cancel_after_start = jsonBool(object, "cancelAfterStart") orelse jsonBool(object, "cancel_after_start") orelse false,
+        };
+    }
+
+    return .{ .items = items, .runtime_work = runtime_work };
+}
+
+fn parseWorkflowStepKind(value: ?[]const u8) workflow_execution.StepKind {
+    const name = value orelse return .deterministic;
+    if (std.mem.eql(u8, name, "side_effect") or std.mem.eql(u8, name, "sideEffect")) return .side_effect;
+    if (std.mem.eql(u8, name, "child_agent") or std.mem.eql(u8, name, "childAgent")) return .child_agent;
+    return .deterministic;
+}
+
+fn parseWorkflowReplayMode(value: ?[]const u8) workflow_execution.StepReplayMode {
+    const name = value orelse return .deterministic;
+    if (std.mem.eql(u8, name, "recorded")) return .recorded;
+    if (std.mem.eql(u8, name, "stubbed")) return .stubbed;
+    if (std.mem.eql(u8, name, "blocked")) return .blocked;
+    return .deterministic;
+}
+
+fn parseWorkflowChildDelta(value: std.json.Value) workflow_execution.ChildAgentDelta {
+    if (value != .object) return .{};
+    return .{
+        .children_started = jsonU64(value.object, "childrenStarted") orelse jsonU64(value.object, "children_started") orelse 0,
+        .turns = jsonU64(value.object, "turns") orelse 0,
+        .tool_calls = jsonU64(value.object, "toolCalls") orelse jsonU64(value.object, "tool_calls") orelse 0,
+        .tokens = jsonU64(value.object, "tokens") orelse 0,
+        .elapsed_ms = jsonU64(value.object, "elapsedMs") orelse jsonU64(value.object, "elapsed_ms") orelse 0,
+        .permission = jsonString(value.object, "permission"),
+    };
+}
+
+fn workflowReplayRequested(input: std.json.Value) bool {
+    if (input != .object) return false;
+    return jsonBool(input.object, "__workflowReplay") orelse jsonBool(input.object, "workflowReplay") orelse false;
+}
+
+const WorkflowReplayMetadataInput = struct {
+    replay: bool = false,
+    recorded_steps: []workflow_execution.RecordedReplayStep = &.{},
+    terminal_state: ?workflow_execution.ExecutionState = null,
+    permissions: ?std.json.Value = null,
+    child_agent_limits: ?workflow_execution.ChildAgentLimits = null,
+
+    fn deinit(self: *WorkflowReplayMetadataInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.recorded_steps);
+        self.* = undefined;
+    }
+};
+
+fn workflowReplayMetadataFromInput(allocator: std.mem.Allocator, input: std.json.Value) !WorkflowReplayMetadataInput {
+    var metadata = WorkflowReplayMetadataInput{
+        .replay = workflowReplayRequested(input),
+        .recorded_steps = try allocator.alloc(workflow_execution.RecordedReplayStep, 0),
+    };
+    errdefer metadata.deinit(allocator);
+
+    const metadata_value = workflowReplayMetadataValue(input) orelse return metadata;
+    metadata.replay = true;
+    if (metadata_value != .object) return metadata;
+    const object = metadata_value.object;
+    metadata.terminal_state = parseWorkflowExecutionState(jsonString(object, "terminalState") orelse jsonString(object, "terminal_state"));
+    metadata.permissions = object.get("permissions");
+    if (object.get("childAgentLimits")) |limits| {
+        metadata.child_agent_limits = workflow_execution.ChildAgentLimits.fromJson(limits);
+    } else if (object.get("child_agent_limits")) |limits| {
+        metadata.child_agent_limits = workflow_execution.ChildAgentLimits.fromJson(limits);
+    }
+    const steps_value = object.get("steps") orelse return metadata;
+    if (steps_value != .array) return metadata;
+    allocator.free(metadata.recorded_steps);
+    metadata.recorded_steps = try allocator.alloc(workflow_execution.RecordedReplayStep, steps_value.array.items.len);
+    for (metadata.recorded_steps, 0..) |*recorded, index| {
+        recorded.* = .{
+            .step_id = "",
+            .mode = .deterministic,
+        };
+        const step_value = steps_value.array.items[index];
+        if (step_value != .object) continue;
+        const step_object = step_value.object;
+        const selected_capability_value = step_object.get("selectedCapability") orelse step_object.get("selected_capability");
+        recorded.* = .{
+            .step_id = jsonString(step_object, "stepId") orelse jsonString(step_object, "step_id") orelse "",
+            .mode = parseWorkflowReplayMode(jsonString(step_object, "mode") orelse jsonString(step_object, "replayMode") orelse jsonString(step_object, "replay_mode")),
+            .output = step_object.get("output"),
+            .order = jsonUsize(step_object, "order"),
+            .kind = parseOptionalWorkflowStepKind(jsonString(step_object, "kind")),
+            .input = step_object.get("input"),
+            .selected_capability_present = selected_capability_value != null,
+            .selected_capability = optionalJsonString(selected_capability_value),
+            .child_agent_limits = parseOptionalChildAgentLimits(step_object.get("childAgentLimits") orelse step_object.get("child_agent_limits")),
+            .permissions = step_object.get("permissions"),
+        };
+    }
+    return metadata;
+}
+
+fn workflowReplayMetadataValue(input: std.json.Value) ?std.json.Value {
+    if (input != .object) return null;
+    return input.object.get("__workflowReplayMetadata") orelse
+        input.object.get("workflowReplayMetadata") orelse
+        input.object.get("replayMetadata") orelse
+        input.object.get("replay_metadata");
+}
+
+fn parseWorkflowExecutionState(value: ?[]const u8) ?workflow_execution.ExecutionState {
+    const name = value orelse return null;
+    if (std.mem.eql(u8, name, "completed")) return .completed;
+    if (std.mem.eql(u8, name, "failed")) return .failed;
+    if (std.mem.eql(u8, name, "cancelled")) return .cancelled;
+    if (std.mem.eql(u8, name, "timed_out")) return .timed_out;
+    if (std.mem.eql(u8, name, "replay_blocked")) return .replay_blocked;
+    return null;
+}
+
+fn parseOptionalWorkflowStepKind(value: ?[]const u8) ?workflow_execution.StepKind {
+    const name = value orelse return null;
+    return parseWorkflowStepKind(name);
+}
+
+fn parseOptionalChildAgentLimits(value: ?std.json.Value) ?workflow_execution.ChildAgentLimits {
+    const json_value = value orelse return null;
+    return workflow_execution.ChildAgentLimits.fromJson(json_value);
+}
+
+fn workflowToolResult(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    result: workflow_execution.ExecutionResult,
+) !agent.AgentToolResult {
+    const content_text = if (result.output) |output|
+        try std.json.Stringify.valueAlloc(allocator, output, .{})
+    else
+        try allocator.dupe(u8, result.state.jsonName());
+    defer allocator.free(content_text);
+
+    return .{
+        .content = try tools_common.makeTextContent(allocator, content_text),
+        .details = try workflowToolDetails(allocator, context, tool_call_id, params, result),
+        .is_error = result.state != .completed,
+    };
+}
+
+fn workflowToolDetails(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    result: workflow_execution.ExecutionResult,
+) !std.json.Value {
+    var details = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, details);
+
+    try details.object.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, "workflow.execution") });
+    try details.object.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, result.state.jsonName()) });
+    try details.object.put(allocator, try allocator.dupe(u8, "extension"), try processToolExtensionDetails(allocator, context));
+    try details.object.put(allocator, try allocator.dupe(u8, "toolName"), .{ .string = try allocator.dupe(u8, context.tool_name) });
+    try details.object.put(allocator, try allocator.dupe(u8, "toolCallId"), .{ .string = try allocator.dupe(u8, tool_call_id) });
+    try details.object.put(allocator, try allocator.dupe(u8, "input"), try tools_common.cloneJsonValue(allocator, params));
+    try details.object.put(allocator, try allocator.dupe(u8, "workflow"), try workflowMetadataJson(allocator, result));
+    try details.object.put(allocator, try allocator.dupe(u8, "diagnostics"), try workflowDiagnosticsJson(allocator, result.diagnostics.items));
+    return details;
+}
+
+pub fn workflowExecutionResultDataJson(allocator: std.mem.Allocator, result: workflow_execution.ExecutionResult) ![]u8 {
+    var data = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, data);
+
+    try data.object.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "workflow") });
+    try data.object.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, result.state.jsonName()) });
+    if (result.output) |output| {
+        try data.object.put(allocator, try allocator.dupe(u8, "output"), try tools_common.cloneJsonValue(allocator, output));
+    } else {
+        try data.object.put(allocator, try allocator.dupe(u8, "output"), .null);
+    }
+    try data.object.put(allocator, try allocator.dupe(u8, "workflow"), try workflowMetadataJson(allocator, result));
+    try data.object.put(allocator, try allocator.dupe(u8, "diagnostics"), try workflowDiagnosticsJson(allocator, result.diagnostics.items));
+
+    const json = try std.json.Stringify.valueAlloc(allocator, data, .{});
+    tools_common.deinitJsonValue(allocator, data);
+    return json;
+}
+
+fn workflowMetadataJson(allocator: std.mem.Allocator, result: workflow_execution.ExecutionResult) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, result.replay_metadata.workflow_id) });
+    try object.put(allocator, try allocator.dupe(u8, "terminalState"), .{ .string = try allocator.dupe(u8, result.replay_metadata.terminal_state.jsonName()) });
+    try object.put(allocator, try allocator.dupe(u8, "cancellationPoint"), optionalStringValue(allocator, result.replay_metadata.cancellation_point));
+    try object.put(allocator, try allocator.dupe(u8, "permissions"), try tools_common.cloneJsonValue(allocator, result.replay_metadata.permissions));
+    try object.put(allocator, try allocator.dupe(u8, "childAgentLimits"), try workflowChildAgentLimitsJson(allocator, result.replay_metadata.child_agent_limits));
+
+    var steps = std.json.Array.init(allocator);
+    for (result.replay_metadata.steps.items) |step| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "stepId"), .{ .string = try allocator.dupe(u8, step.step_id) });
+        try entry.put(allocator, try allocator.dupe(u8, "order"), .{ .integer = @intCast(step.order) });
+        try entry.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, step.kind) });
+        try entry.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, step.mode) });
+        try entry.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, step.state) });
+        try entry.put(allocator, try allocator.dupe(u8, "input"), try tools_common.cloneJsonValue(allocator, step.input));
+        try entry.put(allocator, try allocator.dupe(u8, "sideEffect"), .{ .bool = step.side_effect });
+        try entry.put(allocator, try allocator.dupe(u8, "selectedCapability"), optionalStringValue(allocator, step.selected_capability));
+        try steps.append(.{ .object = entry });
+    }
+    try object.put(allocator, try allocator.dupe(u8, "steps"), .{ .array = steps });
+
+    var usage = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try usage.put(allocator, try allocator.dupe(u8, "childrenStarted"), .{ .integer = @intCast(result.child_usage.children_started) });
+    try usage.put(allocator, try allocator.dupe(u8, "turns"), .{ .integer = @intCast(result.child_usage.turns) });
+    try usage.put(allocator, try allocator.dupe(u8, "toolCalls"), .{ .integer = @intCast(result.child_usage.tool_calls) });
+    try usage.put(allocator, try allocator.dupe(u8, "tokens"), .{ .integer = @intCast(result.child_usage.tokens) });
+    try usage.put(allocator, try allocator.dupe(u8, "elapsedMs"), .{ .integer = @intCast(result.child_usage.elapsed_ms) });
+    try object.put(allocator, try allocator.dupe(u8, "childUsage"), .{ .object = usage });
+    return .{ .object = object };
+}
+
+fn workflowChildAgentLimitsJson(allocator: std.mem.Allocator, limits: workflow_execution.ChildAgentLimits) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
+    try object.put(allocator, try allocator.dupe(u8, "maxChildren"), optionalIntegerValue(limits.max_children));
+    try object.put(allocator, try allocator.dupe(u8, "maxTurns"), optionalIntegerValue(limits.max_turns));
+    try object.put(allocator, try allocator.dupe(u8, "maxToolCalls"), optionalIntegerValue(limits.max_tool_calls));
+    try object.put(allocator, try allocator.dupe(u8, "maxTokens"), optionalIntegerValue(limits.max_tokens));
+    try object.put(allocator, try allocator.dupe(u8, "timeoutMs"), optionalIntegerValue(limits.timeout_ms));
+    if (limits.permission_grants_json) |permissions| {
+        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), try tools_common.cloneJsonValue(allocator, permissions));
+    } else if (limits.workflow_permissions_json) |permissions| {
+        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), try tools_common.cloneJsonValue(allocator, permissions));
+    } else {
+        var grants = std.json.Array.init(allocator);
+        for (limits.permission_grants) |grant| {
+            try grants.append(.{ .string = try allocator.dupe(u8, grant) });
+        }
+        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), .{ .array = grants });
+    }
+    return .{ .object = object };
+}
+
+fn optionalIntegerValue(value: ?u64) std.json.Value {
+    if (value) |number| return .{ .integer = @intCast(number) };
+    return .null;
+}
+
+fn workflowDiagnosticsJson(allocator: std.mem.Allocator, diagnostics: []const workflow_execution.Diagnostic) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    for (diagnostics) |diagnostic| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try entry.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, diagnostic.code) });
+        try entry.put(allocator, try allocator.dupe(u8, "workflowId"), .{ .string = try allocator.dupe(u8, diagnostic.workflow_id) });
+        try entry.put(allocator, try allocator.dupe(u8, "stepId"), optionalStringValue(allocator, diagnostic.step_id));
+        try entry.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, diagnostic.path) });
+        try entry.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, diagnostic.message) });
+        try array.append(.{ .object = entry });
+    }
+    return .{ .array = array };
+}
+
+fn optionalStringValue(allocator: std.mem.Allocator, value: ?[]const u8) std.json.Value {
+    if (value) |text| return .{ .string = allocator.dupe(u8, text) catch return .null };
+    return .null;
+}
+
+fn jsonString(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return optionalJsonString(value);
+}
+
+fn optionalJsonString(value: ?std.json.Value) ?[]const u8 {
+    const json_value = value orelse return null;
+    return switch (json_value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBool(object: std.json.ObjectMap, field: []const u8) ?bool {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn jsonU64(object: std.json.ObjectMap, field: []const u8) ?u64 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn jsonUsize(object: std.json.ObjectMap, field: []const u8) ?usize {
+    const number = jsonU64(object, field) orelse return null;
+    return @intCast(number);
+}
+
+fn processToolResultDetails(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    response_details: ?std.json.Value,
+) !std.json.Value {
+    var details: std.json.Value = if (response_details) |value|
+        try tools_common.cloneJsonValue(allocator, value)
+    else
+        .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, details);
+
+    if (details != .object) {
+        const original = details;
+        var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        errdefer {
+            const failed = std.json.Value{ .object = object };
+            tools_common.deinitJsonValue(allocator, failed);
+        }
+        try object.put(
+            allocator,
+            try allocator.dupe(u8, "resultDetails"),
+            original,
+        );
+        details = .{ .object = object };
+    }
+
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "extension"),
+        try processToolExtensionDetails(allocator, context),
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "toolName"),
+        .{ .string = try allocator.dupe(u8, context.tool_name) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "toolCallId"),
+        .{ .string = try allocator.dupe(u8, tool_call_id) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "input"),
+        try tools_common.cloneJsonValue(allocator, params),
+    );
+
+    return details;
+}
+
+fn processToolExtensionDetails(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value = std.json.Value{ .object = object };
+        tools_common.deinitJsonValue(allocator, value);
+    }
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, "runtime"),
+        .{ .string = try allocator.dupe(u8, "process_jsonl") },
+    );
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, "toolName"),
+        .{ .string = try allocator.dupe(u8, context.tool_name) },
+    );
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, "extensionPath"),
+        .{ .string = try allocator.dupe(u8, context.extension_path) },
+    );
+    return .{ .object = object };
+}
+
+fn validateProcessToolArguments(host: *extension_host.HostProcess, tool_name: []const u8, params: std.json.Value) anyerror!void {
+    host.mutex.lockUncancelable(host.io);
+    defer host.mutex.unlock(host.io);
+    for (host.state.registry.tools.items) |tool| {
+        if (std.mem.eql(u8, tool.name, tool_name)) {
+            try validateRuntimeJsonSchemaValue(tool.parameters, params);
+            return;
+        }
+    }
+    return error.ToolNotRegistered;
+}
+
+fn validateRuntimeJsonSchemaValue(schema: std.json.Value, value: std.json.Value) anyerror!void {
+    if (schema != .object) return;
+    if (schema.object.get("type")) |type_value| {
+        if (type_value == .string) try validateRuntimeJsonSchemaType(type_value.string, schema, value);
+    }
+}
+
+fn validateRuntimeJsonSchemaType(type_name: []const u8, schema: std.json.Value, value: std.json.Value) anyerror!void {
+    if (std.mem.eql(u8, type_name, "object")) {
+        if (value != .object) return error.InvalidToolArguments;
+        if (schema.object.get("required")) |required| {
+            if (required == .array) {
+                for (required.array.items) |item| {
+                    if (item == .string and !value.object.contains(item.string)) return error.InvalidToolArguments;
+                }
+            }
+        }
+        const properties = if (schema.object.get("properties")) |properties_value| switch (properties_value) {
+            .object => |properties_object| properties_object,
+            else => null,
+        } else null;
+        if (properties) |properties_object| {
+            var property_iterator = properties_object.iterator();
+            while (property_iterator.next()) |entry| {
+                if (value.object.get(entry.key_ptr.*)) |property_value| try validateRuntimeJsonSchemaValue(entry.value_ptr.*, property_value);
+            }
+            if (schema.object.get("additionalProperties")) |additional_properties| {
+                if (additional_properties == .bool and !additional_properties.bool) {
+                    var value_iterator = value.object.iterator();
+                    while (value_iterator.next()) |entry| {
+                        if (!properties_object.contains(entry.key_ptr.*)) return error.InvalidToolArguments;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, type_name, "string")) {
+        if (value != .string) return error.InvalidToolArguments;
+        return;
+    }
+    if (std.mem.eql(u8, type_name, "boolean")) {
+        if (value != .bool) return error.InvalidToolArguments;
+        return;
+    }
+    if (std.mem.eql(u8, type_name, "integer")) {
+        if (value != .integer) return error.InvalidToolArguments;
+        return;
+    }
+    if (std.mem.eql(u8, type_name, "number")) {
+        if (value != .integer and value != .float and value != .number_string) return error.InvalidToolArguments;
+        return;
+    }
+    if (std.mem.eql(u8, type_name, "array")) {
+        if (value != .array) return error.InvalidToolArguments;
+        if (schema.object.get("items")) |items_schema| {
+            for (value.array.items) |item| try validateRuntimeJsonSchemaValue(items_schema, item);
+        }
+    }
+}
+
+fn processToolErrorResult(allocator: std.mem.Allocator, message: []const u8) !agent.AgentToolResult {
+    return .{
+        .content = try tools_common.makeTextContent(allocator, message),
+        .is_error = true,
+    };
+}
+
+fn processToolErrorResultWithContext(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    code: []const u8,
+    message: []const u8,
+) !agent.AgentToolResult {
+    var details = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, details);
+
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "code"),
+        .{ .string = try allocator.dupe(u8, code) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "message"),
+        .{ .string = try allocator.dupe(u8, message) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "extension"),
+        try processToolExtensionDetails(allocator, context),
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "toolCallId"),
+        .{ .string = try allocator.dupe(u8, tool_call_id) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "input"),
+        try tools_common.cloneJsonValue(allocator, params),
+    );
+
+    return .{
+        .content = try tools_common.makeTextContent(allocator, message),
+        .details = details,
+        .is_error = true,
+    };
+}
+
+fn processToolValidationErrorResultWithContext(
+    allocator: std.mem.Allocator,
+    context: *const ProcessAgentToolContext,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    failure: agent.types.ToolArgumentValidationFailure,
+) !agent.AgentToolResult {
+    var details = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, details);
+
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "code"),
+        .{ .string = try allocator.dupe(u8, "InvalidToolArguments") },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "message"),
+        .{ .string = try allocator.dupe(u8, "InvalidToolArguments") },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "extension"),
+        try processToolExtensionDetails(allocator, context),
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "toolName"),
+        .{ .string = try allocator.dupe(u8, context.tool_name) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "toolCallId"),
+        .{ .string = try allocator.dupe(u8, tool_call_id) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "input"),
+        try tools_common.cloneJsonValue(allocator, params),
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "fieldPath"),
+        .{ .string = try allocator.dupe(u8, failure.path) },
+    );
+
+    var validation = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    errdefer tools_common.deinitJsonValue(allocator, validation);
+    try validation.object.put(
+        allocator,
+        try allocator.dupe(u8, "code"),
+        .{ .string = try allocator.dupe(u8, failure.code) },
+    );
+    try validation.object.put(
+        allocator,
+        try allocator.dupe(u8, "message"),
+        .{ .string = try allocator.dupe(u8, failure.message) },
+    );
+    try validation.object.put(
+        allocator,
+        try allocator.dupe(u8, "fieldPath"),
+        .{ .string = try allocator.dupe(u8, failure.path) },
+    );
+    try details.object.put(
+        allocator,
+        try allocator.dupe(u8, "validation"),
+        validation,
+    );
+
+    return .{
+        .content = try tools_common.makeTextContent(allocator, "InvalidToolArguments"),
+        .details = details,
+        .is_error = true,
+    };
+}
+
+fn cloneAgentContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
+    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
+    errdefer allocator.free(cloned);
+    for (blocks, 0..) |block, index| {
+        cloned[index] = cloneAgentContentBlock(allocator, block) catch |err| {
+            deinitAgentContentBlockFields(allocator, cloned[0..index]);
+            allocator.free(cloned);
+            return err;
+        };
+    }
+    return cloned;
+}
+
+fn cloneAgentContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
+    return switch (block) {
+        .text => |text| .{ .text = .{
+            .text = try allocator.dupe(u8, text.text),
+            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
+        .image => |image| .{ .image = .{
+            .data = try allocator.dupe(u8, image.data),
+            .mime_type = try allocator.dupe(u8, image.mime_type),
+        } },
+        .thinking => |thinking| .{ .thinking = .{
+            .thinking = try allocator.dupe(u8, thinking.thinking),
+            .thinking_signature = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null,
+            .signature = if (thinking.signature) |signature| try allocator.dupe(u8, signature) else null,
+            .redacted = thinking.redacted,
+        } },
+        .tool_call => |tool_call| .{ .tool_call = .{
+            .id = try allocator.dupe(u8, tool_call.id),
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments = try tools_common.cloneJsonValue(allocator, tool_call.arguments),
+            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+        } },
+    };
+}
+
+fn deinitAgentContentBlockFields(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .tool_call => |tool_call| {
+                allocator.free(tool_call.id);
+                allocator.free(tool_call.name);
+                if (tool_call.thought_signature) |signature| allocator.free(signature);
+                tools_common.deinitJsonValue(allocator, tool_call.arguments);
+            },
+        }
+    }
 }
 
 fn processTakeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]ExtensionUiRequest {
@@ -940,6 +2103,16 @@ fn processSendExtensionUiResponse(ptr: *anyopaque, id: []const u8, payload_json:
 
 fn processSendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
     processHost(ptr).sendExtensionEventFrame(frame_json);
+}
+
+fn processInvokeExtensionEvent(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    event: std.json.Value,
+    timeout_ms: u64,
+) !?std.json.Value {
+    return try processHost(ptr).invokeExtensionEvent(allocator, event_name, event, timeout_ms);
 }
 
 fn processShutdown(ptr: *anyopaque) !void {
@@ -958,6 +2131,7 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
     .has_shutdown_complete = processHasShutdownComplete,
     .registry_frames_applied = processRegistryFramesApplied,
     .has_registered_command = processHasRegisteredCommand,
+    .has_registered_hook = processHasRegisteredHook,
     .snapshot_registry_json = processSnapshotRegistryJson,
     .with_registry = processWithRegistry,
     .apply_cli_flag_values = processApplyCliFlagValues,
@@ -965,6 +2139,7 @@ const process_jsonl_vtable: RuntimeAdapter.VTable = .{
     .take_ui_requests = processTakeUiRequests,
     .send_extension_ui_response = processSendExtensionUiResponse,
     .send_extension_event_frame = processSendExtensionEventFrame,
+    .invoke_extension_event = processInvokeExtensionEvent,
     .shutdown = processShutdown,
     .deinit = processDeinit,
 };
@@ -986,6 +2161,7 @@ const OwnedWasmManifest = struct {
     tool_description: []u8,
     input_schema_json: []u8,
     output_schema_json: []u8,
+    hooks: []RuntimeHookDefinition,
     requested_capabilities: []wasm_manifest.Capability,
     resource_limits: enforcement.ResourceLimits,
     policy_lookup_key: ?[]u8,
@@ -1021,6 +2197,8 @@ const OwnedWasmManifest = struct {
         errdefer allocator.free(input_schema_json);
         const output_schema_json = try allocator.dupe(u8, handoff.output_schema_json);
         errdefer allocator.free(output_schema_json);
+        const hooks = try cloneRuntimeHooks(allocator, handoff.hooks);
+        errdefer freeRuntimeHooks(allocator, hooks);
         const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, handoff.requested_capabilities);
         errdefer allocator.free(requested_capabilities);
         var resource_limits = try cloneEnforcementResourceLimits(allocator, handoff.resource_limits);
@@ -1044,6 +2222,7 @@ const OwnedWasmManifest = struct {
             .tool_description = tool_description,
             .input_schema_json = input_schema_json,
             .output_schema_json = output_schema_json,
+            .hooks = hooks,
             .requested_capabilities = requested_capabilities,
             .resource_limits = resource_limits,
             .policy_lookup_key = policy_lookup_key,
@@ -1066,12 +2245,69 @@ const OwnedWasmManifest = struct {
         allocator.free(self.tool_description);
         allocator.free(self.input_schema_json);
         allocator.free(self.output_schema_json);
+        freeRuntimeHooks(allocator, self.hooks);
         allocator.free(self.requested_capabilities);
         deinitEnforcementResourceLimits(allocator, &self.resource_limits);
         if (self.policy_lookup_key) |value| allocator.free(value);
         self.* = undefined;
     }
 };
+
+fn cloneRuntimeHooks(
+    allocator: std.mem.Allocator,
+    hooks: []const RuntimeHookDefinition,
+) ![]RuntimeHookDefinition {
+    const cloned = try allocator.alloc(RuntimeHookDefinition, hooks.len);
+    errdefer allocator.free(cloned);
+    for (hooks, 0..) |hook, index| {
+        cloned[index] = .{
+            .event_name = try allocator.dupe(u8, hook.event_name),
+            .extension_path = try allocator.dupe(u8, hook.extension_path),
+            .priority = hook.priority,
+            .declaration_order = hook.declaration_order,
+            .error_policy = hook.error_policy,
+        };
+        errdefer {
+            allocator.free(cloned[index].event_name);
+            allocator.free(cloned[index].extension_path);
+        }
+    }
+    return cloned;
+}
+
+fn freeRuntimeHooks(allocator: std.mem.Allocator, hooks: []RuntimeHookDefinition) void {
+    for (hooks) |hook| {
+        allocator.free(hook.event_name);
+        allocator.free(hook.extension_path);
+    }
+    allocator.free(hooks);
+}
+
+fn eventFailsRuntime(event: std.json.Value, runtime_name: []const u8) bool {
+    if (event != .object) return false;
+    const value = event.object.get("failRuntime") orelse event.object.get("fail_runtime") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, runtime_name);
+}
+
+fn runtimeHookMutationResult(
+    allocator: std.mem.Allocator,
+    runtime_name: []const u8,
+    extension_id: []const u8,
+    event: std.json.Value,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
+    const input_text = if (event == .object) blk: {
+        const value = event.object.get("text") orelse break :blk "";
+        break :blk if (value == .string) value.string else "";
+    } else "";
+    const mutated = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ input_text, runtime_name });
+    errdefer allocator.free(mutated);
+    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = mutated });
+    try object.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, runtime_name) });
+    try object.put(allocator, try allocator.dupe(u8, "extensionId"), .{ .string = try allocator.dupe(u8, extension_id) });
+    return .{ .object = object };
+}
 
 fn cloneEnforcementResourceLimits(
     allocator: std.mem.Allocator,
@@ -1145,6 +2381,7 @@ const WasmRuntime = struct {
         errdefer runtime.state.deinit();
         runtime.state.ready_seen = true;
         try runtime.registerManifestTool();
+        try runtime.registerManifestHooks();
         return runtime;
     }
 
@@ -1163,14 +2400,55 @@ const WasmRuntime = struct {
         self.state.registry_frames_applied += 1;
     }
 
+    fn registerManifestHooks(self: *WasmRuntime) !void {
+        for (self.manifest.hooks) |hook| {
+            try self.state.registry.registerHookFull(
+                hook.event_name,
+                hook.extension_path,
+                hook.priority,
+                hook.declaration_order,
+                hook.error_policy,
+            );
+            self.state.registry_frames_applied += 1;
+        }
+    }
+
     fn cleanupForUnload(self: *WasmRuntime) void {
         self.state.clearPendingRequests();
         if (!self.unloaded) {
             self.host.unload(&self.state.registry, self.manifest.tool_id);
+            for (self.manifest.hooks) |hook| {
+                _ = self.state.registry.unregisterHook(hook.event_name, hook.extension_path);
+            }
             self.unloaded = true;
             return;
         }
         _ = self.state.registry.unregisterTool(self.manifest.tool_id);
+        for (self.manifest.hooks) |hook| {
+            _ = self.state.registry.unregisterHook(hook.event_name, hook.extension_path);
+        }
+    }
+
+    fn invokeExtensionEvent(
+        self: *WasmRuntime,
+        allocator: std.mem.Allocator,
+        event_name: []const u8,
+        event: std.json.Value,
+        timeout_ms: u64,
+    ) !?std.json.Value {
+        _ = timeout_ms;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.unloaded) {
+            try self.state.addDiagnostic(.host_error, .warning, "wasm stale hook invocation rejected after runtime unload");
+            return null;
+        }
+        if (!self.state.registry.hasHook(event_name)) return null;
+        if (eventFailsRuntime(event, "wasm")) {
+            try self.state.addDiagnostic(.host_error, .warning, "wasm hook returned configured non-fatal error");
+            return null;
+        }
+        return try runtimeHookMutationResult(allocator, "wasm", self.manifest.id, event);
     }
 
     fn addObservableDiagnostic(
@@ -1259,13 +2537,20 @@ const WasmRuntime = struct {
         try envelope.writer.writeAll("},\"operation\":");
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
-        if (denial.target.id) |target_id| {
+        if (enforcement.diagnosticTargetId(denial.operation, denial.target)) |target_id| {
             try std.json.Stringify.value(target_id, .{}, &envelope.writer);
         } else {
             try envelope.writer.writeAll("null");
         }
         try envelope.writer.writeAll("},\"reason\":");
         try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        if (denial.limit_name) |limit_name| {
+            try envelope.writer.writeAll(",\"limit\":{\"name\":");
+            try std.json.Stringify.value(limit_name, .{}, &envelope.writer);
+            try envelope.writer.writeAll(",\"configuredValue\":");
+            try envelope.writer.print("{}", .{denial.limit_value orelse 0});
+            try envelope.writer.writeAll("}");
+        }
         try envelope.writer.writeAll(",\"source\":{");
         var wrote_source = false;
         if (self.manifest.manifest_path) |manifest_path| {
@@ -1441,6 +2726,7 @@ fn wasmAgentTool(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8
             .description = tool.description,
             .label = tool.label,
             .parameters = try tools_common.cloneJsonValue(allocator, tool.parameters),
+            .source = .extension,
             .execute = wasmAgentToolExecute,
             .execute_context = runtime,
         };
@@ -1606,6 +2892,23 @@ fn wasmSendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
     _ = frame_json;
 }
 
+fn wasmHasRegisteredHook(ptr: *anyopaque, event_name: []const u8) bool {
+    const runtime = wasmRuntime(ptr);
+    runtime.mutex.lockUncancelable(runtime.io);
+    defer runtime.mutex.unlock(runtime.io);
+    return runtime.state.registry.hasHook(event_name);
+}
+
+fn wasmInvokeExtensionEvent(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    event: std.json.Value,
+    timeout_ms: u64,
+) !?std.json.Value {
+    return try wasmRuntime(ptr).invokeExtensionEvent(allocator, event_name, event, timeout_ms);
+}
+
 fn wasmShutdown(ptr: *anyopaque) !void {
     const runtime = wasmRuntime(ptr);
     runtime.mutex.lockUncancelable(runtime.io);
@@ -1626,6 +2929,7 @@ const wasm_vtable: RuntimeAdapter.VTable = .{
     .has_shutdown_complete = wasmHasShutdownComplete,
     .registry_frames_applied = wasmRegistryFramesApplied,
     .has_registered_command = wasmHasRegisteredCommand,
+    .has_registered_hook = wasmHasRegisteredHook,
     .snapshot_registry_json = wasmSnapshotRegistryJson,
     .with_registry = wasmWithRegistry,
     .apply_cli_flag_values = wasmApplyCliFlagValues,
@@ -1633,6 +2937,7 @@ const wasm_vtable: RuntimeAdapter.VTable = .{
     .take_ui_requests = wasmTakeUiRequests,
     .send_extension_ui_response = wasmSendExtensionUiResponse,
     .send_extension_event_frame = wasmSendExtensionEventFrame,
+    .invoke_extension_event = wasmInvokeExtensionEvent,
     .shutdown = wasmShutdown,
     .deinit = wasmDeinit,
 };
@@ -1678,6 +2983,10 @@ fn nativeHasRegisteredCommand(ptr: *anyopaque, name: []const u8) bool {
     return nativeRuntime(ptr).hasRegisteredCommand(name);
 }
 
+fn nativeHasRegisteredHook(ptr: *anyopaque, event_name: []const u8) bool {
+    return nativeRuntime(ptr).hasRegisteredHook(event_name);
+}
+
 fn nativeSnapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
     return try nativeRuntime(ptr).snapshotRegistryJson(allocator);
 }
@@ -1706,6 +3015,16 @@ fn nativeSendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
     nativeRuntime(ptr).sendExtensionEventFrame(frame_json);
 }
 
+fn nativeInvokeExtensionEvent(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    event: std.json.Value,
+    timeout_ms: u64,
+) !?std.json.Value {
+    return try nativeRuntime(ptr).invokeExtensionEvent(allocator, event_name, event, timeout_ms);
+}
+
 fn nativeShutdown(ptr: *anyopaque) !void {
     try nativeRuntime(ptr).shutdown();
 }
@@ -1722,6 +3041,7 @@ const native_vtable: RuntimeAdapter.VTable = .{
     .has_shutdown_complete = nativeHasShutdownComplete,
     .registry_frames_applied = nativeRegistryFramesApplied,
     .has_registered_command = nativeHasRegisteredCommand,
+    .has_registered_hook = nativeHasRegisteredHook,
     .snapshot_registry_json = nativeSnapshotRegistryJson,
     .with_registry = nativeWithRegistry,
     .apply_cli_flag_values = nativeApplyCliFlagValues,
@@ -1729,6 +3049,7 @@ const native_vtable: RuntimeAdapter.VTable = .{
     .take_ui_requests = nativeTakeUiRequests,
     .send_extension_ui_response = nativeSendExtensionUiResponse,
     .send_extension_event_frame = nativeSendExtensionEventFrame,
+    .invoke_extension_event = nativeInvokeExtensionEvent,
     .shutdown = nativeShutdown,
     .deinit = nativeDeinit,
 };
@@ -1871,12 +3192,62 @@ test "extension runtime factory rejects remote runtime deterministically" {
     };
 
     for (unsupported) |options| {
-        try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, options));
+        try std.testing.expectError(error.UnsupportedRuntime, startRuntimeAdapter(allocator, std.testing.io, options));
     }
     try std.testing.expectEqualStrings("process_jsonl", RuntimeKind.process_jsonl.jsonName());
     try std.testing.expectEqualStrings("wasm", RuntimeKind.wasm.jsonName());
     try std.testing.expectEqualStrings("native", RuntimeKind.native.jsonName());
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
+}
+
+test "normal runtime setup entrypoint returns terminal event for setup outcomes" {
+    const allocator = std.testing.allocator;
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+
+    const base_handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
+    const requested = [_]wasm_manifest.Capability{.file_read};
+    var denied_handoff = base_handoff;
+    denied_handoff.requested_capabilities = requested[0..];
+    var wasm_stream = try startRuntime(allocator, std.testing.io, .{ .wasm = .{ .manifest = denied_handoff } });
+    const wasm_event = wasm_stream.next().?;
+    try std.testing.expect(wasm_event == .error_event);
+    try std.testing.expectEqual(RuntimeKind.wasm, wasm_event.error_event.runtime_kind);
+    try std.testing.expectEqualStrings("com.pi.pure-truncate-head", wasm_event.error_event.extension_id);
+    try std.testing.expectEqualStrings("UnsupportedRuntimeCapability", wasm_event.error_event.error_name);
+    try std.testing.expectEqualStrings("error_reason", wasm_event.error_event.stop_reason);
+    try std.testing.expect(wasm_stream.next() == null);
+
+    var native_stream = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_partial_failure_descriptor,
+    } });
+    const native_event = native_stream.next().?;
+    try std.testing.expect(native_event == .error_event);
+    try std.testing.expectEqual(RuntimeKind.native, native_event.error_event.runtime_kind);
+    try std.testing.expectEqualStrings("com.pi.native-partial-failure", native_event.error_event.extension_id);
+    try std.testing.expectEqualStrings("NativeFixtureInjectedFailure", native_event.error_event.error_name);
+    try std.testing.expectEqualStrings("error_reason", native_event.error_event.stop_reason);
+    try std.testing.expect(native_stream.next() == null);
+
+    var remote_stream = try startRuntime(allocator, std.testing.io, .{ .remote = .{ .label = "unsupported-remote" } });
+    const remote_event = remote_stream.next().?;
+    try std.testing.expect(remote_event == .error_event);
+    try std.testing.expectEqual(RuntimeKind.remote, remote_event.error_event.runtime_kind);
+    try std.testing.expectEqualStrings("unsupported-remote", remote_event.error_event.extension_id);
+    try std.testing.expectEqualStrings("UnsupportedRuntime", remote_event.error_event.error_name);
+    try std.testing.expect(remote_stream.next() == null);
+
+    var success_stream = try startRuntime(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_static_descriptor,
+    } });
+    const success_event = success_stream.next().?;
+    try std.testing.expect(success_event == .ready);
+    var success_adapter = success_event.ready;
+    defer success_adapter.deinit();
+    try std.testing.expectEqual(RuntimeKind.native, success_adapter.kind);
+    try success_adapter.waitForReady(0);
+    try std.testing.expect(success_stream.next() == null);
 }
 
 test "extension runtime policy lookup keys are canonical per runtime source" {
@@ -1988,7 +3359,7 @@ test "extension runtime factory constructs wasm adapter and keeps native remote 
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer adapter.deinit();
@@ -2003,7 +3374,7 @@ test "extension runtime factory constructs wasm adapter and keeps native remote 
     try adapter.shutdown();
     try std.testing.expect(adapter.hasShutdownComplete());
 
-    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+    try std.testing.expectError(error.UnsupportedRuntime, startRuntimeAdapter(allocator, std.testing.io, .{ .remote = .{} }));
 }
 
 const native_static_tool: NativeToolDefinition = .{
@@ -2181,7 +3552,7 @@ fn expectNativeStaticRegistry(context: ?*anyopaque, registry: *const Registry) !
 
 test "native runtime factory starts static module and remote stays unsupported" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2210,12 +3581,12 @@ test "native runtime factory starts static module and remote stays unsupported" 
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "remote") == null);
 
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
-    try std.testing.expectError(error.UnsupportedRuntime, startRuntime(allocator, std.testing.io, .{ .remote = .{} }));
+    try std.testing.expectError(error.UnsupportedRuntime, startRuntimeAdapter(allocator, std.testing.io, .{ .remote = .{} }));
 }
 
 test "native descriptor template executes pure tool and recovers after invalid input" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2264,7 +3635,7 @@ test "native descriptor template executes pure tool and recovers after invalid i
 
 test "native runtime shutdown is idempotent and final" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2350,12 +3721,12 @@ test "native descriptor validation rejects invalid shapes before registry regist
     };
 
     for (invalid_descriptors) |descriptor| {
-        try std.testing.expectError(error.InvalidRuntimeOptions, startRuntime(allocator, std.testing.io, .{ .native = .{
+        try std.testing.expectError(error.InvalidRuntimeOptions, startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
             .descriptor = &descriptor,
         } }));
     }
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2377,7 +3748,7 @@ test "native descriptor capability and resource metadata remains default deny" {
             .tool_scopes = &.{"native.fixture.echo"},
         },
     };
-    const resource_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const resource_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &resource_only_descriptor,
     } });
     defer resource_adapter.deinit();
@@ -2402,11 +3773,11 @@ test "native descriptor capability and resource metadata remains default deny" {
     try std.testing.expectEqual(wasm_manifest.CapabilityEnforcementBranch.tool_execution, denial.branch);
     try std.testing.expectEqual(wasm_manifest.LifecyclePhase.initialize, denial.phase);
     try std.testing.expectEqualStrings("native/descriptor", denial.mode);
-    try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntime(allocator, std.testing.io, .{ .native = .{
+    try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &capability_descriptor,
     } }));
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2445,7 +3816,7 @@ test "persisted native extension policy resource limits drive enforcement diagno
     defer allocator.free(approved);
     const effective_limits = nativeResourceLimitsFromExtensionPolicy(policy.resource_limits, native_persisted_policy_limit_descriptor.resource_limits);
     var effects = native_runtime.NativeHostEffects{};
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_persisted_policy_limit_descriptor,
         .approved_capabilities = approved,
         .resource_limits = effective_limits,
@@ -2459,14 +3830,17 @@ test "persisted native extension policy resource limits drive enforcement diagno
     try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
     const diagnostic = nativeRuntime(adapter.ptr).state.diagnostics.items[0].message;
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"operation\":\"agent.spawn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"category\":\"resource_limit_exceeded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"resource limit exceeded: maxChildren\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"limit\":{\"name\":\"maxChildren\",\"configuredValue\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"target\":{\"id\":\"[redacted]\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"native:com.pi.native-persisted-policy-limit:0.1.0:Native Persisted Policy Limit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"runtimeKind\":\"native\"") != null);
 }
 
 test "native runtime preserves ready boundary duplicate readiness and deterministic snapshots" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_ready_boundary_descriptor,
     } });
     defer adapter.deinit();
@@ -2510,7 +3884,7 @@ test "native descriptor rejects dynamic runtime and product policy fields" {
     };
 
     for (forbidden_descriptors) |descriptor| {
-        try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntime(allocator, std.testing.io, .{ .native = .{
+        try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
             .descriptor = &descriptor,
         } }));
     }
@@ -2518,11 +3892,11 @@ test "native descriptor rejects dynamic runtime and product policy fields" {
 
 test "native runtime partial setup failure cleans registry tool and UI state" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.NativeFixtureInjectedFailure, startRuntime(allocator, std.testing.io, .{ .native = .{
+    try std.testing.expectError(error.NativeFixtureInjectedFailure, startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_partial_failure_descriptor,
     } }));
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2536,7 +3910,7 @@ test "native runtime partial setup failure cleans registry tool and UI state" {
 
 test "native runtime participates in adapter conformance and event frames are stable no-op" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer adapter.deinit();
@@ -2588,7 +3962,7 @@ test "native runtime participates in adapter conformance and event frames are st
 
 test "native runtime UI lifecycle rejects unsafe requests and resolves pending responses once" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_ui_lifecycle_descriptor,
     } });
     defer adapter.deinit();
@@ -2639,7 +4013,7 @@ test "native runtime UI lifecycle rejects unsafe requests and resolves pending r
 
 test "native host API privileged operations are explicit default-deny boundaries" {
     const allocator = std.testing.allocator;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_host_api_boundary_descriptor,
     } });
     defer adapter.deinit();
@@ -2689,11 +4063,11 @@ test "native host API privileged operations are explicit default-deny boundaries
 
 test "native runtime same descriptor instances isolate registry pending diagnostics and shutdown" {
     const allocator = std.testing.allocator;
-    const first = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const first = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_instance_isolation_descriptor,
     } });
     defer first.deinit();
-    const second = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const second = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_instance_isolation_descriptor,
     } });
     defer second.deinit();
@@ -2758,7 +4132,7 @@ test "wasm manifest handoff starts runtime without capability execution" {
     const options = WasmOptions{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     };
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = options });
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = options });
     defer adapter.deinit();
 
     try std.testing.expectEqual(RuntimeKind.wasm, adapter.kind);
@@ -2792,7 +4166,7 @@ test "wasm runtime handoff denies every canonical requested capability before re
         try std.testing.expectEqualStrings("runtime/handoff", denial.mode);
 
         try std.testing.expectError(error.UnsupportedRuntimeCapability, handoff.validate());
-        try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        try std.testing.expectError(error.UnsupportedRuntimeCapability, startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
             .manifest = handoff,
         } }));
     }
@@ -2813,7 +4187,7 @@ test "wasm runtime handoff exact approved grants permit matching requested capab
     try std.testing.expect(handoff.deniedRuntimeCapability(.initialize, "runtime/handoff") == null);
     try handoff.validate();
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = handoff,
     } });
     defer adapter.deinit();
@@ -2855,7 +4229,7 @@ test "persisted wasm extension policy resource limits reach tool enforcement dia
     var handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
     handoff.resource_limits = enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits);
     handoff.policy_lookup_key = wasm_key;
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{ .manifest = handoff } });
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{ .manifest = handoff } });
     defer adapter.deinit();
     try adapter.waitForReady(0);
 
@@ -2870,6 +4244,7 @@ test "persisted wasm extension policy resource limits reach tool enforcement dia
     try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
     const diagnostic = wasmRuntime(adapter.ptr).state.diagnostics.items[0].message;
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"operation\":\"tool.use\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"category\":\"resource_limit_exceeded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"tool target is outside toolScopes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"policyLookupKey\":\"wasm:locked:user:pi-extension.v0:com.pi.pure-truncate-head:0.1.0:") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"source\":{\"manifestPath\":") != null);
@@ -3106,7 +4481,7 @@ test "wasm manifest handoff owns and enforces tool scopes after source deinit" {
     const source_scopes_ptr = manifest_result.valid.resource_limits.tool_scopes.ptr;
     const source_scope_ptr = manifest_result.valid.resource_limits.tool_scopes[0].ptr;
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer adapter.deinit();
@@ -3131,6 +4506,7 @@ test "wasm manifest handoff owns and enforces tool scopes after source deinit" {
     try std.testing.expectEqual(@as(usize, 1), adapter.diagnosticCount());
     const diagnostic = runtime.state.diagnostics.items[0].message;
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"reason\":\"tool target is outside toolScopes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"category\":\"resource_limit_exceeded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "\"toolId\":\"builtin.truncateHead\"") != null);
 }
 
@@ -3209,7 +4585,7 @@ test "wasm runtime registers schema preserving tool and executes through agent t
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer adapter.deinit();
@@ -3269,7 +4645,7 @@ test "wasm unload shutdown is idempotent and final across repeated cycles" {
     defer if (expected_output) |output| allocator.free(output);
 
     for (0..2) |cycle| {
-        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
             .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
         } });
         defer adapter.deinit();
@@ -3321,7 +4697,7 @@ test "wasm cleanup covers load failure call failure shutdown and deinit paths" {
     );
     defer mismatch_manifest.deinit(allocator);
     try std.testing.expect(mismatch_manifest == .valid);
-    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&mismatch_manifest.valid),
     } }));
 
@@ -3330,7 +4706,7 @@ test "wasm cleanup covers load failure call failure shutdown and deinit paths" {
     try std.testing.expect(manifest_result == .valid);
 
     {
-        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
             .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
         } });
         defer adapter.deinit();
@@ -3350,7 +4726,7 @@ test "wasm cleanup covers load failure call failure shutdown and deinit paths" {
     }
 
     {
-        const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+        const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
             .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
         } });
         adapter.deinit();
@@ -3365,7 +4741,7 @@ test "wasm runtime rejects metadata schema mismatch before registration" {
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
 
-    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    try std.testing.expectError(error.WasmManifestMetadataMismatch, startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } }));
 }
@@ -3393,7 +4769,7 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
     defer allocator.free(script);
     const argv = [_][]const u8{ "/bin/sh", "-c", script, "mixed-process-jsonl-runtime" };
 
-    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const process_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3418,13 +4794,13 @@ test "extension runtime mixed process_jsonl and wasm adapters isolate interleave
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const wasm_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer wasm_adapter.deinit();
     try expectWasmToolSubsetConformance(allocator, wasm_adapter, manifest_result.valid.artifact_absolute_path);
 
-    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const native_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer native_adapter.deinit();
@@ -3495,7 +4871,7 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
         "printf '{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"promptPaths\":[],\"themePaths\":[],\"extensionPath\":\"fixture/process-display.ts\"}\\n'; " ++
         "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
     const process_argv = [_][]const u8{ "/bin/sh", "-c", process_script, "process-jsonl-display-metadata" };
-    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const process_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &process_argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3514,7 +4890,10 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
     }
     try std.testing.expectEqual(@as(usize, 4), process_adapter.registryFramesApplied());
     try std.testing.expect(process_adapter.hasRegisteredCommand("process-display-command"));
-    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter.agentTool(allocator, "process-display-tool"));
+    var process_display_tool = (try process_adapter.agentTool(allocator, "process-display-tool")).?;
+    defer deinitAgentTool(allocator, &process_display_tool);
+    try std.testing.expectEqualStrings("process-display-tool", process_display_tool.name);
+    try std.testing.expect(process_display_tool.execute != null);
 
     var wasm_resource_manifest = try wasm_manifest.validateManifestText(allocator, "test/fixtures/wasm/pure-truncate-head-v0",
         \\{"schemaVersion":"pi-extension.v0","id":"com.pi.pure-truncate-head","name":"Pure Truncate Head Fixture","version":"0.1.0","description":"Capability-free Wasm migration fixture for the existing truncateHead pure tool implementation.","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"builtin.truncateHead","description":"Keeps the beginning of content within line and byte limits.","inputSchema":{"type":"object","required":["content","maxLines","maxBytes"],"properties":{"content":{"type":"string"},"maxLines":{"type":"number"},"maxBytes":{"type":"number"}}},"outputSchema":{"type":"object"}},"capabilities":[],"resourceLimits":{"turns":1,"timeoutMs":10,"outputBytes":128,"outputLines":2,"toolScopes":["builtin.truncateHead"]}}
@@ -3528,7 +4907,7 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
     var wasm_runtime_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer wasm_runtime_manifest.deinit(allocator);
     try std.testing.expect(wasm_runtime_manifest == .valid);
-    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const wasm_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&wasm_runtime_manifest.valid),
     } });
     defer wasm_adapter.deinit();
@@ -3548,7 +4927,7 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
         },
         .start = nativeHostApiBoundaryStart,
     };
-    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const native_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_resource_denial_descriptor,
     } });
     defer native_adapter.deinit();
@@ -3602,6 +4981,676 @@ test "cross-runtime capability metadata and resource limits do not grant or leak
     try std.testing.expect(process_adapter.hasShutdownComplete());
 }
 
+test "cross-runtime install discovery reload hook and workflow flow uses live capabilities" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const process_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/.pi/extensions/process");
+    defer allocator.free(process_root);
+    const wasm_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/.pi/extensions/wasm");
+    defer allocator.free(wasm_root);
+    const native_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/.pi/extensions/native");
+    defer allocator.free(native_root);
+    const workflow_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/.pi/extensions/workflow");
+    defer allocator.free(workflow_root);
+
+    const process_manifest_path = try std.fs.path.join(allocator, &.{ process_root, "pi-extension.json" });
+    defer allocator.free(process_manifest_path);
+    const wasm_manifest_path = try std.fs.path.join(allocator, &.{ wasm_root, "pi-extension.json" });
+    defer allocator.free(wasm_manifest_path);
+    const native_manifest_path = try std.fs.path.join(allocator, &.{ native_root, "pi-extension.json" });
+    defer allocator.free(native_manifest_path);
+    const workflow_manifest_path = try std.fs.path.join(allocator, &.{ workflow_root, "pi-extension.json" });
+    defer allocator.free(workflow_manifest_path);
+
+    const process_manifest =
+        \\{"schemaVersion":"pi-extension.v1","id":"process.pkg","name":"Process Runtime Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","-u","index.py"]}},"tools":[{"name":"process.echo","description":"Process echo","inputSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}},"additionalProperties":false}}],"hooks":[{"event":"input","hookId":"process.input","priority":-30,"declarationOrder":0}],"capabilities":{"exports":[{"id":"process.echo","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const wasm_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"wasm.pkg","name":"WASM Runtime Package","version":"1.0.0","runtime":{"kind":"wasm","entrypoint":{"artifactPath":"wasm/plugin.wasm"}},"dependencies":[{"id":"process.pkg","version":"^1.0.0"}],"tools":[{"name":"builtin.truncateHead","description":"WASM truncate","inputSchema":{"type":"object"}}],"hooks":[{"event":"input","hookId":"wasm.input","priority":-20,"declarationOrder":0}],"capabilities":{"exports":[{"id":"builtin.truncateHead","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const native_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"native.pkg","name":"Native Runtime Package","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"descriptor":"native_static_descriptor"}},"dependencies":[{"id":"wasm.pkg","version":"^1.0.0"}],"tools":[{"name":"native.fixture.echo","description":"Native echo","inputSchema":{"type":"object"}}],"hooks":[{"event":"input","hookId":"native.input","priority":-10,"declarationOrder":0}],"capabilities":{"exports":[{"id":"native.fixture.echo","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const workflow_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"workflow.pkg","name":"Workflow Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","-u","workflow.py"]}},"dependencies":[{"id":"native.pkg","version":"^1.0.0"}],"capabilities":{"imports":[{"id":"process.echo","kind":"tool","version":"^1.0.0"},{"id":"builtin.truncateHead","kind":"tool","version":"^1.0.0"},{"id":"native.fixture.echo","kind":"tool","version":"^1.0.0"}]},"workflows":[{"id":"workflow.cross","description":"Cross-runtime workflow","exposure":{"tool":"workflow.cross"},"inputSchema":{"type":"object","required":["request"],"properties":{"request":{"type":"string"}},"additionalProperties":false},"outputSchema":{"type":"object","required":["ok","tool","echo"],"properties":{"ok":{"type":"boolean"},"tool":{"type":"string"},"echo":{"type":"string"}}},"steps":[{"id":"process","kind":"side_effect","replayMode":"recorded","selectedCapability":"process.echo"},{"id":"wasm","kind":"side_effect","replayMode":"recorded","selectedCapability":"builtin.truncateHead"},{"id":"native","kind":"side_effect","replayMode":"recorded","selectedCapability":"native.fixture.echo"}]}]}
+    ;
+
+    var install_set = try extension_manifest.resolveManifestSources(allocator, &.{
+        .{ .package_root = process_root, .manifest_path = process_manifest_path, .manifest_text = process_manifest, .source_scope = "project-installed", .precedence_rank = 0 },
+        .{ .package_root = wasm_root, .manifest_path = wasm_manifest_path, .manifest_text = wasm_manifest_text, .source_scope = "project-installed", .precedence_rank = 1 },
+        .{ .package_root = native_root, .manifest_path = native_manifest_path, .manifest_text = native_manifest_text, .source_scope = "project-installed", .precedence_rank = 2 },
+        .{ .package_root = workflow_root, .manifest_path = workflow_manifest_path, .manifest_text = workflow_manifest_text, .source_scope = "project-installed", .precedence_rank = 3 },
+    });
+    defer install_set.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), install_set.diagnostics.len);
+    for (install_set.records) |record| try std.testing.expect(record.active);
+    const install_order = try extension_manifest.activationOrderIndices(allocator, install_set.records);
+    defer allocator.free(install_order);
+    try std.testing.expectEqual(@as(usize, 4), install_order.len);
+    try std.testing.expectEqualStrings("process.pkg", install_set.records[install_order[0]].manifest.id);
+    try std.testing.expectEqualStrings("wasm.pkg", install_set.records[install_order[1]].manifest.id);
+    try std.testing.expectEqualStrings("native.pkg", install_set.records[install_order[2]].manifest.id);
+    try std.testing.expectEqualStrings("workflow.pkg", install_set.records[install_order[3]].manifest.id);
+
+    const install_snapshot = try install_set.registrySnapshotJson(allocator);
+    defer allocator.free(install_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, install_snapshot, "\"sourceScope\":\"project-installed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, install_snapshot, "\"id\":\"workflow.cross\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, install_snapshot, "\"activationOrder\":[\"process.pkg\",\"wasm.pkg\",\"native.pkg\",\"workflow.pkg\"]") != null);
+
+    var startup_set = try extension_manifest.resolveManifestSources(allocator, &.{
+        .{ .package_root = process_root, .manifest_path = process_manifest_path, .manifest_text = process_manifest, .source_scope = "project-auto", .precedence_rank = 0 },
+        .{ .package_root = wasm_root, .manifest_path = wasm_manifest_path, .manifest_text = wasm_manifest_text, .source_scope = "project-auto", .precedence_rank = 1 },
+        .{ .package_root = native_root, .manifest_path = native_manifest_path, .manifest_text = native_manifest_text, .source_scope = "project-auto", .precedence_rank = 2 },
+        .{ .package_root = workflow_root, .manifest_path = workflow_manifest_path, .manifest_text = workflow_manifest_text, .source_scope = "project-auto", .precedence_rank = 3 },
+    });
+    defer startup_set.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), startup_set.diagnostics.len);
+    const startup_snapshot = try startup_set.registrySnapshotJson(allocator);
+    defer allocator.free(startup_snapshot);
+    for ([_][]const u8{ "process.pkg", "wasm.pkg", "native.pkg", "workflow.pkg", "workflow.cross" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, install_snapshot, needle) != null);
+        try std.testing.expect(std.mem.indexOf(u8, startup_snapshot, needle) != null);
+    }
+
+    var startup_snapshot_json = try std.json.parseFromSlice(std.json.Value, allocator, startup_snapshot, .{});
+    defer startup_snapshot_json.deinit();
+    const hook_chains = startup_snapshot_json.value.object.get("hookChains").?.array.items;
+    var input_hook_count: usize = 0;
+    for (hook_chains) |hook| {
+        const hook_object = hook.object;
+        if (!std.mem.eql(u8, hook_object.get("event").?.string, "input")) continue;
+        const expected = switch (input_hook_count) {
+            0 => "process.input",
+            1 => "wasm.input",
+            2 => "native.input",
+            else => return error.UnexpectedHookOrder,
+        };
+        try std.testing.expectEqualStrings(expected, hook_object.get("hookId").?.string);
+        try std.testing.expectEqual(@as(i64, @intCast(input_hook_count)), hook_object.get("chainOrder").?.integer);
+        input_hook_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), input_hook_count);
+
+    const host_script =
+        \\import json
+        \\import sys
+        \\
+        \\capture = open(sys.argv[1], "w", encoding="utf-8")
+        \\version = sys.argv[2]
+        \\init = sys.stdin.readline()
+        \\capture.write(init)
+        \\capture.flush()
+        \\
+        \\def emit(value):
+        \\    print(json.dumps(value, separators=(",", ":")), flush=True)
+        \\
+        \\tool_name = "process.echo" if version == "v1" else "process.echo.v2"
+        \\emit({"type": "ready"})
+        \\emit({"type": "register_tool", "name": tool_name, "label": "Process Echo", "description": "Process echo " + version, "parameters": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string"}}, "additionalProperties": False}, "extensionPath": "fixture/process-" + version + ".ts"})
+        \\if version == "v1":
+        \\    emit({"type": "register_hook", "event": "input", "hookId": "process.input", "priority": -30, "declarationOrder": 0, "extensionPath": "fixture/process-v1.ts"})
+        \\    emit({"type": "register_workflow", "id": "workflow.cross", "description": "Cross-runtime workflow", "toolName": "workflow.cross", "inputSchema": {"type": "object", "required": ["request"], "properties": {"request": {"type": "string"}}, "additionalProperties": False}, "outputSchema": {"type": "object", "required": ["ok", "tool", "echo"], "properties": {"ok": {"type": "boolean"}, "tool": {"type": "string"}, "echo": {"type": "string"}}}, "steps": [{"id": "process", "kind": "side_effect", "input": {"value": "alpha\nbravo\ncharlie"}, "replayMode": "recorded", "selectedCapability": "process.echo"}, {"id": "wasm", "kind": "side_effect", "input": {"content": "v1:alpha\nbravo\ncharlie", "maxLines": 2, "maxBytes": 1024}, "replayMode": "recorded", "selectedCapability": "builtin.truncateHead"}, {"id": "native", "kind": "side_effect", "input": {"value": "native-flow"}, "replayMode": "recorded", "selectedCapability": "native.fixture.echo"}], "extensionPath": "fixture/workflow.ts"})
+        \\
+        \\for line in sys.stdin:
+        \\    capture.write(line)
+        \\    capture.flush()
+        \\    try:
+        \\        frame = json.loads(line)
+        \\    except Exception:
+        \\        continue
+        \\    if frame.get("type") == "shutdown":
+        \\        emit({"type": "shutdown_complete"})
+        \\        break
+        \\    if frame.get("type") == "extension_event":
+        \\        event = frame.get("event") or {}
+        \\        emit({"type": "extension_event_result", "eventId": frame.get("eventId"), "result": {"runtime": "process_jsonl", "version": version, "eventType": event.get("type", "input"), "text": event.get("text", "") + "|process_jsonl"}})
+        \\        continue
+        \\    if frame.get("type") == "tool_call" and frame.get("toolName") == tool_name:
+        \\        value = (frame.get("input") or {}).get("value", "")
+        \\        emit({"type": "tool_result", "toolCallId": frame.get("toolCallId"), "content": [{"type": "text", "text": version + ":" + value}], "details": {"runtime": "process_jsonl", "capability": tool_name, "version": version}})
+        \\
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "process_host.py", .data = host_script });
+    const host_script_path = try absoluteTmpPath(allocator, &tmp.sub_path, "process_host.py");
+    defer allocator.free(host_script_path);
+    const process_capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "realistic-process-v1.jsonl");
+    defer allocator.free(process_capture_path);
+    const process_argv_v1 = [_][]const u8{ "python3", "-u", host_script_path, process_capture_path, "v1" };
+
+    const process_adapter_v1 = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv_v1,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "cross-runtime-realistic",
+            .cwd = "/cross-runtime-realistic-cwd",
+            .fixture = "process-v1",
+        },
+        .extension_path = "fixture/process-v1.ts",
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter_v1.deinit();
+    try process_adapter_v1.waitForReady(500);
+    var process_elapsed: u64 = 0;
+    while (process_adapter_v1.registryFramesApplied() < 3 and process_elapsed <= 1000) : (process_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 3), process_adapter_v1.registryFramesApplied());
+    try std.testing.expect(process_adapter_v1.hasRegisteredHook("input"));
+
+    var input_event = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"input\",\"text\":\"hello\"}", .{});
+    defer input_event.deinit();
+    var process_hook_result = (try process_adapter_v1.invokeExtensionEvent(allocator, "input", input_event.value, 500)).?;
+    defer tools_common.deinitJsonValue(allocator, process_hook_result);
+    try std.testing.expectEqualStrings("process_jsonl", process_hook_result.object.get("runtime").?.string);
+    try std.testing.expectEqualStrings("v1", process_hook_result.object.get("version").?.string);
+
+    var process_tool = (try process_adapter_v1.agentTool(allocator, "process.echo")).?;
+    defer deinitAgentTool(allocator, &process_tool);
+    var process_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\\nbravo\\ncharlie\"}", .{});
+    defer process_params.deinit();
+    const process_result = try process_tool.execute.?(allocator, "cross-process-call", process_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, process_result.content);
+    defer if (process_result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), process_result.is_error);
+    try std.testing.expectEqualStrings("v1:alpha\nbravo\ncharlie", process_result.content[0].text.text);
+
+    var wasm_runtime_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer wasm_runtime_manifest.deinit(allocator);
+    try std.testing.expect(wasm_runtime_manifest == .valid);
+    const wasm_hooks = [_]RuntimeHookDefinition{.{
+        .event_name = "input",
+        .extension_path = "fixture/wasm-hook.wasm",
+        .priority = -20,
+        .declaration_order = 0,
+    }};
+    var wasm_handoff = WasmManifestHandoff.fromManifest(&wasm_runtime_manifest.valid);
+    wasm_handoff.hooks = &wasm_hooks;
+    const wasm_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = wasm_handoff,
+    } });
+    defer wasm_adapter.deinit();
+    try wasm_adapter.waitForReady(0);
+    try std.testing.expect(wasm_adapter.hasRegisteredHook("input"));
+    var wasm_hook_result = (try wasm_adapter.invokeExtensionEvent(allocator, "input", process_hook_result, 500)).?;
+    defer tools_common.deinitJsonValue(allocator, wasm_hook_result);
+    try std.testing.expectEqualStrings("wasm", wasm_hook_result.object.get("runtime").?.string);
+    try std.testing.expectEqualStrings("hello|process_jsonl|wasm", wasm_hook_result.object.get("text").?.string);
+    var wasm_tool = (try wasm_adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer deinitAgentTool(allocator, &wasm_tool);
+    var wasm_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"v1:alpha\\nbravo\\ncharlie\",\"maxLines\":2,\"maxBytes\":1024}", .{});
+    defer wasm_params.deinit();
+    const wasm_result = try wasm_tool.execute.?(allocator, "cross-wasm-call", wasm_params.value, wasm_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, wasm_result.content);
+    try std.testing.expect(std.mem.indexOf(u8, wasm_result.content[0].text.text, "\"content\":\"v1:alpha\\nbravo\"") != null);
+
+    const native_hooks = [_]NativeHookDefinition{.{
+        .event_name = "input",
+        .extension_path = "native://hook/input",
+        .priority = -10,
+        .declaration_order = 0,
+    }};
+    const native_cross_runtime_descriptor = NativeDescriptor{
+        .id = "com.pi.native-static-fixture",
+        .name = "Native Static Fixture",
+        .version = "0.1.0",
+        .description = "Statically linked native runtime fixture",
+        .tools = &.{native_static_tool},
+        .hooks = &native_hooks,
+    };
+    const native_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &native_cross_runtime_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+    try std.testing.expect(native_adapter.hasRegisteredHook("input"));
+    var native_hook_result = (try native_adapter.invokeExtensionEvent(allocator, "input", wasm_hook_result, 500)).?;
+    defer tools_common.deinitJsonValue(allocator, native_hook_result);
+    try std.testing.expectEqualStrings("native", native_hook_result.object.get("runtime").?.string);
+    try std.testing.expectEqualStrings("hello|process_jsonl|wasm|native", native_hook_result.object.get("text").?.string);
+    var failing_native_hook_input = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"input\",\"text\":\"hello\",\"failRuntime\":\"native\"}", .{});
+    defer failing_native_hook_input.deinit();
+    const failing_native_hook = try native_adapter.invokeExtensionEvent(allocator, "input", failing_native_hook_input.value, 500);
+    try std.testing.expect(failing_native_hook == null);
+    try std.testing.expectEqual(@as(usize, 1), native_adapter.diagnosticCategoryCount(.host_error));
+    var native_tool = (try native_adapter.agentTool(allocator, "native.fixture.echo")).?;
+    defer deinitAgentTool(allocator, &native_tool);
+    var native_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"native-flow\"}", .{});
+    defer native_params.deinit();
+    const native_result = try native_tool.execute.?(allocator, "cross-native-call", native_params.value, native_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, native_result.content);
+    try std.testing.expectEqualStrings("{\"ok\":true,\"tool\":\"native.fixture.echo\",\"echo\":\"native-flow\"}", native_result.content[0].text.text);
+
+    var workflow_input_schema = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"object\",\"required\":[\"request\"],\"properties\":{\"request\":{\"type\":\"string\"}},\"additionalProperties\":false}", .{});
+    defer workflow_input_schema.deinit();
+    var workflow_output_schema = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"object\",\"required\":[\"ok\",\"tool\",\"echo\"],\"properties\":{\"ok\":{\"type\":\"boolean\"},\"tool\":{\"type\":\"string\"},\"echo\":{\"type\":\"string\"}}}", .{});
+    defer workflow_output_schema.deinit();
+    var workflow_input = try std.json.parseFromSlice(std.json.Value, allocator, "{\"request\":\"alpha\"}", .{});
+    defer workflow_input.deinit();
+    const workflow_descriptor = workflow_execution.WorkflowDescriptor{
+        .id = "workflow.cross",
+        .extension_path = "fixture/workflow.ts",
+        .input_schema = workflow_input_schema.value,
+        .output_schema = workflow_output_schema.value,
+        .permissions = startup_set.records[install_order[3]].manifest.permissions,
+    };
+    const workflow_steps = [_]workflow_execution.StepSpec{
+        .{ .id = "process", .kind = .side_effect, .input = process_params.value, .replay_mode = .recorded, .selected_capability = "process.echo" },
+        .{ .id = "wasm", .kind = .side_effect, .input = wasm_params.value, .replay_mode = .recorded, .selected_capability = "builtin.truncateHead" },
+        .{ .id = "native", .kind = .side_effect, .input = native_params.value, .replay_mode = .recorded, .selected_capability = "native.fixture.echo" },
+    };
+
+    const WorkflowDispatchContext = struct {
+        process_adapter: RuntimeAdapter,
+        wasm_adapter: RuntimeAdapter,
+        native_adapter: RuntimeAdapter,
+        trace: std.ArrayList([]u8) = .empty,
+
+        fn deinit(self: *@This(), dispatch_allocator: std.mem.Allocator) void {
+            for (self.trace.items) |entry| dispatch_allocator.free(entry);
+            self.trace.deinit(dispatch_allocator);
+        }
+
+        fn dispatch(
+            dispatch_allocator: std.mem.Allocator,
+            capability_id: []const u8,
+            dispatch_input: std.json.Value,
+            context: ?*anyopaque,
+        ) !std.json.Value {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            try self.trace.append(dispatch_allocator, try dispatch_allocator.dupe(u8, capability_id));
+            const adapter = if (std.mem.eql(u8, capability_id, "process.echo"))
+                self.process_adapter
+            else if (std.mem.eql(u8, capability_id, "builtin.truncateHead"))
+                self.wasm_adapter
+            else if (std.mem.eql(u8, capability_id, "native.fixture.echo"))
+                self.native_adapter
+            else
+                return error.UnknownWorkflowCapability;
+
+            var tool = (try adapter.agentTool(dispatch_allocator, capability_id)) orelse return error.WorkflowCapabilityNotRegistered;
+            defer deinitAgentTool(dispatch_allocator, &tool);
+            const result = try tool.execute.?(dispatch_allocator, capability_id, dispatch_input, tool.execute_context, null, null, null);
+            defer tools_common.deinitContentBlocks(dispatch_allocator, result.content);
+            defer if (result.details) |details| tools_common.deinitJsonValue(dispatch_allocator, details);
+            if (result.is_error) return error.WorkflowCapabilityExecutionFailed;
+            if (result.content.len == 0 or result.content[0] != .text) return error.WorkflowCapabilityInvalidOutput;
+
+            if (std.mem.eql(u8, capability_id, "process.echo")) {
+                var object = try std.json.ObjectMap.init(dispatch_allocator, &.{}, &.{});
+                errdefer tools_common.deinitJsonValue(dispatch_allocator, .{ .object = object });
+                try object.put(dispatch_allocator, try dispatch_allocator.dupe(u8, "text"), .{ .string = try dispatch_allocator.dupe(u8, result.content[0].text.text) });
+                return .{ .object = object };
+            }
+            var parsed = try std.json.parseFromSlice(std.json.Value, dispatch_allocator, result.content[0].text.text, .{});
+            defer parsed.deinit();
+            return try tools_common.cloneJsonValue(dispatch_allocator, parsed.value);
+        }
+    };
+    var workflow_dispatch = WorkflowDispatchContext{
+        .process_adapter = process_adapter_v1,
+        .wasm_adapter = wasm_adapter,
+        .native_adapter = native_adapter,
+    };
+    defer workflow_dispatch.deinit(allocator);
+    var workflow_result = (try executeRegisteredWorkflowSurface(
+        allocator,
+        &processHost(process_adapter_v1.ptr).state.registry,
+        .tool,
+        "workflow.cross",
+        workflow_input.value,
+        .{
+            .capability_dispatch = WorkflowDispatchContext.dispatch,
+            .capability_dispatch_context = &workflow_dispatch,
+        },
+    )).?;
+    defer workflow_result.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.completed, workflow_result.state);
+    try std.testing.expectEqualStrings("native-flow", workflow_result.output.?.object.get("echo").?.string);
+    try std.testing.expectEqual(@as(usize, 3), workflow_dispatch.trace.items.len);
+    try std.testing.expectEqualStrings("process.echo", workflow_dispatch.trace.items[0]);
+    try std.testing.expectEqualStrings("builtin.truncateHead", workflow_dispatch.trace.items[1]);
+    try std.testing.expectEqualStrings("native.fixture.echo", workflow_dispatch.trace.items[2]);
+    try std.testing.expectEqual(@as(usize, 3), workflow_result.replay_metadata.steps.items.len);
+    try std.testing.expectEqualStrings("process.echo", workflow_result.replay_metadata.steps.items[0].selected_capability.?);
+    try std.testing.expectEqualStrings("builtin.truncateHead", workflow_result.replay_metadata.steps.items[1].selected_capability.?);
+    try std.testing.expectEqualStrings("native.fixture.echo", workflow_result.replay_metadata.steps.items[2].selected_capability.?);
+
+    const process_text_json = try std.json.Stringify.valueAlloc(allocator, process_result.content[0].text.text, .{});
+    defer allocator.free(process_text_json);
+    const process_step_output_text = try std.fmt.allocPrint(allocator, "{{\"text\":{s}}}", .{process_text_json});
+    defer allocator.free(process_step_output_text);
+    var process_step_output = try std.json.parseFromSlice(std.json.Value, allocator, process_step_output_text, .{});
+    defer process_step_output.deinit();
+    var wasm_step_output = try std.json.parseFromSlice(std.json.Value, allocator, wasm_result.content[0].text.text, .{});
+    defer wasm_step_output.deinit();
+    var native_step_output = try std.json.parseFromSlice(std.json.Value, allocator, native_result.content[0].text.text, .{});
+    defer native_step_output.deinit();
+
+    const recorded_steps = [_]workflow_execution.RecordedReplayStep{
+        .{ .step_id = "process", .mode = .recorded, .order = 0, .kind = .side_effect, .input = process_params.value, .selected_capability_present = true, .selected_capability = "process.echo", .output = process_step_output.value },
+        .{ .step_id = "wasm", .mode = .recorded, .order = 1, .kind = .side_effect, .input = wasm_params.value, .selected_capability_present = true, .selected_capability = "builtin.truncateHead", .output = wasm_step_output.value },
+        .{ .step_id = "native", .mode = .recorded, .order = 2, .kind = .side_effect, .input = native_params.value, .selected_capability_present = true, .selected_capability = "native.fixture.echo", .output = native_step_output.value },
+    };
+    var replay_result = try workflow_execution.executeWorkflow(allocator, workflow_descriptor, workflow_input.value, &workflow_steps, .{ .replay = true, .recorded_steps = &recorded_steps, .recorded_terminal_state = .completed });
+    defer replay_result.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.completed, replay_result.state);
+    try std.testing.expectEqualStrings("native-flow", replay_result.output.?.object.get("echo").?.string);
+
+    var inflight_work = workflow_execution.ActiveRuntimeWork{};
+    const cancel_steps = [_]workflow_execution.StepSpec{.{
+        .id = "process-inflight",
+        .kind = .side_effect,
+        .runtime_work = &inflight_work,
+        .cancel_after_start = true,
+        .selected_capability = "process.echo",
+    }};
+    var cancelled_workflow = try workflow_execution.executeWorkflow(allocator, workflow_descriptor, workflow_input.value, &cancel_steps, .{});
+    defer cancelled_workflow.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.cancelled, cancelled_workflow.state);
+    try std.testing.expect(inflight_work.started);
+    try std.testing.expect(inflight_work.cancelled);
+    try std.testing.expectEqualStrings("process-inflight", cancelled_workflow.replay_metadata.cancellation_point.?);
+
+    try process_adapter_v1.shutdown();
+    try std.testing.expect(process_adapter_v1.hasShutdownComplete());
+    process_adapter_v1.sendExtensionEventFrame("{\"type\":\"input\",\"text\":\"stale-after-shutdown\"}");
+    const stale_result = try process_tool.execute.?(allocator, "cross-process-stale", process_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, stale_result.content);
+    defer if (stale_result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), stale_result.is_error);
+
+    const process_capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture_path, allocator, .unlimited);
+    defer allocator.free(process_capture);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "cross-process-call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "stale-after-shutdown") == null);
+
+    const process_capture_path_v2 = try absoluteTmpPath(allocator, &tmp.sub_path, "realistic-process-v2.jsonl");
+    defer allocator.free(process_capture_path_v2);
+    const process_argv_v2 = [_][]const u8{ "python3", "-u", host_script_path, process_capture_path_v2, "v2" };
+    const process_adapter_v2 = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv_v2,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "cross-runtime-realistic",
+            .cwd = "/cross-runtime-realistic-cwd",
+            .fixture = "process-v2",
+        },
+        .extension_path = "fixture/process-v2.ts",
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter_v2.deinit();
+    try process_adapter_v2.waitForReady(500);
+    var process_v2_elapsed: u64 = 0;
+    while (process_adapter_v2.registryFramesApplied() < 1 and process_v2_elapsed <= 1000) : (process_v2_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter_v2.agentTool(allocator, "process.echo"));
+    var process_tool_v2 = (try process_adapter_v2.agentTool(allocator, "process.echo.v2")).?;
+    defer deinitAgentTool(allocator, &process_tool_v2);
+    var process_v2_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"reload\"}", .{});
+    defer process_v2_params.deinit();
+    const process_v2_result = try process_tool_v2.execute.?(allocator, "cross-process-v2-call", process_v2_params.value, process_tool_v2.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, process_v2_result.content);
+    defer if (process_v2_result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), process_v2_result.is_error);
+    try std.testing.expectEqualStrings("v2:reload", process_v2_result.content[0].text.text);
+
+    try process_adapter_v2.shutdown();
+    try wasm_adapter.shutdown();
+    try native_adapter.shutdown();
+    try std.testing.expect(process_adapter_v2.hasShutdownComplete());
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    try std.testing.expect(!wasm_adapter.hasRegisteredHook("input"));
+    try std.testing.expect(!native_adapter.hasRegisteredHook("input"));
+    const stale_wasm_hook = try wasm_adapter.invokeExtensionEvent(allocator, "input", input_event.value, 500);
+    try std.testing.expect(stale_wasm_hook == null);
+    const stale_native_hook = try native_adapter.invokeExtensionEvent(allocator, "input", input_event.value, 500);
+    try std.testing.expect(stale_native_hook == null);
+    try std.testing.expect(wasm_adapter.diagnosticCategoryCount(.host_error) >= 1);
+    try std.testing.expect(native_adapter.diagnosticCategoryCount(.host_error) >= 2);
+}
+
+test "process_jsonl workflow surfaces execute through workflow engine" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "workflow-surface-routing-capture.jsonl");
+    defer allocator.free(capture_path);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"workflow.capability\",\"label\":\"Workflow Capability\",\"description\":\"Capability used by workflow surfaces\",\"parameters\":{{\"type\":\"object\",\"required\":[\"issue\"],\"properties\":{{\"issue\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"success\",\"description\":\"Success workflow\",\"inputSchema\":{{\"type\":\"object\",\"required\":[\"issue\"],\"properties\":{{\"issue\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"required\":[\"summary\"],\"properties\":{{\"summary\":{{\"type\":\"string\"}}}}}},\"toolName\":\"workflow.success\",\"commandName\":\"workflow-success\",\"presetId\":\"workflow-success-preset\",\"steps\":[{{\"id\":\"produce\",\"input\":{{\"issue\":\"from-workflow\"}},\"selectedCapability\":\"workflow.capability\"}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"timeout\",\"description\":\"Timeout workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"timeoutMs\":5,\"toolName\":\"workflow.timeout\",\"steps\":[{{\"id\":\"slow\",\"elapsedMs\":10,\"runtimeWork\":true,\"output\":{{}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"cancel\",\"description\":\"Cancel workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"toolName\":\"workflow.cancel\",\"steps\":[{{\"id\":\"active\",\"runtimeWork\":true,\"output\":{{}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"replay\",\"description\":\"Replay workflow\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"__workflowReplay\":{{\"type\":\"boolean\"}}}}}},\"outputSchema\":{{}},\"toolName\":\"workflow.replay\",\"steps\":[{{\"id\":\"shell\",\"kind\":\"side_effect\",\"replayMode\":\"blocked\",\"selectedCapability\":\"shell.run\"}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"child\",\"description\":\"Child workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"toolName\":\"workflow.child\",\"presetId\":\"workflow-child-preset\",\"childAgentLimits\":{{\"maxChildren\":0,\"maxTurns\":1,\"maxToolCalls\":0,\"timeoutMs\":100}},\"steps\":[{{\"id\":\"delegate\",\"kind\":\"child_agent\",\"childDelta\":{{\"childrenStarted\":1}},\"selectedCapability\":\"agent.delegate\",\"output\":{{}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"child-granted\",\"description\":\"Child granted workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"permissions\":[\"read\"],\"toolName\":\"workflow.child-granted\",\"childAgentLimits\":{{\"maxChildren\":1,\"maxTurns\":2,\"maxToolCalls\":1,\"timeoutMs\":100}},\"steps\":[{{\"id\":\"delegate\",\"kind\":\"child_agent\",\"input\":{{\"task\":\"triage\"}},\"childDelta\":{{\"childrenStarted\":1,\"turns\":1,\"toolCalls\":1,\"elapsedMs\":50,\"permission\":\"read\"}},\"selectedCapability\":\"agent.delegate\",\"output\":{{}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"toolName\":\"workflow.capability\"'*) tool_call_id=$(printf '%s' \"$line\" | sed -n 's/.*\"toolCallId\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"type\":\"tool_result\",\"toolCallId\":\"%s\",\"content\":[{{\"type\":\"text\",\"text\":\"done via capability\"}}],\"details\":{{\"summary\":\"done via capability\"}}}}\\n' \"$tool_call_id\";; *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{ capture_path, capture_path },
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "workflow-surface-routing" };
+
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "workflow-routing-marker",
+            .cwd = "/workflow-routing-cwd",
+            .fixture = "workflow-routing",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (adapter.registryFramesApplied() < 7 and elapsed <= 1000) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 7), adapter.registryFramesApplied());
+
+    var success_tool = (try adapter.agentTool(allocator, "workflow.success")).?;
+    defer deinitAgentTool(allocator, &success_tool);
+    var success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"issue\":\"bug\"}", .{});
+    defer success_params.deinit();
+    const success = try success_tool.execute.?(allocator, "workflow-success-call", success_params.value, success_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, success.content);
+    defer if (success.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), success.is_error);
+    try std.testing.expectEqualStrings("{\"summary\":\"done via capability\"}", success.content[0].text.text);
+    try std.testing.expectEqualStrings("completed", success.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("success", success.details.?.object.get("workflow").?.object.get("id").?.string);
+
+    var surface_dispatch_context = SingleRuntimeWorkflowCapabilityDispatchContext{ .adapter = adapter };
+    var command_success = (try executeRegisteredWorkflowSurface(
+        allocator,
+        &processHost(adapter.ptr).state.registry,
+        .command,
+        "workflow-success",
+        success_params.value,
+        .{
+            .capability_dispatch = dispatchWorkflowCapabilityFromAdapter,
+            .capability_dispatch_context = &surface_dispatch_context,
+        },
+    )).?;
+    defer command_success.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.completed, command_success.state);
+    try std.testing.expectEqualStrings("done via capability", command_success.output.?.object.get("summary").?.string);
+
+    var preset_success = (try executeRegisteredWorkflowSurface(
+        allocator,
+        &processHost(adapter.ptr).state.registry,
+        .preset,
+        "workflow-success-preset",
+        success_params.value,
+        .{
+            .capability_dispatch = dispatchWorkflowCapabilityFromAdapter,
+            .capability_dispatch_context = &surface_dispatch_context,
+        },
+    )).?;
+    defer preset_success.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.completed, preset_success.state);
+    try std.testing.expectEqualStrings("done via capability", preset_success.output.?.object.get("summary").?.string);
+
+    var invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer invalid_params.deinit();
+    const invalid = try success_tool.execute.?(allocator, "workflow-invalid-call", invalid_params.value, success_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, invalid.content);
+    defer if (invalid.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), invalid.is_error);
+    try std.testing.expectEqualStrings("failed", invalid.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("workflow.input_schema_invalid", invalid.details.?.object.get("diagnostics").?.array.items[0].object.get("code").?.string);
+
+    var empty_params = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer empty_params.deinit();
+    var timeout_tool = (try adapter.agentTool(allocator, "workflow.timeout")).?;
+    defer deinitAgentTool(allocator, &timeout_tool);
+    const timeout = try timeout_tool.execute.?(allocator, "workflow-timeout-call", empty_params.value, timeout_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, timeout.content);
+    defer if (timeout.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), timeout.is_error);
+    try std.testing.expectEqualStrings("timed_out", timeout.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("workflow.timeout", timeout.details.?.object.get("diagnostics").?.array.items[0].object.get("code").?.string);
+
+    var cancel_signal = std.atomic.Value(bool).init(true);
+    var cancel_tool = (try adapter.agentTool(allocator, "workflow.cancel")).?;
+    defer deinitAgentTool(allocator, &cancel_tool);
+    const cancelled = try cancel_tool.execute.?(allocator, "workflow-cancel-call", empty_params.value, cancel_tool.execute_context, &cancel_signal, null, null);
+    defer tools_common.deinitContentBlocks(allocator, cancelled.content);
+    defer if (cancelled.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), cancelled.is_error);
+    try std.testing.expectEqualStrings("cancelled", cancelled.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("active", cancelled.details.?.object.get("workflow").?.object.get("cancellationPoint").?.string);
+
+    var replay_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"__workflowReplay\":true}", .{});
+    defer replay_params.deinit();
+    var replay_tool = (try adapter.agentTool(allocator, "workflow.replay")).?;
+    defer deinitAgentTool(allocator, &replay_tool);
+    const replay = try replay_tool.execute.?(allocator, "workflow-replay-call", replay_params.value, replay_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, replay.content);
+    defer if (replay.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), replay.is_error);
+    try std.testing.expectEqualStrings("replay_blocked", replay.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("workflow.replay_side_effect_blocked", replay.details.?.object.get("diagnostics").?.array.items[0].object.get("code").?.string);
+
+    var child_tool = (try adapter.agentTool(allocator, "workflow.child")).?;
+    defer deinitAgentTool(allocator, &child_tool);
+    const child = try child_tool.execute.?(allocator, "workflow-child-call", empty_params.value, child_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, child.content);
+    defer if (child.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), child.is_error);
+    try std.testing.expectEqualStrings("workflow.child_agent_limit_exceeded", child.details.?.object.get("diagnostics").?.array.items[0].object.get("code").?.string);
+
+    var child_granted_tool = (try adapter.agentTool(allocator, "workflow.child-granted")).?;
+    defer deinitAgentTool(allocator, &child_granted_tool);
+    const child_granted = try child_granted_tool.execute.?(allocator, "workflow-child-granted-call", empty_params.value, child_granted_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, child_granted.content);
+    defer if (child_granted.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), child_granted.is_error);
+    const child_granted_workflow = child_granted.details.?.object.get("workflow").?.object;
+    try std.testing.expectEqualStrings("completed", child_granted.details.?.object.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 1), child_granted_workflow.get("childUsage").?.object.get("childrenStarted").?.integer);
+    try std.testing.expectEqualStrings("read", child_granted_workflow.get("permissions").?.array.items[0].string);
+    try std.testing.expectEqualStrings("read", child_granted_workflow.get("childAgentLimits").?.object.get("permissionGrants").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 0), child_granted_workflow.get("steps").?.array.items[0].object.get("order").?.integer);
+    try std.testing.expectEqualStrings("child_agent", child_granted_workflow.get("steps").?.array.items[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("triage", child_granted_workflow.get("steps").?.array.items[0].object.get("input").?.object.get("task").?.string);
+
+    const PresetContext = struct {
+        allocator: std.mem.Allocator,
+        input: std.json.Value,
+        state: ?workflow_execution.ExecutionState = null,
+
+        fn run(context: ?*anyopaque, registry: *const Registry) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            var result = (try executeRegisteredWorkflowSurface(self.allocator, registry, .preset, "workflow-child-preset", self.input, .{})).?;
+            defer result.deinit(self.allocator);
+            self.state = result.state;
+        }
+    };
+    var preset_context = PresetContext{ .allocator = allocator, .input = empty_params.value };
+    try adapter.withRegistry(&preset_context, PresetContext.run);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.failed, preset_context.state.?);
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "workflow-success-call") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "workflow.capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "workflow-workflow.capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "workflow-invalid-call") == null);
+    try adapter.shutdown();
+    try std.testing.expect(adapter.hasShutdownComplete());
+}
+
+test "registered workflow surface replay consumes recorded metadata" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_workflow", "id": "live-replay", "description": "Live replay", "inputSchema": { "type": "object", "properties": { "issue": { "type": "string" } }, "required": ["issue"], "additionalProperties": false }, "outputSchema": {}, "toolName": "workflow.live-replay", "steps": [{ "id": "first", "kind": "side_effect", "input": { "query": "current" }, "output": { "value": "current" }, "replayMode": "recorded", "selectedCapability": "provider.current" }], "extensionPath": "fixture/workflows.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try extension_registry.applyHostFrameStream(&registry, frames));
+
+    var replay_input = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"issue":"bug","__workflowReplay":true,"__workflowReplayMetadata":{"terminalState":"completed","permissions":[],"childAgentLimits":{"maxChildren":1,"maxTurns":1,"maxToolCalls":0,"maxTokens":0,"timeoutMs":30000},"steps":[{"stepId":"first","order":0,"kind":"side_effect","mode":"recorded","input":{"query":"current"},"selectedCapability":"provider.current","output":{"value":"recorded"}}]}}
+    , .{});
+    defer replay_input.deinit();
+
+    var replayed = (try executeRegisteredWorkflowSurface(allocator, &registry, .tool, "workflow.live-replay", replay_input.value, .{})).?;
+    defer replayed.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.completed, replayed.state);
+    try std.testing.expectEqualStrings("recorded", replayed.output.?.object.get("value").?.string);
+
+    var mismatched_input = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"issue":"bug","__workflowReplay":true,"__workflowReplayMetadata":{"terminalState":"completed","steps":[{"stepId":"first","order":0,"kind":"side_effect","mode":"recorded","input":{"query":"original"},"selectedCapability":"provider.current","output":{"value":"recorded"}}]}}
+    , .{});
+    defer mismatched_input.deinit();
+
+    var mismatch = (try executeRegisteredWorkflowSurface(allocator, &registry, .tool, "workflow.live-replay", mismatched_input.value, .{})).?;
+    defer mismatch.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.replay_blocked, mismatch.state);
+    try std.testing.expectEqualStrings("$.replay.steps[].input", mismatch.diagnostics.items[0].path);
+
+    var terminal_mismatch_input = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"issue":"bug","__workflowReplay":true,"__workflowReplayMetadata":{"terminalState":"failed","steps":[{"stepId":"first","order":0,"kind":"side_effect","mode":"recorded","input":{"query":"current"},"selectedCapability":"provider.current","output":{"value":"recorded"}}]}}
+    , .{});
+    defer terminal_mismatch_input.deinit();
+
+    var terminal_mismatch = (try executeRegisteredWorkflowSurface(allocator, &registry, .tool, "workflow.live-replay", terminal_mismatch_input.value, .{})).?;
+    defer terminal_mismatch.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.replay_blocked, terminal_mismatch.state);
+    try std.testing.expectEqualStrings("$.replay.terminalState", terminal_mismatch.diagnostics.items[0].path);
+
+    var extra_step_input = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"issue":"bug","__workflowReplay":true,"__workflowReplayMetadata":{"terminalState":"completed","steps":[{"stepId":"first","order":0,"kind":"side_effect","mode":"recorded","input":{"query":"current"},"selectedCapability":"provider.current","output":{"value":"recorded"}},{"stepId":"removed","order":1,"kind":"side_effect","mode":"recorded","output":{"value":"stale"}}]}}
+    , .{});
+    defer extra_step_input.deinit();
+
+    var extra_step = (try executeRegisteredWorkflowSurface(allocator, &registry, .tool, "workflow.live-replay", extra_step_input.value, .{})).?;
+    defer extra_step.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.replay_blocked, extra_step.state);
+    try std.testing.expectEqualStrings("$.replay.steps", extra_step.diagnostics.items[0].path);
+
+    var null_capability_input = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"issue":"bug","__workflowReplay":true,"__workflowReplayMetadata":{"terminalState":"completed","steps":[{"stepId":"first","order":0,"kind":"side_effect","mode":"recorded","input":{"query":"current"},"selectedCapability":null,"output":{"value":"recorded"}}]}}
+    , .{});
+    defer null_capability_input.deinit();
+
+    var null_capability = (try executeRegisteredWorkflowSurface(allocator, &registry, .tool, "workflow.live-replay", null_capability_input.value, .{})).?;
+    defer null_capability.deinit(allocator);
+    try std.testing.expectEqual(workflow_execution.ExecutionState.replay_blocked, null_capability.state);
+    try std.testing.expectEqualStrings("$.replay.steps[].selectedCapability", null_capability.diagnostics.items[0].path);
+}
+
 test "runtime validation failures occur before registration while process_jsonl remains compatible" {
     const allocator = std.testing.allocator;
 
@@ -3625,7 +5674,7 @@ test "runtime validation failures occur before registration while process_jsonl 
         .workflow_preset = "workflow",
     };
     try std.testing.expectEqualStrings("remote_url", invalid_native_descriptor.firstForbiddenField().?);
-    try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntime(allocator, std.testing.io, .{ .native = .{
+    try std.testing.expectError(error.ForbiddenNativeDescriptorField, startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &invalid_native_descriptor,
     } }));
 
@@ -3645,7 +5694,7 @@ test "runtime validation failures occur before registration while process_jsonl 
     defer allocator.free(script);
     const process_argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-validation-compat" };
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &process_argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3664,7 +5713,9 @@ test "runtime validation failures occur before registration while process_jsonl 
     }
     try std.testing.expectEqual(@as(usize, 1), adapter.pendingCount());
     try std.testing.expectEqual(@as(usize, 1), adapter.registryFramesApplied());
-    try std.testing.expectEqual(@as(?agent.AgentTool, null), try adapter.agentTool(allocator, "compat-tool"));
+    var compat_tool = (try adapter.agentTool(allocator, "compat-tool")).?;
+    defer deinitAgentTool(allocator, &compat_tool);
+    try std.testing.expectEqualStrings("compat-tool", compat_tool.name);
     try adapter.sendExtensionUiResponse("compat-pending", "{\"ok\":true}");
     try std.testing.expectEqual(@as(usize, 0), adapter.pendingCount());
     try adapter.shutdown();
@@ -3717,7 +5768,7 @@ test "process_jsonl runtime adapter preserves registry UI response event and shu
     defer allocator.free(script);
     const argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-runtime-adapter" };
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3763,7 +5814,7 @@ test "process_jsonl runtime adapter applies duplicate and unregister registry fr
         "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
     const argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-runtime-duplicate-registry" };
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3801,13 +5852,27 @@ test "process_jsonl runtime adapter applies duplicate and unregister registry fr
 
 test "runtime-owned tool execution conformance preserves process wasm and native contracts" {
     const allocator = std.testing.allocator;
-    const process_script =
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const process_capture_path = try absoluteTmpPath(allocator, &tmp.sub_path, "process-owned-tool-capture.jsonl");
+    defer allocator.free(process_capture_path);
+    const process_script = try std.fmt.allocPrint(
+        allocator,
         "IFS= read -r init; " ++
-        "printf '{\"type\":\"ready\"}\\n'; " ++
-        "printf '{\"type\":\"register_tool\",\"name\":\"process-owned-tool\",\"label\":\"Process Tool\",\"description\":\"registered by process\",\"parameters\":{\"type\":\"object\"},\"extensionPath\":\"fixture/process-tool.ts\"}\\n'; " ++
-        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done";
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"process-owned-tool\",\"label\":\"Process Tool\",\"description\":\"registered by process\",\"parameters\":{{\"type\":\"object\",\"required\":[\"value\"],\"properties\":{{\"value\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"executionMode\":\"sequential\",\"extensionPath\":\"fixture/process-tool.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "*'\"toolCallId\":\"process-success\"'*) printf '{{\"type\":\"tool_result\",\"toolCallId\":\"process-success\",\"content\":[{{\"type\":\"text\",\"text\":\"process ok\"}}],\"details\":{{\"source\":\"process\"}}}}\\n';; " ++
+            "*'\"toolCallId\":\"process-fail\"'*) printf '{{\"type\":\"tool_error\",\"toolCallId\":\"process-fail\",\"message\":\"process failed\"}}\\n';; " ++
+            "esac; done",
+        .{process_capture_path},
+    );
+    defer allocator.free(process_script);
     const process_argv = [_][]const u8{ "/bin/sh", "-c", process_script, "process-jsonl-tool-contract" };
-    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const process_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &process_argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3825,14 +5890,61 @@ test "runtime-owned tool execution conformance preserves process wasm and native
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
     }
     try std.testing.expectEqual(@as(usize, 1), process_adapter.registryFramesApplied());
-    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter.agentTool(allocator, "process-owned-tool"));
+    var process_tool = (try process_adapter.agentTool(allocator, "process-owned-tool")).?;
+    defer deinitAgentTool(allocator, &process_tool);
+    try std.testing.expectEqualStrings("process-owned-tool", process_tool.name);
+    try std.testing.expectEqualStrings("Process Tool", process_tool.label);
+    try std.testing.expectEqualStrings("registered by process", process_tool.description);
+    try std.testing.expect(process_tool.execute != null);
+    try std.testing.expectEqualStrings("object", process_tool.parameters.object.get("type").?.string);
+
+    var process_success_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"ok\"}", .{});
+    defer process_success_params.deinit();
+    const process_success = try process_tool.execute.?(allocator, "process-success", process_success_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, process_success.content);
+    defer if (process_success.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), process_success.is_error);
+    try std.testing.expectEqualStrings("process ok", process_success.content[0].text.text);
+    try std.testing.expectEqualStrings("process", process_success.details.?.object.get("source").?.string);
+    try std.testing.expectEqualStrings("process-success", process_success.details.?.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("ok", process_success.details.?.object.get("input").?.object.get("value").?.string);
+    const process_success_extension = process_success.details.?.object.get("extension").?.object;
+    try std.testing.expectEqualStrings("process_jsonl", process_success_extension.get("runtime").?.string);
+    try std.testing.expectEqualStrings("process-owned-tool", process_success_extension.get("toolName").?.string);
+    try std.testing.expectEqualStrings("fixture/process-tool.ts", process_success_extension.get("extensionPath").?.string);
+
+    var process_fail_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"fail\"}", .{});
+    defer process_fail_params.deinit();
+    const process_fail = try process_tool.execute.?(allocator, "process-fail", process_fail_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, process_fail.content);
+    defer if (process_fail.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), process_fail.is_error);
+    try std.testing.expectEqualStrings("process failed", process_fail.content[0].text.text);
+    try std.testing.expectEqualStrings("process-fail", process_fail.details.?.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("process_jsonl_tool_error", process_fail.details.?.object.get("code").?.string);
+    try std.testing.expectEqualStrings("process failed", process_fail.details.?.object.get("message").?.string);
+
+    var process_invalid_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":42}", .{});
+    defer process_invalid_params.deinit();
+    const process_invalid = try process_tool.execute.?(allocator, "process-invalid", process_invalid_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, process_invalid.content);
+    defer if (process_invalid.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), process_invalid.is_error);
+    try std.testing.expectEqualStrings("InvalidToolArguments", process_invalid.content[0].text.text);
+
+    const process_capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture_path, allocator, .unlimited);
+    defer allocator.free(process_capture);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "\"toolCallId\":\"process-success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "\"toolCallId\":\"process-fail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "process-invalid") == null);
+
     try process_adapter.shutdown();
     try std.testing.expect(process_adapter.hasShutdownComplete());
 
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const wasm_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer wasm_adapter.deinit();
@@ -3840,7 +5952,7 @@ test "runtime-owned tool execution conformance preserves process wasm and native
     try wasm_adapter.shutdown();
     try std.testing.expect(wasm_adapter.hasShutdownComplete());
 
-    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const native_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer native_adapter.deinit();
@@ -3887,7 +5999,7 @@ test "process_jsonl runtime adapter carries subscriber readiness envelopes byte 
     defer allocator.free(script);
     const argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-subscriber-envelope" };
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -3927,7 +6039,7 @@ test "wasm runtime ignores subscriber event envelopes without tool or unload sid
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
 
-    const adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer adapter.deinit();
@@ -3985,7 +6097,7 @@ test "runtime adapter event surface matrix is explicit across process wasm and n
     );
     defer allocator.free(script);
     const process_argv = [_][]const u8{ "/bin/sh", "-c", script, "process-jsonl-event-surface-matrix" };
-    const process_adapter = try startRuntime(allocator, std.testing.io, .{ .process_jsonl = .{
+    const process_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
         .argv = &process_argv,
         .cwd = "/tmp",
         .initialize = .{
@@ -4028,7 +6140,7 @@ test "runtime adapter event surface matrix is explicit across process wasm and n
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const wasm_adapter = try startRuntime(allocator, std.testing.io, .{ .wasm = .{
+    const wasm_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
         .manifest = WasmManifestHandoff.fromManifest(&manifest_result.valid),
     } });
     defer wasm_adapter.deinit();
@@ -4048,7 +6160,7 @@ test "runtime adapter event surface matrix is explicit across process wasm and n
     try std.testing.expectEqual(@as(usize, 0), wasm_adapter.pendingCount());
     try std.testing.expectEqual(@as(usize, 0), wasm_adapter.diagnosticCount());
 
-    const native_adapter = try startRuntime(allocator, std.testing.io, .{ .native = .{
+    const native_adapter = try startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
         .descriptor = &native_static_descriptor,
     } });
     defer native_adapter.deinit();

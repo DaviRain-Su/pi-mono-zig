@@ -8,6 +8,7 @@ const session_mod = @import("../sessions/session.zig");
 const shared = @import("shared.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const tool_adapters = @import("tool_adapters.zig");
+const system_prompt_mod = @import("../resources/system_prompt.zig");
 
 const AppContext = shared.AppContext;
 const MissingCwdMode = shared.MissingCwdMode;
@@ -77,9 +78,11 @@ pub const InteractiveBootstrap = struct {
     current_provider: provider_config.ResolvedProviderConfig,
     built_tools: tool_adapters.BuiltTools,
     session: session_mod.AgentSession,
+    owned_system_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *InteractiveBootstrap) void {
         self.session.deinit();
+        if (self.owned_system_prompt) |system_prompt| self.allocator.free(system_prompt);
         self.built_tools.deinit();
         self.current_provider.deinit(self.allocator);
         self.* = undefined;
@@ -126,11 +129,14 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
     );
     errdefer current_provider.deinit(allocator);
 
-    var built_tools = try tool_adapters.buildAgentToolsWithOptions(allocator, app_context, .{
-        .selected_tools = options.selected_tools,
+    var built_tools = try tool_adapters.buildAgentToolsWithExtensionsSelection(allocator, app_context, options.selected_tools, .{
+        .extensions = options.extensions,
+        .env_map = env_map,
+        .cwd = options.cwd,
+        .io = io,
+        .runtime_config = options.runtime_config,
         .include_builtin_tools = options.include_builtin_tools,
         .include_installed_wasm_tools = options.include_installed_wasm_tools,
-        .runtime_config = options.runtime_config,
         .resource_options = if (options.runtime_config) |runtime_config| .{
             .cwd = options.cwd,
             .agent_dir = runtime_config.agent_dir,
@@ -144,23 +150,42 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
     });
     errdefer built_tools.deinit();
 
+    var effective_options = options;
+    var owned_system_prompt: ?[]u8 = null;
+    errdefer if (owned_system_prompt) |system_prompt| allocator.free(system_prompt);
+    if (options.current_date.len > 0) {
+        owned_system_prompt = try system_prompt_mod.buildSystemPrompt(allocator, .{
+            .cwd = options.cwd,
+            .current_date = options.current_date,
+            .custom_prompt = options.custom_prompt,
+            .append_prompts = options.append_prompts,
+            .tool_selection = options.selected_tools,
+            .active_tools = built_tools.items,
+            .context_files = options.context_files,
+            .skills = options.skills,
+        });
+        effective_options.system_prompt = owned_system_prompt.?;
+    }
+
     var session = openInitialSessionWithMissingCwd(
         allocator,
         io,
         options.session_dir,
-        options,
+        effective_options,
         current_provider.model,
         current_provider.api_key,
         built_tools.items,
         out_issue,
     ) catch |err| return err;
     errdefer session.deinit();
+    try session.setExtensionHosts(built_tools.extension_hosts, 1000);
 
     return .{
         .allocator = allocator,
         .current_provider = current_provider,
         .built_tools = built_tools,
         .session = session,
+        .owned_system_prompt = owned_system_prompt,
     };
 }
 

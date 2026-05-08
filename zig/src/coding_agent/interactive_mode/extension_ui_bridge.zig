@@ -46,9 +46,10 @@ pub const Bridge = struct {
         const fixture = env_map.get("PI_M6_EXTENSION_HOST_FIXTURE") orelse "interactive-extension-ui";
         const marker = env_map.get(extension_runtime.HOST_MARKER_ENV) orelse "pi-interactive-extension-host";
         const argv = [_][]const u8{ runtime, entry, marker };
-        const host = try extension_runtime.startRuntime(self.allocator, self.io, .{ .process_jsonl = .{
+        const host = try extension_runtime.startRuntimeAdapter(self.allocator, self.io, .{ .process_jsonl = .{
             .argv = &argv,
             .cwd = cwd,
+            .extension_path = entry,
             .initialize = .{
                 .marker = marker,
                 .cwd = cwd,
@@ -383,6 +384,17 @@ fn dispatchSlashCommand(context: ?*anyopaque, raw_command: []const u8) anyerror!
     const host = self.host orelse return false;
     const command_name = slashCommandName(raw_command) orelse return false;
     if (!host.hasRegisteredCommand(command_name)) return false;
+    var workflow_input = try workflowCommandInput(self.allocator, slashCommandArgument(raw_command));
+    defer workflow_input.deinit();
+    var workflow_context = WorkflowCommandDispatchContext{
+        .allocator = self.allocator,
+        .command_name = command_name,
+        .input = workflow_input.value,
+        .dispatch_context = .{ .adapter = host },
+    };
+    try host.withRegistry(&workflow_context, executeWorkflowCommandCallback);
+    if (workflow_context.handled) return true;
+
     var out: std.Io.Writer.Allocating = .init(self.allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"type\":\"command\",\"name\":");
@@ -395,6 +407,44 @@ fn dispatchSlashCommand(context: ?*anyopaque, raw_command: []const u8) anyerror!
     try out.writer.writeAll("}");
     host.sendExtensionEventFrame(out.written());
     return true;
+}
+
+const WorkflowCommandDispatchContext = struct {
+    allocator: std.mem.Allocator,
+    command_name: []const u8,
+    input: std.json.Value,
+    dispatch_context: extension_runtime.SingleRuntimeWorkflowCapabilityDispatchContext,
+    handled: bool = false,
+};
+
+fn executeWorkflowCommandCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const workflow_context: *WorkflowCommandDispatchContext = @ptrCast(@alignCast(context.?));
+    var result = (try extension_runtime.executeRegisteredWorkflowSurface(
+        workflow_context.allocator,
+        registry,
+        .command,
+        workflow_context.command_name,
+        workflow_context.input,
+        .{
+            .capability_dispatch = extension_runtime.dispatchWorkflowCapabilityFromAdapter,
+            .capability_dispatch_context = &workflow_context.dispatch_context,
+        },
+    )) orelse return;
+    defer result.deinit(workflow_context.allocator);
+    workflow_context.handled = true;
+}
+
+fn workflowCommandInput(allocator: std.mem.Allocator, argument: []const u8) !std.json.Parsed(std.json.Value) {
+    if (argument.len == 0) return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    if (std.mem.startsWith(u8, std.mem.trim(u8, argument, " \t\r\n"), "{")) {
+        if (std.json.parseFromSlice(std.json.Value, allocator, argument, .{})) |parsed| return parsed else |_| {}
+    }
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"argument\":");
+    try writeJsonString(allocator, &out.writer, argument);
+    try out.writer.writeAll("}");
+    return try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
 }
 
 fn slashCommandName(raw_command: []const u8) ?[]const u8 {

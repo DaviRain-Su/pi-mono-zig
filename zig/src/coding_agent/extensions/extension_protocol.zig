@@ -132,12 +132,14 @@ pub const ExtensionEventResponse = struct {
     event_id: []u8,
     result: ?std.json.Value = null,
     error_message: ?[]u8 = null,
+    fatal: bool = false,
 
     pub fn clone(allocator: std.mem.Allocator, response: ExtensionEventResponse) !ExtensionEventResponse {
         return .{
             .event_id = try allocator.dupe(u8, response.event_id),
             .result = if (response.result) |result| try common.cloneJsonValue(allocator, result) else null,
             .error_message = if (response.error_message) |message| try allocator.dupe(u8, message) else null,
+            .fatal = response.fatal,
         };
     }
 
@@ -188,6 +190,8 @@ const REGISTRY_FRAME_TYPES = [_][]const u8{
     "unregister_provider",
     "register_capability",
     "unregister_capability",
+    "register_workflow",
+    "unregister_workflow",
     "register_hook",
     "unregister_hook",
     "set_header",
@@ -434,6 +438,8 @@ pub const ProtocolState = struct {
                     .unregistered_provider,
                     .registered_capability,
                     .unregistered_capability,
+                    .registered_workflow,
+                    .unregistered_workflow,
                     .registered_hook,
                     .unregistered_hook,
                     .set_header_hook,
@@ -846,6 +852,7 @@ fn parseExtensionEventResult(allocator: std.mem.Allocator, object: std.json.Obje
         null;
     errdefer if (result) |result_value| common.deinitJsonValue(allocator, result_value);
     const message = optionalString(object, "message") orelse optionalString(object, "error");
+    const fatal = (optionalBool(object, "fatal") orelse false) or hookErrorPolicyIsFatal(object);
     return .{
         .event_id = try allocator.dupe(u8, event_id),
         .result = result,
@@ -853,6 +860,7 @@ fn parseExtensionEventResult(allocator: std.mem.Allocator, object: std.json.Obje
             try allocator.dupe(u8, message orelse "extension hook error")
         else
             null,
+        .fatal = fatal,
     };
 }
 
@@ -1078,6 +1086,17 @@ fn optionalBool(object: std.json.ObjectMap, field: []const u8) ?bool {
         .bool => |flag| flag,
         else => null,
     };
+}
+
+fn hookErrorPolicyIsFatal(object: std.json.ObjectMap) bool {
+    const policy = optionalString(object, "errorPolicy") orelse
+        optionalString(object, "error_policy") orelse
+        optionalString(object, "onError") orelse
+        optionalString(object, "on_error") orelse
+        return false;
+    return std.mem.eql(u8, policy, "fatal") or
+        std.mem.eql(u8, policy, "abort") or
+        std.mem.eql(u8, policy, "fail");
 }
 
 fn parseCategory(name: ?[]const u8) ?DiagnosticCategory {
@@ -1522,7 +1541,7 @@ test "sub-agent readiness JSON wire validation accepts valid envelopes and rejec
 
 test "extension protocol ABI conformance helper covers diagnostics registry frames and UI lifecycle" {
     const frame_types = registryFrameTypeNames();
-    try std.testing.expectEqual(@as(usize, 25), frame_types.len);
+    try std.testing.expectEqual(@as(usize, 27), frame_types.len);
     try std.testing.expectEqualStrings("register_tool", frame_types[0]);
     try std.testing.expectEqualStrings("unregister_message_renderer", frame_types[frame_types.len - 1]);
 

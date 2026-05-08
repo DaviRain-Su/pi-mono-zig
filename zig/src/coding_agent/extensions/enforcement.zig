@@ -174,6 +174,8 @@ pub const DenyDecision = struct {
     operation: Operation,
     target: OperationTarget,
     reason: []const u8,
+    limit_name: ?[]const u8 = null,
+    limit_value: ?u64 = null,
 };
 
 pub const Decision = union(enum) {
@@ -205,6 +207,32 @@ pub fn operationForRuntimeImport(module_name: []const u8, field_name: []const u8
     return null;
 }
 
+pub fn diagnosticTargetId(operation: Operation, target: OperationTarget) ?[]const u8 {
+    const id = target.id orelse return null;
+    if (isSensitiveOperationTarget(operation) or containsSensitiveMarker(id)) return "[redacted]";
+    return id;
+}
+
+fn isSensitiveOperationTarget(operation: Operation) bool {
+    return switch (operation) {
+        .shell_run,
+        .session_write,
+        .ui_notify,
+        .agent_spawn,
+        .agent_delegate,
+        => true,
+        else => false,
+    };
+}
+
+fn containsSensitiveMarker(value: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(value, "secret") != null or
+        std.ascii.indexOfIgnoreCase(value, "token") != null or
+        std.ascii.indexOfIgnoreCase(value, "key") != null or
+        std.ascii.indexOfIgnoreCase(value, "password") != null or
+        std.ascii.indexOfIgnoreCase(value, "credential") != null;
+}
+
 pub fn decide(
     principal: Principal,
     policy: Policy,
@@ -221,9 +249,9 @@ pub fn decide(
     }
 
     if (operation == .tool_use and policy.resource_limits.tool_scopes.len > 0) {
-        const target_id = target.id orelse return deny(accounting, principal, operation, target, phase, mode, "tool target is required when toolScopes are constrained");
+        const target_id = target.id orelse return denyResourceScope(accounting, principal, operation, target, phase, mode, "tool target is required when toolScopes are constrained");
         if (!containsString(policy.resource_limits.tool_scopes, target_id)) {
-            return deny(accounting, principal, operation, target, phase, mode, "tool target is outside toolScopes");
+            return denyResourceScope(accounting, principal, operation, target, phase, mode, "tool target is outside toolScopes");
         }
     }
 
@@ -243,8 +271,8 @@ pub fn decide(
         }
     }
 
-    if (limitExceededReason(policy.resource_limits, accounting.*, delta)) |reason| {
-        return deny(accounting, principal, operation, target, phase, mode, reason);
+    if (limitExceeded(policy.resource_limits, accounting.*, delta)) |limit| {
+        return denyLimitExceeded(accounting, principal, operation, target, phase, mode, limit);
     }
 
     accounting.applyAllowed(delta);
@@ -282,24 +310,79 @@ fn deny(
     } };
 }
 
-fn limitExceededReason(limits: ResourceLimits, accounting: Accounting, delta: UsageDelta) ?[]const u8 {
+fn denyResourceScope(
+    accounting: *Accounting,
+    principal: Principal,
+    operation: Operation,
+    target: OperationTarget,
+    phase: Phase,
+    mode: []const u8,
+    reason: []const u8,
+) Decision {
+    accounting.recordDenied();
+    return .{ .deny = .{
+        .category = "resource_limit_exceeded",
+        .capability = operation.requiredGrant(),
+        .branch = operation.branch(),
+        .phase = phase,
+        .mode = mode,
+        .principal = principal,
+        .operation = operation,
+        .target = target,
+        .reason = reason,
+        .limit_name = "toolScopes",
+    } };
+}
+
+const LimitExceeded = struct {
+    name: []const u8,
+    configured_value: u64,
+    reason: []const u8,
+};
+
+fn denyLimitExceeded(
+    accounting: *Accounting,
+    principal: Principal,
+    operation: Operation,
+    target: OperationTarget,
+    phase: Phase,
+    mode: []const u8,
+    limit: LimitExceeded,
+) Decision {
+    accounting.recordDenied();
+    return .{ .deny = .{
+        .category = "resource_limit_exceeded",
+        .capability = operation.requiredGrant(),
+        .branch = operation.branch(),
+        .phase = phase,
+        .mode = mode,
+        .principal = principal,
+        .operation = operation,
+        .target = target,
+        .reason = limit.reason,
+        .limit_name = limit.name,
+        .limit_value = limit.configured_value,
+    } };
+}
+
+fn limitExceeded(limits: ResourceLimits, accounting: Accounting, delta: UsageDelta) ?LimitExceeded {
     if (limits.turns) |limit| {
-        if (wouldExceed(accounting.turns, delta.turns, limit)) return "resource limit exceeded: turns";
+        if (wouldExceed(accounting.turns, delta.turns, limit)) return .{ .name = "turns", .configured_value = limit, .reason = "resource limit exceeded: turns" };
     }
     if (limits.timeout_ms) |limit| {
-        if (wouldExceed(accounting.elapsed_ms, delta.elapsed_ms, limit)) return "resource limit exceeded: timeoutMs";
+        if (wouldExceed(accounting.elapsed_ms, delta.elapsed_ms, limit)) return .{ .name = "timeoutMs", .configured_value = limit, .reason = "resource limit exceeded: timeoutMs" };
     }
     if (limits.output_bytes) |limit| {
-        if (wouldExceed(accounting.output_bytes, delta.output_bytes, limit)) return "resource limit exceeded: outputBytes";
+        if (wouldExceed(accounting.output_bytes, delta.output_bytes, limit)) return .{ .name = "outputBytes", .configured_value = limit, .reason = "resource limit exceeded: outputBytes" };
     }
     if (limits.output_lines) |limit| {
-        if (wouldExceed(accounting.output_lines, delta.output_lines, limit)) return "resource limit exceeded: outputLines";
+        if (wouldExceed(accounting.output_lines, delta.output_lines, limit)) return .{ .name = "outputLines", .configured_value = limit, .reason = "resource limit exceeded: outputLines" };
     }
     if (limits.max_children) |limit| {
-        if (wouldExceed(accounting.children_started, delta.children_started, limit)) return "resource limit exceeded: maxChildren";
+        if (wouldExceed(accounting.children_started, delta.children_started, limit)) return .{ .name = "maxChildren", .configured_value = limit, .reason = "resource limit exceeded: maxChildren" };
     }
     if (limits.depth) |limit| {
-        if (@max(accounting.max_depth_observed, delta.depth) > limit) return "resource limit exceeded: depth";
+        if (@max(accounting.max_depth_observed, delta.depth) > limit) return .{ .name = "depth", .configured_value = limit, .reason = "resource limit exceeded: depth" };
     }
     return null;
 }
@@ -418,6 +501,26 @@ test "enforcement runtime imports map to exactly one operation branch" {
     try std.testing.expectEqual(@as(?Operation, null), operationForRuntimeImport("pi:unknown", "read"));
 }
 
+test "enforcement diagnostic target redaction protects secret-like runtime data" {
+    try std.testing.expectEqualStrings(
+        "[redacted]",
+        diagnosticTargetId(.env_read, .{ .id = "OPENAI_API_KEY" }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "[redacted]",
+        diagnosticTargetId(.shell_run, .{ .id = "echo harmless" }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "[redacted]",
+        diagnosticTargetId(.agent_spawn, .{ .id = "{\"task\":\"contains user context\"}" }).?,
+    );
+    try std.testing.expectEqualStrings(
+        "safe-model",
+        diagnosticTargetId(.model_call, .{ .id = "safe-model" }).?,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), diagnosticTargetId(.file_read, .{}));
+}
+
 test "enforcement decisions deny unapproved grants before accounting" {
     var accounting = Accounting{};
     for (all_operations) |operation| {
@@ -522,7 +625,9 @@ test "enforcement resource limits constrain without granting and tool scopes nar
         &scoped_accounting,
     );
     try std.testing.expect(out_of_scope == .deny);
+    try std.testing.expectEqualStrings("resource_limit_exceeded", out_of_scope.deny.category);
     try std.testing.expectEqualStrings("tool target is outside toolScopes", out_of_scope.deny.reason);
+    try std.testing.expectEqualStrings("toolScopes", out_of_scope.deny.limit_name.?);
     try std.testing.expectEqual(@as(u64, 1), scoped_accounting.denied_operations);
     try std.testing.expectEqual(@as(u64, 0), scoped_accounting.allowed_operations);
 
@@ -738,7 +843,10 @@ test "enforcement allows exact numeric limits and denies exceeded limits" {
         &accounting,
     );
     try std.testing.expect(exceeded == .deny);
+    try std.testing.expectEqualStrings("resource_limit_exceeded", exceeded.deny.category);
     try std.testing.expectEqualStrings("resource limit exceeded: turns", exceeded.deny.reason);
+    try std.testing.expectEqualStrings("turns", exceeded.deny.limit_name.?);
+    try std.testing.expectEqual(@as(u64, 2), exceeded.deny.limit_value.?);
     try std.testing.expectEqual(@as(u64, 1), accounting.denied_operations);
     try std.testing.expectEqual(@as(u64, 1), accounting.allowed_operations);
     try std.testing.expectEqual(@as(u64, 2), accounting.turns);
@@ -766,7 +874,10 @@ test "enforcement allows exact numeric limits and denies exceeded limits" {
         &child_accounting,
     );
     try std.testing.expect(child_exceeded == .deny);
+    try std.testing.expectEqualStrings("resource_limit_exceeded", child_exceeded.deny.category);
     try std.testing.expectEqualStrings("resource limit exceeded: maxChildren", child_exceeded.deny.reason);
+    try std.testing.expectEqualStrings("maxChildren", child_exceeded.deny.limit_name.?);
+    try std.testing.expectEqual(@as(u64, 2), child_exceeded.deny.limit_value.?);
     try std.testing.expectEqual(@as(u64, 2), child_accounting.children_started);
 
     const exceeded_cases = [_]struct {
@@ -808,7 +919,10 @@ test "enforcement allows exact numeric limits and denies exceeded limits" {
             &case_accounting,
         );
         try std.testing.expect(decision == .deny);
+        try std.testing.expectEqualStrings("resource_limit_exceeded", decision.deny.category);
         try std.testing.expectEqualStrings(case.reason, decision.deny.reason);
+        try std.testing.expect(decision.deny.limit_name != null);
+        try std.testing.expect(decision.deny.limit_value != null);
         try std.testing.expectEqual(@as(u64, 1), case_accounting.denied_operations);
         try std.testing.expectEqual(@as(u64, 0), case_accounting.allowed_operations);
     }

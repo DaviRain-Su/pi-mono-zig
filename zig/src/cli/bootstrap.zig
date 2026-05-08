@@ -1,5 +1,6 @@
 const std = @import("std");
 const cli = @import("args.zig");
+const tool_selection = @import("../coding_agent/tool_selection.zig");
 
 pub const AppMode = enum {
     interactive,
@@ -32,14 +33,8 @@ pub fn resolveAppMode(mode: cli.Mode, print_requested: bool, stdin_is_tty: bool)
     };
 }
 
-pub fn effectiveToolSelection(options: *const cli.Args) ?[]const []const u8 {
-    if (options.no_tools) {
-        return options.tools orelse &[_][]const u8{};
-    }
-    if (options.no_builtin_tools and options.tools == null) {
-        return &[_][]const u8{};
-    }
-    return options.tools;
+pub fn effectiveToolSelection(options: *const cli.Args) tool_selection.ToolSelection {
+    return tool_selection.ToolSelection.fromCli(options.no_tools, options.no_builtin_tools, options.tools);
 }
 
 pub fn offlineModeEnabled(options: *const cli.Args, env_map: *const std.process.Environ.Map) bool {

@@ -2,6 +2,7 @@ const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const session_manager = @import("session_manager.zig");
 const tools_common = @import("../tools/common.zig");
 
@@ -262,6 +263,7 @@ pub const AgentSession = struct {
         }
         self.agent.deinit();
         if (self.extension_hook_context) |hook_context| {
+            hook_context.deinit(self.allocator);
             self.allocator.destroy(hook_context);
             self.extension_hook_context = null;
         }
@@ -273,6 +275,7 @@ pub const AgentSession = struct {
         if (try self.runHookedPrompt(input, null)) return;
         try self.agent.prompt(input);
         try self.runPostPromptMaintenance();
+        try self.flushExtensionHookDiagnostics();
     }
 
     pub fn promptWithAcceptedCallback(
@@ -283,6 +286,7 @@ pub const AgentSession = struct {
         if (try self.runHookedPrompt(input, accepted_callback)) return;
         try self.agent.promptWithAcceptedCallback(input, accepted_callback);
         try self.runPostPromptMaintenance();
+        try self.flushExtensionHookDiagnostics();
     }
 
     pub fn steer(self: *AgentSession, text: []const u8, images: []const ai.ImageContent) !void {
@@ -342,6 +346,7 @@ pub const AgentSession = struct {
             self.extension_event_subscribed = false;
         }
         if (self.extension_hook_context) |hook_context| {
+            hook_context.deinit(self.allocator);
             self.allocator.destroy(hook_context);
             self.extension_hook_context = null;
         }
@@ -355,8 +360,10 @@ pub const AgentSession = struct {
         }
         const context = try self.allocator.create(ExtensionHookContext);
         context.* = .{
+            .allocator = self.allocator,
             .hosts = extension_hosts,
             .timeout_ms = timeout_ms,
+            .diagnostics = .empty,
         };
         self.extension_hook_context = context;
         self.agent.transform_context = transformContextHook;
@@ -681,12 +688,17 @@ pub const AgentSession = struct {
         const extension_hook_context: ?*ExtensionHookContext = if (extension_hosts.len > 0) blk: {
             const context = try allocator.create(ExtensionHookContext);
             context.* = .{
+                .allocator = allocator,
                 .hosts = extension_hosts,
                 .timeout_ms = extension_hook_timeout_ms,
+                .diagnostics = .empty,
             };
             break :blk context;
         } else null;
-        errdefer if (extension_hook_context) |context| allocator.destroy(context);
+        errdefer if (extension_hook_context) |context| {
+            context.deinit(allocator);
+            allocator.destroy(context);
+        };
 
         var agent_instance = try agent.Agent.init(allocator, .{
             .system_prompt = system_prompt,
@@ -780,6 +792,7 @@ pub const AgentSession = struct {
             defer self.agent.setSystemPrompt(previous_system_prompt);
             try self.agent.promptWithAcceptedCallback(prompt_text.text, accepted_callback);
             try self.runPostPromptMaintenance();
+            try self.flushExtensionHookDiagnostics();
             return true;
         }
         if (comptime isTextWithImagesPrompt(Input)) {
@@ -794,6 +807,7 @@ pub const AgentSession = struct {
             defer self.agent.setSystemPrompt(previous_system_prompt);
             try self.agent.promptWithAcceptedCallback(.{ .text = prompt_text.text, .images = input.images }, accepted_callback);
             try self.runPostPromptMaintenance();
+            try self.flushExtensionHookDiagnostics();
             return true;
         }
         return false;
@@ -812,10 +826,13 @@ pub const AgentSession = struct {
         try putString(self.allocator, &event.object, "type", "input");
         try putString(self.allocator, &event.object, "text", text);
         try putString(self.allocator, &event.object, "source", "agent_session");
-        const result = try context.invoke(self.allocator, "input", event) orelse return try self.allocator.dupe(u8, text);
-        defer tools_common.deinitJsonValue(self.allocator, result);
-        if (hookHandled(result)) return null;
-        return try self.allocator.dupe(u8, stringField(result, "text") orelse stringField(result, "input") orelse stringField(result, "prompt") orelse text);
+        var invocation = (try context.invokeDetailed(self.allocator, "input", event)) orelse return try self.allocator.dupe(u8, text);
+        defer invocation.deinit(self.allocator);
+        if (hookHandled(invocation.result)) {
+            try self.appendHookDiagnostic("input", invocation.extension_id, invocation.result);
+            return null;
+        }
+        return try self.allocator.dupe(u8, stringField(invocation.result, "text") orelse stringField(invocation.result, "input") orelse stringField(invocation.result, "prompt") orelse text);
     }
 
     fn runBeforeAgentStartHook(self: *AgentSession, text: []const u8) !?PromptHookText {
@@ -826,21 +843,65 @@ pub const AgentSession = struct {
         try putString(self.allocator, &event.object, "type", "before_agent_start");
         try putString(self.allocator, &event.object, "text", text);
         try putString(self.allocator, &event.object, "systemPrompt", self.agent.getSystemPrompt());
-        const result = try context.invoke(self.allocator, "before_agent_start", event) orelse return .{ .text = try self.allocator.dupe(u8, text) };
-        defer tools_common.deinitJsonValue(self.allocator, result);
-        if (hookHandled(result)) return null;
+        var invocation = (try context.invokeDetailed(self.allocator, "before_agent_start", event)) orelse return .{ .text = try self.allocator.dupe(u8, text) };
+        defer invocation.deinit(self.allocator);
+        if (hookHandled(invocation.result)) {
+            try self.appendHookDiagnostic("before_agent_start", invocation.extension_id, invocation.result);
+            return null;
+        }
         return .{
-            .text = try self.allocator.dupe(u8, stringField(result, "text") orelse stringField(result, "input") orelse stringField(result, "prompt") orelse text),
-            .system_prompt = if (stringField(result, "systemPrompt") orelse stringField(result, "system_prompt")) |system_prompt| try self.allocator.dupe(u8, system_prompt) else null,
+            .text = try self.allocator.dupe(u8, stringField(invocation.result, "text") orelse stringField(invocation.result, "input") orelse stringField(invocation.result, "prompt") orelse text),
+            .system_prompt = if (stringField(invocation.result, "systemPrompt") orelse stringField(invocation.result, "system_prompt")) |system_prompt| try self.allocator.dupe(u8, system_prompt) else null,
         };
+    }
+
+    fn appendHookDiagnostic(self: *AgentSession, hook_name: []const u8, extension_id: []const u8, result: std.json.Value) !void {
+        const reason = hookReason(result);
+        const diagnostic = try std.fmt.allocPrint(
+            self.allocator,
+            "Extension hook suppressed turn extensionId={s} hook={s} reason={s}",
+            .{ extension_id, hook_name, reason },
+        );
+        defer self.allocator.free(diagnostic);
+        var message = try makeDiagnosticAssistantMessage(self.allocator, self.agent.getModel(), diagnostic);
+        defer agent.deinitMessage(self.allocator, &message);
+        try self.agent.appendMessage(message);
+        _ = try self.session_manager.appendMessage(message);
+    }
+
+    fn flushExtensionHookDiagnostics(self: *AgentSession) !void {
+        const context = self.extension_hook_context orelse return;
+        if (context.diagnostics.items.len == 0) return;
+        var diagnostics = context.diagnostics;
+        context.diagnostics = .empty;
+        defer diagnostics.deinit(self.allocator);
+        for (diagnostics.items) |diagnostic| {
+            defer self.allocator.free(diagnostic);
+            var message = try makeDiagnosticAssistantMessage(self.allocator, self.agent.getModel(), diagnostic);
+            defer agent.deinitMessage(self.allocator, &message);
+            try self.agent.appendMessage(message);
+            _ = try self.session_manager.appendMessage(message);
+        }
     }
 };
 
 const ExtensionHookContext = struct {
+    allocator: std.mem.Allocator,
     hosts: []const extension_runtime.RuntimeAdapter,
     timeout_ms: u64,
     next_turn_index: usize = 0,
     active_turn_index: ?usize = null,
+    diagnostics: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *ExtensionHookContext, allocator: std.mem.Allocator) void {
+        for (self.diagnostics.items) |diagnostic| allocator.free(diagnostic);
+        self.diagnostics.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn recordDiagnostic(self: *ExtensionHookContext, diagnostic: []const u8) !void {
+        try self.diagnostics.append(self.allocator, try self.allocator.dupe(u8, diagnostic));
+    }
 
     fn hasHook(self: *const ExtensionHookContext, event_name: []const u8) bool {
         for (self.hosts) |host| {
@@ -850,16 +911,54 @@ const ExtensionHookContext = struct {
     }
 
     fn invoke(self: *const ExtensionHookContext, allocator: std.mem.Allocator, event_name: []const u8, event: std.json.Value) !?std.json.Value {
+        if (try self.invokeDetailed(allocator, event_name, event)) |invocation| {
+            allocator.free(invocation.extension_id);
+            return invocation.result;
+        }
+        return null;
+    }
+
+    const HookInvocation = struct {
+        result: std.json.Value,
+        extension_id: []u8,
+
+        fn deinit(self: *HookInvocation, allocator: std.mem.Allocator) void {
+            tools_common.deinitJsonValue(allocator, self.result);
+            allocator.free(self.extension_id);
+            self.* = undefined;
+        }
+    };
+
+    fn invokeDetailed(self: *const ExtensionHookContext, allocator: std.mem.Allocator, event_name: []const u8, event: std.json.Value) !?HookInvocation {
         var last_result: ?std.json.Value = null;
         errdefer if (last_result) |value| tools_common.deinitJsonValue(allocator, value);
-        for (self.hosts) |host| {
+        var last_extension_id: ?[]u8 = null;
+        errdefer if (last_extension_id) |value| allocator.free(value);
+        var dispatch_entries = std.ArrayList(HookDispatchEntry).empty;
+        defer dispatch_entries.deinit(allocator);
+        for (self.hosts, 0..) |host, host_index| {
             if (!host.hasRegisteredHook(event_name)) continue;
+            try dispatch_entries.append(allocator, hookDispatchEntryForHost(host, event_name, host_index));
+        }
+        std.mem.sort(HookDispatchEntry, dispatch_entries.items, {}, hookDispatchEntryLessThan);
+
+        for (dispatch_entries.items) |entry| {
+            const host = entry.host;
             if (try host.invokeExtensionEvent(allocator, event_name, event, self.timeout_ms)) |result| {
                 if (last_result) |old| tools_common.deinitJsonValue(allocator, old);
+                if (last_extension_id) |old_id| allocator.free(old_id);
                 last_result = result;
+                last_extension_id = try describeHookSource(allocator, host, event_name);
             }
         }
-        return last_result;
+        const result = last_result orelse return null;
+        last_result = null;
+        const extension_id = last_extension_id orelse try allocator.dupe(u8, "unknown-extension");
+        last_extension_id = null;
+        return .{
+            .result = result,
+            .extension_id = extension_id,
+        };
     }
 
     fn invokeLifecycle(self: *ExtensionHookContext, allocator: std.mem.Allocator, event: agent.AgentEvent) !void {
@@ -883,6 +982,49 @@ const ExtensionHookContext = struct {
     }
 };
 
+const HookDispatchEntry = struct {
+    host: extension_runtime.RuntimeAdapter,
+    host_index: usize,
+    priority: i64 = 0,
+    declaration_order: usize = 0,
+};
+
+const HookDispatchLookup = struct {
+    event_name: []const u8,
+    priority: i64 = 0,
+    declaration_order: usize = 0,
+};
+
+fn hookDispatchEntryForHost(host: extension_runtime.RuntimeAdapter, event_name: []const u8, host_index: usize) HookDispatchEntry {
+    var lookup = HookDispatchLookup{
+        .event_name = event_name,
+        .declaration_order = host_index,
+    };
+    host.withRegistry(&lookup, captureHookDispatchMetadata) catch {};
+    return .{
+        .host = host,
+        .host_index = host_index,
+        .priority = lookup.priority,
+        .declaration_order = lookup.declaration_order,
+    };
+}
+
+fn captureHookDispatchMetadata(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const lookup: *HookDispatchLookup = @ptrCast(@alignCast(context orelse return));
+    for (registry.hooks.items) |hook| {
+        if (!std.mem.eql(u8, hook.event_name, lookup.event_name)) continue;
+        lookup.priority = hook.priority;
+        lookup.declaration_order = hook.declaration_order;
+        return;
+    }
+}
+
+fn hookDispatchEntryLessThan(_: void, lhs: HookDispatchEntry, rhs: HookDispatchEntry) bool {
+    if (lhs.priority != rhs.priority) return lhs.priority < rhs.priority;
+    if (lhs.declaration_order != rhs.declaration_order) return lhs.declaration_order < rhs.declaration_order;
+    return lhs.host_index < rhs.host_index;
+}
+
 fn handleExtensionLifecycleEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     const hook_context: *ExtensionHookContext = @ptrCast(@alignCast(context orelse return));
     try hook_context.invokeLifecycle(std.heap.page_allocator, event);
@@ -903,9 +1045,14 @@ fn transformContextHook(
     defer tools_common.deinitJsonValue(allocator, event);
     try putString(allocator, &event.object, "type", "context");
     try putMessagesSummary(allocator, &event.object, messages);
-    const result = try context.invoke(allocator, "context", event) orelse return @constCast(messages);
-    defer tools_common.deinitJsonValue(allocator, result);
-    const extra = try messagesFromHookResult(allocator, result);
+    var invocation = (try context.invokeDetailed(allocator, "context", event)) orelse return @constCast(messages);
+    defer invocation.deinit(allocator);
+    if (try contextHookContributionDiagnostic(allocator, invocation.extension_id, invocation.result)) |diagnostic| {
+        defer allocator.free(diagnostic);
+        try context.recordDiagnostic(diagnostic);
+        return @constCast(messages);
+    }
+    const extra = try messagesFromHookResult(allocator, invocation.result);
     if (extra.len == 0) {
         allocator.free(extra);
         return @constCast(messages);
@@ -994,6 +1141,79 @@ fn putInt(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []cons
 fn putValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
     try object.put(allocator, try allocator.dupe(u8, key), value);
 }
+
+fn jsonObjectWithString(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {
+    var object = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, object);
+    try putString(allocator, &object.object, key, value);
+    return object;
+}
+
+fn jsonObjectWithTruncateInput(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    max_lines: i64,
+    max_bytes: i64,
+) !std.json.Value {
+    var object = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, object);
+    try putString(allocator, &object.object, "content", content);
+    try putInt(allocator, &object.object, "maxLines", max_lines);
+    try putInt(allocator, &object.object, "maxBytes", max_bytes);
+    return object;
+}
+
+fn absoluteSessionTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []const u8) ![]u8 {
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(cwd);
+    return try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", sub_path, name });
+}
+
+fn expectToolResultContains(messages: []const agent.AgentMessage, tool_name: []const u8, expected: []const u8) !void {
+    for (messages) |message| {
+        if (message != .tool_result) continue;
+        if (!std.mem.eql(u8, message.tool_result.tool_name, tool_name)) continue;
+        for (message.tool_result.content) |block| {
+            if (block != .text) continue;
+            if (std.mem.indexOf(u8, block.text.text, expected) != null) return;
+        }
+    }
+    return error.ExpectedToolResultNotFound;
+}
+
+fn crossNativeEchoExecute(allocator: std.mem.Allocator, params: std.json.Value) !agent.AgentToolResult {
+    if (params != .object) return crossNativeInvalidInput(allocator);
+    const value = params.object.get("value") orelse return crossNativeInvalidInput(allocator);
+    if (value != .string) return crossNativeInvalidInput(allocator);
+    const text = try std.fmt.allocPrint(allocator, "{{\"runtime\":\"native\",\"echo\":\"{s}\"}}", .{value.string});
+    defer allocator.free(text);
+    return .{ .content = try tools_common.makeTextContent(allocator, text) };
+}
+
+fn crossNativeInvalidInput(allocator: std.mem.Allocator) !agent.AgentToolResult {
+    return .{
+        .content = try tools_common.makeTextContent(allocator, "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"expected object with string value\"}}"),
+        .is_error = true,
+    };
+}
+
+const cross_native_tool: extension_runtime.NativeToolDefinition = .{
+    .name = "native.cross.echo",
+    .label = "Native Cross Echo",
+    .description = "Echoes a string through the cross-runtime native fixture.",
+    .input_schema_json = "{\"type\":\"object\",\"required\":[\"value\"],\"properties\":{\"value\":{\"type\":\"string\"}},\"additionalProperties\":false}",
+    .output_schema_json = "{\"type\":\"object\"}",
+    .extension_path = "native://cross/echo",
+    .execute = crossNativeEchoExecute,
+};
+
+const cross_native_descriptor: extension_runtime.NativeDescriptor = .{
+    .id = "com.pi.native-cross-runtime",
+    .name = "Native Cross Runtime",
+    .version = "0.1.0",
+    .description = "Native fixture used by the cross-runtime workflow lifecycle contract.",
+    .tools = &.{cross_native_tool},
+};
 
 fn putMessageSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, message: agent.AgentMessage) !void {
     var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
@@ -1116,6 +1336,109 @@ fn hookHandled(value: std.json.Value) bool {
         return std.mem.eql(u8, action, "handled") or std.mem.eql(u8, action, "block") or std.mem.eql(u8, action, "deny");
     }
     return false;
+}
+
+fn hookReason(value: std.json.Value) []const u8 {
+    return stringField(value, "reason") orelse
+        stringField(value, "message") orelse
+        stringField(value, "error") orelse
+        stringField(value, "action") orelse
+        if (boolField(value, "handled") orelse false) "handled" else "blocked";
+}
+
+const HookSourceLookup = struct {
+    allocator: std.mem.Allocator,
+    event_name: []const u8,
+    extension_id: ?[]u8 = null,
+};
+
+fn describeHookSource(allocator: std.mem.Allocator, host: extension_runtime.RuntimeAdapter, event_name: []const u8) ![]u8 {
+    var lookup = HookSourceLookup{
+        .allocator = allocator,
+        .event_name = event_name,
+    };
+    host.withRegistry(&lookup, captureHookSource) catch {};
+    if (lookup.extension_id) |extension_id| return extension_id;
+    return try allocator.dupe(u8, host.kind.jsonName());
+}
+
+fn captureHookSource(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const lookup: *HookSourceLookup = @ptrCast(@alignCast(context orelse return));
+    for (registry.hooks.items) |hook| {
+        if (!std.mem.eql(u8, hook.event_name, lookup.event_name)) continue;
+        lookup.extension_id = try lookup.allocator.dupe(u8, hook.extension_path);
+        return;
+    }
+}
+
+fn makeDiagnosticAssistantMessage(allocator: std.mem.Allocator, model: ai.Model, diagnostic: []const u8) !agent.AgentMessage {
+    const content = try tools_common.makeTextContent(allocator, diagnostic);
+    errdefer {
+        allocator.free(content[0].text.text);
+        allocator.free(content);
+    }
+    return .{ .assistant = .{
+        .role = try allocator.dupe(u8, "assistant"),
+        .content = content,
+        .tool_calls = null,
+        .api = try allocator.dupe(u8, model.api),
+        .provider = try allocator.dupe(u8, model.provider),
+        .model = try allocator.dupe(u8, model.id),
+        .usage = ai.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = try allocator.dupe(u8, diagnostic),
+        .timestamp = agent.types.nowMilliseconds(),
+    } };
+}
+
+fn contextHookContributionDiagnostic(allocator: std.mem.Allocator, extension_id: []const u8, result: std.json.Value) !?[]u8 {
+    if (result != .object) {
+        return try formatContextHookContributionDiagnostic(allocator, extension_id, "$", "expected object result");
+    }
+    const messages = result.object.get("messages") orelse return null;
+    if (messages != .array) {
+        return try formatContextHookContributionDiagnostic(allocator, extension_id, "$.messages", "expected array");
+    }
+    for (messages.array.items, 0..) |message, index| {
+        switch (message) {
+            .string => {},
+            .object => {
+                if (stringField(message, "content") != null or stringField(message, "text") != null) continue;
+                if (objectField(message, "content") != null) {
+                    const path = try std.fmt.allocPrint(allocator, "$.messages[{d}].content", .{index});
+                    defer allocator.free(path);
+                    return try formatContextHookContributionDiagnostic(allocator, extension_id, path, "expected string");
+                }
+                if (objectField(message, "text") != null) {
+                    const path = try std.fmt.allocPrint(allocator, "$.messages[{d}].text", .{index});
+                    defer allocator.free(path);
+                    return try formatContextHookContributionDiagnostic(allocator, extension_id, path, "expected string");
+                }
+                const path = try std.fmt.allocPrint(allocator, "$.messages[{d}]", .{index});
+                defer allocator.free(path);
+                return try formatContextHookContributionDiagnostic(allocator, extension_id, path, "missing string content or text field");
+            },
+            else => {
+                const path = try std.fmt.allocPrint(allocator, "$.messages[{d}]", .{index});
+                defer allocator.free(path);
+                return try formatContextHookContributionDiagnostic(allocator, extension_id, path, "expected string or object");
+            },
+        }
+    }
+    return null;
+}
+
+fn formatContextHookContributionDiagnostic(
+    allocator: std.mem.Allocator,
+    extension_id: []const u8,
+    path: []const u8,
+    message: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "Invalid extension context hook contribution extensionId={s} hook=context path={s}: {s}",
+        .{ extension_id, path, message },
+    );
 }
 
 fn messagesFromHookResult(allocator: std.mem.Allocator, result: std.json.Value) ![]agent.AgentMessage {
@@ -2228,6 +2551,9 @@ const TestHookHost = struct {
     turn_end_calls: usize = 0,
     tool_call_calls: usize = 0,
     tool_result_calls: usize = 0,
+    input_handled: bool = false,
+    before_agent_start_handled: bool = false,
+    context_invalid: bool = false,
 
     fn adapter(self: *TestHookHost) extension_runtime.RuntimeAdapter {
         return .{
@@ -2326,11 +2652,21 @@ fn testHookInvoke(
     errdefer tools_common.deinitJsonValue(allocator, result);
     if (std.mem.eql(u8, event_name, "input")) {
         host.input_calls += 1;
+        if (host.input_handled) {
+            try putString(allocator, &result.object, "action", "handled");
+            try putString(allocator, &result.object, "reason", "input denied by fixture");
+            return result;
+        }
         try putString(allocator, &result.object, "text", "hooked input");
         return result;
     }
     if (std.mem.eql(u8, event_name, "before_agent_start")) {
         host.before_calls += 1;
+        if (host.before_agent_start_handled) {
+            try putString(allocator, &result.object, "action", "deny");
+            try putString(allocator, &result.object, "reason", "startup denied by fixture");
+            return result;
+        }
         try putString(allocator, &result.object, "text", "hooked before");
         try putString(allocator, &result.object, "systemPrompt", "hook system");
         return result;
@@ -2338,6 +2674,13 @@ fn testHookInvoke(
     if (std.mem.eql(u8, event_name, "context")) {
         host.context_calls += 1;
         var messages = std.json.Array.init(allocator);
+        if (host.context_invalid) {
+            var invalid = try makeObject(allocator);
+            try putString(allocator, &invalid.object, "role", "user");
+            try messages.append(invalid);
+            try putValue(allocator, &result.object, "messages", .{ .array = messages });
+            return result;
+        }
         try messages.append(.{ .string = try allocator.dupe(u8, "hook context") });
         try putValue(allocator, &result.object, "messages", .{ .array = messages });
         return result;
@@ -2397,6 +2740,188 @@ const test_hook_vtable: extension_runtime.RuntimeAdapter.VTable = .{
     .deinit = testHookDeinit,
 };
 
+test "mixed runtime adapter helper covers tool hook workflow shutdown contracts" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response_allocator = arena.allocator();
+
+    const process_args = try jsonObjectWithString(response_allocator, "value", "process-input");
+    const wasm_args = try jsonObjectWithTruncateInput(response_allocator, "alpha\nbravo\ncharlie", 2, 1024);
+    const native_args = try jsonObjectWithString(response_allocator, "value", "native-input");
+    const workflow_args = try jsonObjectWithString(response_allocator, "issue", "mixed-flow");
+    const blocks = try response_allocator.alloc(faux.FauxContentBlock, 4);
+    blocks[0] = try faux.fauxToolCall(response_allocator, "process-cross-tool", process_args, .{ .id = "cross-process-call" });
+    blocks[1] = try faux.fauxToolCall(response_allocator, "builtin.truncateHead", wasm_args, .{ .id = "cross-wasm-call" });
+    blocks[2] = try faux.fauxToolCall(response_allocator, "native.cross.echo", native_args, .{ .id = "cross-native-call" });
+    blocks[3] = try faux.fauxToolCall(response_allocator, "workflow.cross-chain", workflow_args, .{ .id = "cross-workflow-call" });
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("mixed runtime complete")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const process_capture_path = try absoluteSessionTmpPath(allocator, &tmp.sub_path, "cross-runtime-process-capture.jsonl");
+    defer allocator.free(process_capture_path);
+    const process_script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '%s\\n' \"$init\" > {s}; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_tool\",\"name\":\"process-cross-tool\",\"label\":\"Process Cross Tool\",\"description\":\"cross runtime process tool\",\"parameters\":{{\"type\":\"object\",\"required\":[\"value\"],\"properties\":{{\"value\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"extensionPath\":\"fixture/process-cross.ts\"}}\\n'; " ++
+            "for hook in input before_agent_start context tool_call tool_result turn_start message_end turn_end; do printf '{{\"type\":\"register_hook\",\"event\":\"%s\",\"priority\":0,\"declarationOrder\":0,\"errorPolicy\":\"continue\",\"extensionPath\":\"fixture/process-cross.ts\"}}\\n' \"$hook\"; done; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"cross-chain\",\"description\":\"Mixed runtime workflow\",\"inputSchema\":{{\"type\":\"object\",\"required\":[\"issue\"],\"properties\":{{\"issue\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"required\":[\"summary\"],\"properties\":{{\"summary\":{{\"type\":\"string\"}}}}}},\"toolName\":\"workflow.cross-chain\",\"commandName\":\"workflow-cross-chain\",\"presetId\":\"workflow-cross-chain-preset\",\"permissions\":[\"agent.delegate\"],\"childAgentLimits\":{{\"maxChildren\":1,\"maxTurns\":1,\"maxToolCalls\":1,\"timeoutMs\":100}},\"steps\":[{{\"id\":\"process-step\",\"kind\":\"side_effect\",\"input\":{{\"value\":\"from-workflow\"}},\"output\":{{\"runtime\":\"process\"}},\"replayMode\":\"recorded\",\"selectedCapability\":\"process-cross-tool\"}},{{\"id\":\"wasm-step\",\"kind\":\"side_effect\",\"input\":{{\"content\":\"alpha\\\\nbravo\",\"maxLines\":1,\"maxBytes\":1024}},\"output\":{{\"runtime\":\"wasm\"}},\"replayMode\":\"recorded\",\"selectedCapability\":\"builtin.truncateHead\"}},{{\"id\":\"native-step\",\"kind\":\"side_effect\",\"input\":{{\"value\":\"from-workflow\"}},\"output\":{{\"runtime\":\"native\"}},\"replayMode\":\"recorded\",\"selectedCapability\":\"native.cross.echo\"}},{{\"id\":\"child-step\",\"kind\":\"child_agent\",\"childDelta\":{{\"childrenStarted\":1,\"turns\":1,\"toolCalls\":1,\"elapsedMs\":10,\"permission\":\"agent.delegate\"}},\"output\":{{\"summary\":\"mixed workflow complete\"}},\"selectedCapability\":\"agent.delegate\"}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "printf '{{\"type\":\"register_workflow\",\"id\":\"cross-cancel\",\"description\":\"Cancellable mixed workflow\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{}},\"toolName\":\"workflow.cross-cancel\",\"steps\":[{{\"id\":\"active\",\"runtimeWork\":true,\"output\":{{\"ok\":true}}}}],\"extensionPath\":\"fixture/workflows.ts\"}}\\n'; " ++
+            "while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"type\":\"extension_event\"'*) event_id=$(printf '%s' \"$line\" | sed -n 's/.*\"eventId\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"type\":\"extension_event_result\",\"eventId\":\"%s\",\"result\":{{}}}}\\n' \"$event_id\";; " ++
+            "*'\"toolName\":\"process-cross-tool\"'*) tool_call_id=$(printf '%s' \"$line\" | sed -n 's/.*\"toolCallId\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{{\"type\":\"tool_result\",\"toolCallId\":\"%s\",\"content\":[{{\"type\":\"text\",\"text\":\"process cross ok\"}}],\"details\":{{\"runtime\":\"process_jsonl\",\"phase\":\"call\"}}}}\\n' \"$tool_call_id\";; " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "esac; done",
+        .{ process_capture_path, process_capture_path },
+    );
+    defer allocator.free(process_script);
+    const process_argv = [_][]const u8{ "/bin/sh", "-c", process_script, "cross-runtime-process" };
+    const process_adapter = try extension_runtime.startRuntimeAdapter(allocator, std.testing.io, .{ .process_jsonl = .{
+        .argv = &process_argv,
+        .cwd = "/tmp",
+        .initialize = .{
+            .marker = "cross-runtime-process",
+            .cwd = "/cross-runtime-cwd",
+            .fixture = "cross-runtime-process",
+        },
+        .shutdown_timeout_ms = 500,
+    } });
+    defer process_adapter.deinit();
+    try process_adapter.waitForReady(500);
+    var process_elapsed: u64 = 0;
+    while (process_adapter.registryFramesApplied() < 11 and process_elapsed <= 1000) : (process_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 11), process_adapter.registryFramesApplied());
+
+    var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const wasm_adapter = try extension_runtime.startRuntimeAdapter(allocator, std.testing.io, .{ .wasm = .{
+        .manifest = extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid),
+    } });
+    defer wasm_adapter.deinit();
+    try wasm_adapter.waitForReady(0);
+
+    const native_adapter = try extension_runtime.startRuntimeAdapter(allocator, std.testing.io, .{ .native = .{
+        .descriptor = &cross_native_descriptor,
+    } });
+    defer native_adapter.deinit();
+    try native_adapter.waitForReady(0);
+
+    var process_tool = (try process_adapter.agentTool(allocator, "process-cross-tool")).?;
+    defer extension_runtime.deinitAgentTool(allocator, &process_tool);
+    var wasm_tool = (try wasm_adapter.agentTool(allocator, "builtin.truncateHead")).?;
+    defer extension_runtime.deinitAgentTool(allocator, &wasm_tool);
+    var native_tool = (try native_adapter.agentTool(allocator, "native.cross.echo")).?;
+    defer extension_runtime.deinitAgentTool(allocator, &native_tool);
+    var workflow_tool = (try process_adapter.agentTool(allocator, "workflow.cross-chain")).?;
+    defer extension_runtime.deinitAgentTool(allocator, &workflow_tool);
+    var cancel_tool = (try process_adapter.agentTool(allocator, "workflow.cross-cancel")).?;
+    defer extension_runtime.deinitAgentTool(allocator, &cancel_tool);
+
+    const extension_hosts = [_]extension_runtime.RuntimeAdapter{ process_adapter, wasm_adapter, native_adapter };
+    var session_tools = [_]agent.AgentTool{ process_tool, wasm_tool, native_tool, workflow_tool };
+    try extension_runtime.attachWorkflowDispatchAdapters(allocator, session_tools[0..], extension_hosts[0..]);
+    var session = try AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/cross-runtime-e2e",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .tools = session_tools[0..],
+        .extension_hosts = extension_hosts[0..],
+    });
+    defer session.deinit();
+    try session.prompt("run mixed runtime flow");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 7);
+    try std.testing.expectEqualStrings("mixed runtime complete", messages[messages.len - 1].assistant.content[0].text.text);
+    try expectToolResultContains(messages, "process-cross-tool", "process cross ok");
+    try expectToolResultContains(messages, "builtin.truncateHead", "\"content\":\"alpha\\nbravo\"");
+    try expectToolResultContains(messages, "native.cross.echo", "\"runtime\":\"native\"");
+    try expectToolResultContains(messages, "workflow.cross-chain", "mixed workflow complete");
+
+    var cancel_signal = std.atomic.Value(bool).init(true);
+    var empty_input = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer empty_input.deinit();
+    const cancelled = try cancel_tool.execute.?(allocator, "cross-cancel-call", empty_input.value, cancel_tool.execute_context, &cancel_signal, null, null);
+    defer tools_common.deinitContentBlocks(allocator, cancelled.content);
+    defer if (cancelled.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), cancelled.is_error);
+    try std.testing.expectEqualStrings("cancelled", cancelled.details.?.object.get("state").?.string);
+    try std.testing.expectEqualStrings("active", cancelled.details.?.object.get("workflow").?.object.get("cancellationPoint").?.string);
+
+    const process_capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture_path, allocator, .unlimited);
+    defer allocator.free(process_capture);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "\"type\":\"initialize\",\"marker\":\"cross-runtime-process\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "\"type\":\"extension_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "process-cross-tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "builtin.truncateHead") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "native.cross.echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, process_capture, "workflow.cross-chain") != null);
+
+    const loaded_process_snapshot = try process_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(loaded_process_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_process_snapshot, "\"name\":\"process-cross-tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_process_snapshot, "\"id\":\"cross-chain\"") != null);
+    const loaded_wasm_snapshot = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(loaded_wasm_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_wasm_snapshot, "\"name\":\"builtin.truncateHead\"") != null);
+    const loaded_native_snapshot = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(loaded_native_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_native_snapshot, "\"name\":\"native.cross.echo\"") != null);
+
+    try process_adapter.shutdown();
+    try wasm_adapter.shutdown();
+    try native_adapter.shutdown();
+    try std.testing.expect(process_adapter.hasShutdownComplete());
+    try std.testing.expect(wasm_adapter.hasShutdownComplete());
+    try std.testing.expect(native_adapter.hasShutdownComplete());
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try process_adapter.agentTool(allocator, "process-cross-tool"));
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try wasm_adapter.agentTool(allocator, "builtin.truncateHead"));
+    try std.testing.expectEqual(@as(?agent.AgentTool, null), try native_adapter.agentTool(allocator, "native.cross.echo"));
+
+    var stale_process_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"stale\"}", .{});
+    defer stale_process_params.deinit();
+    const stale_process = try process_tool.execute.?(allocator, "stale-process-call", stale_process_params.value, process_tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, stale_process.content);
+    defer if (stale_process.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), stale_process.is_error);
+    try std.testing.expectEqualStrings("ToolNotRegistered", stale_process.details.?.object.get("code").?.string);
+
+    var stale_wasm_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"content\":\"alpha\",\"maxLines\":1,\"maxBytes\":1024}", .{});
+    defer stale_wasm_params.deinit();
+    try std.testing.expectError(error.WasmToolNotRegistered, wasm_tool.execute.?(allocator, "stale-wasm-call", stale_wasm_params.value, wasm_tool.execute_context, null, null, null));
+
+    var stale_native_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"stale\"}", .{});
+    defer stale_native_params.deinit();
+    try std.testing.expectError(error.NativeToolNotRegistered, native_tool.execute.?(allocator, "stale-native-call", stale_native_params.value, native_tool.execute_context, null, null, null));
+
+    const shutdown_process_snapshot = try process_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(shutdown_process_snapshot);
+    const shutdown_wasm_snapshot = try wasm_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(shutdown_wasm_snapshot);
+    const shutdown_native_snapshot = try native_adapter.snapshotRegistryJson(allocator);
+    defer allocator.free(shutdown_native_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, shutdown_process_snapshot, "\"tools\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shutdown_wasm_snapshot, "\"tools\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shutdown_native_snapshot, "\"tools\":[]") != null);
+}
+
 test "extension event hooks mutate input before start and context during session prompt" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{
@@ -2431,6 +2956,119 @@ test "extension event hooks mutate input before start and context during session
     try std.testing.expectEqualStrings("hooked before", session.agent.getMessages()[0].user.content[0].text.text);
 }
 
+test "extension input hook handled result records visible diagnostic and skips provider turn" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("must not run")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .input = true,
+        .input_handled = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/input-hook-denial",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("denied");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.input_calls);
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0] == .assistant);
+    try std.testing.expectEqual(ai.StopReason.error_reason, messages[0].assistant.stop_reason);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "extensionId=process_jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "hook=input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "reason=input denied by fixture") != null);
+}
+
+test "extension before_agent_start denial records visible diagnostic and skips provider turn" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("must not run")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .before_agent_start = true,
+        .before_agent_start_handled = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/before-hook-denial",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("denied before");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.before_calls);
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0] == .assistant);
+    try std.testing.expectEqual(ai.StopReason.error_reason, messages[0].assistant.stop_reason);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "extensionId=process_jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "hook=before_agent_start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].assistant.error_message.?, "reason=startup denied by fixture") != null);
+}
+
+test "extension context hook records invalid contribution diagnostic and preserves base context" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("base-only reply")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .context = true,
+        .context_invalid = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/invalid-context-hook",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("base prompt");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.context_calls);
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 3), messages.len);
+    try std.testing.expectEqualStrings("base prompt", messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("base-only reply", messages[1].assistant.content[0].text.text);
+    try std.testing.expect(messages[2] == .assistant);
+    try std.testing.expectEqual(ai.StopReason.error_reason, messages[2].assistant.stop_reason);
+    const diagnostic = messages[2].assistant.error_message.?;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "Invalid extension context hook contribution") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "extensionId=process_jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "hook=context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "path=$.messages[0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "missing string content or text field") != null);
+}
+
 test "extension tool hooks mutate arguments and patch results" {
     var fixture = TestHookHost{
         .tool_call = true,
@@ -2438,6 +3076,7 @@ test "extension tool hooks mutate arguments and patch results" {
     };
     const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
     const hook_context = ExtensionHookContext{
+        .allocator = std.testing.allocator,
         .hosts = adapters[0..],
         .timeout_ms = 1000,
     };

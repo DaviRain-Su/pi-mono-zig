@@ -71,6 +71,9 @@ pub const ExtensionResourceLimits = struct {
 pub const ExtensionPolicy = struct {
     approved_grants: ?[]const []const u8 = null,
     resource_limits: ?ExtensionResourceLimits = null,
+    approved: ?bool = null,
+    enabled: ?bool = null,
+    required: ?bool = null,
 
     pub fn deinit(self: *ExtensionPolicy, allocator: std.mem.Allocator) void {
         freeStringList(allocator, self.approved_grants);
@@ -83,6 +86,9 @@ pub const ExtensionPolicy = struct {
         errdefer cloned.deinit(allocator);
         cloned.approved_grants = try cloneStringList(allocator, self.approved_grants);
         cloned.resource_limits = if (self.resource_limits) |limits| try limits.clone(allocator) else null;
+        cloned.approved = self.approved;
+        cloned.enabled = self.enabled;
+        cloned.required = self.required;
         return cloned;
     }
 };
@@ -787,7 +793,29 @@ fn parseExtensionPolicyShape(
             return null;
         };
     }
+    if (!try parseAndAssignPolicyBool(allocator, value.object.get("approved"), errors, source, settings_path, policy_path, "approved", &policy.approved)) return null;
+    if (!try parseAndAssignPolicyBool(allocator, value.object.get("enabled"), errors, source, settings_path, policy_path, "enabled", &policy.enabled)) return null;
+    if (!try parseAndAssignPolicyBool(allocator, value.object.get("required"), errors, source, settings_path, policy_path, "required", &policy.required)) return null;
     return policy;
+}
+
+fn parseAndAssignPolicyBool(
+    allocator: std.mem.Allocator,
+    value: ?std.json.Value,
+    errors: *std.ArrayList(ConfigError),
+    source: ConfigErrorSource,
+    settings_path: []const u8,
+    policy_path: []const u8,
+    field_name: []const u8,
+    target: *?bool,
+) !bool {
+    const field = value orelse return true;
+    if (field != .bool) {
+        try appendPolicyMessageFmt(allocator, errors, source, settings_path, "{s}.{s}: expected boolean", .{ policy_path, field_name });
+        return false;
+    }
+    target.* = field.bool;
+    return true;
 }
 
 fn parseApprovedGrants(
@@ -996,6 +1024,9 @@ fn mergeExtensionPolicy(
             merged.resource_limits.?.tool_scopes = replacement;
         }
     }
+    if (override.approved != null) merged.approved = override.approved;
+    if (override.enabled != null) merged.enabled = override.enabled;
+    if (override.required != null) merged.required = override.required;
     return merged;
 }
 
@@ -1058,7 +1089,11 @@ fn appendPolicyMessage(
 }
 
 fn isPolicyField(value: []const u8) bool {
-    return std.mem.eql(u8, value, "approvedGrants") or std.mem.eql(u8, value, "resourceLimits");
+    return std.mem.eql(u8, value, "approvedGrants") or
+        std.mem.eql(u8, value, "resourceLimits") or
+        std.mem.eql(u8, value, "approved") or
+        std.mem.eql(u8, value, "enabled") or
+        std.mem.eql(u8, value, "required");
 }
 
 fn isResourceLimitField(value: []const u8) bool {
@@ -1917,9 +1952,12 @@ test "runtime config parses merges and looks up extension policies" {
         .data =
         \\{
         \\  "extensionPolicies": {
-        \\    "typescript:local:project:/tmp/policy-b.ts": { "approvedGrants": ["file.read"] },
+        \\    "typescript:local:project:/tmp/policy-b.ts": { "approvedGrants": ["file.read"], "approved": false, "enabled": false },
         \\    "typescript:local:project:/tmp/policy-a.ts": {
         \\      "approvedGrants": ["agent.delegate", "tool.use"],
+        \\      "approved": true,
+        \\      "enabled": true,
+        \\      "required": false,
         \\      "resourceLimits": {
         \\        "turns": 5,
         \\        "timeoutMs": 1000,
@@ -1938,6 +1976,7 @@ test "runtime config parses merges and looks up extension policies" {
         \\  "extensionPolicies": {
         \\    "typescript:local:project:/tmp/policy-a.ts": {
         \\      "approvedGrants": ["tool.use"],
+        \\      "required": true,
         \\      "resourceLimits": {
         \\        "turns": 1,
         \\        "toolScopes": []
@@ -1971,10 +2010,15 @@ test "runtime config parses merges and looks up extension policies" {
     try std.testing.expectEqual(@as(u64, 1000), policy_a.resource_limits.?.timeout_ms.?);
     try std.testing.expectEqual(@as(u64, 20), policy_a.resource_limits.?.output_lines.?);
     try std.testing.expectEqual(@as(usize, 0), policy_a.resource_limits.?.tool_scopes.?.len);
+    try std.testing.expectEqual(true, policy_a.approved.?);
+    try std.testing.expectEqual(true, policy_a.enabled.?);
+    try std.testing.expectEqual(true, policy_a.required.?);
 
     const policy_b = runtime.getExtensionPolicy(identity_b).?;
     try std.testing.expectEqual(@as(usize, 1), policy_b.approved_grants.?.len);
     try std.testing.expectEqualStrings("file.read", policy_b.approved_grants.?[0]);
+    try std.testing.expectEqual(false, policy_b.approved.?);
+    try std.testing.expectEqual(false, policy_b.enabled.?);
 }
 
 test "extension policy merge replacement clones are OOM safe" {

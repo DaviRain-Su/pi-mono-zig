@@ -2130,6 +2130,7 @@ pub fn handleReloadSlashCommand(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
     cwd: []const u8,
+    session: *session_mod.AgentSession,
     app_state: *AppState,
     live_resources: *LiveResources,
 ) !void {
@@ -2139,8 +2140,18 @@ pub fn handleReloadSlashCommand(
     }
 
     const diagnostics = try live_resources.reload(allocator, io, env_map, cwd);
-    try app_state.setStatus("Reloaded keybindings, skills, prompts, and themes");
     try appendResourceDiagnostics(allocator, app_state, diagnostics);
+    if (live_resources.reload_extension_tools_sink) |sink| {
+        sink.callback(sink.context, allocator, io, env_map, cwd, session, live_resources) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try app_state.appendError("Reloaded resources, but extension tool refresh failed before diagnostics completed");
+                try app_state.setStatus("Reloaded resources with extension diagnostics");
+                return;
+            },
+        };
+    }
+    try app_state.setStatus("Reloaded keybindings, extensions, skills, prompts, and themes");
 }
 
 pub fn configurePrimaryEditor(editor: *tui.Editor, runtime_config: ?*const config_mod.RuntimeConfig) void {

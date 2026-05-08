@@ -74,6 +74,18 @@ pub fn printUsageWithExtensions(
     try stdout.writeAll(text);
 }
 
+pub fn printUsageWithExtensionDiagnostics(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    extension_flags: []const cli.ExtensionFlagInfo,
+    extension_flag_diagnostics: []const cli.ExtensionFlagDiagnosticInfo,
+    stdout: *std.Io.Writer,
+) !void {
+    const text = try cli.helpTextWithExtensionDiagnostics(allocator, version, extension_flags, extension_flag_diagnostics);
+    defer allocator.free(text);
+    try stdout.writeAll(text);
+}
+
 pub fn printVersion(allocator: std.mem.Allocator, version: []const u8, stdout: *std.Io.Writer) !void {
     const text = try cli.versionText(allocator, version);
     defer allocator.free(text);

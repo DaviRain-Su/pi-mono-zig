@@ -1,6 +1,7 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
+const extension_manifest = @import("../extensions/extension_manifest.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -288,11 +289,17 @@ fn executeInstall(
         if (!installed) return .{ .exit_code = 1 };
     }
 
-    var wasm_install = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
+    var wasm_install = try validateLocalPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
     defer wasm_install.deinit(allocator);
     if (wasm_install == .invalid) {
         return .{ .exit_code = 1 };
     }
+
+    const install_metadata = if (wasm_install == .valid)
+        null
+    else
+        try createInstallMetadataForSource(allocator, io, source, persisted_source, command.local, options);
+    defer if (install_metadata) |metadata| common.deinitJsonValue(allocator, metadata);
 
     if (existing_index != null) {
         if (wasm_install == .valid) {
@@ -337,6 +344,10 @@ fn executeInstall(
         return .{ .exit_code = 0 };
     }
 
+    if (install_metadata) |metadata| {
+        try writeExtensionProvenanceLockEntry(allocator, io, command.local, options, metadata);
+    }
+
     var entry_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     var entry_object_owned_by_settings = false;
     errdefer if (!entry_object_owned_by_settings) {
@@ -344,6 +355,9 @@ fn executeInstall(
         common.deinitJsonValue(allocator, cleanup);
     };
     try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, persisted_source) });
+    if (install_metadata) |metadata| {
+        try entry_object.put(allocator, try allocator.dupe(u8, "installMetadata"), try common.cloneJsonValue(allocator, metadata));
+    }
     try packages_array_ptr.*.append(.{ .object = entry_object });
     entry_object_owned_by_settings = true;
 
@@ -361,7 +375,7 @@ fn executeInstall(
         try writeProvenanceEntry(allocator, io, scope, lockfile_path, wasm_install.valid, options);
         wrote_lock = true;
 
-        var revalidated = try validateLocalWasmPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
+        var revalidated = try validateLocalPackageForInstall(allocator, io, source, command.local, options, .input, stderr);
         defer revalidated.deinit(allocator);
         if (revalidated != .valid or !provenance_lockfile.entriesEqual(wasm_install.valid, revalidated.valid)) {
             try restoreFileSnapshot(allocator, io, lock_snapshot.?);
@@ -398,6 +412,15 @@ const LocalWasmInstallValidation = union(enum) {
     }
 };
 
+const WasmPackagePolicyRequest = struct {
+    policy_lookup_key: []u8,
+
+    fn deinit(self: *WasmPackagePolicyRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.policy_lookup_key);
+        self.* = undefined;
+    }
+};
+
 const WasmPackageListMetadata = struct {
     extension_id: []u8,
     extension_version: []u8,
@@ -425,7 +448,233 @@ const WasmPackageListMetadata = struct {
     }
 };
 
-fn validateLocalWasmPackageForInstall(
+const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
+const EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION = "pi-extension-lock.v0";
+
+fn createInstallMetadataForSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input_source: []const u8,
+    persisted_source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+) !?std.json.Value {
+    if (!isLocalSource(persisted_source)) return null;
+    const package_root = computeInstalledPath(allocator, persisted_source, is_project, options.cwd, options.agent_dir) catch return null;
+    defer allocator.free(package_root);
+    if (!pathExists(io, package_root)) return null;
+
+    const package_root_real = realpathAlloc(allocator, package_root) catch try allocator.dupe(u8, package_root);
+    defer allocator.free(package_root_real);
+    const package_root_sha256 = try wasm_manifest.computePackageRootSha256(allocator, package_root);
+    defer allocator.free(package_root_sha256);
+
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (manifest_text) |value| allocator.free(value);
+
+    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = entry });
+    const key = try std.fmt.allocPrint(allocator, "local:{s}", .{package_root_real});
+    try entry.put(allocator, try allocator.dupe(u8, "key"), .{ .string = key });
+    try entry.put(allocator, try allocator.dupe(u8, "scope"), .{ .string = try allocator.dupe(u8, if (is_project) "project" else "user") });
+
+    var source = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = source });
+    try source.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, if (isLocalSource(persisted_source)) "local" else "package") });
+    try source.put(allocator, try allocator.dupe(u8, "identity"), .{ .string = try allocator.dupe(u8, package_root_real) });
+    try source.put(allocator, try allocator.dupe(u8, "specifier"), .{ .string = try allocator.dupe(u8, persisted_source) });
+    try source.put(allocator, try allocator.dupe(u8, "inputSpecifier"), .{ .string = try allocator.dupe(u8, input_source) });
+    try entry.put(allocator, try allocator.dupe(u8, "source"), .{ .object = source });
+
+    try entry.put(allocator, try allocator.dupe(u8, "packageRoot"), .{ .string = try allocator.dupe(u8, package_root_real) });
+    try entry.put(allocator, try allocator.dupe(u8, "manifestPath"), .{ .string = try allocator.dupe(u8, if (manifest_text != null) manifest_path else package_root) });
+
+    var manifest = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = manifest });
+    if (manifest_text) |text| {
+        const schema_version = manifestSchemaVersion(allocator, text) catch null;
+        if (schema_version) |version| {
+            defer allocator.free(version);
+            if (std.mem.eql(u8, version, extension_manifest.SCHEMA_VERSION)) {
+                const sources = [_]extension_manifest.ManifestSource{.{
+                    .package_root = package_root,
+                    .manifest_path = manifest_path,
+                    .manifest_text = text,
+                    .source_scope = if (is_project) "project-install" else "user-install",
+                    .precedence_rank = if (is_project) 1 else 0,
+                }};
+                var manifest_set = try installManifestSetForMetadata(allocator, io, options, is_project, sources[0]);
+                defer manifest_set.deinit(allocator);
+                const record = manifestRecordForPath(manifest_set.records, manifest_path) orelse return null;
+                try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "pi-extension-package") });
+                try manifest.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, record.manifest.schema_version) });
+                try manifest.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, record.manifest.id) });
+                try manifest.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, record.manifest.name) });
+                try manifest.put(allocator, try allocator.dupe(u8, "version"), .{ .string = try allocator.dupe(u8, record.manifest.version) });
+                try manifest.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
+                try entry.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
+                try entry.put(allocator, try allocator.dupe(u8, "declarations"), try installManifestDeclarationsValue(allocator, record.manifest));
+                try entry.put(allocator, try allocator.dupe(u8, "installGraph"), try installGraphValue(allocator, manifest_set));
+            } else {
+                try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
+                try manifest.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, version) });
+            }
+        } else {
+            try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
+        }
+    } else {
+        try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
+    }
+    try entry.put(allocator, try allocator.dupe(u8, "manifest"), .{ .object = manifest });
+
+    var digests = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = digests });
+    try digests.put(allocator, try allocator.dupe(u8, "packageRootSha256"), .{ .string = try allocator.dupe(u8, package_root_sha256) });
+    if (manifest_text) |text| {
+        const manifest_sha256 = try sha256HexAlloc(allocator, text);
+        defer allocator.free(manifest_sha256);
+        try digests.put(allocator, try allocator.dupe(u8, "manifestSha256"), .{ .string = try allocator.dupe(u8, manifest_sha256) });
+    }
+    try entry.put(allocator, try allocator.dupe(u8, "digests"), .{ .object = digests });
+    return .{ .object = entry };
+}
+
+fn installManifestSetForMetadata(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    is_project: bool,
+    current_source: extension_manifest.ManifestSource,
+) !extension_manifest.ManifestSet {
+    var owned_sources = std.ArrayList(InstallManifestSource).empty;
+    defer freeInstallManifestSources(allocator, &owned_sources);
+    try collectInstalledUnifiedManifestSourcesForScope(allocator, io, options, false, &owned_sources);
+    try collectInstalledUnifiedManifestSourcesForScope(allocator, io, options, true, &owned_sources);
+    try owned_sources.append(allocator, .{
+        .package_root = try allocator.dupe(u8, current_source.package_root),
+        .manifest_path = try allocator.dupe(u8, current_source.manifest_path),
+        .manifest_text = try allocator.dupe(u8, current_source.manifest_text),
+        .source_scope = if (is_project) "project-install" else "user-install",
+        .precedence_rank = if (is_project) 1 else 0,
+    });
+
+    const manifest_sources = try allocator.alloc(extension_manifest.ManifestSource, owned_sources.items.len);
+    defer allocator.free(manifest_sources);
+    for (owned_sources.items, 0..) |entry, idx| manifest_sources[idx] = entry.asManifestSource();
+    return extension_manifest.resolveManifestSources(allocator, manifest_sources);
+}
+
+fn manifestRecordForPath(records: []const extension_manifest.ManifestRecord, manifest_path: []const u8) ?*const extension_manifest.ManifestRecord {
+    for (records) |*record| {
+        if (std.mem.eql(u8, record.manifest.manifest_path, manifest_path)) return record;
+    }
+    return null;
+}
+
+fn installManifestDeclarationsValue(allocator: std.mem.Allocator, manifest: extension_manifest.NormalizedManifest) !std.json.Value {
+    var declarations = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = declarations });
+    try declarations.put(allocator, try allocator.dupe(u8, "tools"), try common.cloneJsonValue(allocator, manifest.tools));
+    try declarations.put(allocator, try allocator.dupe(u8, "hooks"), try common.cloneJsonValue(allocator, manifest.hooks));
+    try declarations.put(allocator, try allocator.dupe(u8, "capabilities"), try common.cloneJsonValue(allocator, manifest.capabilities));
+    try declarations.put(allocator, try allocator.dupe(u8, "permissions"), try common.cloneJsonValue(allocator, manifest.permissions));
+    try declarations.put(allocator, try allocator.dupe(u8, "dependencies"), try common.cloneJsonValue(allocator, manifest.dependencies));
+    try declarations.put(allocator, try allocator.dupe(u8, "workflows"), try common.cloneJsonValue(allocator, manifest.workflows));
+    return .{ .object = declarations };
+}
+
+fn installGraphValue(allocator: std.mem.Allocator, manifest_set: extension_manifest.ManifestSet) !std.json.Value {
+    const snapshot_text = try manifest_set.registrySnapshotJson(allocator);
+    defer allocator.free(snapshot_text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot_text, .{});
+    defer parsed.deinit();
+    return common.cloneJsonValue(allocator, parsed.value);
+}
+
+fn writeExtensionProvenanceLockEntry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    is_project: bool,
+    options: ExecuteOptions,
+    entry: std.json.Value,
+) !void {
+    if (entry != .object) return;
+    const entry_key = jsonStringField(entry.object, "key") orelse return;
+    const lock_path = try extensionProvenanceLockfilePath(allocator, is_project, options);
+    defer allocator.free(lock_path);
+    var entries = std.json.Array.init(allocator);
+    errdefer common.deinitJsonValue(allocator, .{ .array = entries });
+    const lock_text = std.Io.Dir.readFileAlloc(.cwd(), io, lock_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (lock_text) |value| allocator.free(value);
+    if (lock_text) |text| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch null;
+        if (parsed) |*parsed_value| {
+            defer parsed_value.deinit();
+            if (parsed_value.value == .object) {
+                if (parsed_value.value.object.get("entries")) |old_entries| {
+                    if (old_entries == .array) {
+                        for (old_entries.array.items) |old_entry| {
+                            if (old_entry != .object) continue;
+                            const old_key = jsonStringField(old_entry.object, "key") orelse continue;
+                            if (std.mem.eql(u8, old_key, entry_key)) continue;
+                            try entries.append(try common.cloneJsonValue(allocator, old_entry));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try entries.append(try common.cloneJsonValue(allocator, entry));
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = root });
+    try root.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION) });
+    try root.put(allocator, try allocator.dupe(u8, "entries"), .{ .array = entries });
+    const value = std.json.Value{ .object = root };
+    defer common.deinitJsonValue(allocator, value);
+    const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, lock_path, serialized, true);
+}
+
+fn extensionProvenanceLockfilePath(
+    allocator: std.mem.Allocator,
+    is_project: bool,
+    options: ExecuteOptions,
+) ![]u8 {
+    if (is_project) return std.fs.path.join(allocator, &[_][]const u8{ options.cwd, ".pi", EXTENSION_PROVENANCE_LOCKFILE_NAME });
+    return std.fs.path.join(allocator, &[_][]const u8{ options.agent_dir, EXTENSION_PROVENANCE_LOCKFILE_NAME });
+}
+
+fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return error.FileNotFound;
+    return allocator.dupe(u8, std.mem.span(resolved));
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, hex[0..]);
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch return false;
+    return true;
+}
+
+fn validateLocalPackageForInstall(
     allocator: std.mem.Allocator,
     io: std.Io,
     source: []const u8,
@@ -444,13 +693,63 @@ fn validateLocalWasmPackageForInstall(
 
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    _ = std.Io.Dir.statFile(.cwd(), io, manifest_path, .{}) catch |err| switch (err) {
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .absent,
         else => return err,
     };
+    defer allocator.free(manifest_text);
 
+    const schema_version = manifestSchemaVersion(allocator, manifest_text) catch null;
+    if (schema_version) |version| {
+        defer allocator.free(version);
+        if (std.mem.eql(u8, version, extension_manifest.SCHEMA_VERSION)) {
+            const valid = try validateUnifiedExtensionPackageForInstall(
+                allocator,
+                io,
+                source,
+                is_project,
+                options,
+                package_root,
+                manifest_path,
+                manifest_text,
+                stderr,
+            );
+            return if (valid) .absent else .invalid;
+        }
+    }
+
+    return validateLocalWasmPackageForInstall(allocator, io, package_root, manifest_path, is_project, stderr, options);
+}
+
+fn validateLocalWasmPackageForInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_root: []const u8,
+    manifest_path: []const u8,
+    is_project: bool,
+    stderr: *std.Io.Writer,
+    options: ExecuteOptions,
+) !LocalWasmInstallValidation {
+    var approved_capabilities: ?[]wasm_manifest.Capability = null;
+    defer {
+        if (approved_capabilities) |capabilities| allocator.free(capabilities);
+    }
+
+    if (try readWasmPackagePolicyRequest(allocator, io, package_root, manifest_path)) |request_value| {
+        var request = request_value;
+        defer request.deinit(allocator);
+        var effective_settings = try loadEffectiveSettingsForPackageInstall(allocator, io, options);
+        defer effective_settings.deinit(allocator);
+        const policy = (try resolveFinalWasmExtensionPolicy(allocator, io, effective_settings, package_root)) orelse
+            lookupExtensionPolicy(effective_settings, request.policy_lookup_key);
+        if (policy) |resolved_policy| {
+            approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, resolved_policy);
+        }
+    }
+
+    const capabilities = approved_capabilities orelse wasm_manifest.CANONICAL_CAPABILITIES[0..];
     var result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
-        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+        .approved_capabilities = capabilities,
     });
     defer result.deinit(allocator);
     if (result == .invalid) {
@@ -460,6 +759,402 @@ fn validateLocalWasmPackageForInstall(
     const source_identity = try allocator.dupe(u8, result.valid.package_root);
     defer allocator.free(source_identity);
     return .{ .valid = try provenance_lockfile.createWasmLockEntry(allocator, provenanceScope(is_project), source_identity, &result.valid) };
+}
+
+fn manifestSchemaVersion(allocator: std.mem.Allocator, manifest_text: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, manifest_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("schemaVersion") orelse return null;
+    if (value != .string) return null;
+    return try allocator.dupe(u8, value.string);
+}
+
+const InstallManifestSource = struct {
+    package_root: []u8,
+    manifest_path: []u8,
+    manifest_text: []u8,
+    source_scope: []const u8,
+    precedence_rank: u16,
+
+    fn asManifestSource(self: InstallManifestSource) extension_manifest.ManifestSource {
+        return .{
+            .package_root = self.package_root,
+            .manifest_path = self.manifest_path,
+            .manifest_text = self.manifest_text,
+            .source_scope = self.source_scope,
+            .precedence_rank = self.precedence_rank,
+        };
+    }
+
+    fn deinit(self: *InstallManifestSource, allocator: std.mem.Allocator) void {
+        allocator.free(self.package_root);
+        allocator.free(self.manifest_path);
+        allocator.free(self.manifest_text);
+        self.* = undefined;
+    }
+};
+
+fn freeInstallManifestSources(allocator: std.mem.Allocator, list: *std.ArrayList(InstallManifestSource)) void {
+    for (list.items) |*entry| entry.deinit(allocator);
+    list.deinit(allocator);
+}
+
+fn collectInstalledUnifiedManifestSourcesForScope(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    is_project: bool,
+    out: *std.ArrayList(InstallManifestSource),
+) !void {
+    var entries = try collectScopePackageEntries(allocator, io, options, is_project);
+    defer freeListEntries(allocator, &entries);
+
+    for (entries.items) |entry| {
+        if (!isLocalSource(entry.source)) continue;
+        const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ entry.installed_path, wasm_manifest.MANIFEST_FILE_NAME });
+        errdefer allocator.free(manifest_path);
+        const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(manifest_path);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer allocator.free(manifest_text);
+
+        const schema_version = manifestSchemaVersion(allocator, manifest_text) catch null;
+        if (schema_version) |version| {
+            defer allocator.free(version);
+            if (!std.mem.eql(u8, version, extension_manifest.SCHEMA_VERSION)) {
+                allocator.free(manifest_path);
+                allocator.free(manifest_text);
+                continue;
+            }
+        } else {
+            allocator.free(manifest_path);
+            allocator.free(manifest_text);
+            continue;
+        }
+
+        try out.append(allocator, .{
+            .package_root = try allocator.dupe(u8, entry.installed_path),
+            .manifest_path = manifest_path,
+            .manifest_text = manifest_text,
+            .source_scope = if (is_project) "project-installed" else "user-installed",
+            .precedence_rank = if (is_project) 2 else 3,
+        });
+    }
+}
+
+fn validateUnifiedExtensionPackageForInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    package_root: []const u8,
+    manifest_path: []const u8,
+    manifest_text: []const u8,
+    stderr: *std.Io.Writer,
+) !bool {
+    var owned_sources = std.ArrayList(InstallManifestSource).empty;
+    defer freeInstallManifestSources(allocator, &owned_sources);
+
+    try collectInstalledUnifiedManifestSourcesForScope(allocator, io, options, false, &owned_sources);
+    try collectInstalledUnifiedManifestSourcesForScope(allocator, io, options, true, &owned_sources);
+    try owned_sources.append(allocator, .{
+        .package_root = try allocator.dupe(u8, package_root),
+        .manifest_path = try allocator.dupe(u8, manifest_path),
+        .manifest_text = try allocator.dupe(u8, manifest_text),
+        .source_scope = if (is_project) "project-install" else "user-install",
+        .precedence_rank = if (is_project) 1 else 0,
+    });
+
+    const manifest_sources = try allocator.alloc(extension_manifest.ManifestSource, owned_sources.items.len);
+    defer allocator.free(manifest_sources);
+    for (owned_sources.items, 0..) |entry, idx| manifest_sources[idx] = entry.asManifestSource();
+
+    var manifest_set = try extension_manifest.resolveManifestSources(allocator, manifest_sources);
+    defer manifest_set.deinit(allocator);
+    var effective_settings = try loadEffectiveSettingsForPackageInstall(allocator, io, options);
+    defer effective_settings.deinit(allocator);
+
+    var accepted = true;
+    for (manifest_set.diagnostics) |diagnostic| {
+        try writeUnifiedInstallDiagnostic(stderr, diagnostic);
+        accepted = false;
+    }
+    for (manifest_set.records) |record| {
+        if (!std.mem.eql(u8, record.manifest.manifest_path, manifest_path)) continue;
+        if (!record.active) {
+            const reason = record.inactive_reason orelse "inactive";
+            try stderr.print("Error: {s}: install.package_inactive: package \"{s}\" inactive before load ({s})\n", .{
+                record.manifest.manifest_path,
+                record.manifest.id,
+                reason,
+            });
+            accepted = false;
+        }
+        if (!record.manifest.runtime_kind.executable()) {
+            try stderr.print("Error: {s}: install.unsupported_runtime: runtime \"{s}\" is not executable for package \"{s}\"\n", .{
+                record.manifest.manifest_path,
+                record.manifest.runtime_kind.jsonName(),
+                record.manifest.id,
+            });
+            accepted = false;
+        }
+        if (try packageHasDeniedPermissions(allocator, record, stderr)) accepted = false;
+        if (try packageHasUnapprovedRequestedPermissions(allocator, record, effective_settings, is_project, stderr)) accepted = false;
+    }
+
+    if (!accepted) {
+        try stderr.print("Error: install rejected {s} before load\n", .{source});
+        return false;
+    }
+    return true;
+}
+
+fn writeUnifiedInstallDiagnostic(stderr: *std.Io.Writer, diagnostic: extension_manifest.Diagnostic) !void {
+    try stderr.print("Error: severity={s} code={s} packageId={s} runtime={s} capabilityId={s} policySource={s} phase={s} correlationId={s} spanId={s} manifest={s} path={s}: {s}\n", .{
+        diagnostic.severity,
+        diagnostic.code,
+        diagnostic.package_id orelse "unknown",
+        diagnostic.runtime orelse "unknown",
+        diagnostic.capability_id orelse "none",
+        diagnostic.policy_source orelse "none",
+        diagnostic.phase,
+        diagnostic.correlation_id,
+        diagnostic.span_id,
+        diagnostic.manifest_path,
+        diagnostic.path,
+        diagnostic.message,
+    });
+}
+
+fn packageHasDeniedPermissions(
+    allocator: std.mem.Allocator,
+    record: extension_manifest.ManifestRecord,
+    stderr: *std.Io.Writer,
+) !bool {
+    if (record.manifest.permissions != .array) return false;
+    var denied = false;
+    for (record.manifest.permissions.array.items, 0..) |permission, idx| {
+        if (!jsonObjectPolicyDenied(permission)) continue;
+        const permission_id = jsonObjectString(permission, "id") orelse jsonObjectString(permission, "permission") orelse jsonObjectString(permission, "grant") orelse "unknown";
+        const policy_source = jsonObjectString(permission, "policySource") orelse "manifest";
+        const correlation_id = try std.fmt.allocPrint(allocator, "install:{s}", .{record.manifest.id});
+        defer allocator.free(correlation_id);
+        const span_id = try std.fmt.allocPrint(allocator, "install.policy_denied_permission:$.permissions[{d}]", .{idx});
+        defer allocator.free(span_id);
+        try stderr.print(
+            "Error: severity=error code=install.policy_denied_permission packageId={s} runtime={s} capabilityId={s} policySource={s} phase=install correlationId={s} spanId={s} manifest={s} path=$.permissions[{d}]: permission \"{s}\" denied by {s} policy for package \"{s}\"\n",
+            .{
+                record.manifest.id,
+                record.manifest.runtime_kind.jsonName(),
+                permission_id,
+                policy_source,
+                correlation_id,
+                span_id,
+                record.manifest.manifest_path,
+                idx,
+                permission_id,
+                policy_source,
+                record.manifest.id,
+            },
+        );
+        denied = true;
+    }
+    return denied;
+}
+
+fn packageHasUnapprovedRequestedPermissions(
+    allocator: std.mem.Allocator,
+    record: extension_manifest.ManifestRecord,
+    effective_settings: config_mod.Settings,
+    is_project: bool,
+    stderr: *std.Io.Writer,
+) !bool {
+    if (record.manifest.permissions != .array) return false;
+    const policy_key = try unifiedManifestPolicyLookupKey(allocator, record, is_project);
+    defer allocator.free(policy_key);
+    const policy = lookupExtensionPolicy(effective_settings, policy_key) orelse
+        lookupExtensionPolicy(effective_settings, record.manifest.id);
+
+    var denied = false;
+    for (record.manifest.permissions.array.items, 0..) |permission, idx| {
+        if (jsonObjectPolicyDenied(permission)) continue;
+        const permission_id = jsonObjectString(permission, "id") orelse jsonObjectString(permission, "permission") orelse jsonObjectString(permission, "grant") orelse continue;
+        const approved = if (policy) |resolved| extensionPolicyApprovesGrant(resolved, permission_id) else false;
+        if (approved) continue;
+        const policy_source: []const u8 = if (policy == null) "merged-default-deny" else "merged";
+        const correlation_id = try std.fmt.allocPrint(allocator, "install:{s}", .{record.manifest.id});
+        defer allocator.free(correlation_id);
+        const span_id = try std.fmt.allocPrint(allocator, "install.policy_denied_permission:$.permissions[{d}]", .{idx});
+        defer allocator.free(span_id);
+        try stderr.print(
+            "Error: severity=error code=install.policy_denied_permission packageId={s} runtime={s} capabilityId={s} policySource={s} phase=install correlationId={s} spanId={s} manifest={s} path=$.permissions[{d}]: permission \"{s}\" is not approved by merged policy for package \"{s}\" (policyKey={s})\n",
+            .{
+                record.manifest.id,
+                record.manifest.runtime_kind.jsonName(),
+                permission_id,
+                policy_source,
+                correlation_id,
+                span_id,
+                record.manifest.manifest_path,
+                idx,
+                permission_id,
+                record.manifest.id,
+                policy_key,
+            },
+        );
+        denied = true;
+    }
+    return denied;
+}
+
+fn unifiedManifestPolicyLookupKey(
+    allocator: std.mem.Allocator,
+    record: extension_manifest.ManifestRecord,
+    is_project: bool,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}:manifest:{s}:{s}:{s}:{s}:{s}",
+        .{
+            record.manifest.runtime_kind.jsonName(),
+            if (is_project) "project" else "user",
+            record.manifest.id,
+            record.manifest.version,
+            record.manifest.package_root,
+            record.manifest.manifest_path,
+        },
+    );
+}
+
+fn extensionPolicyApprovesGrant(policy: config_mod.ExtensionPolicy, grant: []const u8) bool {
+    if (policy.enabled) |enabled| if (!enabled) return false;
+    if (policy.approved) |approved| if (!approved) return false;
+    const approved_grants = policy.approved_grants orelse return false;
+    for (approved_grants) |approved_grant| {
+        if (std.mem.eql(u8, approved_grant, grant)) return true;
+    }
+    return false;
+}
+
+fn jsonObjectPolicyDenied(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (value.object.get("policyDenied")) |policy_denied| {
+        if (policy_denied == .bool and policy_denied.bool) return true;
+    }
+    if (value.object.get("policy")) |policy| {
+        if (policy == .object) {
+            if (policy.object.get("approved")) |approved| {
+                if (approved == .bool and !approved.bool) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn jsonObjectString(value: std.json.Value, field: []const u8) ?[]const u8 {
+    if (value != .object) return null;
+    const field_value = value.object.get(field) orelse return null;
+    if (field_value != .string) return null;
+    return field_value.string;
+}
+
+fn jsonStringField(object: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = object.get(field) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn readWasmPackagePolicyRequest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_root: []const u8,
+    manifest_path: []const u8,
+) !?WasmPackagePolicyRequest {
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(manifest_text);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, manifest_text, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+    const schema_version = jsonStringField(root, "schemaVersion") orelse return null;
+    const id = jsonStringField(root, "id") orelse return null;
+    const version = jsonStringField(root, "version") orelse return null;
+    const artifact = root.get("artifact") orelse return null;
+    if (artifact != .object) return null;
+    const artifact_path = jsonStringField(artifact.object, "path") orelse return null;
+
+    const policy_lookup_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = schema_version,
+        .id = id,
+        .version = version,
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = artifact_path,
+    });
+    return .{ .policy_lookup_key = policy_lookup_key };
+}
+
+fn loadEffectiveSettingsForPackageInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+) !config_mod.Settings {
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", options.agent_dir);
+    return config_mod.loadMergedSettingsForPreflight(allocator, io, &env_map, options.cwd);
+}
+
+fn resolveFinalWasmExtensionPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    effective_settings: config_mod.Settings,
+    package_root: []const u8,
+) !?config_mod.ExtensionPolicy {
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    if (manifest_result != .valid) return null;
+    const identity_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(identity_key);
+    return lookupExtensionPolicy(effective_settings, identity_key);
+}
+
+fn lookupExtensionPolicy(settings: config_mod.Settings, identity_key: []const u8) ?config_mod.ExtensionPolicy {
+    var policies = settings.extension_policies orelse return null;
+    var iterator = policies.iterator();
+    while (iterator.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, identity_key)) return entry.value_ptr.*;
+    }
+    return null;
+}
+
+fn approvedCapabilitiesFromExtensionPolicy(
+    allocator: std.mem.Allocator,
+    policy: config_mod.ExtensionPolicy,
+) ![]wasm_manifest.Capability {
+    const approved_grants = policy.approved_grants orelse return allocator.alloc(wasm_manifest.Capability, 0);
+    var capabilities = std.ArrayList(wasm_manifest.Capability).empty;
+    errdefer capabilities.deinit(allocator);
+    for (approved_grants) |grant| {
+        if (wasm_manifest.parseCapability(grant)) |capability| {
+            try capabilities.append(allocator, capability);
+        }
+    }
+    return capabilities.toOwnedSlice(allocator);
 }
 
 fn wasmPolicyLookupKeyFromLockEntry(
@@ -881,7 +1576,7 @@ fn executeExtensionUpdates(
             return .{ .exit_code = 1 };
         }
         if (isLocalSource(entry.source)) {
-            var wasm_update = try validateLocalWasmPackageForInstall(allocator, io, entry.source, entry.is_project, options, .settings, stderr);
+            var wasm_update = try validateLocalPackageForInstall(allocator, io, entry.source, entry.is_project, options, .settings, stderr);
             defer wasm_update.deinit(allocator);
             if (wasm_update == .invalid) {
                 try stderr.print("Error: failed to update extension {s}\n", .{entry.source});
@@ -3724,10 +4419,10 @@ test "wasm project install persists pre-artifact package despite unapproved poli
     defer stderr_buf.deinit(allocator);
 
     const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-pre-denied", "-l" }, options, &stdout_buf, &stderr_buf);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/wasm-merged-pre-denied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: wasm:") != null);
-    try std.testing.expectEqualStrings("", stderr_buf.items);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
 }
 
 test "wasm project install persists final package despite unapproved policy" {
@@ -3764,10 +4459,10 @@ test "wasm project install persists final package despite unapproved policy" {
     defer stderr_buf.deinit(allocator);
 
     const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-final-denied", "-l" }, options, &stdout_buf, &stderr_buf);
-    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/wasm-merged-final-denied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: wasm:") != null);
-    try std.testing.expectEqualStrings("", stderr_buf.items);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
 }
 
 test "wasm package install reports approval target without treating sibling grants as approval" {
@@ -3805,14 +4500,505 @@ test "wasm package install reports approval target without treating sibling gran
     defer stderr_buf.deinit(allocator);
 
     const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-sibling" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+}
+
+test "unified package install validates manifest graph before load" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/provider");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/consumer");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/provider/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"provider.pkg\",\"name\":\"Provider\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"index.ts\"},\"capabilities\":{\"exports\":[{\"id\":\"cap.install\",\"kind\":\"tool\",\"version\":\"1.0.0\"}]}}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/provider/index.ts",
+        .data = "export default {};",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/consumer/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"consumer.pkg\",\"name\":\"Consumer\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"index.ts\"},\"capabilities\":{\"imports\":[{\"id\":\"cap.install\",\"kind\":\"tool\",\"version\":\"^1.0.0\"}]}}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/consumer/index.ts",
+        .data = "export default {};",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const missing_result = try runCommand(allocator, &.{ "install", "./fixtures/consumer" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), missing_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "graph.missing_capability_import") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "install rejected ./fixtures/consumer before load") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const provider_result = try runCommand(allocator, &.{ "install", "./fixtures/provider" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), provider_result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/provider\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const consumer_result = try runCommand(allocator, &.{ "install", "./fixtures/consumer" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), consumer_result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/consumer\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "cross-runtime local packages install and reload from startup manifests" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/process");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/wasm");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/native");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/workflow");
+
+    const process_manifest =
+        \\{"schemaVersion":"pi-extension.v1","id":"process.pkg","name":"Process Runtime Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","-u","index.py"]}},"tools":[{"name":"process.echo","description":"Process echo","inputSchema":{"type":"object"}}],"hooks":[{"event":"input","hookId":"process.input","priority":-30,"declarationOrder":0}],"capabilities":{"exports":[{"id":"process.echo","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const wasm_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"wasm.pkg","name":"WASM Runtime Package","version":"1.0.0","runtime":{"kind":"wasm","entrypoint":{"artifactPath":"wasm/plugin.wasm"}},"dependencies":[{"id":"process.pkg","version":"^1.0.0"}],"tools":[{"name":"builtin.truncateHead","description":"WASM truncate","inputSchema":{"type":"object"}}],"hooks":[{"event":"input","hookId":"wasm.input","priority":-20,"declarationOrder":0}],"capabilities":{"exports":[{"id":"builtin.truncateHead","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const native_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"native.pkg","name":"Native Runtime Package","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"descriptor":"native_static_descriptor"}},"dependencies":[{"id":"wasm.pkg","version":"^1.0.0"}],"tools":[{"name":"native.fixture.echo","description":"Native echo","inputSchema":{"type":"object"}}],"hooks":[{"event":"input","hookId":"native.input","priority":-10,"declarationOrder":0}],"capabilities":{"exports":[{"id":"native.fixture.echo","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const workflow_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"workflow.pkg","name":"Workflow Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","-u","workflow.py"]}},"dependencies":[{"id":"native.pkg","version":"^1.0.0"}],"capabilities":{"imports":[{"id":"process.echo","kind":"tool","version":"^1.0.0"},{"id":"builtin.truncateHead","kind":"tool","version":"^1.0.0"},{"id":"native.fixture.echo","kind":"tool","version":"^1.0.0"}]},"workflows":[{"id":"workflow.cross","description":"Cross-runtime workflow","exposure":{"tool":"workflow.cross"},"inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"steps":[{"id":"process","kind":"side_effect","selectedCapability":"process.echo"},{"id":"wasm","kind":"side_effect","selectedCapability":"builtin.truncateHead"},{"id":"native","kind":"side_effect","selectedCapability":"native.fixture.echo"}]}]}
+    ;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/process/pi-extension.json", .data = process_manifest });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/wasm/pi-extension.json", .data = wasm_manifest_text });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native/pi-extension.json", .data = native_manifest_text });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/workflow/pi-extension.json", .data = workflow_manifest_text });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    for ([_][]const u8{ "process", "wasm", "native", "workflow" }) |fixture_name| {
+        stdout_buf.clearRetainingCapacity();
+        stderr_buf.clearRetainingCapacity();
+        const source = try std.fmt.allocPrint(allocator, "./fixtures/{s}", .{fixture_name});
+        defer allocator.free(source);
+        const result = try runCommand(allocator, &.{ "install", source, "-l" }, options, &stdout_buf, &stderr_buf);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/") != null);
+        try std.testing.expectEqualStrings("", stderr_buf.items);
+    }
+
+    const settings_path = try std.fs.path.join(allocator, &.{ cwd, ".pi", "settings.json" });
+    defer allocator.free(settings_path);
+    const settings = try readSettings(allocator, settings_path);
+    defer allocator.free(settings);
+    for ([_][]const u8{ "process", "wasm", "native", "workflow" }) |fixture_name| {
+        const needle = try std.fmt.allocPrint(allocator, "fixtures/{s}", .{fixture_name});
+        defer allocator.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, settings, needle) != null);
+    }
+
+    const process_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures", "process" });
+    defer allocator.free(process_root);
+    const wasm_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures", "wasm" });
+    defer allocator.free(wasm_root);
+    const native_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures", "native" });
+    defer allocator.free(native_root);
+    const workflow_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures", "workflow" });
+    defer allocator.free(workflow_root);
+    const process_manifest_path = try std.fs.path.join(allocator, &.{ process_root, "pi-extension.json" });
+    defer allocator.free(process_manifest_path);
+    const wasm_manifest_path = try std.fs.path.join(allocator, &.{ wasm_root, "pi-extension.json" });
+    defer allocator.free(wasm_manifest_path);
+    const native_manifest_path = try std.fs.path.join(allocator, &.{ native_root, "pi-extension.json" });
+    defer allocator.free(native_manifest_path);
+    const workflow_manifest_path = try std.fs.path.join(allocator, &.{ workflow_root, "pi-extension.json" });
+    defer allocator.free(workflow_manifest_path);
+
+    var startup_set = try extension_manifest.resolveManifestSources(allocator, &.{
+        .{ .package_root = process_root, .manifest_path = process_manifest_path, .manifest_text = process_manifest, .source_scope = "project-auto", .precedence_rank = 0 },
+        .{ .package_root = wasm_root, .manifest_path = wasm_manifest_path, .manifest_text = wasm_manifest_text, .source_scope = "project-auto", .precedence_rank = 1 },
+        .{ .package_root = native_root, .manifest_path = native_manifest_path, .manifest_text = native_manifest_text, .source_scope = "project-auto", .precedence_rank = 2 },
+        .{ .package_root = workflow_root, .manifest_path = workflow_manifest_path, .manifest_text = workflow_manifest_text, .source_scope = "project-auto", .precedence_rank = 3 },
+    });
+    defer startup_set.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), startup_set.diagnostics.len);
+    const startup_snapshot = try startup_set.registrySnapshotJson(allocator);
+    defer allocator.free(startup_snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, startup_snapshot, "\"activationOrder\":[\"process.pkg\",\"wasm.pkg\",\"native.pkg\",\"workflow.pkg\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, startup_snapshot, "\"id\":\"workflow.cross\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, startup_snapshot, "\"selectedCapability\":\"native.fixture.echo\"") != null);
+}
+
+test "unified package install rejects denied permission and unsupported runtime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/denied");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/future");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/denied/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"denied.pkg\",\"name\":\"Denied\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"index.ts\"},\"permissions\":[{\"id\":\"network\",\"policyDenied\":true,\"policySource\":\"project\"}]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/denied/index.ts",
+        .data = "export default {};",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/future/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"future.pkg\",\"name\":\"Future\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"future\",\"entrypoint\":{\"contract\":\"next\"}}}",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const denied_result = try runCommand(allocator, &.{ "install", "./fixtures/denied" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), denied_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "install.policy_denied_permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "severity=error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "packageId=denied.pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "runtime=typescript") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "capabilityId=network") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "phase=install") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "correlationId=install:denied.pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "spanId=install.policy_denied_permission:$.permissions[0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "permission \"network\" denied by project policy") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const future_result = try runCommand(allocator, &.{ "install", "./fixtures/future" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), future_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "install.unsupported_runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "runtime \"future\" is not executable") != null);
+}
+
+test "unified package install validates requested permissions against merged policy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/policy");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/policy/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"policy.pkg\",\"name\":\"Policy\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"index.ts\"},\"permissions\":[{\"id\":\"file.read\"}]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/policy/index.ts",
+        .data = "export default {};",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const denied_result = try runCommand(allocator, &.{ "install", "./fixtures/policy" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), denied_result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "code=install.policy_denied_permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "packageId=policy.pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "runtime=typescript") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "capabilityId=file.read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "policySource=merged-default-deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "phase=install") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "correlationId=install:policy.pkg") != null);
+
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/policy" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try std.fmt.allocPrint(allocator, "typescript:manifest:user:policy.pkg:1.0.0:{s}:{s}", .{ package_root, manifest_path });
+    defer allocator.free(policy_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, policy_key, "file.read", false);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const allowed_result = try runCommand(allocator, &.{ "install", "./fixtures/policy" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), allowed_result.exit_code);
+    try std.testing.expectEqualStrings("Installed ./fixtures/policy\n", stdout_buf.items);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+}
+
+test "unified project package install honors project policy override denial" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/project-policy");
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/project-policy/pi-extension.json",
+        .data = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"project.policy.pkg\",\"name\":\"Project Policy\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"index.ts\"},\"permissions\":[{\"id\":\"file.read\"}]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/project-policy/index.ts",
+        .data = "export default {};",
+    });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/project-policy" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try std.fmt.allocPrint(allocator, "typescript:manifest:project:project.policy.pkg:1.0.0:{s}:{s}", .{ package_root, manifest_path });
+    defer allocator.free(policy_key);
+
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, policy_key, "file.read", false);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writePolicySettingsGrantList(allocator, project_settings_path, policy_key, "", false);
+
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const denied_result = try runCommand(allocator, &.{ "install", "./fixtures/project-policy", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), denied_result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "code=install.policy_denied_permission") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "packageId=project.policy.pkg") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "policySource=merged") != null);
+}
+
+test "wasm project install rejects approved grants from malformed resource limits policy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-invalid-policy", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-invalid-policy" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const quoted_key = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = final_key }, .{});
+    defer allocator.free(quoted_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    const settings = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "extensionPolicies": {{
+        \\    {s}: {{
+        \\      "approvedGrants": ["file.read"],
+        \\      "resourceLimits": {{ "timeoutMs": 9007199254740992 }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{quoted_key});
+    defer allocator.free(settings);
+    try common.writeFileAbsolute(std.testing.io, user_settings_path, settings, true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-invalid-policy", "-l" }, options, &stdout_buf, &stderr_buf);
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/wasm-sibling") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/wasm-invalid-policy") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: wasm:") != null);
     try std.testing.expectEqualStrings("", stderr_buf.items);
 
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    const project_settings_exists = blk: {
+        _ = std.Io.Dir.statFile(.cwd(), std.testing.io, project_settings_path, .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (project_settings_exists) {
+        const project_settings = try readSettings(allocator, project_settings_path);
+        defer allocator.free(project_settings);
+        try std.testing.expect(std.mem.indexOf(u8, project_settings, "wasm-invalid-policy") != null);
+    }
+}
+
+test "wasm project policy override keeps pre-artifact grants default-denied when unapproved" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-pre-denied", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-pre-denied" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, policy_key, "file.read", false);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writePolicySettings(allocator, project_settings_path, policy_key, "file.write", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-pre-denied", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+}
+
+test "wasm project policy override keeps final artifact grants default-denied when unapproved" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-merged-final-denied", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-merged-final-denied" });
+    defer allocator.free(package_root);
+    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, package_root, .{
+        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    });
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(final_key);
+    const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(user_settings_path);
+    try writePolicySettings(allocator, user_settings_path, final_key, "file.read", false);
+    const project_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "settings.json" });
+    defer allocator.free(project_settings_path);
+    try writePolicySettingsGrantList(allocator, project_settings_path, final_key, "", false);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-merged-final-denied", "-l" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+}
+
+test "wasm package install rejects sibling grants and resource limits as approval" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try writeWasmPackageFixture(&tmp, "repo/fixtures/wasm-sibling", "file.read", true);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &[_][]const u8{ cwd, "fixtures/wasm-sibling" });
+    defer allocator.free(package_root);
+    const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+        .schema_version = wasm_manifest.SCHEMA_VERSION,
+        .id = "com.example.policy",
+        .version = "0.1.0",
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .artifact_path = "wasm/example-tool.wasm",
+    });
+    defer allocator.free(policy_key);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try writePolicySettings(allocator, settings_path, policy_key, "file.write", true);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/wasm-sibling" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "denied_capability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "file.read") != null);
+
     const settings = try readSettings(allocator, settings_path);
     defer allocator.free(settings);
-    try std.testing.expect(std.mem.indexOf(u8, settings, "wasm-sibling") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings, "\"packages\"") == null);
 }
 
 test "VAL-M12-PKG-005 uninstall alias matches remove" {

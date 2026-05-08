@@ -3,9 +3,11 @@ const ai = @import("ai");
 const agent = @import("agent");
 const config_mod = @import("../config/config.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
+const context_files_mod = @import("../resources/context_files.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
+const tool_selection_mod = @import("../tool_selection.zig");
 
 pub const ToolRuntime = struct {
     cwd: []const u8,
@@ -48,6 +50,10 @@ pub const MissingCwdMode = enum {
 pub const RunInteractiveModeOptions = struct {
     cwd: []const u8,
     system_prompt: []const u8,
+    current_date: []const u8 = "",
+    custom_prompt: ?[]const u8 = null,
+    append_prompts: []const []const u8 = &.{},
+    context_files: []const context_files_mod.ContextFile = &.{},
     session_dir: []const u8,
     provider: []const u8,
     model: ?[]const u8 = null,
@@ -59,13 +65,16 @@ pub const RunInteractiveModeOptions = struct {
     fork: ?[]const u8 = null,
     no_session: bool = false,
     model_patterns: ?[]const []const u8 = null,
-    selected_tools: ?[]const []const u8 = null,
+    selected_tools: tool_selection_mod.ToolSelection = .{},
     include_builtin_tools: bool = true,
     include_installed_wasm_tools: bool = true,
     initial_prompt: ?[]const u8 = null,
     initial_messages: []const []const u8 = &.{},
     initial_images: []const ai.ImageContent = &.{},
     prompt_templates: []const resources_mod.PromptTemplate = &.{},
+    extensions: []const resources_mod.LoadedExtension = &.{},
+    startup_cli_extensions: []const []const u8 = &.{},
+    include_default_extensions: bool = true,
     skills: []const resources_mod.Skill = &.{},
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
@@ -85,6 +94,19 @@ pub const RunInteractiveModeOptions = struct {
 };
 
 pub const LiveResources = struct {
+    pub const ReloadExtensionToolsSink = struct {
+        context: ?*anyopaque = null,
+        callback: *const fn (
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            env_map: *const std.process.Environ.Map,
+            cwd: []const u8,
+            session: *session_mod.AgentSession,
+            live_resources: *LiveResources,
+        ) anyerror!void,
+    };
+
     runtime_config: ?*const config_mod.RuntimeConfig,
     keybindings: ?*const keybindings_mod.Keybindings,
     prompt_templates: []const resources_mod.PromptTemplate,
@@ -92,6 +114,9 @@ pub const LiveResources = struct {
     theme: ?*const resources_mod.Theme,
     terminal_name: []const u8,
     extension_command_sink: ?ExtensionCommandSink = null,
+    reload_extension_tools_sink: ?ReloadExtensionToolsSink = null,
+    startup_cli_extensions: []const []const u8,
+    include_default_extensions: bool,
     runtime_theme_name: ?[]u8 = null,
     owned_runtime_config: ?config_mod.RuntimeConfig = null,
     owned_resource_bundle: ?resources_mod.ResourceBundle = null,
@@ -104,6 +129,8 @@ pub const LiveResources = struct {
             .skills = options.skills,
             .theme = options.theme,
             .terminal_name = if (options.terminal_name.len > 0) options.terminal_name else "term",
+            .startup_cli_extensions = options.startup_cli_extensions,
+            .include_default_extensions = options.include_default_extensions,
         };
     }
 
@@ -180,8 +207,10 @@ pub const LiveResources = struct {
             .agent_dir = next_runtime.agent_dir,
             .global = settingsResources(next_runtime.global_settings),
             .project = settingsResources(next_runtime.project_settings),
+            .cli_extensions = self.startup_cli_extensions,
             .runtime_theme = runtime_theme_copy,
             .env_map = env_map,
+            .include_default_extensions = self.include_default_extensions,
         });
         errdefer next_bundle.deinit(allocator);
 

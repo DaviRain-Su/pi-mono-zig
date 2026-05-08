@@ -6,11 +6,12 @@ const input_prep = @import("input_prep.zig");
 const runtime_prep = @import("runtime_prep.zig");
 const output = @import("output.zig");
 const coding_agent = @import("../coding_agent/root.zig");
+const tool_selection = @import("../coding_agent/tool_selection.zig");
 
 pub const DispatchRunModeOptions = struct {
     cwd: []const u8,
     app_mode: bootstrap.AppMode,
-    selected_tools: ?[]const []const u8,
+    selected_tools: tool_selection.ToolSelection,
     preflight_continue_confirmed: bool = false,
     version: []const u8,
 };
@@ -104,6 +105,10 @@ pub fn dispatchRunMode(
         .{
             .cwd = cwd,
             .system_prompt = prepared.system_prompt,
+            .current_date = prepared.current_date,
+            .custom_prompt = options.system_prompt,
+            .append_prompts = options.append_system_prompt orelse &.{},
+            .context_files = prepared.context_files,
             .session_dir = prepared.session_dir,
             .provider = prepared.provider_name,
             .model = prepared.model_name,
@@ -122,6 +127,10 @@ pub fn dispatchRunMode(
             .initial_messages = initial_input.messages,
             .initial_images = initial_input.images,
             .prompt_templates = prepared.resource_bundle.prompt_templates,
+            .extensions = prepared.resource_bundle.extensions,
+            .startup_cli_extensions = options.extensions orelse &.{},
+            .include_default_extensions = !options.no_extensions,
+            .skills = prepared.resource_bundle.skills,
             .keybindings = &prepared.runtime_config.keybindings,
             .theme = prepared.resource_bundle.selectedTheme(),
             .terminal_name = prepared.resource_bundle.terminal_name,
@@ -155,11 +164,14 @@ fn dispatchNonInteractiveMode(
     const cwd = dispatch_options.cwd;
     const construction_selected_tools = constructionToolSelection(options, dispatch_options.selected_tools);
     var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
-    var built_tools = try coding_agent.interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
-        .selected_tools = construction_selected_tools,
+    var built_tools = try coding_agent.interactive_mode.buildAgentToolsWithExtensionsSelection(allocator, &app_context, construction_selected_tools, .{
+        .extensions = prepared.resource_bundle.extensions,
+        .env_map = env_map,
+        .cwd = cwd,
+        .io = io,
+        .runtime_config = &prepared.runtime_config,
         .include_builtin_tools = includeBuiltinTools(options),
         .include_installed_wasm_tools = includeInstalledWasmTools(options),
-        .runtime_config = &prepared.runtime_config,
         .resource_options = .{
             .cwd = cwd,
             .agent_dir = prepared.runtime_config.agent_dir,
@@ -175,6 +187,20 @@ fn dispatchNonInteractiveMode(
     if (built_tools.locked_wasm_runtimes) |*runtime_set| {
         try output.writeResourceDiagnostics(stderr, runtime_set.diagnostics);
     }
+    try coding_agent.interactive_mode.writeStartupDiagnostics(stderr, built_tools.startup_diagnostics);
+    if (built_tools.required_startup_failed) {
+        try stderr.flush();
+        return 1;
+    }
+
+    try runtime_prep.refreshSystemPromptWithActiveTools(
+        allocator,
+        prepared,
+        cwd,
+        options,
+        dispatch_options.selected_tools,
+        built_tools.items,
+    );
 
     var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
     defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
@@ -203,6 +229,7 @@ fn dispatchNonInteractiveMode(
             .initial_messages = &.{},
             .initial_images = &.{},
             .prompt_templates = prepared.resource_bundle.prompt_templates,
+            .extensions = prepared.resource_bundle.extensions,
             .keybindings = &prepared.runtime_config.keybindings,
             .theme = prepared.resource_bundle.selectedTheme(),
             .runtime_config = &prepared.runtime_config,
@@ -285,9 +312,12 @@ fn includeInstalledWasmTools(options: *const cli.Args) bool {
     return true;
 }
 
-fn constructionToolSelection(options: *const cli.Args, selected_tools: ?[]const []const u8) ?[]const []const u8 {
-    if (options.no_builtin_tools and !options.no_tools and options.tools == null) return null;
-    return selected_tools;
+fn constructionToolSelection(options: *const cli.Args, selected_tools: tool_selection.ToolSelection) tool_selection.ToolSelection {
+    var result = selected_tools;
+    result.include_builtins = includeBuiltinTools(options);
+    result.disable_all = options.no_tools;
+    if (options.tools) |allowlist| result.allowlist = allowlist;
+    return result;
 }
 
 const OwnedTsRpcExtensionHostOptions = struct {
@@ -321,6 +351,7 @@ fn tsRpcExtensionHostOptions(
         .options = .{
             .argv = argv,
             .cwd = cwd,
+            .extension_path = entry,
             .marker = marker,
             .fixture = fixture,
         },

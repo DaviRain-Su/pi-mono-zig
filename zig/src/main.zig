@@ -12,6 +12,9 @@ const run_mode_dispatch = @import("cli/run_mode_dispatch.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config/config.zig");
+const resources_mod = @import("coding_agent/resources/resources.zig");
+const tools_common = @import("coding_agent/tools/common.zig");
+const tool_adapters = @import("coding_agent/interactive_mode/tool_adapters.zig");
 const json_event_wire = @import("coding_agent/modes/json_event_wire.zig");
 const builtin = @import("builtin");
 const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struct {};
@@ -96,7 +99,9 @@ fn runCliWithInput(
     if (options.help) {
         const help_flags = try prepared_extensions.snapshotHelpFlags(allocator);
         defer allocator.free(help_flags);
-        try output.printUsageWithExtensions(allocator, VERSION, help_flags, stdout);
+        const help_flag_diagnostics = try prepared_extensions.snapshotHelpDiagnostics(allocator);
+        defer allocator.free(help_flag_diagnostics);
+        try output.printUsageWithExtensionDiagnostics(allocator, VERSION, help_flags, help_flag_diagnostics, stdout);
         return 0;
     }
 
@@ -114,6 +119,7 @@ fn runCliWithInput(
             io,
             env_map,
             paths,
+            prepared_extensions.rejectedFlagDiagnostics(),
             prepared_extensions.parsedCliFlagValues(),
             cwd_override,
             stdout,
@@ -306,8 +312,9 @@ test "effectiveToolSelection disables built-in tools when requested" {
 
     var no_builtin_args = try cli.parseArgs(allocator, &.{"--no-builtin-tools"});
     defer no_builtin_args.deinit(allocator);
-    const no_builtin_selection = effectiveToolSelection(&no_builtin_args).?;
-    try std.testing.expectEqual(@as(usize, 0), no_builtin_selection.len);
+    const no_builtin_selection = effectiveToolSelection(&no_builtin_args);
+    try std.testing.expect(!no_builtin_selection.allowsBuiltin("read"));
+    try std.testing.expect(no_builtin_selection.allowsExtension("ext-echo"));
 
     var explicit_args = try cli.parseArgs(allocator, &.{
         "--no-builtin-tools",
@@ -315,13 +322,14 @@ test "effectiveToolSelection disables built-in tools when requested" {
         "read,ls",
     });
     defer explicit_args.deinit(allocator);
-    const explicit_selection = effectiveToolSelection(&explicit_args).?;
-    try std.testing.expectEqual(@as(usize, 2), explicit_selection.len);
-    try std.testing.expectEqualStrings("read", explicit_selection[0]);
-    try std.testing.expectEqualStrings("ls", explicit_selection[1]);
+    const explicit_selection = effectiveToolSelection(&explicit_args);
+    try std.testing.expect(!explicit_selection.allowsBuiltin("read"));
+    try std.testing.expect(!explicit_selection.allowsBuiltin("ls"));
+    try std.testing.expect(!explicit_selection.allowsExtension("ext-echo"));
+    try std.testing.expect(explicit_selection.allowsExtension("read"));
 
     var app_context = coding_agent.interactive_mode.AppContext.init("/tmp", std.testing.io);
-    var built_tools = try coding_agent.interactive_mode.buildAgentTools(allocator, &app_context, no_builtin_selection);
+    var built_tools = try coding_agent.interactive_mode.buildAgentToolsWithSelection(allocator, &app_context, no_builtin_selection);
     defer built_tools.deinit();
     try std.testing.expectEqual(@as(usize, 0), built_tools.items.len);
 }
@@ -437,6 +445,744 @@ test "runCli prints faux response end to end" {
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
+test "VAL-CROSS-010 settings backed package lifecycle e2e uses normal startup reload shutdown" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
+    try tmp.dir.createDirPath(std.testing.io, "project/process-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "project/wasm-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "project/native-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "project/workflow-pkg/extensions");
+
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const agent_dir = try cli_test.makeTmpPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const process_root = try cli_test.makeTmpPath(allocator, tmp, "project/process-pkg");
+    defer allocator.free(process_root);
+    const wasm_root = try cli_test.makeTmpPath(allocator, tmp, "project/wasm-pkg");
+    defer allocator.free(wasm_root);
+    const native_root = try cli_test.makeTmpPath(allocator, tmp, "project/native-pkg");
+    defer allocator.free(native_root);
+    const workflow_root = try cli_test.makeTmpPath(allocator, tmp, "project/workflow-pkg");
+    defer allocator.free(workflow_root);
+
+    const package_json =
+        \\{"pi":{"extensions":["extensions/host.py"]}}
+    ;
+    const process_script_path = try std.fs.path.join(allocator, &.{ process_root, "extensions/host.py" });
+    defer allocator.free(process_script_path);
+    const wasm_script_path = try std.fs.path.join(allocator, &.{ wasm_root, "extensions/host.py" });
+    defer allocator.free(wasm_script_path);
+    const native_script_path = try std.fs.path.join(allocator, &.{ native_root, "extensions/host.py" });
+    defer allocator.free(native_script_path);
+    const workflow_script_path = try std.fs.path.join(allocator, &.{ workflow_root, "extensions/host.py" });
+    defer allocator.free(workflow_script_path);
+    const process_capture = try cli_test.makeTmpPath(allocator, tmp, "process-capture.jsonl");
+    defer allocator.free(process_capture);
+    const process_v2_capture = try cli_test.makeTmpPath(allocator, tmp, "process-v2-capture.jsonl");
+    defer allocator.free(process_v2_capture);
+    const wasm_capture = try cli_test.makeTmpPath(allocator, tmp, "wasm-capture.jsonl");
+    defer allocator.free(wasm_capture);
+    const native_capture = try cli_test.makeTmpPath(allocator, tmp, "native-capture.jsonl");
+    defer allocator.free(native_capture);
+    const workflow_capture = try cli_test.makeTmpPath(allocator, tmp, "workflow-capture.jsonl");
+    defer allocator.free(workflow_capture);
+
+    const process_manifest =
+        \\{"schemaVersion":"pi-extension.v1","id":"process.pkg","name":"Process Runtime Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","extensions/host.py"]}},"tools":[{"name":"process.cross","description":"Process package tool","inputSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}},"additionalProperties":false}}],"hooks":[{"event":"input","hookId":"process.input","priority":-30,"declarationOrder":0}],"capabilities":{"exports":[{"id":"process.cross","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const wasm_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"wasm.pkg","name":"WASM Runtime Package","version":"1.0.0","runtime":{"kind":"wasm","entrypoint":{"artifactPath":"wasm/plugin.wasm"}},"dependencies":[{"id":"process.pkg","version":"^1.0.0"}],"tools":[{"name":"wasm.cross","description":"WASM package tool","inputSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}},"additionalProperties":false}}],"hooks":[{"event":"input","hookId":"wasm.input","priority":-20,"declarationOrder":0}],"capabilities":{"exports":[{"id":"wasm.cross","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const native_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"native.pkg","name":"Native Runtime Package","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"descriptor":"native_static_descriptor"}},"dependencies":[{"id":"wasm.pkg","version":"^1.0.0"}],"tools":[{"name":"native.cross","description":"Native package tool","inputSchema":{"type":"object","required":["value"],"properties":{"value":{"type":"string"}},"additionalProperties":false}}],"hooks":[{"event":"input","hookId":"native.input","priority":-10,"declarationOrder":0}],"capabilities":{"exports":[{"id":"native.cross","kind":"tool","version":"1.0.0"}]}}
+    ;
+    const workflow_manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"workflow.pkg","name":"Workflow Package","version":"1.0.0","runtime":{"kind":"process_jsonl","entrypoint":{"argv":["python3","extensions/host.py"]}},"dependencies":[{"id":"native.pkg","version":"^1.0.0"}],"capabilities":{"imports":[{"id":"process.cross","kind":"tool","version":"^1.0.0"},{"id":"wasm.cross","kind":"tool","version":"^1.0.0"},{"id":"native.cross","kind":"tool","version":"^1.0.0"}]},"workflows":[{"id":"workflow.cross","description":"Settings backed mixed workflow","exposure":{"tool":"workflow.cross"},"inputSchema":{"type":"object","required":["issue"],"properties":{"issue":{"type":"string"}},"additionalProperties":false},"outputSchema":{"type":"object"},"steps":[{"id":"process","kind":"side_effect","input":{"value":"workflow-process"},"replayMode":"recorded","selectedCapability":"process.cross"},{"id":"wasm","kind":"side_effect","input":{"value":"workflow-wasm"},"replayMode":"recorded","selectedCapability":"wasm.cross"},{"id":"native","kind":"side_effect","input":{"value":"workflow-native"},"replayMode":"recorded","selectedCapability":"native.cross"}]}]}
+    ;
+
+    const process_script_v1 = try packageHostScript(allocator, process_capture, "process.cross", "process", "v1", true, false);
+    defer allocator.free(process_script_v1);
+    const process_script_v2 = try packageHostScript(allocator, process_v2_capture, "process.cross.v2", "process", "v2", true, false);
+    defer allocator.free(process_script_v2);
+    const wasm_script = try packageHostScript(allocator, wasm_capture, "wasm.cross", "wasm", "v1", true, false);
+    defer allocator.free(wasm_script);
+    const native_script = try packageHostScript(allocator, native_capture, "native.cross", "native", "v1", true, false);
+    defer allocator.free(native_script);
+    const workflow_script = try packageHostScript(allocator, workflow_capture, "workflow.cross", "workflow", "v1", false, true);
+    defer allocator.free(workflow_script);
+
+    const fixtures = [_]LifecyclePackageFixture{
+        .{ .root = process_root, .source = "./process-pkg", .script_rel = "extensions/host.py", .script_abs = process_script_path, .manifest = process_manifest, .initial_script = process_script_v1, .manifest_id = "process.pkg", .runtime_kind = .process_jsonl, .tool_name = "process.cross", .hook_event = "input" },
+        .{ .root = wasm_root, .source = "./wasm-pkg", .script_rel = "extensions/host.py", .script_abs = wasm_script_path, .manifest = wasm_manifest_text, .initial_script = wasm_script, .manifest_id = "wasm.pkg", .runtime_kind = .wasm, .tool_name = "wasm.cross", .hook_event = "input" },
+        .{ .root = native_root, .source = "./native-pkg", .script_rel = "extensions/host.py", .script_abs = native_script_path, .manifest = native_manifest_text, .initial_script = native_script, .manifest_id = "native.pkg", .runtime_kind = .native, .tool_name = "native.cross", .hook_event = "input" },
+        .{ .root = workflow_root, .source = "./workflow-pkg", .script_rel = "extensions/host.py", .script_abs = workflow_script_path, .manifest = workflow_manifest_text, .initial_script = workflow_script, .manifest_id = "workflow.pkg", .runtime_kind = .process_jsonl, .workflow_id = "workflow.cross" },
+    };
+    for (fixtures) |fixture| {
+        const package_json_path = try std.fs.path.join(allocator, &.{ fixture.root, "package.json" });
+        defer allocator.free(package_json_path);
+        const manifest_path = try std.fs.path.join(allocator, &.{ fixture.root, "pi-extension.json" });
+        defer allocator.free(manifest_path);
+        const script_path = try std.fs.path.join(allocator, &.{ fixture.root, fixture.script_rel });
+        defer allocator.free(script_path);
+        try writeAbsoluteTestFile(package_json_path, package_json);
+        try writeAbsoluteTestFile(manifest_path, fixture.manifest);
+        try writeAbsoluteTestFile(script_path, fixture.initial_script);
+    }
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("PI_M1_EXTENSION_HOST_RUNTIME", "python3");
+    try env_map.put("PI_M1_EXTENSION_DRAIN_TIMEOUT_MS", "1000");
+    try env_map.put("PI_M2_EXTENSION_STARTUP_TIMEOUT_MS", "500");
+
+    for (fixtures) |fixture| {
+        var install_stdout: std.Io.Writer.Allocating = .init(allocator);
+        defer install_stdout.deinit();
+        var install_stderr: std.Io.Writer.Allocating = .init(allocator);
+        defer install_stderr.deinit();
+        const exit_code = try runCli(allocator, std.testing.io, &env_map, &.{ "install", fixture.source, "-l" }, project_dir, &install_stdout.writer, &install_stderr.writer);
+        try std.testing.expectEqual(@as(u8, 0), exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, install_stdout.writer.buffered(), "Installed") != null);
+        try std.testing.expectEqualStrings("", install_stderr.writer.buffered());
+    }
+
+    const installed_settings_path = try std.fs.path.join(allocator, &.{ project_dir, ".pi/settings.json" });
+    defer allocator.free(installed_settings_path);
+    const installed_settings_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, installed_settings_path, allocator, .unlimited);
+    defer allocator.free(installed_settings_text);
+    const installed_sources = try readSettingsPackageSources(allocator, installed_settings_text);
+    defer freeOwnedStringSlice(allocator, installed_sources);
+    try expectInstalledPackageSources(installed_sources, &.{
+        "../process-pkg",
+        "../wasm-pkg",
+        "../native-pkg",
+        "../workflow-pkg",
+    });
+
+    const process_policy_key = try packagePolicyKey(allocator, installed_sources[0], process_script_path);
+    defer allocator.free(process_policy_key);
+    const wasm_policy_key = try packagePolicyKey(allocator, installed_sources[1], wasm_script_path);
+    defer allocator.free(wasm_policy_key);
+    const native_policy_key = try packagePolicyKey(allocator, installed_sources[2], native_script_path);
+    defer allocator.free(native_policy_key);
+    const workflow_policy_key = try packagePolicyKey(allocator, installed_sources[3], workflow_script_path);
+    defer allocator.free(workflow_policy_key);
+    const project_settings = try settingsWithInstalledPackagePolicies(allocator, installed_settings_text, .{
+        process_policy_key,
+        wasm_policy_key,
+        native_policy_key,
+        workflow_policy_key,
+    });
+    defer allocator.free(project_settings);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/.pi/settings.json", .data = project_settings });
+
+    var args = try cli.parseArgs(allocator, &.{ "--provider", "faux", "--no-session" });
+    defer args.deinit(allocator);
+    const selected_tools = effectiveToolSelection(&args);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, project_dir, &args, selected_tools);
+    defer prepared.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), prepared.resource_bundle.extensions.len);
+    try expectPackageConfigSources(prepared.runtime_config.project_settings.packages, installed_sources);
+    try expectLoadedExtensionsMatchInstalledPackages(allocator, prepared.resource_bundle.extensions, fixtures[0..], installed_sources);
+
+    var first_arena = std.heap.ArenaAllocator.init(allocator);
+    defer first_arena.deinit();
+    const response_allocator = first_arena.allocator();
+    const process_args = try jsonObjectWithString(response_allocator, "value", "process-input");
+    const wasm_args = try jsonObjectWithString(response_allocator, "value", "wasm-input");
+    const native_args = try jsonObjectWithString(response_allocator, "value", "native-input");
+    const workflow_args = try jsonObjectWithString(response_allocator, "issue", "mixed-flow");
+    const blocks = try response_allocator.alloc(faux.FauxContentBlock, 4);
+    blocks[0] = try faux.fauxToolCall(response_allocator, "process.cross", process_args, .{ .id = "process-call" });
+    blocks[1] = try faux.fauxToolCall(response_allocator, "wasm.cross", wasm_args, .{ .id = "wasm-call" });
+    blocks[2] = try faux.fauxToolCall(response_allocator, "native.cross", native_args, .{ .id = "native-call" });
+    blocks[3] = try faux.fauxToolCall(response_allocator, "workflow.cross", workflow_args, .{ .id = "workflow-call" });
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("settings backed lifecycle complete")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    var startup_app_context = coding_agent.interactive_mode.AppContext.init(project_dir, std.testing.io);
+    var session_bootstrap = try coding_agent.interactive_mode.bootstrapInteractiveState(allocator, std.testing.io, &env_map, .{
+        .cwd = project_dir,
+        .system_prompt = prepared.system_prompt,
+        .current_date = prepared.current_date,
+        .session_dir = prepared.session_dir,
+        .provider = prepared.provider_name,
+        .model = prepared.model_name,
+        .thinking = prepared.thinking_level,
+        .no_session = true,
+        .selected_tools = selected_tools,
+        .prompt_templates = prepared.resource_bundle.prompt_templates,
+        .extensions = prepared.resource_bundle.extensions,
+        .skills = prepared.resource_bundle.skills,
+        .runtime_config = &prepared.runtime_config,
+    }, &startup_app_context);
+    defer session_bootstrap.deinit();
+    try expectRegistrySnapshotsMatchLoadedPackages(allocator, session_bootstrap.built_tools.extension_hosts, prepared.resource_bundle.extensions, fixtures[0..], installed_sources);
+    try expectInstallLockSettingsMetadataMatchesLoadedRegistry(allocator, project_dir, prepared.resource_bundle.extensions, session_bootstrap.built_tools.startup_manifest_registry_snapshot.?, fixtures[0..], installed_sources);
+    try session_bootstrap.session.prompt("run installed package lifecycle");
+
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "process.cross", "process:v1:process-input");
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "wasm.cross", "wasm:v1:wasm-input");
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "native.cross", "native:v1:native-input");
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "workflow.cross", "workflow-native");
+    try expectFileContains(allocator, process_capture, "\"type\":\"extension_event\"");
+    try expectFileContains(allocator, process_capture, "run installed package lifecycle");
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/process-pkg/extensions/host.py", .data = process_script_v2 });
+    var live_resources = coding_agent.interactive_mode.LiveResources.init(.{
+        .cwd = project_dir,
+        .system_prompt = prepared.system_prompt,
+        .session_dir = prepared.session_dir,
+        .provider = prepared.provider_name,
+        .model = prepared.model_name,
+        .selected_tools = selected_tools,
+        .prompt_templates = prepared.resource_bundle.prompt_templates,
+        .extensions = prepared.resource_bundle.extensions,
+        .skills = prepared.resource_bundle.skills,
+        .runtime_config = &prepared.runtime_config,
+        .startup_cli_extensions = &.{},
+        .include_default_extensions = true,
+    });
+    defer live_resources.deinit(allocator);
+    _ = try live_resources.reload(allocator, std.testing.io, &env_map, project_dir);
+    var reload_app_context = coding_agent.interactive_mode.AppContext.init(project_dir, std.testing.io);
+    try tool_adapters.replaceAgentToolsForReload(allocator, &reload_app_context, &session_bootstrap.session, &session_bootstrap.built_tools, selected_tools, .{
+        .extensions = live_resources.owned_resource_bundle.?.extensions,
+        .env_map = &env_map,
+        .cwd = project_dir,
+        .io = std.testing.io,
+        .runtime_config = &live_resources.owned_runtime_config.?,
+    });
+    try session_bootstrap.session.setExtensionHosts(session_bootstrap.built_tools.extension_hosts, 1000);
+    try std.testing.expect(findToolByName(session_bootstrap.session.agent.getTools(), "process.cross") == null);
+    try std.testing.expect(findToolByName(session_bootstrap.session.agent.getTools(), "process.cross.v2") != null);
+
+    const v1_capture_after_reload = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture, allocator, .unlimited);
+    defer allocator.free(v1_capture_after_reload);
+
+    var reload_arena = std.heap.ArenaAllocator.init(allocator);
+    defer reload_arena.deinit();
+    const reload_allocator = reload_arena.allocator();
+    const stale_args = try jsonObjectWithString(reload_allocator, "value", "stale");
+    const new_args = try jsonObjectWithString(reload_allocator, "value", "fresh");
+    const reload_blocks = try reload_allocator.alloc(faux.FauxContentBlock, 2);
+    reload_blocks[0] = try faux.fauxToolCall(reload_allocator, "process.cross", stale_args, .{ .id = "stale-process-call" });
+    reload_blocks[1] = try faux.fauxToolCall(reload_allocator, "process.cross.v2", new_args, .{ .id = "fresh-process-call" });
+    const reload_final_blocks = [_]faux.FauxContentBlock{faux.fauxText("reload complete")};
+    try registration.appendResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(reload_blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = faux.fauxAssistantMessage(reload_final_blocks[0..], .{}) },
+    });
+    try session_bootstrap.session.prompt("verify reload replaced registry");
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "process.cross", "Tool process.cross not found");
+    try expectToolResultContainsMain(session_bootstrap.session.agent.getMessages(), "process.cross.v2", "process:v2:fresh");
+    const v1_capture_after_reload_prompt = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture, allocator, .unlimited);
+    defer allocator.free(v1_capture_after_reload_prompt);
+    try std.testing.expectEqualSlices(u8, v1_capture_after_reload, v1_capture_after_reload_prompt);
+    try expectFileContains(allocator, process_v2_capture, "\"type\":\"extension_event\"");
+    try expectFileContains(allocator, process_v2_capture, "verify reload replaced registry");
+
+    for (session_bootstrap.built_tools.extension_hosts) |host| {
+        try host.shutdown();
+        try std.testing.expect(host.hasShutdownComplete());
+    }
+    const capture_after_shutdown = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_capture, allocator, .unlimited);
+    defer allocator.free(capture_after_shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, capture_after_shutdown, "\"type\":\"shutdown\"") != null);
+    const v2_capture_after_shutdown = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_v2_capture, allocator, .unlimited);
+    defer allocator.free(v2_capture_after_shutdown);
+    try std.testing.expect(std.mem.indexOf(u8, v2_capture_after_shutdown, "\"type\":\"shutdown\"") != null);
+
+    var shutdown_event = try jsonObjectWithString(allocator, "type", "input");
+    defer tools_common.deinitJsonValue(allocator, shutdown_event);
+    try shutdown_event.object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "post-shutdown stale hook attempt") });
+    var rejected_shutdown_hooks: usize = 0;
+    for (session_bootstrap.built_tools.extension_hosts) |host| {
+        if (!host.hasRegisteredHook("input")) continue;
+        const maybe_result = host.invokeExtensionEvent(allocator, "input", shutdown_event, 50) catch |err| switch (err) {
+            error.ExtensionHostClosed => {
+                rejected_shutdown_hooks += 1;
+                continue;
+            },
+            else => return err,
+        };
+        if (maybe_result) |result| {
+            tools_common.deinitJsonValue(allocator, result);
+            return error.ExpectedShutdownHookRejected;
+        }
+        rejected_shutdown_hooks += 1;
+    }
+    try std.testing.expect(rejected_shutdown_hooks > 0);
+    const v2_capture_after_shutdown_attempt = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, process_v2_capture, allocator, .unlimited);
+    defer allocator.free(v2_capture_after_shutdown_attempt);
+    try std.testing.expectEqualSlices(u8, v2_capture_after_shutdown, v2_capture_after_shutdown_attempt);
+}
+
+const LifecyclePackageFixture = struct {
+    root: []const u8,
+    source: []const u8,
+    script_rel: []const u8,
+    script_abs: []const u8,
+    manifest: []const u8,
+    initial_script: []const u8,
+    manifest_id: []const u8,
+    runtime_kind: coding_agent.extension_manifest.RuntimeKind,
+    tool_name: ?[]const u8 = null,
+    hook_event: ?[]const u8 = null,
+    workflow_id: ?[]const u8 = null,
+};
+
+fn readSettingsPackageSources(allocator: std.mem.Allocator, settings_text: []const u8) ![][]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, settings_text, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    const packages = parsed.value.object.get("packages") orelse return error.ExpectedSettingsPackages;
+    try std.testing.expect(packages == .array);
+
+    var sources = std.ArrayList([]u8).empty;
+    errdefer freeOwnedStringSlice(allocator, sources.items);
+    for (packages.array.items) |entry| {
+        switch (entry) {
+            .string => |source| try sources.append(allocator, try allocator.dupe(u8, source)),
+            .object => |object| {
+                const source_value = object.get("source") orelse return error.ExpectedSettingsPackageSource;
+                try std.testing.expect(source_value == .string);
+                try sources.append(allocator, try allocator.dupe(u8, source_value.string));
+            },
+            else => return error.ExpectedSettingsPackageSource,
+        }
+    }
+    return try sources.toOwnedSlice(allocator);
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, values: []const []u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
+}
+
+fn expectInstalledPackageSources(actual: []const []u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (actual, expected) |actual_source, expected_source| {
+        try std.testing.expectEqualStrings(expected_source, actual_source);
+    }
+}
+
+fn settingsWithInstalledPackagePolicies(
+    allocator: std.mem.Allocator,
+    installed_settings_text: []const u8,
+    policy_keys: [4][]const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, installed_settings_text, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    var root = try tools_common.cloneJsonValue(allocator, parsed.value);
+    defer tools_common.deinitJsonValue(allocator, root);
+    try std.testing.expect(root == .object);
+
+    var policies = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = policies });
+    for (policy_keys, 0..) |policy_key, index| {
+        _ = index;
+        var policy = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        errdefer tools_common.deinitJsonValue(allocator, .{ .object = policy });
+        try policy.put(allocator, try allocator.dupe(u8, "approved"), .{ .bool = true });
+        var grants = std.json.Array.init(allocator);
+        errdefer tools_common.deinitJsonValue(allocator, .{ .array = grants });
+        try grants.append(.{ .string = try allocator.dupe(u8, "tool.use") });
+        try policy.put(allocator, try allocator.dupe(u8, "approvedGrants"), .{ .array = grants });
+        var limits = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        errdefer tools_common.deinitJsonValue(allocator, .{ .object = limits });
+        try limits.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = 500 });
+        try policy.put(allocator, try allocator.dupe(u8, "resourceLimits"), .{ .object = limits });
+        try policies.put(allocator, try allocator.dupe(u8, policy_key), .{ .object = policy });
+    }
+    if (root.object.getPtr("extensionPolicies")) |existing| {
+        tools_common.deinitJsonValue(allocator, existing.*);
+        existing.* = .{ .object = policies };
+    } else {
+        try root.object.put(allocator, try allocator.dupe(u8, "extensionPolicies"), .{ .object = policies });
+    }
+    return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
+}
+
+fn writeJsonStringValue(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
+    defer allocator.free(encoded);
+    try writer.writeAll(encoded);
+}
+
+fn expectPackageConfigSources(packages: ?[]const resources_mod.PackageSourceConfig, installed_sources: []const []u8) !void {
+    const package_config = packages orelse return error.ExpectedSettingsPackages;
+    try std.testing.expectEqual(installed_sources.len, package_config.len);
+    for (package_config, installed_sources) |package_source, installed_source| {
+        try std.testing.expectEqualStrings(installed_source, package_source.source);
+    }
+}
+
+fn expectLoadedExtensionsMatchInstalledPackages(
+    allocator: std.mem.Allocator,
+    extensions: []const resources_mod.LoadedExtension,
+    fixtures: []const LifecyclePackageFixture,
+    installed_sources: []const []u8,
+) !void {
+    try std.testing.expectEqual(fixtures.len, installed_sources.len);
+    for (fixtures, installed_sources) |fixture, installed_source| {
+        const extension = loadedExtensionForSource(extensions, installed_source) orelse return error.ExpectedLoadedPackageExtension;
+        try std.testing.expectEqualStrings(fixture.script_abs, extension.path);
+        try std.testing.expectEqualStrings("package", @tagName(extension.source_info.origin));
+        try std.testing.expectEqualStrings("project", @tagName(extension.source_info.scope));
+        try std.testing.expectEqualStrings(installed_source, extension.source_info.source);
+        try std.testing.expect(extension.source_info.base_dir != null);
+        try std.testing.expectEqualStrings(fixture.root, extension.source_info.base_dir.?);
+        try expectLoadedExtensionManifestMetadata(allocator, extension.*, fixture);
+    }
+}
+
+fn loadedExtensionForSource(
+    extensions: []const resources_mod.LoadedExtension,
+    source: []const u8,
+) ?*const resources_mod.LoadedExtension {
+    for (extensions) |*extension| {
+        if (std.mem.eql(u8, extension.source_info.source, source)) return extension;
+    }
+    return null;
+}
+
+fn expectLoadedExtensionManifestMetadata(
+    allocator: std.mem.Allocator,
+    extension: resources_mod.LoadedExtension,
+    fixture: LifecyclePackageFixture,
+) !void {
+    const package_root = extension.source_info.base_dir orelse return error.ExpectedLoadedPackageExtension;
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, "pi-extension.json" });
+    defer allocator.free(manifest_path);
+    const manifest_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, manifest_path, allocator, .limited(256 * 1024));
+    defer allocator.free(manifest_text);
+    var sources = [_]coding_agent.extension_manifest.ManifestSource{.{
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .manifest_text = manifest_text,
+        .source_scope = "project-installed-settings",
+        .precedence_rank = 0,
+    }};
+    var manifest_set = try coding_agent.extension_manifest.resolveManifestSources(allocator, sources[0..]);
+    defer manifest_set.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest_set.records.len);
+    try std.testing.expectEqualStrings(fixture.manifest_id, manifest_set.records[0].manifest.id);
+    try std.testing.expectEqual(fixture.runtime_kind, manifest_set.records[0].manifest.runtime_kind);
+}
+
+fn expectRegistrySnapshotsMatchLoadedPackages(
+    allocator: std.mem.Allocator,
+    hosts: []const coding_agent.extension_runtime.RuntimeAdapter,
+    extensions: []const resources_mod.LoadedExtension,
+    fixtures: []const LifecyclePackageFixture,
+    installed_sources: []const []u8,
+) !void {
+    for (fixtures, installed_sources) |fixture, installed_source| {
+        const extension = loadedExtensionForSource(extensions, installed_source) orelse return error.ExpectedLoadedPackageExtension;
+        var found = false;
+        for (hosts) |host| {
+            const snapshot = try host.snapshotRegistryJson(allocator);
+            defer allocator.free(snapshot);
+            if (std.mem.indexOf(u8, snapshot, extension.path) == null) continue;
+            if (fixture.tool_name) |tool_name| try std.testing.expect(std.mem.indexOf(u8, snapshot, tool_name) != null);
+            if (fixture.hook_event) |hook_event| try std.testing.expect(std.mem.indexOf(u8, snapshot, hook_event) != null);
+            if (fixture.workflow_id) |workflow_id| try std.testing.expect(std.mem.indexOf(u8, snapshot, workflow_id) != null);
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+fn expectInstallLockSettingsMetadataMatchesLoadedRegistry(
+    allocator: std.mem.Allocator,
+    project_dir: []const u8,
+    extensions: []const resources_mod.LoadedExtension,
+    startup_manifest_registry_snapshot: []const u8,
+    fixtures: []const LifecyclePackageFixture,
+    installed_sources: []const []u8,
+) !void {
+    const settings_path = try std.fs.path.join(allocator, &.{ project_dir, ".pi/settings.json" });
+    defer allocator.free(settings_path);
+    const settings_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .unlimited);
+    defer allocator.free(settings_text);
+    var settings = try std.json.parseFromSlice(std.json.Value, allocator, settings_text, .{});
+    defer settings.deinit();
+
+    const lock_path = try std.fs.path.join(allocator, &.{ project_dir, ".pi/extensions.lock.json" });
+    defer allocator.free(lock_path);
+    const lock_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, lock_path, allocator, .unlimited);
+    defer allocator.free(lock_text);
+    var lock = try std.json.parseFromSlice(std.json.Value, allocator, lock_text, .{});
+    defer lock.deinit();
+
+    var startup_snapshot = try std.json.parseFromSlice(std.json.Value, allocator, startup_manifest_registry_snapshot, .{});
+    defer startup_snapshot.deinit();
+    const startup_packages = jsonArrayField(startup_snapshot.value, "packages");
+    try std.testing.expect(startup_packages.len == fixtures.len);
+
+    for (fixtures, installed_sources) |fixture, installed_source| {
+        const extension = loadedExtensionForSource(extensions, installed_source) orelse return error.ExpectedLoadedPackageExtension;
+        const provenance = extension.source_info.provenance orelse return error.ExpectedLoadedPackageProvenance;
+        const settings_entry = settingsPackageEntry(settings.value, installed_source) orelse return error.ExpectedSettingsPackageSource;
+        const install_metadata = jsonObjectField(settings_entry, "installMetadata") orelse return error.ExpectedInstallMetadata;
+        try expectJsonStringFieldValue(install_metadata, "key", provenance.lock_entry_key);
+        try expectJsonStringFieldValue(install_metadata, "packageRoot", provenance.package_root);
+
+        const lock_entry = lockEntryForKey(lock.value, provenance.lock_entry_key) orelse return error.ExpectedProvenanceLockEntry;
+        try expectJsonStringFieldValue(lock_entry, "key", provenance.lock_entry_key);
+        try expectJsonStringFieldValue(lock_entry, "packageRoot", provenance.package_root);
+        const source = jsonObjectField(lock_entry, "source") orelse return error.ExpectedProvenanceSource;
+        try expectJsonStringFieldValue(source, "identity", provenance.source_identity);
+        const digests = jsonObjectField(lock_entry, "digests") orelse return error.ExpectedProvenanceDigests;
+        try expectJsonStringFieldValue(digests, "packageRootSha256", provenance.package_root_sha256);
+        const install_digests = jsonObjectField(install_metadata, "digests") orelse return error.ExpectedProvenanceDigests;
+        try expectJsonFieldEqual(allocator, install_digests, digests, "packageRootSha256");
+        try expectJsonFieldEqual(allocator, install_digests, digests, "manifestSha256");
+
+        const manifest = jsonObjectField(lock_entry, "manifest") orelse return error.ExpectedManifestMetadata;
+        try expectJsonStringFieldValue(manifest, "id", fixture.manifest_id);
+        try expectJsonStringFieldValue(manifest, "runtime", fixture.runtime_kind.jsonName());
+        const loaded_package = packageSnapshotForId(startup_packages, fixture.manifest_id) orelse return error.ExpectedLoadedRegistryPackage;
+        try expectJsonFieldEqual(allocator, manifest, loaded_package, "id");
+        try expectJsonFieldEqual(allocator, manifest, loaded_package, "version");
+        try expectJsonFieldEqual(allocator, manifest, loaded_package, "schemaVersion");
+        const loaded_runtime = jsonObjectField(loaded_package, "runtime") orelse return error.ExpectedRuntimeMetadata;
+        try expectJsonStringFieldValue(loaded_runtime, "kind", fixture.runtime_kind.jsonName());
+        try expectJsonStringFieldValue(loaded_runtime, "adapter", fixture.runtime_kind.adapterName());
+
+        const lock_declarations = jsonObjectField(lock_entry, "declarations") orelse return error.ExpectedDeclarationMetadata;
+        const loaded_declarations = jsonObjectField(loaded_package, "declarations") orelse return error.ExpectedDeclarationMetadata;
+        inline for (.{ "tools", "hooks", "capabilities", "permissions", "dependencies", "workflows" }) |field| {
+            try expectJsonFieldEqual(allocator, lock_declarations, loaded_declarations, field);
+        }
+    }
+
+    const final_extension = loadedExtensionForSource(extensions, installed_sources[installed_sources.len - 1]) orelse return error.ExpectedLoadedPackageExtension;
+    const final_provenance = final_extension.source_info.provenance orelse return error.ExpectedLoadedPackageProvenance;
+    const final_lock_entry = lockEntryForKey(lock.value, final_provenance.lock_entry_key) orelse return error.ExpectedProvenanceLockEntry;
+    const install_graph = jsonObjectField(final_lock_entry, "installGraph") orelse return error.ExpectedInstallGraphMetadata;
+    const install_composition = jsonObjectField(install_graph, "composition") orelse return error.ExpectedInstallGraphMetadata;
+    const startup_composition = jsonObjectField(startup_snapshot.value, "composition") orelse return error.ExpectedInstallGraphMetadata;
+    inline for (.{ "activeNodes", "edges", "selectedProviders", "activationOrder" }) |field| {
+        try expectJsonFieldEqual(allocator, install_composition, startup_composition, field);
+    }
+}
+
+fn settingsPackageEntry(settings: std.json.Value, source: []const u8) ?std.json.Value {
+    const packages = jsonArrayField(settings, "packages");
+    for (packages) |entry| {
+        if (entry == .object) {
+            const source_value = entry.object.get("source") orelse continue;
+            if (source_value == .string and std.mem.eql(u8, source_value.string, source)) return entry;
+        }
+    }
+    return null;
+}
+
+fn lockEntryForKey(lock: std.json.Value, key: []const u8) ?std.json.Value {
+    const entries = jsonArrayField(lock, "entries");
+    for (entries) |entry| {
+        if (entry != .object) continue;
+        const value = entry.object.get("key") orelse continue;
+        if (value == .string and std.mem.eql(u8, value.string, key)) return entry;
+    }
+    return null;
+}
+
+fn packageSnapshotForId(packages: []const std.json.Value, id: []const u8) ?std.json.Value {
+    for (packages) |entry| {
+        if (entry != .object) continue;
+        const value = entry.object.get("id") orelse continue;
+        if (value == .string and std.mem.eql(u8, value.string, id)) return entry;
+    }
+    return null;
+}
+
+fn jsonArrayField(value: std.json.Value, field: []const u8) []const std.json.Value {
+    if (value != .object) return &.{};
+    const field_value = value.object.get(field) orelse return &.{};
+    if (field_value != .array) return &.{};
+    return field_value.array.items;
+}
+
+fn jsonObjectField(value: std.json.Value, field: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    const field_value = value.object.get(field) orelse return null;
+    if (field_value != .object) return null;
+    return field_value;
+}
+
+fn expectJsonStringFieldValue(value: std.json.Value, field: []const u8, expected: []const u8) !void {
+    if (value != .object) return error.ExpectedJsonObject;
+    const field_value = value.object.get(field) orelse return error.ExpectedJsonField;
+    try std.testing.expect(field_value == .string);
+    try std.testing.expectEqualStrings(expected, field_value.string);
+}
+
+fn expectJsonFieldEqual(allocator: std.mem.Allocator, left: std.json.Value, right: std.json.Value, field: []const u8) !void {
+    if (left != .object or right != .object) return error.ExpectedJsonObject;
+    const left_field = left.object.get(field) orelse return error.ExpectedJsonField;
+    const right_field = right.object.get(field) orelse return error.ExpectedJsonField;
+    const left_json = try std.json.Stringify.valueAlloc(allocator, left_field, .{});
+    defer allocator.free(left_json);
+    const right_json = try std.json.Stringify.valueAlloc(allocator, right_field, .{});
+    defer allocator.free(right_json);
+    try std.testing.expectEqualStrings(left_json, right_json);
+}
+
+fn expectFileContains(allocator: std.mem.Allocator, path: []const u8, needle: []const u8) !void {
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, needle) != null);
+}
+
+fn writeAbsoluteTestFile(path: []const u8, data: []const u8) !void {
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = path, .data = data });
+}
+
+fn packagePolicyKey(allocator: std.mem.Allocator, source: []const u8, script_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "typescript:package:project:{s}:extensions/host.py:{s}",
+        .{ source, script_path },
+    );
+}
+
+fn packageHostScript(
+    allocator: std.mem.Allocator,
+    capture_path: []const u8,
+    tool_name: []const u8,
+    runtime_label: []const u8,
+    version: []const u8,
+    register_hook: bool,
+    register_workflow: bool,
+) ![]u8 {
+    const hook_frame = if (register_hook)
+        "emit({'type':'register_hook','event':'input','hookId':'" ++ "input" ++ "','priority':0,'declarationOrder':0,'extensionPath':sys.argv[0]})\n"
+    else
+        "";
+    const workflow_frame = if (register_workflow)
+        "emit({'type':'register_workflow','id':'workflow.cross','description':'Settings backed mixed workflow','toolName':'workflow.cross','inputSchema':{'type':'object','required':['issue'],'properties':{'issue':{'type':'string'}},'additionalProperties':False},'outputSchema':{'type':'object'},'steps':[{'id':'process','kind':'side_effect','input':{'value':'workflow-process'},'selectedCapability':'process.cross','replayMode':'recorded'},{'id':'wasm','kind':'side_effect','input':{'value':'workflow-wasm'},'selectedCapability':'wasm.cross','replayMode':'recorded'},{'id':'native','kind':'side_effect','input':{'value':'workflow-native'},'selectedCapability':'native.cross','replayMode':'recorded'}],'extensionPath':sys.argv[0]})\n"
+    else
+        "";
+    return try std.fmt.allocPrint(allocator,
+        \\import json
+        \\import sys
+        \\
+        \\capture = open("{s}", "a", encoding="utf-8")
+        \\init = sys.stdin.readline()
+        \\capture.write(init)
+        \\capture.flush()
+        \\
+        \\def emit(value):
+        \\    print(json.dumps(value, separators=(",", ":")), flush=True)
+        \\
+        \\TOOL_NAME = "{s}"
+        \\RUNTIME = "{s}"
+        \\VERSION = "{s}"
+        \\emit({{'type':'ready'}})
+        \\emit({{'type':'register_tool','name':TOOL_NAME,'label':TOOL_NAME,'description':RUNTIME + ' package tool','parameters':{{'type':'object','required':['value'],'properties':{{'value':{{'type':'string'}}}},'additionalProperties':False}},'extensionPath':sys.argv[0]}})
+        \\{s}{s}
+        \\for line in sys.stdin:
+        \\    capture.write(line)
+        \\    capture.flush()
+        \\    try:
+        \\        frame = json.loads(line)
+        \\    except Exception:
+        \\        continue
+        \\    if frame.get('type') == 'shutdown':
+        \\        emit({{'type':'shutdown_complete'}})
+        \\        break
+        \\    if frame.get('type') == 'extension_event':
+        \\        event = frame.get('event') or {{}}
+        \\        text = event.get('text', '')
+        \\        emit({{'type':'extension_event_result','eventId':frame.get('eventId'),'result':{{'text':text + '|' + RUNTIME,'runtime':RUNTIME,'version':VERSION}}}})
+        \\        continue
+        \\    if frame.get('type') == 'tool_call' and frame.get('toolName') == TOOL_NAME:
+        \\        value = (frame.get('input') or {{}}).get('value', '')
+        \\        emit({{'type':'tool_result','toolCallId':frame.get('toolCallId'),'content':[{{'type':'text','text':RUNTIME + ':' + VERSION + ':' + value}}],'details':{{'runtime':RUNTIME,'version':VERSION,'toolName':TOOL_NAME}}}})
+        \\
+    , .{ capture_path, tool_name, runtime_label, version, hook_frame, workflow_frame });
+}
+
+fn makeManifestSources(
+    allocator: std.mem.Allocator,
+    fixtures: []const LifecyclePackageFixture,
+    source_scope: []const u8,
+) ![]coding_agent.extension_manifest.ManifestSource {
+    const sources = try allocator.alloc(coding_agent.extension_manifest.ManifestSource, fixtures.len);
+    errdefer allocator.free(sources);
+    for (fixtures, 0..) |fixture, index| {
+        const manifest_path = try std.fs.path.join(allocator, &.{ fixture.root, "pi-extension.json" });
+        errdefer allocator.free(manifest_path);
+        const manifest_text = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, manifest_path, allocator, .limited(256 * 1024));
+        errdefer allocator.free(manifest_text);
+        sources[index] = .{
+            .package_root = fixture.root,
+            .manifest_path = manifest_path,
+            .manifest_text = manifest_text,
+            .source_scope = source_scope,
+            .precedence_rank = @intCast(index),
+        };
+    }
+    return sources;
+}
+
+fn freeManifestSources(allocator: std.mem.Allocator, sources: []coding_agent.extension_manifest.ManifestSource) void {
+    for (sources) |source| {
+        allocator.free(@constCast(source.manifest_path));
+        allocator.free(@constCast(source.manifest_text));
+    }
+    allocator.free(sources);
+}
+
+fn jsonObjectWithString(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer object.deinit(allocator);
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    return .{ .object = object };
+}
+
+fn expectToolResultContainsMain(messages: []const agent.AgentMessage, tool_name: []const u8, expected: []const u8) !void {
+    for (messages) |message| {
+        if (message != .tool_result) continue;
+        if (!std.mem.eql(u8, message.tool_result.tool_name, tool_name)) continue;
+        for (message.tool_result.content) |block| {
+            if (block != .text) continue;
+            if (std.mem.indexOf(u8, block.text.text, expected) != null) return;
+        }
+    }
+    return error.ExpectedToolResultNotFound;
+}
+
+fn findToolByName(tools: []const agent.AgentTool, name: []const u8) ?agent.AgentTool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return tool;
+    }
+    return null;
+}
+
 test "runCli resolves provider-prefixed model without explicit provider" {
     const allocator = std.testing.allocator;
 
@@ -505,7 +1251,7 @@ test "prepareCliRuntime resolves model thinking suffix" {
     var args = try cli.parseArgs(allocator, &.{ "--model", "faux/faux-1:high" });
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, "/tmp/project", &args, .{});
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqualStrings("faux", prepared.provider_name);
@@ -1576,6 +2322,74 @@ test "runCli M11 extension registry dump emits live registry snapshot for explic
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
+test "runCli M8 extension registry dump includes rejected flag diagnostics" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_M11_EXTENSION_REGISTRY_DUMP", "1");
+    try env_map.put("PI_M11_EXTENSION_HOST_RUNTIME", "/bin/sh");
+    try env_map.put("PI_M11_EXTENSION_READY_TIMEOUT_MS", "1500");
+    try env_map.put("PI_M11_EXTENSION_DRAIN_TIMEOUT_MS", "20");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const script_body =
+        "IFS= read -r init\n" ++
+        "printf '{\"type\":\"ready\"}\\n'\n" ++
+        "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.sh", .data = script_body });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "second.ts", .data = "export default {};" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "first.sh.flags.json",
+        .data =
+        \\{ "flags": [
+        \\  { "name": "plan", "type": "boolean" },
+        \\  { "name": "model", "type": "string" }
+        \\] }
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "second.ts.flags.json",
+        .data =
+        \\{ "flags": [
+        \\  { "name": "plan", "type": "string" }
+        \\] }
+        ,
+    });
+    const first_path = try cli_test.makeTmpPath(allocator, tmp, "first.sh");
+    defer allocator.free(first_path);
+    const second_path = try cli_test.makeTmpPath(allocator, tmp, "second.ts");
+    defer allocator.free(second_path);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--extension", first_path, "--extension", second_path },
+        "/tmp",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    const out = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"extensionFlagDiagnostics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"code\":\"extension_flag.builtin_collision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"code\":\"extension_flag.owner_collision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"flag\":\"model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"flag\":\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"owner\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"source\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"reason\":\"collides with built-in option\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"reason\":\"collides with another extension flag owner\"") != null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
 test "runCli M11 extension registry dump surfaces shutdown failure without losing snapshot" {
     const allocator = std.testing.allocator;
 
@@ -1693,6 +2507,53 @@ test "runCli help with --extension lists fixture extension flags" {
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--plan") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "Enable plan mode (fixture flag)") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "--model-alias <value>") != null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli help with --extension surfaces rejected flag diagnostics" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "extension.ts", .data = "export default {};" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "extension.ts.flags.json",
+        .data =
+        \\{ "flags": [
+        \\  { "name": "model", "type": "string" },
+        \\  { "name": "approved-flag", "type": "boolean", "description": "Approved fixture flag" }
+        \\] }
+        ,
+    });
+    const ext_path = try cli_test.makeTmpPath(allocator, tmp, "extension.ts");
+    defer allocator.free(ext_path);
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--extension", ext_path, "--help" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    const help_text = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "Extension CLI Flags:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "--approved-flag") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "Extension CLI Flag Diagnostics:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "extension_flag.builtin_collision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "flag=--model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "owner=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help_text, "source=") != null);
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
@@ -2089,7 +2950,7 @@ test "prepareCliRuntime appends repeatable CLI system prompts in order" {
     });
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, .{});
     defer prepared.deinit(allocator);
 
     const first_index_opt = std.mem.indexOf(u8, prepared.system_prompt, "First appended chunk.");
@@ -2313,7 +3174,7 @@ test "prepareCliRuntime selects default model from configured api key" {
     var args = try cli.parseArgs(allocator, &.{});
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, .{});
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqualStrings("kimi", prepared.provider_name);
@@ -2342,7 +3203,7 @@ test "prepareCliRuntime selects kimi-coding from KIMI_API_KEY" {
     var args = try cli.parseArgs(allocator, &.{});
     defer args.deinit(allocator);
 
-    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, null);
+    var prepared = try prepareCliRuntime(allocator, std.testing.io, &env_map, repo_dir, &args, .{});
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqualStrings("kimi-coding", prepared.provider_name);

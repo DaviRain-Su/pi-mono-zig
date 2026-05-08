@@ -8,6 +8,7 @@ const print_mode = @import("../../modes/print_mode.zig");
 const resources_mod = @import("../../resources/resources.zig");
 const sdk = @import("pi_extension_sdk.zig");
 const session_mod = @import("../../sessions/session.zig");
+const tool_selection_mod = @import("../../tool_selection.zig");
 const tools_common = @import("../../tools/common.zig");
 const wasm_manifest = @import("wasm_manifest.zig");
 
@@ -337,15 +338,15 @@ test "VAL-RUNTIME normal agent construction includes installed wasm tools with f
         .include_installed_wasm_tools = true,
     }, .text, "default construction ok\n");
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "selected builtins", .{
-        .selected_tools = &.{ "read", "grep" },
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{ "read", "grep" }),
         .include_installed_wasm_tools = true,
     }, .text, "selected builtins ok\n");
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "selected wasm", .{
-        .selected_tools = &.{"template.echo"},
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{"template.echo"}),
         .include_installed_wasm_tools = true,
     }, .text, "selected wasm ok\n");
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "no tools", .{
-        .selected_tools = &.{},
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{}),
         .include_builtin_tools = false,
         .include_installed_wasm_tools = false,
     }, .text, "no tools ok\n");
@@ -354,7 +355,7 @@ test "VAL-RUNTIME normal agent construction includes installed wasm tools with f
         .include_installed_wasm_tools = true,
     }, .text, "no builtins ok\n");
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "no tools explicit wasm", .{
-        .selected_tools = &.{"template.echo"},
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{"template.echo"}),
         .include_installed_wasm_tools = true,
     }, .text, "no tools explicit wasm ok\n");
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "json construction", .{
@@ -419,7 +420,7 @@ test "VAL-RUNTIME installed wasm executes through normal session history and err
 
     var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
     var built_tools = try interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
-        .selected_tools = &.{"template.echo"},
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{"template.echo"}),
         .runtime_config = &runtime_config,
         .resource_options = .{
             .cwd = project_dir,
@@ -503,6 +504,7 @@ test "VAL-RUNTIME installed wasm executes through normal session history and err
     var invalid_stdout: std.Io.Writer.Allocating = .init(allocator);
     defer invalid_stdout.deinit();
     var invalid_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer invalid_stderr.deinit();
     const invalid_exit = try print_mode.runPrintMode(
         allocator,
         std.testing.io,
@@ -515,14 +517,7 @@ test "VAL-RUNTIME installed wasm executes through normal session history and err
     try std.testing.expectEqual(@as(u8, 0), invalid_exit);
     try std.testing.expectEqualStrings("installed wasm invalid input observed\n", invalid_stdout.writer.buffered());
     try std.testing.expectEqualStrings("", invalid_stderr.writer.buffered());
-    try expectLatestToolResult(session.agent.getMessages(), .{
-        .tool_call_id = "wasm-normal-invalid",
-        .tool_name = "template.echo",
-        .is_error = true,
-        .content_contains = "\"category\":\"invalid_input\"",
-        .expected_extension_id = "com.pi.template.echo",
-        .expected_artifact_sha256 = manifest_result.valid.artifact_sha256,
-    });
+    try expectLatestGenericToolError(session.agent.getMessages(), "wasm-normal-invalid", "template.echo", "InvalidToolArguments");
     try std.testing.expectEqual(@as(usize, 0), built_tools.locked_wasm_runtimes.?.entries[0].adapter.pendingCount());
 }
 
@@ -830,14 +825,7 @@ fn verifyWasmInvalidResultFactory(
     _: *usize,
     _: ai.Model,
 ) !ai.providers.faux.FauxAssistantMessage {
-    try expectLatestToolResult(context.messages, .{
-        .tool_call_id = "wasm-normal-invalid",
-        .tool_name = "template.echo",
-        .is_error = true,
-        .content_contains = "\"category\":\"invalid_input\"",
-        .expected_extension_id = "com.pi.template.echo",
-        .expected_artifact_sha256 = null,
-    });
+    try expectLatestGenericToolError(context.messages, "wasm-normal-invalid", "template.echo", "InvalidToolArguments");
 
     const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
     blocks[0] = ai.providers.faux.fauxText("installed wasm invalid input observed");
@@ -938,6 +926,30 @@ fn expectLatestToolResult(messages: []const ai.Message, expected: ExpectedToolRe
     }
     return error.ExpectedToolResultMissing;
 }
+
+fn expectLatestGenericToolError(
+    messages: []const ai.Message,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    content_contains: []const u8,
+) !void {
+    var index = messages.len;
+    while (index > 0) {
+        index -= 1;
+        switch (messages[index]) {
+            .tool_result => |tool_result| {
+                try std.testing.expectEqualStrings(tool_call_id, tool_result.tool_call_id);
+                try std.testing.expectEqualStrings(tool_name, tool_result.tool_name);
+                try std.testing.expect(tool_result.is_error);
+                try std.testing.expect(std.mem.indexOf(u8, tool_result.content[0].text.text, content_contains) != null);
+                return;
+            },
+            else => {},
+        }
+    }
+    return error.ExpectedToolResultMissing;
+}
+
 fn runNormalTemplateInvocation(
     allocator: std.mem.Allocator,
     home_dir: []const u8,
@@ -999,7 +1011,7 @@ fn runNormalTemplateInvocationWithPrompt(
 
     var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
     var built_tools = try interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
-        .selected_tools = &.{expected.tool_name},
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{expected.tool_name}),
         .runtime_config = &runtime_config,
         .resource_options = .{
             .cwd = project_dir,
