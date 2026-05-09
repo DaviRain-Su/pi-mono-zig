@@ -5,6 +5,7 @@ const auth = @import("../auth/auth.zig");
 const tui = @import("tui");
 const config_mod = @import("../config/config.zig");
 const extension_registry = @import("../extensions/extension_registry.zig");
+const extension_runtime = @import("../extensions/extension_runtime.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -2912,6 +2913,382 @@ test "extension shortcut duplicates invalid entries failures and reload isolatio
     sink.fail_matching_dispatch = false;
     try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("x") }, .{ .ctrl = true, .alt = true });
     try std.testing.expectEqual(@as(usize, 2), sink.invocation_count);
+}
+
+const CombinedShortcutIntegrationHost = struct {
+    const UiResponse = struct {
+        id: []u8,
+        payload_json: []u8,
+
+        fn deinit(self: *UiResponse, allocator: std.mem.Allocator) void {
+            allocator.free(self.id);
+            allocator.free(self.payload_json);
+            self.* = undefined;
+        }
+    };
+
+    allocator: std.mem.Allocator,
+    registry: extension_registry.Registry,
+    requests: std.ArrayList(extension_runtime.ExtensionUiRequest) = .empty,
+    responses: std.ArrayList(UiResponse) = .empty,
+    event_log: std.ArrayList([]u8) = .empty,
+    diagnostics: std.ArrayList([]u8) = .empty,
+    registry_frames_applied: usize = 0,
+    command_invocations: usize = 0,
+    shutdown_requested: bool = false,
+    approve_ui_notify: bool = true,
+
+    fn init(allocator: std.mem.Allocator) CombinedShortcutIntegrationHost {
+        return .{
+            .allocator = allocator,
+            .registry = extension_registry.Registry.init(allocator),
+        };
+    }
+
+    fn deinit(self: *CombinedShortcutIntegrationHost) void {
+        for (self.requests.items) |*request| request.deinit(self.allocator);
+        self.requests.deinit(self.allocator);
+        for (self.responses.items) |*response| response.deinit(self.allocator);
+        self.responses.deinit(self.allocator);
+        for (self.event_log.items) |entry| self.allocator.free(entry);
+        self.event_log.deinit(self.allocator);
+        for (self.diagnostics.items) |diagnostic| self.allocator.free(diagnostic);
+        self.diagnostics.deinit(self.allocator);
+        self.registry.deinit();
+        self.* = undefined;
+    }
+
+    fn adapter(self: *CombinedShortcutIntegrationHost) extension_runtime.RuntimeAdapter {
+        return .{ .ptr = self, .vtable = &vtable, .kind = .process_jsonl };
+    }
+
+    fn registerCommandShortcutAndSubscriber(
+        self: *CombinedShortcutIntegrationHost,
+        command: []const u8,
+        shortcut: []const u8,
+        extension_path: []const u8,
+    ) !void {
+        try self.registry.registerCommand(command, "Combined integration command", extension_path);
+        try self.registry.registerShortcut(shortcut, "Combined integration shortcut", command, extension_path);
+        try self.registry.registerHook("message_start", extension_path);
+        self.registry_frames_applied += 1;
+    }
+
+    fn snapshot(self: *CombinedShortcutIntegrationHost) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try extension_registry.writeRegistrySnapshotJson(self.allocator, &self.registry, &out.writer);
+        return try self.allocator.dupe(u8, out.written());
+    }
+
+    fn appendLog(self: *CombinedShortcutIntegrationHost, message: []const u8) !void {
+        try self.event_log.append(self.allocator, try self.allocator.dupe(u8, message));
+    }
+
+    fn appendDiagnostic(self: *CombinedShortcutIntegrationHost, message: []const u8) !void {
+        try self.diagnostics.append(self.allocator, try self.allocator.dupe(u8, message));
+    }
+
+    fn appendUiRequest(
+        self: *CombinedShortcutIntegrationHost,
+        id: []const u8,
+        method: []const u8,
+        response_required: bool,
+        payload_json: []const u8,
+    ) !void {
+        try self.requests.append(self.allocator, .{
+            .id = try self.allocator.dupe(u8, id),
+            .method = try self.allocator.dupe(u8, method),
+            .response_required = response_required,
+            .payload_json = try self.allocator.dupe(u8, payload_json),
+        });
+    }
+
+    fn commandNameFromFrame(self: *CombinedShortcutIntegrationHost, frame_json: []const u8) !?[]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, frame_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const frame_type = parsed.value.object.get("type") orelse return null;
+        if (frame_type != .string or !std.mem.eql(u8, frame_type.string, "command")) return null;
+        const name = parsed.value.object.get("name") orelse return null;
+        if (name != .string) return null;
+        return try self.allocator.dupe(u8, name.string);
+    }
+
+    const vtable = extension_runtime.RuntimeAdapter.VTable{
+        .wait_for_ready = waitForReady,
+        .pending_count = pendingCount,
+        .diagnostic_count = diagnosticCount,
+        .diagnostic_category_count = diagnosticCategoryCount,
+        .has_shutdown_complete = hasShutdownComplete,
+        .registry_frames_applied = registryFramesApplied,
+        .has_registered_command = hasRegisteredCommand,
+        .has_registered_hook = hasRegisteredHook,
+        .snapshot_registry_json = snapshotRegistryJson,
+        .with_registry = withRegistry,
+        .apply_cli_flag_values = applyCliFlagValues,
+        .agent_tool = agentTool,
+        .take_ui_requests = takeUiRequests,
+        .send_extension_ui_response = sendExtensionUiResponse,
+        .send_extension_event_frame = sendExtensionEventFrame,
+        .invoke_extension_event = invokeExtensionEvent,
+        .shutdown = shutdown,
+        .deinit = runtimeDeinit,
+    };
+
+    fn host(ptr: *anyopaque) *CombinedShortcutIntegrationHost {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn waitForReady(_: *anyopaque, _: u64) !void {}
+
+    fn pendingCount(ptr: *anyopaque) usize {
+        return host(ptr).requests.items.len;
+    }
+
+    fn diagnosticCount(ptr: *anyopaque) usize {
+        return host(ptr).diagnostics.items.len;
+    }
+
+    fn diagnosticCategoryCount(ptr: *anyopaque, category: extension_runtime.DiagnosticCategory) usize {
+        if (category != .host_error) return 0;
+        return host(ptr).diagnostics.items.len;
+    }
+
+    fn hasShutdownComplete(ptr: *anyopaque) bool {
+        return host(ptr).shutdown_requested;
+    }
+
+    fn registryFramesApplied(ptr: *anyopaque) usize {
+        const self = host(ptr);
+        return if (self.shutdown_requested) 0 else self.registry_frames_applied;
+    }
+
+    fn hasRegisteredCommand(ptr: *anyopaque, name: []const u8) bool {
+        const self = host(ptr);
+        return !self.shutdown_requested and self.registry.hasCommandInvocation(name);
+    }
+
+    fn hasRegisteredHook(ptr: *anyopaque, event_name: []const u8) bool {
+        const self = host(ptr);
+        return !self.shutdown_requested and self.registry.hasHook(event_name);
+    }
+
+    fn snapshotRegistryJson(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+        const self = host(ptr);
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        if (!self.shutdown_requested) {
+            try extension_registry.writeRegistrySnapshotJson(allocator, &self.registry, &out.writer);
+        } else {
+            try out.writer.writeAll("{\"commands\":[],\"shortcuts\":[],\"hooks\":[]}");
+        }
+        return try allocator.dupe(u8, out.written());
+    }
+
+    fn withRegistry(ptr: *anyopaque, context: ?*anyopaque, callback: extension_runtime.RegistryCallback) !void {
+        const self = host(ptr);
+        if (self.shutdown_requested) return;
+        try callback(context, &self.registry);
+    }
+
+    fn applyCliFlagValues(_: *anyopaque, _: []const extension_registry.ParsedCliFlag) !void {}
+
+    fn agentTool(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !?agent.AgentTool {
+        return null;
+    }
+
+    fn takeUiRequests(ptr: *anyopaque, allocator: std.mem.Allocator) ![]extension_runtime.ExtensionUiRequest {
+        const self = host(ptr);
+        const out = try allocator.alloc(extension_runtime.ExtensionUiRequest, self.requests.items.len);
+        for (self.requests.items, 0..) |request, index| {
+            out[index] = .{
+                .id = try allocator.dupe(u8, request.id),
+                .method = try allocator.dupe(u8, request.method),
+                .response_required = request.response_required,
+                .payload_json = try allocator.dupe(u8, request.payload_json),
+            };
+        }
+        for (self.requests.items) |*request| request.deinit(self.allocator);
+        self.requests.clearRetainingCapacity();
+        return out;
+    }
+
+    fn sendExtensionUiResponse(ptr: *anyopaque, id: []const u8, payload_json: []const u8) !void {
+        const self = host(ptr);
+        if (self.shutdown_requested) return;
+        try self.responses.append(self.allocator, .{
+            .id = try self.allocator.dupe(u8, id),
+            .payload_json = try self.allocator.dupe(u8, payload_json),
+        });
+    }
+
+    fn sendExtensionEventFrame(ptr: *anyopaque, frame_json: []const u8) void {
+        const self = host(ptr);
+        if (self.shutdown_requested) return;
+        const command_name = self.commandNameFromFrame(frame_json) catch {
+            self.appendDiagnostic("phase=command; category=invalid_frame; message=invalid command frame") catch {};
+            return;
+        } orelse return;
+        defer self.allocator.free(command_name);
+
+        self.command_invocations += 1;
+        if (self.registry.hasHook("message_start")) {
+            self.appendLog("message_start:delivered") catch {};
+        }
+
+        if (!self.approve_ui_notify or std.mem.eql(u8, command_name, "denied-ui")) {
+            self.appendDiagnostic("phase=command; category=denied_capability; capability=ui.notify; token=[REDACTED]; message=extension command UI request denied") catch {};
+            return;
+        }
+
+        if (std.mem.eql(u8, command_name, "ui-command")) {
+            self.appendUiRequest(
+                "shortcut-notify",
+                "notify",
+                true,
+                "{\"message\":\"Shortcut notice\",\"notifyType\":\"warning\"}",
+            ) catch {};
+            self.appendUiRequest(
+                "shortcut-status",
+                "setStatus",
+                false,
+                "{\"statusKey\":\"shortcut\",\"statusText\":\"Shortcut running\"}",
+            ) catch {};
+        }
+    }
+
+    fn invokeExtensionEvent(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        event_name: []const u8,
+        event: std.json.Value,
+        _: u64,
+    ) !?std.json.Value {
+        _ = allocator;
+        _ = event;
+        const self = host(ptr);
+        if (self.shutdown_requested or !self.registry.hasHook(event_name)) return null;
+        try self.appendLog(event_name);
+        return null;
+    }
+
+    fn shutdown(ptr: *anyopaque) !void {
+        host(ptr).shutdown_requested = true;
+    }
+
+    fn runtimeDeinit(_: *anyopaque) void {}
+};
+
+test "shortcut command integration preserves UI events policy diagnostics and isolation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+    var bridge = extension_ui_bridge.Bridge.init(allocator, std.testing.io);
+    defer bridge.queued_dialogs.deinit(allocator);
+    var host = CombinedShortcutIntegrationHost.init(allocator);
+    defer host.deinit();
+    try host.registerCommandShortcutAndSubscriber("ui-command", "ctrl+alt+u", "fixture/combined-ui.ts");
+    bridge.host = host.adapter();
+    harness.live_resources.extension_shortcut_sink = bridge.shortcutSink();
+
+    const registry_before = try host.snapshot();
+    defer allocator.free(registry_before);
+    _ = try harness.editor.handlePaste("draft");
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("u") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 1), host.command_invocations);
+    try std.testing.expectEqualStrings("draft", harness.editor.text());
+    try std.testing.expectEqualStrings("extension command dispatched", harness.state.status);
+    try std.testing.expectEqual(@as(usize, 1), host.event_log.items.len);
+    try std.testing.expectEqualStrings("message_start:delivered", host.event_log.items[0]);
+    try std.testing.expectEqual(@as(usize, 2), host.adapter().pendingCount());
+
+    var terminal: tui.Terminal = undefined;
+    try bridge.service(
+        &harness.env_map,
+        cwd,
+        &terminal,
+        &harness.editor,
+        &harness.overlay,
+        &harness.state,
+        &harness.live_resources,
+        &harness.session,
+        0,
+    );
+    try std.testing.expectEqualStrings("draft", harness.editor.text());
+    try std.testing.expectEqual(@as(usize, 1), host.responses.items.len);
+    try std.testing.expectEqualStrings("shortcut-notify", host.responses.items[0].id);
+    try std.testing.expectEqualStrings("{}", host.responses.items[0].payload_json);
+    var ui_snapshot = try harness.state.snapshotForRender(allocator);
+    defer ui_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("Shortcut running", ui_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 1), ui_snapshot.extension_footer_statuses.len);
+    try std.testing.expectEqualStrings("Shortcut running", ui_snapshot.extension_footer_statuses[0]);
+    var saw_notice = false;
+    for (ui_snapshot.items) |item| {
+        if (item.kind == rendering.ChatKind.info and std.mem.eql(u8, item.text, "Warning: Shortcut notice")) {
+            saw_notice = true;
+        }
+    }
+    try std.testing.expect(saw_notice);
+    const registry_after = try host.snapshot();
+    defer allocator.free(registry_after);
+    try std.testing.expectEqualStrings(registry_before, registry_after);
+
+    try host.adapter().shutdown();
+    try std.testing.expect(host.adapter().hasShutdownComplete());
+    host.adapter().sendExtensionEventFrame("{\"type\":\"command\",\"name\":\"ui-command\"}");
+    try std.testing.expectEqual(@as(usize, 1), host.command_invocations);
+    try std.testing.expectEqual(@as(usize, 0), host.adapter().registryFramesApplied());
+
+    var restarted = CombinedShortcutIntegrationHost.init(allocator);
+    defer restarted.deinit();
+    var restarted_bridge = extension_ui_bridge.Bridge.init(allocator, std.testing.io);
+    defer restarted_bridge.queued_dialogs.deinit(allocator);
+    restarted_bridge.host = restarted.adapter();
+    harness.live_resources.extension_shortcut_sink = restarted_bridge.shortcutSink();
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("u") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 0), restarted.command_invocations);
+    try std.testing.expectEqualStrings("draftu", harness.editor.text());
+
+    var denied_bridge = extension_ui_bridge.Bridge.init(allocator, std.testing.io);
+    defer denied_bridge.queued_dialogs.deinit(allocator);
+    var denied_host = CombinedShortcutIntegrationHost.init(allocator);
+    defer denied_host.deinit();
+    denied_host.approve_ui_notify = false;
+    try denied_host.registerCommandShortcutAndSubscriber("denied-ui", "ctrl+alt+d", "fixture/denied-ui.ts");
+    denied_bridge.host = denied_host.adapter();
+    harness.live_resources.extension_shortcut_sink = denied_bridge.shortcutSink();
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("d") }, .{ .ctrl = true, .alt = true });
+    try denied_bridge.service(
+        &harness.env_map,
+        cwd,
+        &terminal,
+        &harness.editor,
+        &harness.overlay,
+        &harness.state,
+        &harness.live_resources,
+        &harness.session,
+        0,
+    );
+    try std.testing.expectEqual(@as(usize, 1), denied_host.command_invocations);
+    try std.testing.expectEqual(@as(usize, 0), denied_host.responses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), denied_host.diagnostics.items.len);
+    try std.testing.expectEqualStrings(
+        "phase=command; category=denied_capability; capability=ui.notify; token=[REDACTED]; message=extension command UI request denied",
+        denied_host.diagnostics.items[0],
+    );
+    try std.testing.expect(std.mem.indexOf(u8, denied_host.diagnostics.items[0], "super-secret-token") == null);
 }
 
 test "configured editor keybindings drive movement and submit while old defaults stop" {
