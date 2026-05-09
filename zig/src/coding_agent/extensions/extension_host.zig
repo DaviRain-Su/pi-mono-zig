@@ -769,9 +769,12 @@ fn stderrMain(host: *HostProcess) void {
     var buffer: [4096]u8 = undefined;
     while (true) {
         const file = host.stderr_file orelse break;
-        const bytes_read = std.posix.read(file.handle, &buffer) catch |err| {
-            host.stderr_err = err;
-            break;
+        const bytes_read = file.readStreaming(host.io, &.{&buffer}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => {
+                host.stderr_err = err;
+                break;
+            },
         };
         if (bytes_read == 0) break;
         for (buffer[0..bytes_read]) |byte| {
