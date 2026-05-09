@@ -12,7 +12,11 @@ const extension_host = @import("extension_host.zig");
 const extension_manifest = @import("extension_manifest.zig");
 const extension_registry = @import("extension_registry.zig");
 const workflow_execution = @import("workflow_execution.zig");
+const native_loader = @import("native/native_loader.zig");
+const native_manifest = @import("native/native_manifest.zig");
 const native_runtime = @import("native_runtime.zig");
+const native_sdk = @import("native/pi_native_extension_sdk.zig");
+const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
 const sdk = @import("sdk.zig");
 const resources_mod = @import("../resources/resources.zig");
 const tools_common = @import("../tools/common.zig");
@@ -498,6 +502,57 @@ pub const LockedWasmRuntimeSet = struct {
     }
 };
 
+pub const NativePackageLoader = struct {
+    context: ?*anyopaque = null,
+    load: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        manifest: *const native_manifest.Manifest,
+        host_api: *const native_sdk.HostApiV0,
+    ) anyerror!native_loader.LoadResult = productionNativePackageLoad,
+};
+
+fn productionNativePackageLoad(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    manifest: *const native_manifest.Manifest,
+    host_api: *const native_sdk.HostApiV0,
+) !native_loader.LoadResult {
+    _ = context;
+    return native_loader.loadVerifiedPackage(allocator, manifest, host_api);
+}
+
+pub const LockedNativeRuntimeEntry = struct {
+    package_root: []u8,
+    manifest_path: []u8,
+    tool_name: []u8,
+    policy_lookup_key: []u8,
+    loaded: native_loader.LoadedLibrary,
+
+    fn deinit(self: *LockedNativeRuntimeEntry, allocator: std.mem.Allocator) void {
+        self.loaded.deinit(allocator);
+        allocator.free(self.package_root);
+        allocator.free(self.manifest_path);
+        allocator.free(self.tool_name);
+        allocator.free(self.policy_lookup_key);
+        self.* = undefined;
+    }
+};
+
+pub const LockedNativeRuntimeSet = struct {
+    allocator: std.mem.Allocator,
+    entries: []LockedNativeRuntimeEntry,
+    diagnostics: []resources_mod.Diagnostic,
+
+    pub fn deinit(self: *LockedNativeRuntimeSet) void {
+        for (self.entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.entries);
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(self.allocator);
+        self.allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
 pub fn startLockedWasmPackageRuntimes(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -650,6 +705,235 @@ pub fn startLockedWasmPackageRuntimes(
         .retired_entries = &.{},
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
+}
+
+pub fn startLockedNativePackageRuntimes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *const config_mod.RuntimeConfig,
+    options: resources_mod.ResolveResourcesOptions,
+) !LockedNativeRuntimeSet {
+    return startLockedNativePackageRuntimesWithLoader(allocator, io, runtime_config, options, .{});
+}
+
+pub fn startLockedNativePackageRuntimesWithLoader(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *const config_mod.RuntimeConfig,
+    options: resources_mod.ResolveResourcesOptions,
+    loader: NativePackageLoader,
+) !LockedNativeRuntimeSet {
+    var resolved = try resources_mod.resolveConfiguredLockedNativePackages(allocator, io, options);
+    defer resolved.deinit(allocator);
+
+    var diagnostics = std.ArrayList(resources_mod.Diagnostic).empty;
+    errdefer deinitResourceDiagnosticsList(allocator, &diagnostics);
+    for (resolved.diagnostics) |diagnostic| {
+        try diagnostics.append(allocator, try cloneResourceDiagnostic(allocator, diagnostic));
+    }
+
+    var entries = std.ArrayList(LockedNativeRuntimeEntry).empty;
+    errdefer deinitLockedNativeRuntimeEntryList(allocator, &entries);
+    var seen_tools = std.StringHashMap(void).init(allocator);
+    defer seen_tools.deinit();
+
+    for (resolved.packages) |package| {
+        const policy_key = try provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, package.lock_entry);
+        defer allocator.free(policy_key);
+
+        const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
+            if (try findStaleLockedNativePolicyKey(allocator, runtime_config, package.lock_entry)) |attempted_policy| {
+                defer allocator.free(attempted_policy);
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactPath={s}; artifactSha256={s}; attemptedPolicy={s}; requiredPolicy={s}; stale digest-bound native extension policy",
+                    .{
+                        package.manifest.tool_name,
+                        package.source_info.source,
+                        package.lock_entry.scope.jsonName(),
+                        package.manifest.package_root,
+                        package.manifest.package_root_sha256,
+                        package.manifest.selected_artifact_absolute_path,
+                        package.manifest.selected_artifact_sha256,
+                        attempted_policy,
+                        policy_key,
+                    },
+                );
+                defer allocator.free(message);
+                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "policy_digest_mismatch", message, package.manifest.manifest_path));
+            } else {
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactPath={s}; artifactSha256={s}; requiredPolicy={s}; missing exact digest-bound native extension policy",
+                    .{
+                        package.manifest.tool_name,
+                        package.source_info.source,
+                        package.lock_entry.scope.jsonName(),
+                        package.manifest.package_root,
+                        package.manifest.package_root_sha256,
+                        package.manifest.selected_artifact_absolute_path,
+                        package.manifest.selected_artifact_sha256,
+                        policy_key,
+                    },
+                );
+                defer allocator.free(message);
+                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
+            }
+            continue;
+        };
+        const approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
+        defer allocator.free(approved_capabilities);
+        if (wasm_manifest.denyFirstUnapprovedCapability(package.manifest.requested_capabilities, approved_capabilities, .initialize, "runtime/native-loader")) |denial| {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase={s}; category={s}; capability={s}; branch={s}; mode={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; policyDigest={s}; requiredPolicy={s}; native extension capability denied before library load",
+                .{
+                    denial.phase.jsonName(),
+                    denial.category,
+                    denial.capability.jsonName(),
+                    denial.branch.jsonName(),
+                    denial.mode,
+                    package.manifest.tool_name,
+                    package.source_info.source,
+                    package.lock_entry.scope.jsonName(),
+                    package.manifest.package_root,
+                    package.manifest.selected_artifact_absolute_path,
+                    package.manifest.package_root_sha256,
+                    package.manifest.selected_artifact_sha256,
+                    policy_key,
+                    policy_key,
+                },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, denial.category, message, package.manifest.manifest_path));
+            continue;
+        }
+
+        const seen = try seen_tools.getOrPut(package.manifest.tool_name);
+        if (seen.found_existing) {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=registration; tool={s}; packageRoot={s}; duplicate locked native tool id",
+                .{ package.manifest.tool_name, package.manifest.package_root },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_native_tool", message, package.manifest.manifest_path));
+            continue;
+        }
+
+        var host_api = native_sdk.HostApiV0{ .abi_version = native_sdk.ABI_VERSION };
+        const load_result = loader.load(loader.context, allocator, &package.manifest, &host_api) catch |err| {
+            _ = seen_tools.remove(package.manifest.tool_name);
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=load; category=native_loader_exception; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; reason={s}; native loader failed closed before tool registration",
+                .{
+                    package.manifest.id,
+                    package.manifest.tool_name,
+                    package.source_info.source,
+                    package.lock_entry.scope.jsonName(),
+                    package.manifest.package_root,
+                    package.manifest.manifest_path,
+                    package.manifest.selected_artifact_absolute_path,
+                    package.manifest.package_root_sha256,
+                    package.manifest.selected_artifact_sha256,
+                    @errorName(err),
+                },
+            );
+            defer allocator.free(message);
+            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_loader_exception", message, package.manifest.manifest_path));
+            continue;
+        };
+        switch (load_result) {
+            .invalid => |diagnostic| {
+                _ = seen_tools.remove(package.manifest.tool_name);
+                const message = try nativeLoaderDiagnosticMessage(allocator, package, policy_key, diagnostic);
+                defer allocator.free(message);
+                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, diagnostic.code, message, package.manifest.manifest_path));
+                continue;
+            },
+            .loaded => |loaded| {
+                var entry = LockedNativeRuntimeEntry{
+                    .package_root = try allocator.dupe(u8, package.manifest.package_root),
+                    .manifest_path = try allocator.dupe(u8, package.manifest.manifest_path),
+                    .tool_name = try allocator.dupe(u8, package.manifest.tool_name),
+                    .policy_lookup_key = try allocator.dupe(u8, policy_key),
+                    .loaded = loaded,
+                };
+                errdefer entry.deinit(allocator);
+                try entries.append(allocator, entry);
+            },
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .entries = try entries.toOwnedSlice(allocator),
+        .diagnostics = try diagnostics.toOwnedSlice(allocator),
+    };
+}
+
+fn nativeLoaderDiagnosticMessage(
+    allocator: std.mem.Allocator,
+    package: resources_mod.LockedNativePackage,
+    policy_key: []const u8,
+    diagnostic: native_loader.Diagnostic,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.print(
+        "phase={s}; category={s}; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; selectedArtifactPath={s}; packageRootSha256={s}; artifactSha256={s}; requiredPolicy={s}; native loader failed closed before tool registration",
+        .{
+            diagnostic.phase,
+            diagnostic.code,
+            package.manifest.id,
+            package.manifest.tool_name,
+            package.source_info.source,
+            package.lock_entry.scope.jsonName(),
+            package.manifest.package_root,
+            package.manifest.manifest_path,
+            diagnostic.artifact_path,
+            package.manifest.selected_artifact_absolute_path,
+            package.manifest.package_root_sha256,
+            package.manifest.selected_artifact_sha256,
+            policy_key,
+        },
+    );
+    if (diagnostic.cause) |cause| try out.writer.print("; cause={s}", .{cause});
+    if (diagnostic.symbol) |symbol| try out.writer.print("; symbol={s}", .{symbol});
+    if (diagnostic.expected) |expected| try out.writer.print("; expected={s}", .{expected});
+    if (diagnostic.actual) |actual| try out.writer.print("; actual={s}", .{actual});
+    try out.writer.print("; message={s}", .{diagnostic.message});
+    return out.toOwnedSlice();
+}
+
+fn findStaleLockedNativePolicyKey(
+    allocator: std.mem.Allocator,
+    runtime_config: *const config_mod.RuntimeConfig,
+    entry: provenance_lockfile.LockEntry,
+) !?[]u8 {
+    var policies = runtime_config.settings.extension_policies orelse return null;
+    const schema_version = entry.manifest_schema_version orelse native_manifest.SCHEMA_VERSION;
+    const extension_id = entry.manifest_id orelse "";
+    const extension_version = entry.manifest_version orelse "";
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "native:locked:{s}:{s}:{s}:{s}:{s}:",
+        .{ entry.scope.jsonName(), entry.source_identity, schema_version, extension_id, extension_version },
+    );
+    defer allocator.free(prefix);
+    var iterator = policies.iterator();
+    while (iterator.next()) |policy_entry| {
+        if (std.mem.startsWith(u8, policy_entry.key_ptr.*, prefix)) {
+            return try allocator.dupe(u8, policy_entry.key_ptr.*);
+        }
+    }
+    return null;
+}
+
+fn deinitLockedNativeRuntimeEntryList(allocator: std.mem.Allocator, entries: *std.ArrayList(LockedNativeRuntimeEntry)) void {
+    for (entries.items) |*entry| entry.deinit(allocator);
+    entries.deinit(allocator);
 }
 
 fn findStaleLockedWasmPolicyKey(
@@ -2792,6 +3076,111 @@ fn absoluteTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []c
     return try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", sub_path, name });
 }
 
+fn nativeDynamicArtifactName() []const u8 {
+    return switch (@import("builtin").os.tag) {
+        .macos => "plugin.dylib",
+        .windows => "plugin.dll",
+        else => "plugin.so",
+    };
+}
+
+fn nativeDynamicHostOs() []const u8 {
+    return switch (@import("builtin").os.tag) {
+        .macos => "macos",
+        .windows => "windows",
+        else => "linux",
+    };
+}
+
+fn nativeDynamicHostArch() []const u8 {
+    return switch (@import("builtin").cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => @tagName(@import("builtin").cpu.arch),
+    };
+}
+
+const CountingNativeLoader = struct {
+    calls: usize = 0,
+    opened_path: ?[]u8 = null,
+
+    fn deinit(self: *CountingNativeLoader, allocator: std.mem.Allocator) void {
+        if (self.opened_path) |path| allocator.free(path);
+        self.* = .{};
+    }
+};
+
+fn countingNativeLoader(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    manifest: *const native_manifest.Manifest,
+    host_api: *const native_sdk.HostApiV0,
+) !native_loader.LoadResult {
+    _ = host_api;
+    const state: *CountingNativeLoader = @ptrCast(@alignCast(context.?));
+    state.calls += 1;
+    if (state.opened_path) |path| allocator.free(path);
+    state.opened_path = try allocator.dupe(u8, manifest.selected_artifact_absolute_path);
+    return .{ .invalid = .{
+        .phase = "load",
+        .code = "native_fixture_loader_failure",
+        .message = "test loader rejected selected artifact",
+        .artifact_path = manifest.selected_artifact_absolute_path,
+        .cause = "injected",
+    } };
+}
+
+fn writeNativeDynamicRuntimePackage(
+    allocator: std.mem.Allocator,
+    tmp: anytype,
+    package_dir: []const u8,
+    id: []const u8,
+    name: []const u8,
+    tool_name: []const u8,
+    permissions_json: []const u8,
+) ![]u8 {
+    const native_dir = try std.fs.path.join(allocator, &.{ package_dir, "native" });
+    defer allocator.free(native_dir);
+    try tmp.dir.createDirPath(std.testing.io, native_dir);
+    const artifact_sub_path = try std.fs.path.join(allocator, &.{ package_dir, "native", nativeDynamicArtifactName() });
+    defer allocator.free(artifact_sub_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_sub_path, .data = "native-loader-test-bytes" });
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_dir, "pi-extension.json" });
+    defer allocator.free(manifest_path);
+    const manifest_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "{s}",
+        \\  "name": "{s}",
+        \\  "version": "0.1.0",
+        \\  "description": "Native loader fixture.",
+        \\  "runtime": {{ "kind": "native", "entrypoint": {{ "descriptor": "native://dynamic/{s}" }} }},
+        \\  "artifacts": [{{ "kind": "native-dynamic", "os": "{s}", "arch": "{s}", "path": "native/{s}" }}],
+        \\  "tools": [{{ "name": "{s}", "description": "Native loader fixture.", "inputSchema": {{}}, "outputSchema": {{}} }}],
+        \\  "capabilities": {{ "exports": [{{ "id": "{s}", "kind": "tool" }}], "imports": [] }},
+        \\  "permissions": [{s}]
+        \\}}
+    , .{ id, name, id, nativeDynamicHostOs(), nativeDynamicHostArch(), nativeDynamicArtifactName(), tool_name, tool_name, permissions_json });
+    defer allocator.free(manifest_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest_json });
+    return absoluteTmpPath(allocator, &tmp.sub_path, package_dir);
+}
+
+fn nativePolicyForLockedPackage(
+    allocator: std.mem.Allocator,
+    package_root: []const u8,
+    scope: provenance_lockfile.Scope,
+    lock_path: []const u8,
+) ![]u8 {
+    var manifest_result = try native_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    var lock_entry = try provenance_lockfile.createNativeLockEntry(allocator, scope, manifest_result.valid.package_root, &manifest_result.valid);
+    defer lock_entry.deinit(allocator);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, scope, lock_path, lock_entry);
+    return provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, lock_entry);
+}
+
 fn freeUiRequests(allocator: std.mem.Allocator, requests: []ExtensionUiRequest) void {
     for (requests) |*request| request.deinit(allocator);
     allocator.free(requests);
@@ -3316,6 +3705,171 @@ test "native runtime factory starts static module and remote stays unsupported" 
 
     try std.testing.expectEqualStrings("remote", RuntimeKind.remote.jsonName());
     try std.testing.expectError(error.UnsupportedRuntime, startRuntimeAdapter(allocator, std.testing.io, .{ .remote = .{} }));
+}
+
+test "native dynamic loader requires exact policy before opening selected artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/no-policy");
+
+    const package_root = try writeNativeDynamicRuntimePackage(allocator, tmp, "project/no-policy", "com.example.native.no-policy", "Native No Policy", "native.noPolicy", "");
+    defer allocator.free(package_root);
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    const policy_key = try nativePolicyForLockedPackage(allocator, package_root, .user, lock_path);
+    defer allocator.free(policy_key);
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = "{\"extensionPolicies\":{}}" });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, package_root) };
+    defer package_config.deinit(allocator);
+    var loader_state = CountingNativeLoader{};
+    defer loader_state.deinit(allocator);
+    var set = try startLockedNativePackageRuntimesWithLoader(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+    }, .{
+        .context = &loader_state,
+        .load = countingNativeLoader,
+    });
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), set.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
+    try std.testing.expectEqualStrings("missing_policy", set.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, policy_key) != null);
+}
+
+test "native dynamic loader opens only locked selected artifact and fails closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/locked");
+    try tmp.dir.createDirPath(std.testing.io, "project/decoy/native");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/decoy/native/plugin.dylib", .data = "decoy" });
+
+    const package_root = try writeNativeDynamicRuntimePackage(allocator, tmp, "project/locked", "com.example.native.locked", "Native Locked", "native.locked", "");
+    defer allocator.free(package_root);
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    const policy_key = try nativePolicyForLockedPackage(allocator, package_root, .user, lock_path);
+    defer allocator.free(policy_key);
+    const settings_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"extensionPolicies\":{{\"{s}\":{{\"approvedGrants\":[]}}}}}}",
+        .{policy_key},
+    );
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, package_root) };
+    defer package_config.deinit(allocator);
+    var loader_state = CountingNativeLoader{};
+    defer loader_state.deinit(allocator);
+    var set = try startLockedNativePackageRuntimesWithLoader(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+    }, .{
+        .context = &loader_state,
+        .load = countingNativeLoader,
+    });
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loader_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), set.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
+    try std.testing.expectEqualStrings("native_fixture_loader_failure", set.diagnostics[0].kind);
+    try std.testing.expect(loader_state.opened_path != null);
+    try std.testing.expect(std.mem.indexOf(u8, loader_state.opened_path.?, package_root) != null);
+    try std.testing.expect(std.mem.indexOf(u8, loader_state.opened_path.?, "project/decoy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, "failed closed before tool registration") != null);
+}
+
+test "native dynamic loader denies capabilities before opening library" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/capability-denied");
+
+    const package_root = try writeNativeDynamicRuntimePackage(allocator, tmp, "project/capability-denied", "com.example.native.capability", "Native Capability", "native.capability", "{\"id\":\"file.read\"}");
+    defer allocator.free(package_root);
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    const policy_key = try nativePolicyForLockedPackage(allocator, package_root, .user, lock_path);
+    defer allocator.free(policy_key);
+    const settings_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"extensionPolicies\":{{\"{s}\":{{\"approvedGrants\":[]}}}}}}",
+        .{policy_key},
+    );
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, package_root) };
+    defer package_config.deinit(allocator);
+    var loader_state = CountingNativeLoader{};
+    defer loader_state.deinit(allocator);
+    var set = try startLockedNativePackageRuntimesWithLoader(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+    }, .{
+        .context = &loader_state,
+        .load = countingNativeLoader,
+    });
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), loader_state.calls);
+    try std.testing.expectEqual(@as(usize, 0), set.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
+    try std.testing.expectEqualStrings("denied_capability", set.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, "before library load") != null);
 }
 
 test "native descriptor template executes pure tool and recovers after invalid input" {
@@ -4115,7 +4669,6 @@ test "locked wasm runtime set omits missing policy, capability-denied, and abi i
     const invalid_abi_root = try absoluteTmpPath(allocator, &tmp.sub_path, "project/invalid-abi-token=pi-secret");
     defer allocator.free(invalid_abi_root);
 
-    const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
     const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
     defer allocator.free(lock_path);
 

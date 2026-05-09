@@ -817,6 +817,12 @@ fn makePackageRoot(allocator: std.mem.Allocator, tmp: anytype) ![]u8 {
     return std.fs.path.resolve(allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "package" });
 }
 
+fn makeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relative_path: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, relative_path });
+}
+
 test "native dynamic manifest accepts host artifact selector and normalizes aliases" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -906,6 +912,35 @@ test "native dynamic manifest rejects malformed artifacts and unsupported select
     defer duplicate_result.deinit(allocator);
     try std.testing.expect(duplicate_result == .invalid);
     try std.testing.expect(std.mem.indexOf(u8, duplicate_result.invalid[0].message, "duplicate OS/arch artifact selector") != null);
+}
+
+test "native dynamic manifest rejects symlink-resolved artifact escapes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "package/native");
+    const artifact_name = try std.fmt.allocPrint(allocator, "native/escape{s}", .{nativeLibrarySuffix()});
+    defer allocator.free(artifact_name);
+    const outside_name = try std.fmt.allocPrint(allocator, "outside{s}", .{nativeLibrarySuffix()});
+    defer allocator.free(outside_name);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = outside_name, .data = "native-bytes" });
+    const outside_path = try makeAbsoluteTestPath(allocator, tmp, outside_name);
+    defer allocator.free(outside_path);
+    const symlink_rel = try std.fmt.allocPrint(allocator, "package/native/escape{s}", .{nativeLibrarySuffix()});
+    defer allocator.free(symlink_rel);
+    const symlink_path = try makeAbsoluteTestPath(allocator, tmp, symlink_rel);
+    defer allocator.free(symlink_path);
+    try std.Io.Dir.symLinkAbsolute(std.testing.io, outside_path, symlink_path, .{});
+    const package_root = try makePackageRoot(allocator, tmp);
+    defer allocator.free(package_root);
+    const manifest = try makeValidNativeManifest(allocator, package_root, hostOs(), hostArch(), artifact_name);
+    defer allocator.free(manifest);
+
+    var result = try validateManifestText(allocator, package_root, manifest);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .invalid);
+    try std.testing.expectEqualStrings("$.artifacts[0].path", result.invalid[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, result.invalid[0].message, "resolves outside package root") != null);
 }
 
 test "native dynamic manifest rejects invalid resource limits and capability shapes" {
