@@ -86,24 +86,28 @@ pub fn nativePolicyLookupKey(allocator: std.mem.Allocator, descriptor: anytype) 
 }
 
 pub fn processJsonlPolicyLookupKey(allocator: std.mem.Allocator, options: anytype) ![]u8 {
+    const argv: []const []const u8 = options.argv;
+    const extension_path: ?[]const u8 = options.extension_path;
+    const cwd: ?[]const u8 = options.cwd;
+
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     try out.writer.writeAll("process_jsonl:{\"argv\":[");
-    for (options.argv, 0..) |arg, index| {
+    for (argv, 0..) |arg, index| {
         if (index > 0) try out.writer.writeAll(",");
         const normalized = try toPolicyPathAlloc(allocator, arg);
         defer allocator.free(normalized);
         try writeJsonString(&out.writer, normalized);
     }
     try out.writer.writeAll("]");
-    if (options.extension_path) |extension_path| {
-        const normalized = try toPolicyPathAlloc(allocator, extension_path);
+    if (extension_path) |path| {
+        const normalized = try toPolicyPathAlloc(allocator, path);
         defer allocator.free(normalized);
         try out.writer.writeAll(",\"extensionPath\":");
         try writeJsonString(&out.writer, normalized);
     }
-    if (options.cwd) |cwd| {
-        const resolved = try std.fs.path.resolve(allocator, &.{cwd});
+    if (cwd) |path| {
+        const resolved = try std.fs.path.resolve(allocator, &.{path});
         defer allocator.free(resolved);
         const normalized = try toPolicyPathAlloc(allocator, resolved);
         defer allocator.free(normalized);
