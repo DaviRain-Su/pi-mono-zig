@@ -17,6 +17,7 @@ pub const Action = enum(u8) {
     editor_external,
     message_followUp,
     message_dequeue,
+    chat_scrollToBottom,
     clipboard_pasteImage,
     session_new,
     session_tree,
@@ -96,6 +97,7 @@ pub const KeySpec = union(enum) {
     alt_right,
     ctrl_left,
     ctrl_right,
+    ctrl_end,
     ctrl_backspace,
     shift_char: u8,
     shift_ctrl_char: u8,
@@ -143,6 +145,7 @@ pub const KeySpec = union(enum) {
             .alt_right => key == .right and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
             .ctrl_left => key == .ctrl_left and !modifiers.hasAny(),
             .ctrl_right => key == .ctrl_right and !modifiers.hasAny(),
+            .ctrl_end => key == .ctrl_end and !modifiers.hasAny(),
             .ctrl_backspace => key == .backspace and modifiers.ctrl and !modifiers.shift and !modifiers.alt and !modifiers.super,
             .shift_char => |letter| blk: {
                 break :blk switch (key) {
@@ -200,6 +203,7 @@ pub const KeySpec = union(enum) {
             .alt_right => std.fmt.allocPrint(allocator, "{s}+Right", .{altModifierDisplayName(os_tag)}),
             .ctrl_left => allocator.dupe(u8, "Ctrl+Left"),
             .ctrl_right => allocator.dupe(u8, "Ctrl+Right"),
+            .ctrl_end => allocator.dupe(u8, "Ctrl+End"),
             .ctrl_backspace => allocator.dupe(u8, "Ctrl+Backspace"),
             .shift_char => |letter| std.fmt.allocPrint(allocator, "Shift+{c}", .{std.ascii.toUpper(letter)}),
             .shift_ctrl_char => |letter| std.fmt.allocPrint(allocator, "Shift+Ctrl+{c}", .{std.ascii.toUpper(letter)}),
@@ -244,6 +248,7 @@ const DEFINITIONS = [_]BindingDefinition{
     .{ .action = .editor_external, .id = "app.editor.external", .defaults = &.{"ctrl+g"} },
     .{ .action = .message_followUp, .id = "app.message.followUp", .defaults = &.{"alt+enter"} },
     .{ .action = .message_dequeue, .id = "app.message.dequeue", .defaults = &.{"alt+up"} },
+    .{ .action = .chat_scrollToBottom, .id = "app.chat.scrollToBottom", .defaults = &.{"ctrl+end"} },
     .{ .action = .clipboard_pasteImage, .id = "app.clipboard.pasteImage", .defaults = &.{"ctrl+v"} },
     .{ .action = .session_new, .id = "app.session.new", .defaults = &.{} },
     .{ .action = .session_tree, .id = "app.session.tree", .defaults = &.{} },
@@ -274,7 +279,7 @@ const DEFINITIONS = [_]BindingDefinition{
 };
 
 comptime {
-    std.debug.assert(DEFINITIONS.len == 41);
+    std.debug.assert(DEFINITIONS.len == 42);
     std.debug.assert(DEFINITIONS.len == @typeInfo(Action).@"enum".fields.len);
 }
 
@@ -616,6 +621,7 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
     if (std.mem.eql(u8, normalized, "alt+right")) return .alt_right;
     if (std.mem.eql(u8, normalized, "ctrl+left")) return .ctrl_left;
     if (std.mem.eql(u8, normalized, "ctrl+right")) return .ctrl_right;
+    if (std.mem.eql(u8, normalized, "ctrl+end")) return .ctrl_end;
     if (std.mem.eql(u8, normalized, "ctrl+backspace")) return .ctrl_backspace;
     if (std.mem.eql(u8, normalized, "up")) return .up;
     if (std.mem.eql(u8, normalized, "down")) return .down;

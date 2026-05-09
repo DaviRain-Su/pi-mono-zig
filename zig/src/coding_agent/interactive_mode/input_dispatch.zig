@@ -1200,6 +1200,11 @@ pub fn dispatchInputEvent(
                 context.app_state.handleChatMouseWheel(wheel);
             }
         },
+        .mouse_click => |click| {
+            if (context.overlay.* == null and context.auth_flow.* == null) {
+                context.app_state.handleMouseClick(click);
+            }
+        },
     }
     consumeInputBytes(input_buffer, parsed.consumed);
 }
@@ -1287,6 +1292,7 @@ fn dispatchMainEditorShortcut(
             context.app_state,
             context.editor,
         ),
+        .chat_scrollToBottom => context.app_state.chatScrollToBottom(),
         else => return false,
     }
 
@@ -2078,6 +2084,7 @@ pub fn handleAppAction(
         // Clipboard image paste is handled before the app dispatcher because it
         // depends only on environment/clipboard state, not session execution state.
         .clipboard_pasteImage => {},
+        .chat_scrollToBottom => app_state.chatScrollToBottom(),
         // Overlay-scoped actions are resolved and executed only by their overlay
         // dispatchers. Listing each action here makes new Action variants require
         // deliberate main-editor dispatch coverage at compile time.

@@ -169,6 +169,7 @@ pub const AppState = struct {
     chat_visible_rows: usize = 0,
     chat_width: usize = 1,
     chat_region: ChatRegion = .{},
+    scroll_indicator_row: ?usize = null,
     all_expanded: bool = false,
     last_streaming_assistant_index: ?usize = null,
     last_streaming_thinking_index: ?usize = null,
@@ -528,6 +529,22 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.chat_scroll_offset = self.chat_scroll_offset -| self.chatScrollPageSizeLocked();
+    }
+
+    pub fn chatScrollToBottom(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = 0;
+    }
+
+    pub fn handleMouseClick(self: *AppState, click: tui.keys.MouseClickInput) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.scroll_indicator_row) |indicator_row| {
+            if (click.row == @as(i16, @intCast(indicator_row))) {
+                self.chat_scroll_offset = 0;
+            }
+        }
     }
 
     fn chatScrollPageSizeLocked(self: *const AppState) usize {
@@ -2131,7 +2148,8 @@ pub const ScreenComponent = struct {
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
-        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height;
+        const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
+        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height + scroll_indicator_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
@@ -2163,6 +2181,29 @@ pub const ScreenComponent = struct {
         );
         self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;
+
+        if (snapshot.chat_scroll_offset > 0 and row < window.height) {
+            self.state.scroll_indicator_row = row;
+            const indicator_text = " \xe2\x86\x91 scrolled  \xe2\x86\x93 Jump to bottom (Ctrl+End) ";
+            const indicator_style = styleForToken(self.theme, .status);
+            const indicator_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = 1,
+            });
+            indicator_window.fill(.{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = indicator_style,
+            });
+            const text_width = std.unicode.utf8CountCodepoints(indicator_text) catch indicator_text.len;
+            const x_center: usize = if (width > text_width) (width - text_width) / 2 else 0;
+            _ = indicator_window.printSegment(.{
+                .text = indicator_text,
+                .style = indicator_style,
+            }, .{ .col_offset = @intCast(x_center), .wrap = .none });
+            row += 1;
+        } else {
+            self.state.scroll_indicator_row = null;
+        }
 
         if (queued_height > 0 and row < window.height) {
             const queued_window = window.child(.{

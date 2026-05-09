@@ -463,7 +463,8 @@ fn processLoopEvent(
             };
         },
         .mouse => |mouse| {
-            const parsed = keys.parsedMouseWheelInput(mouse) orelse return null;
+            const parsed = keys.parsedMouseWheelInput(mouse) orelse
+                keys.parsedMouseClickInput(mouse) orelse return null;
             return .{ .parsed = parsed };
         },
     }
