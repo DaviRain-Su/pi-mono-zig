@@ -19,7 +19,7 @@
       "zaiToolStream": false
     },
     "typeScriptRequest": {
-      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
       "headers": {
         "authorization": "<redacted-present>",
         "content-type": "application/json"
@@ -43,8 +43,8 @@
         }
       },
       "method": "POST",
-      "path": "/api/paas/v4/chat/completions",
-      "url": "https://api.z.ai/api/paas/v4/chat/completions"
+      "path": "/api/coding/paas/v4/chat/completions",
+      "url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
     }
   },
   "id": "zai-reasoning-enabled-exclusive",
@@ -60,7 +60,7 @@
     },
     "model": {
       "api": "openai-completions",
-      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
       "id": "glm-4.5-enabled-fixture",
       "input": [
         "text"

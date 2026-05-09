@@ -582,7 +582,7 @@ pub const OpenAICompat = struct {
 pub fn getCompat(model: types.Model) OpenAICompat {
     const is_non_standard = isNonStandardProvider(model);
     const is_chutes = std.mem.indexOf(u8, model.base_url, "chutes.ai") != null;
-    const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null;
+    const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null or std.mem.indexOf(u8, model.base_url, "open.bigmodel.cn") != null;
     const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
     const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
     const is_together = std.mem.eql(u8, model.provider, "together") or
@@ -670,6 +670,7 @@ fn isNonStandardProvider(model: types.Model) bool {
         std.mem.indexOf(u8, base_url, "chutes.ai") != null or
         std.mem.indexOf(u8, base_url, "deepseek.com") != null or
         std.mem.indexOf(u8, base_url, "api.z.ai") != null or
+        std.mem.indexOf(u8, base_url, "open.bigmodel.cn") != null or
         std.mem.indexOf(u8, base_url, "api.together.ai") != null or
         std.mem.indexOf(u8, base_url, "api.together.xyz") != null or
         std.mem.indexOf(u8, base_url, "opencode.ai") != null or
