@@ -1,8 +1,8 @@
 # Zig Code Review Fix Summary
 
 **Date**: 2026-05-09
-**Commits**: 14 commits on branch `zig-implementation`
-**Lines changed**: ~+800 / -400 (net reduction of ~200 lines of duplication)
+**Commits**: 22 commits on branch `zig-implementation`
+**Lines changed**: ~+1200 / -900 (net reduction of ~700 lines of duplication)
 
 ## Completed Review Items
 
@@ -22,7 +22,7 @@
 | P1-1 | page_allocator in agent_loop | DONE | 2 files | agent.zig: `promptTextWithImages` now uses `self.allocator` + dupe text. Fixed leak. |
 | P1-2 | file_mutation_queue page_allocator | DONE | 3 files | Removed global `queue_allocator`. `acquire()` now accepts `allocator` parameter. Updated edit.zig + write.zig callers. |
 | P1-3 | NativeHostApi stubs | DONE | 1 file | Added "Permission-gated counter stub" doc comments to all 12 methods. |
-| P1-5 | agent_loop.zig split | PARTIAL | 2 files | Extracted `json_schema.zig` (~200 LOC). Remaining: accumulator, streaming, tool_execution. |
+| P1-5 | agent_loop.zig split | PARTIAL | 3 files | Extracted `json_schema.zig` (~200 LOC) and `accumulator.zig` (~240 LOC). Remaining: streaming, tool_execution. |
 | P1-6 | agent.zig JSON tools | DONE | 0 files | Already using `provider_json` module. No local definitions remain. |
 
 ### P2: Architecture & Design (MOSTLY DONE)
@@ -54,12 +54,15 @@
 14. `refactor(zig): B11 complete bedrock provider union migration`
 15. `refactor(zig): B11 populate provider union in stream.zig`
 16. `docs(zig): update fix plan with completed items`
+17. `refactor(zig): extract accumulator.zig from agent_loop.zig`
+18. `docs(zig): update fix plan with accumulator extraction status`
 
 ## New/Modified Files
 
 ### Created
 - `src/ai/shared/sandbox.zig`
 - `src/agent/json_schema.zig`
+- `src/agent/accumulator.zig`
 - `src/coding_agent/extensions/lifecycle_support.zig`
 - `docs/review/zig-code-review-fix-plan.md`
 - `docs/review/stream-options-refactor.md`
@@ -94,7 +97,6 @@
 ## Remaining Work (Lower Priority)
 
 ### B8: agent_loop.zig continued
-- Extract `PartialAssistantAccumulator` + related types (~183 LOC)
 - Extract tool execution functions (executeToolCalls, prepareToolCall, etc.)
 - Extract streaming helpers (streamAssistantResponse, etc.)
 
