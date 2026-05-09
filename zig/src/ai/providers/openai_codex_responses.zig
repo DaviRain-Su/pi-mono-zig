@@ -587,7 +587,7 @@ fn parseSseStreamLines(
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
-    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
+    try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve_or_full_usage, .coerce_stop_reason_for_tool_calls = true });
     // Tool calls live inline in output.content; legacy field intentionally null.
 
     finalize.calculateCost(model, &output.usage);
@@ -885,28 +885,9 @@ fn finalizeOutputFromPartials(
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finalizeCurrentBlock(allocator, null, current_block, content_blocks, tool_calls, stream_ptr);
-    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, .when_output_empty, .preserve, false);
+    try finalize.finalizeOutput(allocator, output, .{ .content_blocks = content_blocks, .tool_calls = tool_calls }, .{ .content_transfer = .when_output_empty, .total_tokens = .preserve, .coerce_stop_reason_for_tool_calls = false });
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
-}
-
-fn finalizeCollectedOutput(
-    allocator: std.mem.Allocator,
-    output: *types.AssistantMessage,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
-    content_transfer: finalize.ContentTransferMode,
-    total_tokens: finalize.TotalTokenMode,
-    coerce_stop_reason_for_tool_calls: bool,
-) !void {
-    try finalize.finalizeOutput(allocator, output, .{
-        .content_blocks = content_blocks,
-        .tool_calls = tool_calls,
-    }, .{
-        .content_transfer = content_transfer,
-        .total_tokens = total_tokens,
-        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
-    });
 }
 
 fn emitRuntimeFailure(
@@ -1755,7 +1736,7 @@ test "finalizeCollectedOutput preserves Codex finalization semantics" {
     output.usage.cache_read = 2;
     output.usage.cache_write = 1;
 
-    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
+    try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve_or_full_usage, .coerce_stop_reason_for_tool_calls = true });
     defer freeAssistantMessageOwned(allocator, output);
 
     try std.testing.expectEqual(@as(usize, 0), content_blocks.items.len);

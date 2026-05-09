@@ -533,7 +533,7 @@ fn parseSseStreamLines(
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr);
 
-    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, true);
+    try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve, .coerce_stop_reason_for_tool_calls = true });
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
 
@@ -746,27 +746,9 @@ fn finalizeOutputFromPartials(
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
     try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
-    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, .when_output_empty, false);
+    try finalize.finalizeOutput(allocator, output, .{ .content_blocks = content_blocks, .tool_calls = tool_calls }, .{ .content_transfer = .when_output_empty, .total_tokens = .preserve, .coerce_stop_reason_for_tool_calls = false });
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
-}
-
-fn finalizeCollectedOutput(
-    allocator: std.mem.Allocator,
-    output: *types.AssistantMessage,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
-    content_transfer: finalize.ContentTransferMode,
-    coerce_stop_reason_for_tool_calls: bool,
-) !void {
-    try finalize.finalizeOutput(allocator, output, .{
-        .content_blocks = content_blocks,
-        .tool_calls = tool_calls,
-    }, .{
-        .content_transfer = content_transfer,
-        .total_tokens = .preserve,
-        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
-    });
 }
 
 fn emitRuntimeFailure(

@@ -16,7 +16,6 @@ const anthropic_json = @import("anthropic_json.zig");
 const test_stream_server = @import("test_stream_server.zig");
 
 const AnthropicError = error{
-    UnknownStopReason,
     InvalidAnthropicChunk,
 };
 
@@ -373,11 +372,8 @@ pub fn buildRequestPayload(
     return .{ .object = payload };
 }
 
-pub fn mapStopReason(reason: []const u8) !types.StopReason {
-    inline for (stop_reason_mod.anthropic_mappings) |mapping| {
-        if (std.mem.eql(u8, reason, mapping.literal)) return mapping.reason;
-    }
-    return AnthropicError.UnknownStopReason;
+pub fn mapStopReason(reason: []const u8) types.StopReason {
+    return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.anthropic_mappings, reason, .error_reason);
 }
 
 fn anthropicEffortString(effort: types.AnthropicEffort) []const u8 {
@@ -1515,11 +1511,11 @@ test "parse first-party anthropic unmatched lifecycle remains strict" {
 }
 
 test "mapStopReason covers anthropic variants" {
-    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("end_turn"));
-    try std.testing.expectEqual(types.StopReason.length, try mapStopReason("max_tokens"));
-    try std.testing.expectEqual(types.StopReason.tool_use, try mapStopReason("tool_use"));
-    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("pause_turn"));
-    try std.testing.expectError(error.UnknownStopReason, mapStopReason("unexpected"));
+    try std.testing.expectEqual(types.StopReason.stop, mapStopReason("end_turn"));
+    try std.testing.expectEqual(types.StopReason.length, mapStopReason("max_tokens"));
+    try std.testing.expectEqual(types.StopReason.tool_use, mapStopReason("tool_use"));
+    try std.testing.expectEqual(types.StopReason.stop, mapStopReason("pause_turn"));
+    try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("unexpected"));
 }
 
 test "buildRequestPayload adds eager_input_streaming by default" {
@@ -2090,7 +2086,8 @@ fn parseSseStreamLines(
         return;
     }
 
-    try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, model, .always, true);
+    try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve_or_full_usage, .coerce_stop_reason_for_tool_calls = true });
+    finalize.calculateCost(model, &output.usage);
     // Tool calls live inline in output.content; legacy AssistantMessage.tool_calls
     // is intentionally left null. tool_calls ArrayList holds borrow-only copies
     // and tool_calls.deinit only releases its buffer.
@@ -2190,30 +2187,10 @@ fn finalizeOutputFromPartials(
         }
     }
 
-    try finalizeCollectedOutput(allocator, output, content_blocks, tool_calls, model, .when_output_empty, false);
+    try finalize.finalizeOutput(allocator, output, .{ .content_blocks = content_blocks, .tool_calls = tool_calls }, .{ .content_transfer = .when_output_empty, .total_tokens = .preserve_or_full_usage, .coerce_stop_reason_for_tool_calls = false });
+    finalize.calculateCost(model, &output.usage);
     // Tool calls are emitted inline; legacy field intentionally null.
 }
-
-fn finalizeCollectedOutput(
-    allocator: std.mem.Allocator,
-    output: *types.AssistantMessage,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
-    model: types.Model,
-    content_transfer: finalize.ContentTransferMode,
-    coerce_stop_reason_for_tool_calls: bool,
-) !void {
-    try finalize.finalizeOutput(allocator, output, .{
-        .content_blocks = content_blocks,
-        .tool_calls = tool_calls,
-    }, .{
-        .content_transfer = content_transfer,
-        .total_tokens = .preserve_or_full_usage,
-        .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
-    });
-    finalize.calculateCost(model, &output.usage);
-}
-
 fn emitRuntimeFailure(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
@@ -2326,7 +2303,7 @@ fn processAnthropicSseEvent(
         if (value.object.get("delta")) |delta_value| {
             if (delta_value == .object) {
                 if (delta_value.object.get("stop_reason")) |stop_reason| {
-                    if (stop_reason == .string) output.stop_reason = try mapStopReason(stop_reason.string);
+                    if (stop_reason == .string) output.stop_reason = mapStopReason(stop_reason.string);
                 }
             }
         }

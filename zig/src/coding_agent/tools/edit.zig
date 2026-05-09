@@ -111,7 +111,7 @@ pub const EditTool = struct {
         const absolute_path = try common.resolvePath(allocator, self.cwd, args.path);
         defer allocator.free(absolute_path);
 
-        var mutation_guard = try mutation_queue.acquire(self.io, absolute_path);
+        var mutation_guard = try mutation_queue.acquire(self.io, allocator, absolute_path);
         defer mutation_guard.release();
 
         const raw_content = std.Io.Dir.readFileAlloc(.cwd(), self.io, absolute_path, allocator, .unlimited) catch |err| {
@@ -611,7 +611,7 @@ test "edit and write share the same queued mutation order for one file" {
     const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
     defer std.testing.allocator.free(absolute_path);
 
-    var held_guard = try mutation_queue.acquire(std.testing.io, absolute_path);
+    var held_guard = try mutation_queue.acquire(std.testing.io, std.testing.allocator, absolute_path);
 
     var edit_context = QueuedEditThreadContext{ .path = absolute_path };
     const edit_thread = try std.Thread.spawn(.{}, QueuedEditThreadContext.run, .{&edit_context});

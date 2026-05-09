@@ -29,7 +29,6 @@ const BedrockError = error{
     MissingBedrockMessageStart,
     UnsupportedEventStreamHeaderType,
     UnexpectedBedrockMessageRole,
-    UnknownStopReason,
 };
 
 const AwsCredentials = struct {
@@ -1927,7 +1926,7 @@ fn handleEventValue(
     if (value.object.get("messageStop")) |stop_value| {
         if (stop_value == .object) {
             if (stop_value.object.get("stopReason")) |reason_value| {
-                if (reason_value == .string) output.stop_reason = mapStopReason(reason_value.string) catch .error_reason;
+                if (reason_value == .string) output.stop_reason = mapStopReason(reason_value.string);
             }
         }
         return;
@@ -2421,22 +2420,19 @@ fn finalizeOutput(
     stream_ptr.end(output.*);
 }
 
-pub fn mapStopReason(reason: []const u8) !types.StopReason {
-    inline for (stop_reason_mod.bedrock_mappings) |mapping| {
-        if (std.mem.eql(u8, reason, mapping.literal)) return mapping.reason;
-    }
-    return BedrockError.UnknownStopReason;
+pub fn mapStopReason(reason: []const u8) types.StopReason {
+    return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.bedrock_mappings, reason, .error_reason);
 }
 
 test "ISS-041 mapStopReason aligns Bedrock safety stops with terminal errors" {
-    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("end_turn"));
-    try std.testing.expectEqual(types.StopReason.stop, try mapStopReason("stop_sequence"));
-    try std.testing.expectEqual(types.StopReason.length, try mapStopReason("max_tokens"));
-    try std.testing.expectEqual(types.StopReason.length, try mapStopReason("model_context_window_exceeded"));
-    try std.testing.expectEqual(types.StopReason.tool_use, try mapStopReason("tool_use"));
-    try std.testing.expectEqual(types.StopReason.error_reason, try mapStopReason("guardrail_intervened"));
-    try std.testing.expectEqual(types.StopReason.error_reason, try mapStopReason("content_filtered"));
-    try std.testing.expectError(BedrockError.UnknownStopReason, mapStopReason("future_stop_reason"));
+    try std.testing.expectEqual(types.StopReason.stop, mapStopReason("end_turn"));
+    try std.testing.expectEqual(types.StopReason.stop, mapStopReason("stop_sequence"));
+    try std.testing.expectEqual(types.StopReason.length, mapStopReason("max_tokens"));
+    try std.testing.expectEqual(types.StopReason.length, mapStopReason("model_context_window_exceeded"));
+    try std.testing.expectEqual(types.StopReason.tool_use, mapStopReason("tool_use"));
+    try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("guardrail_intervened"));
+    try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("content_filtered"));
+    try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("future_stop_reason"));
 }
 
 fn emitAuthError(

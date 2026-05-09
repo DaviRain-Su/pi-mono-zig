@@ -71,7 +71,7 @@ pub const WriteTool = struct {
         const absolute_path = try common.resolvePath(allocator, self.cwd, args.path);
         defer allocator.free(absolute_path);
 
-        var mutation_guard = try mutation_queue.acquire(self.io, absolute_path);
+        var mutation_guard = try mutation_queue.acquire(self.io, allocator, absolute_path);
         defer mutation_guard.release();
 
         common.writeFileAbsolute(self.io, absolute_path, args.content, true) catch |err| {
@@ -226,7 +226,7 @@ test "write tool waits for an earlier queued mutation before replacing the file"
     const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, relative_path);
     defer std.testing.allocator.free(absolute_path);
 
-    var held_guard = try mutation_queue.acquire(std.testing.io, absolute_path);
+    var held_guard = try mutation_queue.acquire(std.testing.io, std.testing.allocator, absolute_path);
 
     var context = QueuedWriteThreadContext{
         .path = absolute_path,

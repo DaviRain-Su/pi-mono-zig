@@ -6,7 +6,7 @@ const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
 const enforcement = @import("enforcement.zig");
 const tools_common = @import("../tools/common.zig");
-const wasm_manifest = @import("wasm/wasm_manifest.zig");
+const capability = @import("capability.zig");
 
 pub const Registry = extension_registry.Registry;
 pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
@@ -65,7 +65,7 @@ pub const NativeDescriptor = struct {
     description: []const u8,
     tools: []const NativeToolDefinition = &.{},
     hooks: []const NativeHookDefinition = &.{},
-    requested_capabilities: []const wasm_manifest.Capability = &.{},
+    requested_capabilities: []const capability.Capability = &.{},
     resource_limits: NativeResourceLimits = .{},
     library_path: ?[]const u8 = null,
     dynamic_library_path: ?[]const u8 = null,
@@ -117,19 +117,19 @@ pub const NativeDescriptor = struct {
 
     pub fn deniedCapability(
         self: NativeDescriptor,
-        phase: wasm_manifest.LifecyclePhase,
+        phase: capability.LifecyclePhase,
         mode: []const u8,
-    ) ?wasm_manifest.CapabilityDenialDiagnostic {
-        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
+    ) ?capability.CapabilityDenialDiagnostic {
+        return capability.denyFirstUnapprovedCapability(self.requested_capabilities, &.{}, phase, mode);
     }
 
     pub fn deniedCapabilityWithApprovals(
         self: NativeDescriptor,
-        approved_capabilities: []const wasm_manifest.Capability,
-        phase: wasm_manifest.LifecyclePhase,
+        approved_capabilities: []const capability.Capability,
+        phase: capability.LifecyclePhase,
         mode: []const u8,
-    ) ?wasm_manifest.CapabilityDenialDiagnostic {
-        return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, approved_capabilities, phase, mode);
+    ) ?capability.CapabilityDenialDiagnostic {
+        return capability.denyFirstUnapprovedCapability(self.requested_capabilities, approved_capabilities, phase, mode);
     }
 
     const forbidden_fields = &[_][]const u8{
@@ -159,7 +159,7 @@ pub const NativeDescriptor = struct {
 
 pub const NativeOptions = struct {
     descriptor: *const NativeDescriptor,
-    approved_capabilities: []const wasm_manifest.Capability = &.{},
+    approved_capabilities: []const capability.Capability = &.{},
     resource_limits: ?NativeResourceLimits = null,
     policy_lookup_key: ?[]const u8 = null,
     host_effects: ?*NativeHostEffects = null,
@@ -326,6 +326,9 @@ pub const NativeHostApi = struct {
         });
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not perform actual file I/O.
+    /// Real file reads are handled by the extension protocol message loop.
     pub fn readFile(self: *NativeHostApi, path: []const u8) !void {
         try self.enforceOperation(.file_read, .{ .id = path }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| {
@@ -339,6 +342,8 @@ pub const NativeHostApi = struct {
         }
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not perform actual file I/O.
     pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
         _ = contents;
         try self.enforceOperation(.file_write, .{ .id = path }, .initialize, "native/host-api", .{});
@@ -353,21 +358,29 @@ pub const NativeHostApi = struct {
         }
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not perform actual network I/O.
     pub fn requestNetwork(self: *NativeHostApi, url: []const u8) !void {
         try self.enforceOperation(.network_request, .{ .id = url }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.network_requests += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not execute shell commands.
     pub fn runShell(self: *NativeHostApi, command: []const u8) !void {
         try self.enforceOperation(.shell_run, .{ .id = command }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.shell_runs += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not read environment variables.
     pub fn readEnv(self: *NativeHostApi, name: []const u8) !void {
         try self.enforceOperation(.env_read, .{ .id = name }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.env_reads += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not call language models.
     pub fn callModel(self: *NativeHostApi, model: []const u8, payload_json: []const u8) !void {
         try self.enforceOperation(.model_call, .{ .id = model }, .call, "native/host-api", .{
             .turns = 1,
@@ -376,33 +389,45 @@ pub const NativeHostApi = struct {
         if (self.runtime.host_effects) |effects| effects.model_calls += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not read session state.
     pub fn readSession(self: *NativeHostApi, session_id: []const u8) !void {
         try self.enforceOperation(.session_read, .{ .id = session_id }, .call, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.session_reads += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not write session state.
     pub fn writeSession(self: *NativeHostApi, session_id: []const u8, payload_json: []const u8) !void {
         _ = payload_json;
         try self.enforceOperation(.session_write, .{ .id = session_id }, .call, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.session_writes += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not emit UI notifications.
     pub fn notifyUi(self: *NativeHostApi, payload_json: []const u8) !void {
         try self.enforceOperation(.ui_notify, .{ .id = payload_json }, .call, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.ui_notifications += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not invoke tools.
     pub fn useTool(self: *NativeHostApi, name: []const u8, payload_json: []const u8) !void {
         _ = payload_json;
         try self.enforceOperation(.tool_use, .{ .id = name }, .call, "native/host-api", .{ .turns = 1 });
         if (self.runtime.host_effects) |effects| effects.tool_uses += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not spawn agents.
     pub fn spawnAgent(self: *NativeHostApi, task_json: []const u8) !void {
         try self.enforceOperation(.agent_spawn, .{ .id = task_json }, .call, "native/host-api", .{ .children_started = 1 });
         if (self.runtime.host_effects) |effects| effects.agent_spawns += 1;
     }
 
+    /// Permission-gated counter stub. Enforces capability checks and records
+    /// the operation via host_effects, but does not delegate to agents.
     pub fn delegateAgent(self: *NativeHostApi, task_json: []const u8) !void {
         try self.enforceOperation(.agent_delegate, .{ .id = task_json }, .call, "native/host-api", .{ .turns = 1 });
         if (self.runtime.host_effects) |effects| effects.agent_delegations += 1;
@@ -422,7 +447,7 @@ pub const NativeHostApi = struct {
         self: *NativeHostApi,
         operation: enforcement.Operation,
         target: enforcement.OperationTarget,
-        phase: wasm_manifest.LifecyclePhase,
+        phase: capability.LifecyclePhase,
         mode: []const u8,
         delta: enforcement.UsageDelta,
     ) !void {
@@ -516,11 +541,11 @@ pub const NativeHostApi = struct {
     ) !void {
         var envelope: std.Io.Writer.Allocating = .init(self.runtime.allocator);
         defer envelope.deinit();
-        const capability = operation.requiredGrant();
+        const required_capability = operation.requiredGrant();
         try envelope.writer.writeAll("{\"category\":\"sandbox_path_denied\",\"capability\":");
-        try std.json.Stringify.value(capability.jsonName(), .{}, &envelope.writer);
+        try std.json.Stringify.value(required_capability.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"branch\":");
-        try std.json.Stringify.value(capability.enforcementBranch().jsonName(), .{}, &envelope.writer);
+        try std.json.Stringify.value(required_capability.enforcementBranch().jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"phase\":\"initialize\",\"mode\":\"native/host-api\"");
         try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":\"native\",\"extensionId\":");
         try std.json.Stringify.value(self.runtime.descriptor.id, .{}, &envelope.writer);
@@ -566,7 +591,7 @@ pub const NativeRuntime = struct {
     state: extension_host.ProtocolState,
     mutex: std.Io.Mutex = .init,
     descriptor: *const NativeDescriptor,
-    approved_capabilities: []const wasm_manifest.Capability,
+    approved_capabilities: []const capability.Capability,
     resource_limits: NativeResourceLimits,
     policy_lookup_key: ?[]const u8,
     accounting: enforcement.Accounting,
@@ -965,7 +990,7 @@ const native_allowed_operation_matrix_descriptor: NativeDescriptor = .{
     .version = "0.1.0",
     .description = "Exercises every allowed native host operation using fake/sandbox effects.",
     .tools = &.{native_enforcement_matrix_tool},
-    .requested_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    .requested_capabilities = capability.CANONICAL_CAPABILITIES[0..],
     .resource_limits = .{
         .turns = 8,
         .output_bytes = 1024,
@@ -1054,7 +1079,7 @@ test "native host operation gates deny side effects through enforcement matrix" 
     try std.testing.expectEqual(@as(u64, 0), runtime.accounting.children_started);
 
     const expected = [_]struct {
-        capability: wasm_manifest.Capability,
+        capability: capability.Capability,
         operation: []const u8,
     }{
         .{ .capability = .file_read, .operation = "file.read" },
@@ -1101,7 +1126,7 @@ test "native host operation gates allow only fake and sandbox side effects" {
     var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
     const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
         .descriptor = &native_allowed_operation_matrix_descriptor,
-        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+        .approved_capabilities = capability.CANONICAL_CAPABILITIES[0..],
         .host_effects = &effects,
     });
     defer runtime.deinit();

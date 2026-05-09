@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const queue_allocator = std.heap.page_allocator;
+const global_queue_allocator = std.heap.page_allocator;
 
 const QueueEntry = struct {
     key: []u8,
@@ -28,34 +28,33 @@ pub const FileMutationGuard = struct {
     }
 };
 
-pub fn acquire(io: std.Io, absolute_path: []const u8) !FileMutationGuard {
-    const lookup_key = try canonicalizeKey(io, absolute_path);
-    errdefer queue_allocator.free(lookup_key);
+pub fn acquire(io: std.Io, allocator: std.mem.Allocator, absolute_path: []const u8) !FileMutationGuard {
+    const lookup_key = try canonicalizeKey(io, allocator, absolute_path);
+    errdefer allocator.free(lookup_key);
 
     global_queue.mutex.lockUncancelable(io);
     defer global_queue.mutex.unlock(io);
 
     var ticket: usize = 0;
-    var queue_owns_lookup_key = false;
-
     if (findEntryIndexLocked(lookup_key)) |index| {
         const entry = &global_queue.entries.items[index];
         ticket = entry.next_ticket;
         entry.next_ticket += 1;
     } else {
-        try global_queue.entries.append(queue_allocator, .{
-            .key = lookup_key,
+        const queue_key = try global_queue_allocator.dupe(u8, lookup_key);
+        errdefer global_queue_allocator.free(queue_key);
+        try global_queue.entries.append(global_queue_allocator, .{
+            .key = queue_key,
             .next_ticket = 1,
             .serving_ticket = 0,
         });
-        queue_owns_lookup_key = true;
     }
 
     while (true) {
         const index = findEntryIndexLocked(lookup_key) orelse unreachable;
         const entry = &global_queue.entries.items[index];
         if (entry.serving_ticket == ticket) {
-            if (!queue_owns_lookup_key) queue_allocator.free(lookup_key);
+            allocator.free(lookup_key);
             return .{
                 .io = io,
                 .key = entry.key,
@@ -75,7 +74,10 @@ fn releaseUnlocked(io: std.Io, key: []const u8) void {
 
     if (entry.serving_ticket == entry.next_ticket) {
         const removed = global_queue.entries.swapRemove(index);
-        queue_allocator.free(removed.key);
+        global_queue_allocator.free(removed.key);
+        if (global_queue.entries.items.len == 0) {
+            global_queue.entries.clearAndFree(global_queue_allocator);
+        }
     }
 
     global_queue.condition.broadcast(io);
@@ -88,9 +90,11 @@ fn findEntryIndexLocked(key: []const u8) ?usize {
     return null;
 }
 
-fn canonicalizeKey(io: std.Io, absolute_path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().realPathFileAlloc(io, absolute_path, queue_allocator) catch
-        try queue_allocator.dupe(u8, absolute_path);
+fn canonicalizeKey(io: std.Io, allocator: std.mem.Allocator, absolute_path: []const u8) ![]u8 {
+    const real_path = std.Io.Dir.cwd().realPathFileAlloc(io, absolute_path, allocator) catch
+        return try allocator.dupe(u8, absolute_path);
+    defer allocator.free(real_path);
+    return allocator.dupe(u8, real_path);
 }
 
 const QueueEvent = enum(u8) {
@@ -116,6 +120,7 @@ const QueueOrderRecorder = struct {
 
 const QueueThreadContext = struct {
     io: std.Io = std.testing.io,
+    allocator: std.mem.Allocator = std.testing.allocator,
     path: []const u8,
     start_event: QueueEvent,
     end_event: QueueEvent,
@@ -125,7 +130,7 @@ const QueueThreadContext = struct {
 };
 
 fn runQueuedThread(context: *QueueThreadContext) void {
-    var guard = acquire(context.io, context.path) catch unreachable;
+    var guard = acquire(context.io, context.allocator, context.path) catch unreachable;
     defer guard.release();
 
     context.recorder.record(context.start_event);
@@ -191,6 +196,37 @@ test "file mutation queue serializes operations for the same file" {
         QueueEvent,
         &[_]QueueEvent{ .first_start, .first_end, .second_start, .second_end },
         recorder.events[0..],
+    );
+}
+
+test "file mutation queue releases keys when callers use different allocators" {
+    var first_allocator: std.heap.DebugAllocator(.{}) = .init;
+    var second_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.testing.expectEqual(.ok, first_allocator.deinit()) catch unreachable;
+    defer std.testing.expectEqual(.ok, second_allocator.deinit()) catch unreachable;
+
+    var recorder = QueueOrderRecorder{};
+    var first_guard = try acquire(std.testing.io, first_allocator.allocator(), "/tmp/pi-file-mutation-queue-mixed-allocators");
+
+    var second = QueueThreadContext{
+        .allocator = second_allocator.allocator(),
+        .path = "/tmp/pi-file-mutation-queue-mixed-allocators",
+        .start_event = .second_start,
+        .end_event = .second_end,
+        .recorder = &recorder,
+    };
+    const second_thread = try std.Thread.spawn(.{}, runQueuedThread, .{&second});
+
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+    try std.testing.expectEqual(@as(usize, 0), recorder.count());
+
+    first_guard.release();
+    second_thread.join();
+
+    try std.testing.expectEqualSlices(
+        QueueEvent,
+        &[_]QueueEvent{ .second_start, .second_end },
+        recorder.events[0..2],
     );
 }
 

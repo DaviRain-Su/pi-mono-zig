@@ -495,7 +495,8 @@ pub const Agent = struct {
         images: []const ai.ImageContent,
         accepted_callback: ?types.PromptAcceptedCallback,
     ) !void {
-        const prompt_message = try userMessageWithImages(std.heap.page_allocator, text, images, 0);
+        var prompt_message = try userMessageWithImages(self.allocator, text, images, 0);
+        defer deinitBorrowedUserMessage(self.allocator, &prompt_message);
         const prompts = [_]types.AgentMessage{prompt_message};
         try self.runPromptMessages(prompts[0..], accepted_callback);
     }
@@ -626,33 +627,72 @@ fn emitAgentEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
 
 pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !types.AgentMessage {
     return switch (message) {
-        .user => |user| .{ .user = .{
-            .role = try allocator.dupe(u8, user.role),
-            .content = try cloneContentBlocks(allocator, user.content),
-            .timestamp = user.timestamp,
-        } },
-        .assistant => |assistant| .{ .assistant = .{
-            .role = try allocator.dupe(u8, assistant.role),
-            .content = try cloneContentBlocks(allocator, assistant.content),
-            .tool_calls = if (assistant.tool_calls) |tool_calls| try cloneToolCalls(allocator, tool_calls) else null,
-            .api = try allocator.dupe(u8, assistant.api),
-            .provider = try allocator.dupe(u8, assistant.provider),
-            .model = try allocator.dupe(u8, assistant.model),
-            .response_id = if (assistant.response_id) |response_id| try allocator.dupe(u8, response_id) else null,
-            .usage = assistant.usage,
-            .stop_reason = assistant.stop_reason,
-            .error_message = if (assistant.error_message) |error_message| try allocator.dupe(u8, error_message) else null,
-            .timestamp = assistant.timestamp,
-        } },
-        .tool_result => |tool_result| .{ .tool_result = .{
-            .role = try allocator.dupe(u8, tool_result.role),
-            .tool_call_id = try allocator.dupe(u8, tool_result.tool_call_id),
-            .tool_name = try allocator.dupe(u8, tool_result.tool_name),
-            .content = try cloneContentBlocks(allocator, tool_result.content),
-            .details = if (tool_result.details) |details| try provider_json.cloneValue(allocator, details) else null,
-            .is_error = tool_result.is_error,
-            .timestamp = tool_result.timestamp,
-        } },
+        .user => |user| blk: {
+            const role = try allocator.dupe(u8, user.role);
+            errdefer allocator.free(role);
+            const content = try cloneContentBlocks(allocator, user.content);
+            errdefer deinitContentBlocks(allocator, content);
+
+            break :blk .{ .user = .{
+                .role = role,
+                .content = content,
+                .timestamp = user.timestamp,
+            } };
+        },
+        .assistant => |assistant| blk: {
+            const role = try allocator.dupe(u8, assistant.role);
+            errdefer allocator.free(role);
+            const content = try cloneContentBlocks(allocator, assistant.content);
+            errdefer deinitContentBlocks(allocator, content);
+            const tool_calls = if (assistant.tool_calls) |calls| try cloneToolCalls(allocator, calls) else null;
+            errdefer if (tool_calls) |calls| deinitToolCalls(allocator, calls);
+            const api = try allocator.dupe(u8, assistant.api);
+            errdefer allocator.free(api);
+            const provider = try allocator.dupe(u8, assistant.provider);
+            errdefer allocator.free(provider);
+            const model = try allocator.dupe(u8, assistant.model);
+            errdefer allocator.free(model);
+            const response_id = if (assistant.response_id) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (response_id) |value| allocator.free(value);
+            const error_message = if (assistant.error_message) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (error_message) |value| allocator.free(value);
+
+            break :blk .{ .assistant = .{
+                .role = role,
+                .content = content,
+                .tool_calls = tool_calls,
+                .api = api,
+                .provider = provider,
+                .model = model,
+                .response_id = response_id,
+                .usage = assistant.usage,
+                .stop_reason = assistant.stop_reason,
+                .error_message = error_message,
+                .timestamp = assistant.timestamp,
+            } };
+        },
+        .tool_result => |tool_result| blk: {
+            const role = try allocator.dupe(u8, tool_result.role);
+            errdefer allocator.free(role);
+            const tool_call_id = try allocator.dupe(u8, tool_result.tool_call_id);
+            errdefer allocator.free(tool_call_id);
+            const tool_name = try allocator.dupe(u8, tool_result.tool_name);
+            errdefer allocator.free(tool_name);
+            const content = try cloneContentBlocks(allocator, tool_result.content);
+            errdefer deinitContentBlocks(allocator, content);
+            const details = if (tool_result.details) |value| try provider_json.cloneValue(allocator, value) else null;
+            errdefer if (details) |value| provider_json.freeValue(allocator, value);
+
+            break :blk .{ .tool_result = .{
+                .role = role,
+                .tool_call_id = tool_call_id,
+                .tool_name = tool_name,
+                .content = content,
+                .details = details,
+                .is_error = tool_result.is_error,
+                .timestamp = tool_result.timestamp,
+            } };
+        },
     };
 }
 
@@ -707,8 +747,12 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBl
     const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
     errdefer allocator.free(cloned);
 
+    var initialized_len: usize = 0;
+    errdefer deinitContentBlocksPartial(allocator, cloned, initialized_len);
+
     for (blocks, 0..) |block, index| {
         cloned[index] = try cloneContentBlock(allocator, block);
+        initialized_len += 1;
     }
 
     return cloned;
@@ -716,22 +760,66 @@ fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBl
 
 fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
     return switch (block) {
-        .text => |text| ai.ContentBlock{ .text = .{
-            .text = try allocator.dupe(u8, text.text),
-            .text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null,
-        } },
-        .image => |image| ai.ContentBlock{ .image = .{
-            .data = try allocator.dupe(u8, image.data),
-            .mime_type = try allocator.dupe(u8, image.mime_type),
-        } },
-        .thinking => |thinking| ai.ContentBlock{ .thinking = .{
-            .thinking = try allocator.dupe(u8, thinking.thinking),
-            .thinking_signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
-            .signature = if (ai.thinkingSignature(thinking)) |signature| try allocator.dupe(u8, signature) else null,
-            .redacted = thinking.redacted,
-        } },
+        .text => |text| blk: {
+            const cloned_text = try allocator.dupe(u8, text.text);
+            errdefer allocator.free(cloned_text);
+            const text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
+            errdefer if (text_signature) |signature| allocator.free(signature);
+
+            break :blk ai.ContentBlock{ .text = .{
+                .text = cloned_text,
+                .text_signature = text_signature,
+            } };
+        },
+        .image => |image| blk: {
+            const data = try allocator.dupe(u8, image.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, image.mime_type);
+            errdefer allocator.free(mime_type);
+
+            break :blk ai.ContentBlock{ .image = .{
+                .data = data,
+                .mime_type = mime_type,
+            } };
+        },
+        .thinking => |thinking| blk: {
+            const cloned_thinking = try allocator.dupe(u8, thinking.thinking);
+            errdefer allocator.free(cloned_thinking);
+            const thinking_signature = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null;
+            errdefer if (thinking_signature) |signature| allocator.free(signature);
+            const signature = if (thinking.signature) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (signature) |value| allocator.free(value);
+
+            break :blk ai.ContentBlock{ .thinking = .{
+                .thinking = cloned_thinking,
+                .thinking_signature = thinking_signature,
+                .signature = signature,
+                .redacted = thinking.redacted,
+            } };
+        },
         .tool_call => |tool_call| ai.ContentBlock{ .tool_call = try cloneToolCall(allocator, tool_call) },
     };
+}
+
+fn deinitContentBlocksPartial(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock, initialized_len: usize) void {
+    for (blocks[0..initialized_len]) |block| {
+        switch (block) {
+            .text => |text| {
+                allocator.free(text.text);
+                if (text.text_signature) |signature| allocator.free(signature);
+            },
+            .image => |image| {
+                allocator.free(image.data);
+                allocator.free(image.mime_type);
+            },
+            .thinking => |thinking| {
+                allocator.free(thinking.thinking);
+                if (thinking.thinking_signature) |signature| allocator.free(signature);
+                if (thinking.signature) |signature| allocator.free(signature);
+            },
+            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
+        }
+    }
 }
 
 fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
@@ -760,13 +848,12 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
     const cloned = try allocator.alloc(ai.ToolCall, tool_calls.len);
     errdefer allocator.free(cloned);
 
+    var initialized_len: usize = 0;
+    errdefer deinitToolCallsPartial(allocator, cloned, initialized_len);
+
     for (tool_calls, 0..) |tool_call, index| {
-        cloned[index] = .{
-            .id = try allocator.dupe(u8, tool_call.id),
-            .name = try allocator.dupe(u8, tool_call.name),
-            .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
-            .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
-        };
+        cloned[index] = try cloneToolCall(allocator, tool_call);
+        initialized_len += 1;
     }
 
     return cloned;
@@ -779,12 +866,27 @@ fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall
     allocator.free(tool_calls);
 }
 
+fn deinitToolCallsPartial(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall, initialized_len: usize) void {
+    for (tool_calls[0..initialized_len]) |tool_call| {
+        deinitToolCall(allocator, tool_call);
+    }
+}
+
 fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
+    const id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(name);
+    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
+    errdefer provider_json.freeValue(allocator, arguments);
+    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
+    errdefer if (thought_signature) |signature| allocator.free(signature);
+
     return .{
-        .id = try allocator.dupe(u8, tool_call.id),
-        .name = try allocator.dupe(u8, tool_call.name),
-        .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
-        .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
+        .id = id,
+        .name = name,
+        .arguments = arguments,
+        .thought_signature = thought_signature,
     };
 }
 
@@ -826,7 +928,8 @@ fn userMessageWithImages(
     timestamp: i64,
 ) !types.AgentMessage {
     const content = try allocator.alloc(ai.ContentBlock, 1 + images.len);
-    content[0] = .{ .text = .{ .text = text } };
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
     for (images, 0..) |image, index| {
         content[index + 1] = .{ .image = image };
     }
@@ -834,6 +937,25 @@ fn userMessageWithImages(
         .content = content,
         .timestamp = timestamp,
     } };
+}
+
+fn deinitBorrowedUserMessage(allocator: std.mem.Allocator, message: *types.AgentMessage) void {
+    switch (message.*) {
+        .user => |user| {
+            if (user.content.len > 0) {
+                switch (user.content[0]) {
+                    .text => |text| {
+                        allocator.free(text.text);
+                        if (text.text_signature) |signature| allocator.free(signature);
+                    },
+                    else => {},
+                }
+            }
+            allocator.free(user.content);
+        },
+        else => {},
+    }
+    message.* = undefined;
 }
 
 fn userTextMessage(
@@ -1164,6 +1286,26 @@ test "pending message queue clear and deinit release nested queue-owned allocati
             defer source_arena.deinit();
 
             try deinit_queue.enqueue(try complexAssistantMessage(source_arena.allocator(), "deinit", 10));
+        }
+    }
+}
+
+test "VAL-AGENT-FACADE-001 cloneMessage allocation failures release prompt-message ownership" {
+    var source_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source_arena.deinit();
+
+    const source_message = try complexAssistantMessage(source_arena.allocator(), "facade-oom", 11);
+
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing_state = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_state.allocator();
+
+        if (cloneMessage(failing_allocator, source_message)) |cloned| {
+            var owned = cloned;
+            deinitMessage(failing_allocator, &owned);
+        } else |err| switch (err) {
+            error.OutOfMemory => {},
         }
     }
 }
@@ -1860,6 +2002,243 @@ fn blockingAbortStreamFn(
     });
     stream.end(fallback);
     return stream;
+}
+
+const FacadeLifecycleStreamContext = struct {
+    call_count: usize = 0,
+};
+
+fn allocFacadeTextAssistant(
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+    text: []const u8,
+    stop_reason: ai.StopReason,
+    error_message: ?[]const u8,
+) !ai.AssistantMessage {
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    errdefer allocator.free(content);
+    const text_copy = try allocator.dupe(u8, text);
+    errdefer allocator.free(text_copy);
+    const error_copy = if (error_message) |message| try allocator.dupe(u8, message) else null;
+    errdefer if (error_copy) |message| allocator.free(message);
+
+    content[0] = .{ .text = .{ .text = text_copy } };
+    return .{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = stop_reason,
+        .error_message = error_copy,
+        .timestamp = 0,
+    };
+}
+
+fn allocFacadeToolCallAssistant(
+    allocator: std.mem.Allocator,
+    model: ai.Model,
+) !ai.AssistantMessage {
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    errdefer allocator.free(content);
+    var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer provider_json.freeValue(allocator, .{ .object = args });
+    const arg_key = try allocator.dupe(u8, "value");
+    var arg_key_moved = false;
+    errdefer if (!arg_key_moved) allocator.free(arg_key);
+    const arg_value = try allocator.dupe(u8, "fail");
+    var arg_value_moved = false;
+    errdefer if (!arg_value_moved) allocator.free(arg_value);
+    try args.put(allocator, arg_key, .{ .string = arg_value });
+    arg_key_moved = true;
+    arg_value_moved = true;
+    const id = try allocator.dupe(u8, "facade-tool-1");
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, "facade_fail");
+    errdefer allocator.free(name);
+
+    content[0] = .{ .tool_call = .{
+        .id = id,
+        .name = name,
+        .arguments = .{ .object = args },
+    } };
+    return .{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+}
+
+fn facadeLifecycleStreamFn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    context: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const state: *FacadeLifecycleStreamContext = @ptrCast(@alignCast(stream_context orelse return error.MissingFacadeLifecycleContext));
+    state.call_count += 1;
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    const assistant = switch (state.call_count) {
+        1 => blk: {
+            try std.testing.expectEqual(@as(usize, 2), context.messages.len);
+            try expectUserText(context.messages[0], "normal prompt");
+            try expectUserText(context.messages[1], "steer once");
+            break :blk try allocFacadeTextAssistant(allocator, model, "normal reply", .stop, null);
+        },
+        2 => blk: {
+            try std.testing.expectEqual(@as(usize, 4), context.messages.len);
+            try expectUserText(context.messages[3], "follow once");
+            break :blk try allocFacadeTextAssistant(allocator, model, "follow reply", .stop, null);
+        },
+        3 => blk: {
+            try expectUserText(context.messages[context.messages.len - 1], "provider error prompt");
+            break :blk try allocFacadeTextAssistant(allocator, model, "provider failed", .error_reason, "provider failed");
+        },
+        4 => blk: {
+            try expectUserText(context.messages[context.messages.len - 1], "tool error prompt");
+            break :blk try allocFacadeToolCallAssistant(allocator, model);
+        },
+        5 => blk: {
+            try std.testing.expectEqualStrings("facade_fail", context.messages[context.messages.len - 1].tool_result.tool_name);
+            try std.testing.expect(context.messages[context.messages.len - 1].tool_result.is_error);
+            break :blk try allocFacadeTextAssistant(allocator, model, "tool failure handled", .stop, null);
+        },
+        6 => blk: {
+            try expectUserText(context.messages[context.messages.len - 1], "after failures");
+            break :blk try allocFacadeTextAssistant(allocator, model, "still usable", .stop, null);
+        },
+        else => return error.UnexpectedFacadeLifecycleCall,
+    };
+
+    stream.push(.{
+        .event_type = if (assistant.stop_reason == .error_reason) .error_event else .done,
+        .message = assistant,
+        .error_message = assistant.error_message,
+    });
+    stream.end(assistant);
+    return stream;
+}
+
+fn facadeFailingToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    _ = allocator;
+    return error.FacadeToolFailed;
+}
+
+fn expectFacadeIdle(agent: *const Agent) !void {
+    try std.testing.expect(!agent.isStreaming());
+    try std.testing.expect(agent.getStreamingMessage() == null);
+    try std.testing.expectEqual(@as(usize, 0), agent.getPendingToolCalls().len);
+    try std.testing.expect(agent.active_abort_signal == null);
+}
+
+test "VAL-AGENT-FACADE-001 stateful Agent facade survives normal abort provider and tool errors" {
+    const model = ai.Model{
+        .id = "facade-lifecycle",
+        .name = "Facade Lifecycle",
+        .api = "facade-lifecycle",
+        .provider = "facade-lifecycle",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 4096,
+        .max_tokens = 256,
+    };
+
+    var stream_state = FacadeLifecycleStreamContext{};
+    var prompt_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer prompt_arena.deinit();
+    const tool = types.AgentTool{
+        .name = "facade_fail",
+        .description = "Fails for lifecycle coverage",
+        .label = "Facade fail",
+        .parameters = .null,
+        .execute = facadeFailingToolExecute,
+    };
+    var agent = try Agent.init(std.testing.allocator, .{
+        .model = model,
+        .tools = &[_]types.AgentTool{tool},
+        .stream_fn = facadeLifecycleStreamFn,
+        .stream_context = &stream_state,
+        .steering_mode = .one_at_a_time,
+        .follow_up_mode = .one_at_a_time,
+    });
+    defer agent.deinit();
+
+    var removed_capture = SubscriberCapture.init(std.testing.allocator);
+    defer removed_capture.deinit();
+    const removed_subscriber = types.AgentSubscriber{
+        .context = &removed_capture,
+        .callback = captureSubscriberEvent,
+    };
+    try agent.subscribe(removed_subscriber);
+    try agent.steer(try userTextMessage(prompt_arena.allocator(), "steer once", 1));
+    try agent.followUp(try userTextMessage(prompt_arena.allocator(), "follow once", 2));
+    try agent.prompt("normal prompt");
+    try expectFacadeIdle(&agent);
+    try std.testing.expectEqual(@as(usize, 0), agent.steeringQueueLen());
+    try std.testing.expectEqual(@as(usize, 0), agent.followUpQueueLen());
+    try std.testing.expectEqual(@as(usize, 5), agent.getMessages().len);
+
+    const removed_count_after_normal = removed_capture.event_types.items.len;
+    try std.testing.expect(agent.unsubscribe(removed_subscriber));
+    try std.testing.expect(!agent.unsubscribe(removed_subscriber));
+
+    var active_capture = SubscriberCapture.init(std.testing.allocator);
+    defer active_capture.deinit();
+    try agent.subscribe(.{
+        .context = &active_capture,
+        .callback = captureSubscriberEvent,
+    });
+
+    try agent.prompt("provider error prompt");
+    try expectFacadeIdle(&agent);
+    try std.testing.expectEqualStrings("provider failed", agent.getErrorMessage().?);
+    try std.testing.expectEqual(@as(usize, 7), agent.getMessages().len);
+    try std.testing.expectEqual(removed_count_after_normal, removed_capture.event_types.items.len);
+
+    const abort_capture = try std.testing.allocator.create(AbortEventCapture);
+    defer std.testing.allocator.destroy(abort_capture);
+    abort_capture.* = .{};
+    agent.stream_fn = blockingAbortStreamFn;
+    agent.stream_context = abort_capture;
+    var handle = try RunPromptHandle.start(&agent, "abort prompt");
+    defer handle.join() catch {};
+    try waitForAtomicTrue(&abort_capture.assistant_started);
+    agent.abort();
+    try handle.join();
+    try expectFacadeIdle(&agent);
+    try std.testing.expectEqualStrings("Request was aborted", agent.getErrorMessage().?);
+    try std.testing.expectEqual(@as(usize, 9), agent.getMessages().len);
+
+    agent.stream_fn = facadeLifecycleStreamFn;
+    agent.stream_context = &stream_state;
+    try agent.prompt("tool error prompt");
+    try expectFacadeIdle(&agent);
+    try std.testing.expect(agent.getErrorMessage() == null);
+    try std.testing.expectEqual(@as(usize, 13), agent.getMessages().len);
+    try std.testing.expectEqualStrings("tool failure handled", agent.getMessages()[12].assistant.content[0].text.text);
+
+    try agent.prompt("after failures");
+    try expectFacadeIdle(&agent);
+    try std.testing.expectEqual(@as(usize, 15), agent.getMessages().len);
+    try expectUserText(agent.getMessages()[13], "after failures");
+    try std.testing.expectEqualStrings("still usable", agent.getMessages()[14].assistant.content[0].text.text);
+    try std.testing.expect(active_capture.event_types.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 6), stream_state.call_count);
 }
 
 test "agent abort stops an in-flight stream and clears runtime state" {
