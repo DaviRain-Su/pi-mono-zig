@@ -52,14 +52,3 @@ pub fn appendAllocatingScreenRowsAsPlainLines(
     }
 }
 
-/// Renders plain legacy line lists into a vaxis window without interpreting ANSI.
-pub fn renderLineListToWindow(window: vaxis.Window, lines: []const []const u8, _: std.mem.Allocator) std.mem.Allocator.Error!void {
-    const row_count = @min(lines.len, @as(usize, window.height));
-    for (lines[0..row_count], 0..) |line, row| {
-        const row_window = window.child(.{
-            .y_off = @intCast(row),
-            .height = 1,
-        });
-        _ = row_window.printSegment(.{ .text = line }, .{ .wrap = .none });
-    }
-}
