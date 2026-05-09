@@ -6,6 +6,7 @@ const extension_runtime = @import("../extensions/extension_runtime.zig");
 const native_runtime = @import("../extensions/native_runtime.zig");
 const sdk = @import("../extensions/sdk.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
+const json_event_wire = @import("../modes/json_event_wire.zig");
 const session_manager = @import("session_manager.zig");
 const tools_common = @import("../tools/common.zig");
 
@@ -360,6 +361,8 @@ pub const AgentSession = struct {
         if (extension_hosts.len == 0) {
             self.agent.transform_context = null;
             self.agent.transform_context_context = null;
+            self.agent.message_end_transform = null;
+            self.agent.message_end_transform_context = null;
             self.agent.before_tool_call = null;
             self.agent.after_tool_call = null;
             self.agent.extension_hook_context = null;
@@ -375,6 +378,8 @@ pub const AgentSession = struct {
         self.extension_hook_context = context;
         self.agent.transform_context = transformContextHook;
         self.agent.transform_context_context = context;
+        self.agent.message_end_transform = messageEndHook;
+        self.agent.message_end_transform_context = context;
         self.agent.before_tool_call = beforeToolCallHook;
         self.agent.after_tool_call = afterToolCallHook;
         self.agent.extension_hook_context = context;
@@ -719,6 +724,8 @@ pub const AgentSession = struct {
             .io = io,
             .transform_context = if (extension_hook_context != null) transformContextHook else null,
             .transform_context_context = if (extension_hook_context) |context| context else null,
+            .message_end_transform = if (extension_hook_context != null) messageEndHook else null,
+            .message_end_transform_context = if (extension_hook_context) |context| context else null,
             .before_tool_call = if (extension_hook_context != null) beforeToolCallHook else null,
             .after_tool_call = if (extension_hook_context != null) afterToolCallHook else null,
             .extension_hook_context = if (extension_hook_context) |context| context else null,
@@ -1053,7 +1060,11 @@ const ExtensionHookContext = struct {
             .agent_start => "agent_start",
             .agent_end => "agent_end",
             .turn_start => "turn_start",
-            .message_end => "message_end",
+            .message_start => "message_start",
+            .message_update => "message_update",
+            .tool_execution_start => "tool_execution_start",
+            .tool_execution_update => "tool_execution_update",
+            .tool_execution_end => "tool_execution_end",
             .turn_end => "turn_end",
             else => return,
         };
@@ -1210,6 +1221,109 @@ fn afterToolCallHook(
     return patch;
 }
 
+fn messageEndHook(
+    allocator: std.mem.Allocator,
+    message: agent.AgentMessage,
+    transform_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+) !?agent.AgentMessage {
+    _ = signal;
+    const context: *ExtensionHookContext = @ptrCast(@alignCast(transform_context orelse return null));
+    if (!context.hasHook("message_end")) return null;
+    const event = try json_event_wire.agentEventToJsonValue(allocator, .{
+        .event_type = .message_end,
+        .message = message,
+    });
+    defer tools_common.deinitJsonValue(allocator, event);
+    var invocation = (try context.invokeDetailed(allocator, "message_end", event)) orelse return null;
+    defer invocation.deinit(allocator);
+    return try messageEndReplacementFromResult(allocator, context, invocation.extension_id, message, invocation.result);
+}
+
+fn messageEndReplacementFromResult(
+    allocator: std.mem.Allocator,
+    context: *ExtensionHookContext,
+    extension_id: []const u8,
+    message: agent.AgentMessage,
+    result: std.json.Value,
+) !?agent.AgentMessage {
+    const current_role = messageRole(message);
+    var replacement_role = stringField(result, "role");
+    var replacement_text = stringField(result, "message") orelse stringField(result, "content");
+
+    if (objectField(result, "message")) |message_value| {
+        switch (message_value) {
+            .string => |text| replacement_text = text,
+            .object => {
+                if (replacement_role == null) replacement_role = stringField(message_value, "role");
+                if (replacement_text == null) replacement_text = stringField(message_value, "content") orelse firstTextFromJsonContent(message_value);
+            },
+            else => {},
+        }
+    }
+
+    if (replacement_role) |role| {
+        if (!std.mem.eql(u8, role, current_role)) {
+            const diagnostic = try std.fmt.allocPrint(
+                allocator,
+                "Extension message_end hook ignored incompatible replacement extensionId={s}: message_end handlers must return a message with the same role",
+                .{extension_id},
+            );
+            defer allocator.free(diagnostic);
+            try context.recordDiagnostic(diagnostic);
+            return null;
+        }
+    }
+    const text = replacement_text orelse return null;
+    var replacement = try agent.cloneMessage(allocator, message);
+    errdefer agent.deinitMessage(allocator, &replacement);
+    try replaceMessageText(allocator, &replacement, text);
+    return replacement;
+}
+
+fn firstTextFromJsonContent(message_value: std.json.Value) ?[]const u8 {
+    const content = objectField(message_value, "content") orelse return null;
+    switch (content) {
+        .string => |text| return text,
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .object) continue;
+                const item_type = stringField(item, "type") orelse continue;
+                if (!std.mem.eql(u8, item_type, "text")) continue;
+                if (stringField(item, "text")) |text| return text;
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn messageRole(message: agent.AgentMessage) []const u8 {
+    return switch (message) {
+        .user => "user",
+        .assistant => "assistant",
+        .tool_result => "toolResult",
+    };
+}
+
+fn replaceMessageText(allocator: std.mem.Allocator, message: *agent.AgentMessage, text: []const u8) !void {
+    const content = try tools_common.makeTextContent(allocator, text);
+    switch (message.*) {
+        .user => |*user| {
+            tools_common.deinitContentBlocks(allocator, user.content);
+            user.content = content;
+        },
+        .assistant => |*assistant| {
+            tools_common.deinitContentBlocks(allocator, assistant.content);
+            assistant.content = content;
+        },
+        .tool_result => |*tool_result| {
+            tools_common.deinitContentBlocks(allocator, tool_result.content);
+            tool_result.content = content;
+        },
+    }
+}
+
 fn makeObject(allocator: std.mem.Allocator) !std.json.Value {
     return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
 }
@@ -1354,24 +1468,10 @@ fn makeLifecycleEventObject(
     event: agent.AgentEvent,
     turn_index: usize,
 ) !std.json.Value {
-    var payload = try makeObject(allocator);
+    var payload = try json_event_wire.agentEventToJsonValue(allocator, event);
     errdefer tools_common.deinitJsonValue(allocator, payload);
-    try putString(allocator, &payload.object, "type", event_name);
+    _ = event_name;
     try putInt(allocator, &payload.object, "turnIndex", @intCast(turn_index));
-    if (event.message) |message| try putMessageSummary(allocator, &payload.object, message);
-    if (event.messages) |messages| try putMessagesSummary(allocator, &payload.object, messages);
-    if (event.tool_results) |tool_results| {
-        var array = std.json.Array.init(allocator);
-        for (tool_results) |tool_result| {
-            var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try putString(allocator, &entry, "toolCallId", tool_result.tool_call_id);
-            try putString(allocator, &entry, "toolName", tool_result.tool_name);
-            try putString(allocator, &entry, "content", firstText(tool_result.content) orelse "");
-            try putBool(allocator, &entry, "isError", tool_result.is_error);
-            try array.append(.{ .object = entry });
-        }
-        try putValue(allocator, &payload.object, "toolResults", .{ .array = array });
-    }
     return payload;
 }
 
@@ -2630,8 +2730,13 @@ const TestHookHost = struct {
     agent_end: bool = false,
     session_shutdown: bool = false,
     turn_start: bool = false,
+    message_start: bool = false,
+    message_update: bool = false,
     message_end: bool = false,
     turn_end: bool = false,
+    tool_execution_start: bool = false,
+    tool_execution_update: bool = false,
+    tool_execution_end: bool = false,
     tool_call: bool = false,
     tool_result: bool = false,
     label: []const u8 = "",
@@ -2646,13 +2751,26 @@ const TestHookHost = struct {
     agent_end_calls: usize = 0,
     session_shutdown_calls: usize = 0,
     turn_start_calls: usize = 0,
+    message_start_calls: usize = 0,
+    message_update_calls: usize = 0,
     message_end_calls: usize = 0,
     turn_end_calls: usize = 0,
+    tool_execution_start_calls: usize = 0,
+    tool_execution_update_calls: usize = 0,
+    tool_execution_end_calls: usize = 0,
     tool_call_calls: usize = 0,
     tool_result_calls: usize = 0,
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
+    message_end_replacement: ?[]const u8 = null,
+    saw_agent_end_messages: bool = false,
+    saw_message_update_assistant_event: bool = false,
+    saw_tool_result_message_start: bool = false,
+    saw_tool_result_message_end: bool = false,
+    saw_tool_execution_identity: bool = false,
+    saw_tool_execution_partial_result: bool = false,
+    saw_tool_execution_result: bool = false,
     fail_event_name: ?[]const u8 = null,
 
     fn adapter(self: *TestHookHost) extension_runtime.RuntimeAdapter {
@@ -2701,8 +2819,13 @@ fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     if (std.mem.eql(u8, event_name, "agent_end")) return host.agent_end;
     if (std.mem.eql(u8, event_name, "session_shutdown")) return host.session_shutdown;
     if (std.mem.eql(u8, event_name, "turn_start")) return host.turn_start;
+    if (std.mem.eql(u8, event_name, "message_start")) return host.message_start;
+    if (std.mem.eql(u8, event_name, "message_update")) return host.message_update;
     if (std.mem.eql(u8, event_name, "message_end")) return host.message_end;
     if (std.mem.eql(u8, event_name, "turn_end")) return host.turn_end;
+    if (std.mem.eql(u8, event_name, "tool_execution_start")) return host.tool_execution_start;
+    if (std.mem.eql(u8, event_name, "tool_execution_update")) return host.tool_execution_update;
+    if (std.mem.eql(u8, event_name, "tool_execution_end")) return host.tool_execution_end;
     if (std.mem.eql(u8, event_name, "tool_call")) return host.tool_call;
     if (std.mem.eql(u8, event_name, "tool_result")) return host.tool_result;
     return false;
@@ -2816,6 +2939,11 @@ fn testHookInvoke(
     if (std.mem.eql(u8, event_name, "agent_end")) {
         host.agent_end_calls += 1;
         try std.testing.expectEqualStrings("agent_end", event.object.get("type").?.string);
+        if (event.object.get("messages")) |messages| {
+            if (messages == .array and messages.array.items.len > 0) {
+                host.saw_agent_end_messages = true;
+            }
+        }
         return result;
     }
     if (std.mem.eql(u8, event_name, "session_shutdown")) {
@@ -2828,12 +2956,46 @@ fn testHookInvoke(
         host.turn_start_calls += 1;
         return result;
     }
+    if (std.mem.eql(u8, event_name, "message_start")) {
+        host.message_start_calls += 1;
+        try testHookExpectToolResultMessage(host, event, true);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "message_update")) {
+        host.message_update_calls += 1;
+        try testHookExpectMessageUpdate(host, event);
+        return result;
+    }
     if (std.mem.eql(u8, event_name, "message_end")) {
         host.message_end_calls += 1;
+        const message = event.object.get("message").?.object;
+        const role = message.get("role").?.string;
+        try testHookExpectToolResultMessage(host, event, false);
+        if (host.message_end_replacement) |replacement| {
+            if (std.mem.eql(u8, role, "assistant")) {
+                try putString(allocator, &result.object, "role", "assistant");
+                try putString(allocator, &result.object, "message", replacement);
+            }
+        }
         return result;
     }
     if (std.mem.eql(u8, event_name, "turn_end")) {
         host.turn_end_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_start")) {
+        host.tool_execution_start_calls += 1;
+        try testHookExpectToolExecutionStart(host, event);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_update")) {
+        host.tool_execution_update_calls += 1;
+        try testHookExpectToolExecutionUpdate(host, event);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_end")) {
+        host.tool_execution_end_calls += 1;
+        try testHookExpectToolExecutionEnd(host, event);
         return result;
     }
     if (std.mem.eql(u8, event_name, "tool_call")) {
@@ -2851,6 +3013,56 @@ fn testHookInvoke(
     }
     return result;
 }
+
+fn testHookExpectToolResultMessage(host: *TestHookHost, event: std.json.Value, is_start: bool) !void {
+    const message = event.object.get("message").?.object;
+    const role = message.get("role").?.string;
+    if (!std.mem.eql(u8, role, "toolResult")) return;
+    if (is_start) {
+        host.saw_tool_result_message_start = true;
+    } else {
+        host.saw_tool_result_message_end = true;
+    }
+    try std.testing.expectEqualStrings("lifecycle-call", message.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("lifecycle_tool", message.get("toolName").?.string);
+    try std.testing.expect(message.get("details") != null);
+    try std.testing.expect(!message.get("isError").?.bool);
+}
+
+fn testHookExpectMessageUpdate(host: *TestHookHost, event: std.json.Value) !void {
+    try std.testing.expectEqualStrings("message_update", event.object.get("type").?.string);
+    try std.testing.expectEqualStrings("assistant", event.object.get("message").?.object.get("role").?.string);
+    if (event.object.get("assistantMessageEvent")) |assistant_event| {
+        if (assistant_event == .object and assistant_event.object.get("type") != null) {
+            host.saw_message_update_assistant_event = true;
+        }
+    }
+}
+
+fn testHookExpectToolExecutionStart(host: *TestHookHost, event: std.json.Value) !void {
+    try std.testing.expectEqualStrings("lifecycle-call", event.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("lifecycle_tool", event.object.get("toolName").?.string);
+    try std.testing.expectEqualStrings("tool input", event.object.get("args").?.object.get("value").?.string);
+    host.saw_tool_execution_identity = true;
+}
+
+fn testHookExpectToolExecutionUpdate(host: *TestHookHost, event: std.json.Value) !void {
+    try std.testing.expectEqualStrings("lifecycle-call", event.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("lifecycle_tool", event.object.get("toolName").?.string);
+    const partial_result = event.object.get("partialResult").?.object;
+    try std.testing.expectEqualStrings("partial tool output", partial_result.get("content").?.array.items[0].object.get("text").?.string);
+    host.saw_tool_execution_partial_result = true;
+}
+
+fn testHookExpectToolExecutionEnd(host: *TestHookHost, event: std.json.Value) !void {
+    try std.testing.expectEqualStrings("lifecycle-call", event.object.get("toolCallId").?.string);
+    try std.testing.expectEqualStrings("lifecycle_tool", event.object.get("toolName").?.string);
+    const tool_result = event.object.get("result").?.object;
+    try std.testing.expectEqualStrings("final tool output", tool_result.get("content").?.array.items[0].object.get("text").?.string);
+    try std.testing.expect(!event.object.get("isError").?.bool);
+    host.saw_tool_execution_result = true;
+}
+
 fn testHookShutdown(ptr: *anyopaque) !void {
     _ = ptr;
 }
@@ -3278,6 +3490,157 @@ test "extension tool hooks mutate arguments and patch results" {
     try std.testing.expectEqual(@as(usize, 1), fixture.tool_result_calls);
     try std.testing.expectEqualStrings("patched result", patch.content.?[0].text.text);
     try std.testing.expectEqual(false, patch.is_error.?);
+}
+
+fn lifecycleToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    try std.testing.expectEqualStrings("tool input", params.object.get("value").?.string);
+    if (on_update) |callback| {
+        const partial_content = try tools_common.makeTextContent(allocator, "partial tool output");
+        try callback(on_update_context, .{ .content = partial_content });
+    }
+    var details = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try putString(allocator, &details, "phase", "final");
+    return .{
+        .content = try tools_common.makeTextContent(allocator, "final tool output"),
+        .details = .{ .object = details },
+        .is_error = false,
+    };
+}
+
+fn firstEventIndex(events: []const []const u8, name: []const u8) !usize {
+    for (events, 0..) |event_name, index| {
+        if (std.mem.eql(u8, event_name, name)) return index;
+    }
+    return error.ExpectedEventNotFound;
+}
+
+test "extension subscribers receive message tool and agent_end payloads" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var response_arena = std.heap.ArenaAllocator.init(allocator);
+    defer response_arena.deinit();
+    const response_allocator = response_arena.allocator();
+    var args = try makeObject(response_allocator);
+    try putString(response_allocator, &args.object, "value", "tool input");
+    const tool_call_blocks = try response_allocator.alloc(faux.FauxContentBlock, 1);
+    tool_call_blocks[0] = try faux.fauxToolCall(response_allocator, "lifecycle_tool", args, .{ .id = "lifecycle-call" });
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("final assistant")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(tool_call_blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    var order_log = std.ArrayList([]const u8).empty;
+    defer order_log.deinit(allocator);
+    var fixture = TestHookHost{
+        .agent_end = true,
+        .message_start = true,
+        .message_update = true,
+        .message_end = true,
+        .tool_execution_start = true,
+        .tool_execution_update = true,
+        .tool_execution_end = true,
+        .order_log = &order_log,
+        .order_allocator = allocator,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    const tool = agent.AgentTool{
+        .name = "lifecycle_tool",
+        .description = "lifecycle tool fixture",
+        .label = "Lifecycle Tool",
+        .parameters = .null,
+        .execute = lifecycleToolExecute,
+        .execution_mode = .sequential,
+    };
+    var session = try AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/message-tool-lifecycle",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .tools = &[_]agent.AgentTool{tool},
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("hello lifecycle");
+
+    try std.testing.expect(fixture.message_start_calls >= 4);
+    try std.testing.expect(fixture.message_update_calls >= 1);
+    try std.testing.expect(fixture.message_end_calls >= 4);
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_update_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_end_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.agent_end_calls);
+    try std.testing.expect(fixture.saw_agent_end_messages);
+    try std.testing.expect(fixture.saw_message_update_assistant_event);
+    try std.testing.expect(fixture.saw_tool_result_message_start);
+    try std.testing.expect(fixture.saw_tool_result_message_end);
+    try std.testing.expect(fixture.saw_tool_execution_identity);
+    try std.testing.expect(fixture.saw_tool_execution_partial_result);
+    try std.testing.expect(fixture.saw_tool_execution_result);
+
+    const tool_start_index = try firstEventIndex(order_log.items, "tool_execution_start");
+    const tool_update_index = try firstEventIndex(order_log.items, "tool_execution_update");
+    const tool_end_index = try firstEventIndex(order_log.items, "tool_execution_end");
+    try std.testing.expect(tool_start_index < tool_update_index);
+    try std.testing.expect(tool_update_index < tool_end_index);
+}
+
+test "extension message_end hook replaces final assistant content before persistence" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("raw assistant")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .message_end = true,
+        .message_end_replacement = "patched assistant",
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/message-end-replacement",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("hello replacement");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("hello replacement", messages[0].user.content[0].text.text);
+    try std.testing.expectEqualStrings("patched assistant", messages[1].assistant.content[0].text.text);
+
+    const entries = session.session_manager.getEntries();
+    var persisted_replacement = false;
+    for (entries) |entry| {
+        if (entry != .message) continue;
+        if (entry.message.message != .assistant) continue;
+        if (std.mem.eql(u8, entry.message.message.assistant.content[0].text.text, "patched assistant")) {
+            persisted_replacement = true;
+        }
+    }
+    try std.testing.expect(persisted_replacement);
+    try std.testing.expectEqual(@as(usize, 2), fixture.message_end_calls);
 }
 
 test "extension lifecycle hooks fire once per turn and message in agent order" {
