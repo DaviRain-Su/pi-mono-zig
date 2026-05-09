@@ -632,7 +632,10 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
             const role = try allocator.dupe(u8, user.role);
             errdefer allocator.free(role);
             const content = try content_clone.cloneContentBlocks(allocator, user.content);
-            errdefer content_clone.deinitContentBlocks(allocator, content);
+            errdefer {
+                content_clone.deinitContentBlocks(allocator, content);
+                allocator.free(content);
+            }
 
             break :blk .{ .user = .{
                 .role = role,
@@ -644,7 +647,10 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
             const role = try allocator.dupe(u8, assistant.role);
             errdefer allocator.free(role);
             const content = try content_clone.cloneContentBlocks(allocator, assistant.content);
-            errdefer content_clone.deinitContentBlocks(allocator, content);
+            errdefer {
+                content_clone.deinitContentBlocks(allocator, content);
+                allocator.free(content);
+            }
             const tool_calls = if (assistant.tool_calls) |calls| try cloneToolCalls(allocator, calls) else null;
             errdefer if (tool_calls) |calls| deinitToolCalls(allocator, calls);
             const api = try allocator.dupe(u8, assistant.api);
@@ -680,7 +686,10 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
             const tool_name = try allocator.dupe(u8, tool_result.tool_name);
             errdefer allocator.free(tool_name);
             const content = try content_clone.cloneContentBlocks(allocator, tool_result.content);
-            errdefer content_clone.deinitContentBlocks(allocator, content);
+            errdefer {
+                content_clone.deinitContentBlocks(allocator, content);
+                allocator.free(content);
+            }
             const details = if (tool_result.details) |value| try provider_json.cloneValue(allocator, value) else null;
             errdefer if (details) |value| provider_json.freeValue(allocator, value);
 
