@@ -2380,13 +2380,14 @@ fn drawTaskPanel(
         .style = content_style,
     });
 
-    if (panel_inner.height > 0) {
+    if (panel_inner.width > 0 and panel_inner.height > 0) {
+        const content_width = @as(usize, panel_inner.width);
         const content = try formatTaskHeaderTextForDisplay(
             ctx.arena,
             keybindings,
             snapshot,
-            @as(usize, panel_inner.width),
-            layoutMode(@as(usize, window.width)),
+            content_width,
+            layoutMode(content_width),
             now_ms,
         );
         _ = panel_inner.printSegment(.{

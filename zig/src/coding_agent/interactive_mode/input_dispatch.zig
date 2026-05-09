@@ -397,7 +397,9 @@ pub fn handleInputKeyWithModifiers(
                     _ = try editor.handleKey(key);
                     return;
                 }
-                const trimmed = std.mem.trim(u8, editor.text(), " \t\r\n");
+                const expanded_text = try editor.expandedTextAlloc(allocator);
+                defer allocator.free(expanded_text);
+                const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
                 submitAuthFlowInput(
                     allocator,
                     io,

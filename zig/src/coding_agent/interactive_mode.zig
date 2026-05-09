@@ -524,6 +524,56 @@ pub fn runInteractiveMode(
         }
         try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
 
+        // NOTE: screen/overlay resource pointers are rebound after input
+        // handling (see below), because auth/logout/settings flows can call
+        // live_resources.reload() during dispatchInputEvent(), which frees
+        // the previous ResourceBundle and its Theme instances.
+
+        if (should_exit and !prompt_worker_active) break;
+
+        const background_render_active = prompt_worker_active or app_state.user_bash_task.isActive();
+        if (background_render_active) {
+            renderer.markDirty();
+        }
+
+        var handled_input = false;
+        while (try input_loop.tryInputEvent()) |event| {
+            defer event.deinit(allocator);
+            handled_input = true;
+            renderer.markDirty();
+            try dispatchInputEvent(
+                allocator,
+                io,
+                env_map,
+                event.parsed,
+                &bootstrap.session,
+                &bootstrap.current_provider,
+                options.session_dir,
+                options,
+                bootstrap.built_tools.items,
+                &app_state,
+                &editor,
+                &overlay,
+                &auth_flow,
+                &prompt_worker,
+                &prompt_worker_active,
+                subscriber,
+                &should_exit,
+                &input_buffer,
+                &app_context,
+                &live_resources,
+            );
+            if (app_context.suspend_requested) break;
+        }
+        if (app_context.suspend_requested) {
+            try suspendInteractiveTerminal(allocator, io, env_map, &terminal, &input_loop, &app_state);
+            app_context.suspend_requested = false;
+            continue;
+        }
+
+        // Rebind live resource pointers after input handling. Auth/logout/settings
+        // flows may have called live_resources.reload() during dispatchInputEvent(),
+        // freeing the previous ResourceBundle and its Theme instances.
         const size = try terminal.refreshSize();
         screen.height = size.height;
         screen.overlay = if (overlay) |*value| value else null;
@@ -562,46 +612,11 @@ pub fn runInteractiveMode(
             }
         }
 
-        if (should_exit and !prompt_worker_active) break;
-
-        var handled_input = false;
-        while (try input_loop.tryInputEvent()) |event| {
-            defer event.deinit(allocator);
-            handled_input = true;
-            renderer.markDirty();
-            try dispatchInputEvent(
-                allocator,
-                io,
-                env_map,
-                event.parsed,
-                &bootstrap.session,
-                &bootstrap.current_provider,
-                options.session_dir,
-                options,
-                bootstrap.built_tools.items,
-                &app_state,
-                &editor,
-                &overlay,
-                &auth_flow,
-                &prompt_worker,
-                &prompt_worker_active,
-                subscriber,
-                &should_exit,
-                &input_buffer,
-                &app_context,
-                &live_resources,
-            );
-            if (app_context.suspend_requested) break;
-        }
-        if (app_context.suspend_requested) {
-            try suspendInteractiveTerminal(allocator, io, env_map, &terminal, &input_loop, &app_state);
-            app_context.suspend_requested = false;
-            continue;
-        }
         try renderer.renderToVaxis(screen.drawComponent(), input_loop.vaxis_state, input_loop.loop.tty.writer());
 
         if (!handled_input) {
-            std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+            const sleep_ms: i64 = if (background_render_active) 16 else 50;
+            std.Io.sleep(io, .fromMilliseconds(sleep_ms), .awake) catch {};
         }
     }
 
