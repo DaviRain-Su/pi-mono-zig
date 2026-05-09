@@ -12,9 +12,26 @@ const capability = @import("capability.zig");
 pub const Registry = extension_registry.Registry;
 pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
 
-pub const NativeToolExecute = *const fn (
+/// Context passed to native extension tool execute functions.
+/// Provides access to the allocator, parsed parameters, abort signal,
+/// progress callbacks, and the host API for capability-gated operations.
+pub const ToolContext = struct {
     allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
     params: std.json.Value,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
+    host_api: ?*NativeHostApi,
+
+    pub fn isAborted(self: ToolContext) bool {
+        if (self.signal) |s| return s.load(.acquire);
+        return false;
+    }
+};
+
+pub const NativeToolExecute = *const fn (
+    ctx: *ToolContext,
 ) anyerror!agent.AgentToolResult;
 
 pub const NativeToolDefinition = struct {
@@ -831,10 +848,6 @@ fn nativeAgentToolExecute(
     on_update_context: ?*anyopaque,
     on_update: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
-    _ = tool_call_id;
-    _ = signal;
-    _ = on_update_context;
-    _ = on_update;
     const binding: *NativeToolBinding = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
     binding.runtime.mutex.lockUncancelable(binding.runtime.io);
     defer binding.runtime.mutex.unlock(binding.runtime.io);
@@ -848,7 +861,19 @@ fn nativeAgentToolExecute(
     }
     if (!registered) return error.NativeToolNotRegistered;
     const execute = binding.definition.execute orelse return error.NativeToolNotExecutable;
-    return execute(allocator, params) catch |err| switch (err) {
+
+    var api = NativeHostApi{ .runtime = binding.runtime };
+    var ctx = ToolContext{
+        .allocator = allocator,
+        .tool_call_id = tool_call_id,
+        .params = params,
+        .signal = signal,
+        .on_update_context = on_update_context,
+        .on_update = on_update,
+        .host_api = &api,
+    };
+
+    return execute(&ctx) catch |err| switch (err) {
         error.InvalidNativeToolInput => {
             try binding.runtime.state.addDiagnostic(
                 .host_error,
@@ -1216,4 +1241,87 @@ test "native agent host operation gates enforce exact and exceeded resource boun
     }
     try std.testing.expect(max_children_denial);
     try std.testing.expect(turns_denial);
+}
+
+
+const tool_context_test_descriptor: NativeDescriptor = .{
+    .id = "com.pi.tool-context-test",
+    .name = "Tool Context Test",
+    .version = "0.1.0",
+    .description = "Validates that ToolContext reaches the native tool execute function.",
+    .tools = &.{.{
+        .name = "native.tool.context.probe",
+        .label = "Tool Context Probe",
+        .description = "Echoes back tool_call_id and params through the result.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}}}",
+        .extension_path = "native://tool-context/probe",
+        .execute = toolContextProbeExecute,
+    }},
+    .start = toolContextProbeStart,
+};
+
+fn toolContextProbeStart(api: *NativeHostApi) !void {
+    try api.ready();
+    for (api.runtime.descriptor.tools) |tool| {
+        try api.registerTool(tool);
+    }
+}
+
+fn toolContextProbeExecute(ctx: *ToolContext) !agent.AgentToolResult {
+    const value = if (ctx.params == .object)
+        (ctx.params.object.get("value") orelse .null).string
+    else
+        "no-value";
+
+    const text = try std.fmt.allocPrint(ctx.allocator, "id={s} value={s}", .{ ctx.tool_call_id, value });
+    errdefer ctx.allocator.free(text);
+
+    return .{
+        .content = try tools_common.makeTextContent(ctx.allocator, text),
+        .details = .{ .object = blk: {
+            var obj = try std.json.ObjectMap.init(ctx.allocator, &.{}, &.{});
+            try obj.put(ctx.allocator, try ctx.allocator.dupe(u8, "received_tool_call_id"), .{ .string = try ctx.allocator.dupe(u8, ctx.tool_call_id) });
+            try obj.put(ctx.allocator, try ctx.allocator.dupe(u8, "received_value"), .{ .string = try ctx.allocator.dupe(u8, value) });
+            break :blk obj;
+        } },
+    };
+}
+
+test "native tool execute receives full ToolContext" {
+    const allocator = std.testing.allocator;
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &tool_context_test_descriptor,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+
+    const tool = try runtime.agentTool(allocator, "native.tool.context.probe");
+    try std.testing.expect(tool != null);
+    defer if (tool) |*t| {
+        if (t.deinit_execute_context) |deinit_ctx| {
+            deinit_ctx(allocator, t.execute_context);
+        }
+        tools_common.deinitJsonValue(allocator, t.parameters);
+    };
+
+    const args = try std.json.parseFromSlice(std.json.Value, allocator,
+        "{\"value\":\"hello-context\"}", .{});
+    defer args.deinit();
+
+    const result = try tool.?.execute.?(allocator, "call-123", args.value, tool.?.execute_context, null, null, null);
+    defer {
+        for (result.content) |block| {
+            if (block == .text) allocator.free(block.text.text);
+        }
+        allocator.free(result.content);
+        if (result.details) |*d| tools_common.deinitJsonValue(allocator, d.*);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expectEqualStrings("id=call-123 value=hello-context", result.content[0].text.text);
+    try std.testing.expect(result.details != null);
+    const detail_id = result.details.?.object.get("received_tool_call_id").?;
+    try std.testing.expectEqualStrings("call-123", detail_id.string);
 }
