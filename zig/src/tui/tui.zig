@@ -91,6 +91,7 @@ pub const Renderer = struct {
             .component = component,
             .options = options,
         });
+        self.markDirty();
         return id;
     }
 
@@ -98,6 +99,7 @@ pub const Renderer = struct {
         for (self.draw_overlays.items, 0..) |entry, index| {
             if (entry.id != id) continue;
             _ = self.draw_overlays.orderedRemove(index);
+            self.markDirty();
             return true;
         }
         return false;
@@ -106,6 +108,7 @@ pub const Renderer = struct {
     pub fn dismissTopOverlay(self: *Renderer) bool {
         if (self.draw_overlays.items.len == 0) return false;
         _ = self.draw_overlays.pop();
+        self.markDirty();
         return true;
     }
 
@@ -114,6 +117,7 @@ pub const Renderer = struct {
             if (entry.id != id) continue;
             entry.component = component;
             entry.options = options;
+            self.markDirty();
             return true;
         }
         return false;
