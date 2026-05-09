@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
     mod.addImport("tui", tui_mod);
+    mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     // Main executable
     const exe = b.addExecutable(.{
