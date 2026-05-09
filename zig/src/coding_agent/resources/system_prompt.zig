@@ -4,6 +4,22 @@ const context_files_mod = @import("context_files.zig");
 const resources_mod = @import("resources.zig");
 const tool_selection_mod = @import("../tool_selection.zig");
 
+fn normalizePathForPrompt(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var has_backslash = false;
+    for (path) |c| {
+        if (c == '\\') {
+            has_backslash = true;
+            break;
+        }
+    }
+    if (!has_backslash) return allocator.dupe(u8, path);
+    const buf = try allocator.alloc(u8, path.len);
+    for (path, 0..) |c, i| {
+        buf[i] = if (c == '\\') '/' else c;
+    }
+    return buf;
+}
+
 const BUILTIN_TOOLS = [_]ToolInfo{
     .{ .name = "read", .description = "Read file contents" },
     .{ .name = "bash", .description = "Execute shell commands" },
@@ -71,7 +87,13 @@ pub fn buildSystemPrompt(allocator: std.mem.Allocator, options: BuildSystemPromp
     try prompt.appendSlice(allocator, "\n\nCurrent date: ");
     try prompt.appendSlice(allocator, options.current_date);
     try prompt.appendSlice(allocator, "\nCurrent working directory: ");
-    try prompt.appendSlice(allocator, options.cwd);
+    if (@import("builtin").os.tag == .windows) {
+        const normalized = try normalizePathForPrompt(allocator, options.cwd);
+        defer allocator.free(normalized);
+        try prompt.appendSlice(allocator, normalized);
+    } else {
+        try prompt.appendSlice(allocator, options.cwd);
+    }
 
     return try prompt.toOwnedSlice(allocator);
 }
