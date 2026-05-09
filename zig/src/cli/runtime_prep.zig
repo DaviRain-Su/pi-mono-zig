@@ -586,19 +586,20 @@ test "prepareCliRuntime surfaces extension provider collision diagnostics throug
     try tmp.dir.createDirPath(std.testing.io, "project");
     try tmp.dir.createDirPath(std.testing.io, "agent");
 
-    const valid_path = try makeRuntimePrepTestPath(allocator, tmp, "valid-provider.js");
+    const valid_path = try makeRuntimePrepTestPath(allocator, tmp, "valid-provider.ts");
     defer allocator.free(valid_path);
-    const duplicate_a_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-a-provider.js");
+    const duplicate_a_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-a-provider.ts");
     defer allocator.free(duplicate_a_path);
-    const duplicate_b_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-b-provider.js");
+    const duplicate_b_path = try makeRuntimePrepTestPath(allocator, tmp, "duplicate-b-provider.ts");
     defer allocator.free(duplicate_b_path);
-    const builtin_path = try makeRuntimePrepTestPath(allocator, tmp, "builtin-provider.js");
+    const builtin_path = try makeRuntimePrepTestPath(allocator, tmp, "builtin-provider.ts");
     defer allocator.free(builtin_path);
 
-    try writeRuntimePrepProviderScript(&tmp, allocator, "valid-provider.js", valid_path, "ext-valid-provider", "Valid Provider", "valid-model", "Valid Model", "http://localhost:4521/v1");
-    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-a-provider.js", duplicate_a_path, "ext-colliding-provider", "Duplicate A", "dup-a-model", "Duplicate A Model", "http://localhost:4522/v1");
-    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-b-provider.js", duplicate_b_path, "ext-colliding-provider", "Duplicate B", "dup-b-model", "Duplicate B Model", "http://localhost:4523/v1");
-    try writeRuntimePrepProviderScript(&tmp, allocator, "builtin-provider.js", builtin_path, "openai", "Builtin Collision", "shadow-gpt", "Shadow GPT", "http://localhost:4524/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "valid-provider.ts", valid_path, "ext-valid-provider", "Valid Provider", "valid-model", "Valid Model", "http://localhost:4521/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-a-provider.ts", duplicate_a_path, "ext-colliding-provider", "Duplicate A", "dup-a-model", "Duplicate A Model", "http://localhost:4522/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "duplicate-b-provider.ts", duplicate_b_path, "ext-colliding-provider", "Duplicate B", "dup-b-model", "Duplicate B Model", "http://localhost:4523/v1");
+    try writeRuntimePrepProviderScript(&tmp, allocator, "builtin-provider.ts", builtin_path, "openai", "Builtin Collision", "shadow-gpt", "Shadow GPT", "http://localhost:4524/v1");
+
 
     const project_dir = try makeRuntimePrepTestPath(allocator, tmp, "project");
     defer allocator.free(project_dir);
@@ -678,11 +679,8 @@ fn makeRuntimePrepTestPath(
     tmp: std.testing.TmpDir,
     sub_path: []const u8,
 ) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    const tmp_path = try std.fs.path.resolve(allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
-    defer allocator.free(tmp_path);
-    const base = try runtimePrepRealpathAlloc(allocator, tmp_path);
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+
     defer allocator.free(base);
     if (std.mem.eql(u8, sub_path, ".")) return try allocator.dupe(u8, base);
     return try std.fs.path.join(allocator, &.{ base, sub_path });

@@ -693,6 +693,18 @@ fn testSessionWithModel(allocator: std.mem.Allocator, model: ai.Model) !session_
     });
 }
 
+fn testPersistentSessionWithModel(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    model: ai.Model,
+) !session_mod.AgentSession {
+    return try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/pi-webview-assets",
+        .model = model,
+        .session_dir = session_dir,
+    });
+}
+
 fn testBridge(session: *session_mod.AgentSession) BridgeHost {
     const model = ai.Model{
         .id = "faux-model",
@@ -925,6 +937,78 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     try std.testing.expect(std.mem.indexOf(u8, after, "\"sequence\"") == null);
 }
 
+test "webview get_state mirrors existing session without mutating persisted state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    const session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(session_id);
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    const before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before);
+
+    const first = try bridge.handleRequestJson(allocator, "{\"id\":\"state-1\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(first);
+    const second = try bridge.handleRequestJson(allocator, "{\"id\":\"state-2\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(second);
+
+    const after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"sessionId\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, session_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"noSession\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, session_id) != null);
+    try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "webview no-session prompt remains in memory without session file persistence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("ephemeral answer")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{}) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.model = registration.getModel();
+    bridge.context.no_session = true;
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"ephemeral prompt\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"completed\"") != null);
+
+    const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "ephemeral prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "ephemeral answer") != null);
+    try std.testing.expect(session.session_manager.getSessionFile() == null);
+    try std.testing.expectEqual(@as(usize, 0), try countDirectoryEntries(session_dir));
+}
+
 test "webview prompt denies concurrent active turn deterministically" {
     const allocator = std.testing.allocator;
     var session = try testSession(allocator);
@@ -976,6 +1060,63 @@ test "webview provider error is surfaced safely and bridge remains usable" {
     try std.testing.expect(std.mem.indexOf(u8, state, "\"id\":\"after-error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"busy\":false") != null);
+}
+
+test "webview provider error persists explicit canonical policy for non-webview readers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("partial before persisted error")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{
+            .stop_reason = .error_reason,
+            .error_message = "persisted provider error",
+        }) },
+    });
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, registration.getModel());
+    defer session.deinit();
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    var bridge = testBridge(&session);
+    bridge.context.model = registration.getModel();
+    bridge.context.no_session = false;
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt-error\",\"command\":\"prompt\",\"payload\":{\"text\":\"persist failing turn\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"provider_error\"") != null);
+
+    const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages-after-error\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "persist failing turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "partial before persisted error") == null);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "persist failing turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "partial before persisted error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"stopReason\":\"error\"") != null);
+
+    var reopened = try session_mod.AgentSession.open(allocator, std.testing.io, .{
+        .session_file = session_file,
+        .system_prompt = "",
+        .model = registration.getModel(),
+    });
+    defer reopened.deinit();
+    const replayed = reopened.agent.getMessages();
+    try std.testing.expectEqual(@as(usize, 1), replayed.len);
+    try std.testing.expectEqualStrings("persist failing turn", replayed[0].user.content[0].text.text);
 }
 
 test "webview abort without active generation is safe no-op" {
@@ -1381,4 +1522,15 @@ test "bridge diagnostics do not echo credential-shaped input" {
     try std.testing.expect(std.mem.indexOf(u8, response, "sk-live-webview-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"unknown_command\"") != null);
+}
+
+fn countDirectoryEntries(path: []const u8) !usize {
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, path, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |_| {
+        count += 1;
+    }
+    return count;
 }

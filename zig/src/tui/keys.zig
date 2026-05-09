@@ -37,6 +37,7 @@ pub const Key = union(enum) {
     right,
     ctrl_left,
     ctrl_right,
+    ctrl_end,
     home,
     end,
     insert,
@@ -90,11 +91,29 @@ pub const MouseWheelInput = struct {
     col: i16,
 };
 
+pub const MouseClickInput = struct {
+    row: i16,
+    col: i16,
+};
+
+pub const MouseDragInput = struct {
+    row: i16,
+    col: i16,
+};
+
+pub const MouseReleaseInput = struct {
+    row: i16,
+    col: i16,
+};
+
 pub const InputEvent = union(enum) {
     key: Key,
     paste: []const u8,
     protocol: ProtocolEvent,
     mouse_wheel: MouseWheelInput,
+    mouse_click: MouseClickInput,
+    mouse_drag: MouseDragInput,
+    mouse_release: MouseReleaseInput,
 };
 
 pub const ParsedInput = struct {
@@ -128,6 +147,40 @@ pub fn parsedMouseWheelInput(mouse: vaxis.Mouse) ?ParsedInput {
     };
 }
 
+pub fn parsedMouseClickInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .press) return null;
+    if (mouse.button != .left) return null;
+    return .{
+        .event = .{ .mouse_click = .{
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedMouseDragInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .drag) return null;
+    return .{
+        .event = .{ .mouse_drag = .{
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedMouseReleaseInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .release) return null;
+    return .{
+        .event = .{ .mouse_release = .{
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
+        .consumed = 0,
+    };
+}
+
 pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?ParsedInput {
     var modifiers = keyModifiersFromVaxis(vaxis_key.mods);
     if (ctrlShortcutFromVaxisKey(vaxis_key, modifiers)) |ctrl| {
@@ -151,7 +204,7 @@ pub fn parsedInputFromVaxisKey(vaxis_key: vaxis.Key, event_type: KeyEventType) ?
 
     key = canonicalizeLegacyVaxisAltNavigation(key, modifiers);
     switch (key) {
-        .ctrl, .ctrl_left, .ctrl_right => modifiers.ctrl = false,
+        .ctrl, .ctrl_left, .ctrl_right, .ctrl_end => modifiers.ctrl = false,
         .shift_tab => modifiers.shift = false,
         else => {},
     }
@@ -259,7 +312,7 @@ fn keyFromVaxisCodepoint(
         vaxis.Key.page_up => .page_up,
         vaxis.Key.page_down => .page_down,
         vaxis.Key.home => .home,
-        vaxis.Key.end => .end,
+        vaxis.Key.end => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_end else .end,
         vaxis.Key.f1 => .f1,
         vaxis.Key.f2 => .f2,
         vaxis.Key.f3 => .f3,
@@ -280,7 +333,7 @@ fn keyFromVaxisCodepoint(
         57421 => .page_up,
         57422 => .page_down,
         57423 => .home,
-        57424 => .end,
+        57424 => if (modifiers.ctrl and !modifiers.alt and !modifiers.shift and !modifiers.super) .ctrl_end else .end,
         57425 => .insert,
         57426 => .delete,
         else => keyFromCodepoint(effective_codepoint, modifiers),

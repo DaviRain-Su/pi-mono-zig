@@ -1710,6 +1710,8 @@ pub fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process
         try expandLeadingHome(allocator, env_map, value)
     else if (env_map.get("HOME")) |home|
         try std.fs.path.join(allocator, &[_][]const u8{ home, ".pi" })
+    else if (env_map.get("USERPROFILE")) |userprofile|
+        try std.fs.path.join(allocator, &[_][]const u8{ userprofile, ".pi" })
     else
         try allocator.dupe(u8, ".pi");
     defer allocator.free(base_dir);
@@ -1726,7 +1728,7 @@ pub fn expandPath(allocator: std.mem.Allocator, env_map: *const std.process.Envi
 }
 
 fn expandLeadingHome(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map, value: []const u8) ![]u8 {
-    const home = env_map.get("HOME") orelse return allocator.dupe(u8, value);
+    const home = env_map.get("HOME") orelse env_map.get("USERPROFILE") orelse return allocator.dupe(u8, value);
     if (std.mem.eql(u8, value, "~")) return allocator.dupe(u8, home);
     if (std.mem.startsWith(u8, value, "~/")) return std.fs.path.join(allocator, &[_][]const u8{ home, value[2..] });
     return allocator.dupe(u8, value);

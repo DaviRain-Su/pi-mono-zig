@@ -48,3 +48,10 @@ zig/zig-out/
 .factory
 zig/.pi/
 validation/
+zig/root
+zig/vendor/zwasm/*
+!zig/vendor/zwasm/build.zig
+!zig/vendor/zwasm/build.zig.zon
+!zig/vendor/zwasm/LICENSE
+!zig/vendor/zwasm/src/
+!zig/vendor/zwasm/src/**

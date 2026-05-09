@@ -418,8 +418,9 @@ pub const HostProcess = struct {
             break :blk id;
         };
 
-        var elapsed: u64 = 0;
-        while (elapsed <= timeout_ms) : (elapsed += 10) {
+        const start_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
+        const timeout_ns: @TypeOf(start_ns) = @as(@TypeOf(start_ns), @intCast(timeout_ms)) * std.time.ns_per_ms;
+        while (std.Io.Clock.now(.awake, self.io).nanoseconds - start_ns < timeout_ns) {
             self.mutex.lockUncancelable(self.io);
             if (self.state.takeExtensionEventResponse(event_id)) |response| {
                 self.mutex.unlock(self.io);
@@ -472,8 +473,16 @@ pub const HostProcess = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            self.state.removeExtensionEventResponses(event_id);
+            var stale_response_seen = false;
+            while (self.state.takeExtensionEventResponse(event_id)) |response| {
+                var owned_response = response;
+                owned_response.deinit(self.allocator);
+                stale_response_seen = true;
+            }
             _ = self.state.resolvePendingExtensionEventRequest(event_id);
+            if (stale_response_seen) {
+                try self.state.addDiagnostic(.host_error, .warning, "host emitted stale or unknown extension event response");
+            }
             const message = try std.fmt.allocPrint(
                 self.allocator,
                 "extension hook dispatch timed out after {d}ms source={s} event={s} eventId={s}",
@@ -1046,7 +1055,10 @@ test "process_jsonl host times out unresponsive extension event hook and rejects
     try std.testing.expect(hostDiagnosticContains(host, .host_error, "extension hook dispatch timed out"));
     try std.testing.expect(hostDiagnosticContains(host, .host_error, "message_end"));
     try std.testing.expectEqual(@as(usize, 0), host.state.pending_extension_event_ids.count());
-    std.Io.sleep(std.testing.io, .fromMilliseconds(300), .awake) catch {};
+    var stale_elapsed: u64 = 0;
+    while (!hostDiagnosticContains(host, .host_error, "stale or unknown extension event response") and stale_elapsed <= 1500) : (stale_elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
     try std.testing.expect(hostDiagnosticContains(host, .host_error, "stale or unknown extension event response"));
 }
 

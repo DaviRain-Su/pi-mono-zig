@@ -3,6 +3,7 @@
     .version = "0.16.0",
     .dependencies = .{
         .vaxis = .{ .path = "vendor/vaxis" },
+        .zwasm = .{ .path = "vendor/zwasm" },
     },
     .paths = .{""},
     .fingerprint = 0xc1ce1081f1ad3ac6,

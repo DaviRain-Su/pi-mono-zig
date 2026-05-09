@@ -112,6 +112,7 @@ pub const SessionManager = struct {
     labels_by_id: std.StringHashMap([]const u8),
     label_timestamps_by_id: std.StringHashMap([]const u8),
     leaf_id: ?[]const u8,
+    last_persisted_hash: ?u64,
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -188,6 +189,7 @@ pub const SessionManager = struct {
             .labels_by_id = std.StringHashMap([]const u8).init(allocator),
             .label_timestamps_by_id = std.StringHashMap([]const u8).init(allocator),
             .leaf_id = null,
+            .last_persisted_hash = std.hash.Wyhash.hash(0, bytes),
         };
         errdefer manager.deinit();
 
@@ -301,6 +303,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendMessage(self: *SessionManager, message: agent.AgentMessage) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -321,6 +324,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendThinkingLevelChange(self: *SessionManager, thinking_level: agent.ThinkingLevel) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -341,6 +345,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendModelChange(self: *SessionManager, provider: []const u8, model_id: []const u8) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -367,6 +372,7 @@ pub const SessionManager = struct {
         first_kept_entry_id: []const u8,
         tokens_before: u32,
     ) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -395,6 +401,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendCustomEntry(self: *SessionManager, custom_type: []const u8, data: ?std.json.Value) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -425,6 +432,7 @@ pub const SessionManager = struct {
         display: bool,
         details: ?std.json.Value,
     ) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -457,6 +465,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendSessionInfo(self: *SessionManager, name: []const u8) ![]const u8 {
+        try self.ensureDiskNotModified();
         const id = try generateUniqueId(self.allocator, &self.by_id);
         errdefer self.allocator.free(id);
 
@@ -485,6 +494,7 @@ pub const SessionManager = struct {
     }
 
     pub fn appendLabelChange(self: *SessionManager, target_id: []const u8, label: ?[]const u8) ![]const u8 {
+        try self.ensureDiskNotModified();
         if (self.getEntry(target_id) == null) return error.EntryNotFound;
 
         const id = try generateUniqueId(self.allocator, &self.by_id);
@@ -523,6 +533,7 @@ pub const SessionManager = struct {
         details: ?std.json.Value,
         from_hook: ?bool,
     ) ![]const u8 {
+        try self.ensureDiskNotModified();
         if (branch_from_id) |entry_id| {
             if (self.getEntry(entry_id) == null) return error.EntryNotFound;
         }
@@ -775,7 +786,7 @@ pub const SessionManager = struct {
 
     fn appendEntry(self: *SessionManager, entry: SessionEntry) !void {
         try self.appendLoadedEntry(entry);
-        try self.persistToDisk();
+        try self.persistToDiskAfterPreflight();
     }
 
     /// Forces a full rewrite of the session JSONL file from the in-memory
@@ -785,6 +796,11 @@ pub const SessionManager = struct {
     }
 
     fn persistToDisk(self: *SessionManager) !void {
+        try self.ensureDiskNotModified();
+        try self.persistToDiskAfterPreflight();
+    }
+
+    fn persistToDiskAfterPreflight(self: *SessionManager) !void {
         if (!self.persist) return;
         const path = self.session_file orelse return;
 
@@ -804,6 +820,21 @@ pub const SessionManager = struct {
         }
 
         try common.writeFileAbsolute(self.io, path, bytes.items, true);
+        self.last_persisted_hash = std.hash.Wyhash.hash(0, bytes.items);
+    }
+
+    fn ensureDiskNotModified(self: *SessionManager) !void {
+        if (!self.persist) return;
+        const expected_hash = self.last_persisted_hash orelse return;
+        const path = self.session_file orelse return;
+        const bytes = std.Io.Dir.readFileAlloc(.cwd(), self.io, path, self.allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => return error.SessionConcurrentModification,
+            else => return err,
+        };
+        defer self.allocator.free(bytes);
+        if (std.hash.Wyhash.hash(0, bytes) != expected_hash) {
+            return error.SessionConcurrentModification;
+        }
     }
 };
 
@@ -1169,6 +1200,7 @@ fn initEmpty(
         .labels_by_id = std.StringHashMap([]const u8).init(allocator),
         .label_timestamps_by_id = std.StringHashMap([]const u8).init(allocator),
         .leaf_id = null,
+        .last_persisted_hash = null,
     };
 }
 
@@ -1740,6 +1772,49 @@ test "session manager persists messages to jsonl and resumes from disk" {
     try std.testing.expectEqual(tool_result_timestamp, context.messages[2].tool_result.timestamp);
     try std.testing.expectEqualStrings("faux", context.model.?.provider);
     try std.testing.expectEqualStrings("faux-session", context.model.?.model_id);
+}
+
+test "session manager denies stale concurrent persisted writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_dir = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "sessions",
+    });
+    defer std.testing.allocator.free(relative_dir);
+    const session_dir = try makeAbsoluteTestPath(std.testing.allocator, relative_dir);
+    defer std.testing.allocator.free(session_dir);
+
+    var first = try SessionManager.create(std.testing.allocator, std.testing.io, "/tmp/project", session_dir);
+    defer first.deinit();
+    const session_file = try std.testing.allocator.dupe(u8, first.getSessionFile().?);
+    defer std.testing.allocator.free(session_file);
+
+    var second = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
+    defer second.deinit();
+
+    var first_user = try userTextMessage(std.testing.allocator, "first writer", 1);
+    defer deinitMessage(std.testing.allocator, &first_user);
+    _ = try first.appendMessage(first_user);
+
+    var second_user = try userTextMessage(std.testing.allocator, "stale writer", 2);
+    defer deinitMessage(std.testing.allocator, &second_user);
+    try std.testing.expectError(error.SessionConcurrentModification, second.appendMessage(second_user));
+
+    var reopened = try SessionManager.open(std.testing.allocator, std.testing.io, session_file, null);
+    defer reopened.deinit();
+    var context = try reopened.buildSessionContext(std.testing.allocator);
+    defer context.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expectEqualStrings("first writer", context.messages[0].user.content[0].text.text);
+
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "first writer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "stale writer") == null);
 }
 
 test "session context excludes aborted assistant messages from replay" {

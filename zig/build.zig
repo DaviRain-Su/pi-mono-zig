@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zwasm_dep = b.dependency("zwasm", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -87,6 +91,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
     mod.addImport("tui", tui_mod);
+    mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -208,6 +213,7 @@ pub fn build(b: *std.Build) void {
     coding_agent_mod.addImport("ai", ai_mod);
     coding_agent_mod.addImport("agent", agent_mod);
     coding_agent_mod.addImport("tui", tui_mod);
+    coding_agent_mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     const coding_agent_tests = b.addTest(.{
         .root_module = coding_agent_mod,
@@ -230,6 +236,7 @@ pub fn build(b: *std.Build) void {
     main_test_mod.addImport("ai", ai_mod);
     main_test_mod.addImport("agent", agent_mod);
     main_test_mod.addImport("tui", tui_mod);
+    main_test_mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,

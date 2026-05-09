@@ -5473,7 +5473,7 @@ test "M7 TS RPC lists extension commands and dispatches slash command without ag
             "printf '{{\"type\":\"register_message_renderer\",\"customType\":\"m7.message\",\"extensionPath\":\"fixture/m7.ts\"}}\\n'; " ++
             "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; " ++
             "case \"$line\" in " ++
-            "*'\"type\":\"extension_event\"'*) printf '{{\"type\":\"extension_ui_request\",\"id\":\"m7_command_status\",\"method\":\"setStatus\",\"payload\":{{\"statusKey\":\"m7\",\"statusText\":\"command dispatched\"}}}}\\n'; printf '{{\"type\":\"extension_event_result\",\"eventId\":\"event-1-command\",\"result\":{{\"handled\":true,\"command\":\"m7.echo\"}}}}\\n';; " ++
+            "*'\"type\":\"extension_event\"'*) event_id=${{line#*'\"eventId\":\"'}}; event_id=${{event_id%%'\"'*}}; printf '{{\"type\":\"extension_ui_request\",\"id\":\"m7_command_status\",\"method\":\"setStatus\",\"payload\":{{\"statusKey\":\"m7\",\"statusText\":\"command dispatched\"}}}}\\n'; printf '{{\"type\":\"extension_event_result\",\"eventId\":\"%s\",\"result\":{{\"handled\":true,\"command\":\"m7.echo\"}}}}\\n' \"$event_id\";; " ++
             "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
             "esac; done",
         .{ capture_path, capture_path },
@@ -5503,9 +5503,10 @@ test "M7 TS RPC lists extension commands and dispatches slash command without ag
     });
 
     var registry_elapsed: u64 = 0;
-    while (!server.extension_host.?.hasRegisteredCommand("m7.echo") and registry_elapsed < 500) : (registry_elapsed += 5) {
+    while (server.extension_host.?.registryFramesApplied() < 3 and registry_elapsed < 500) : (registry_elapsed += 5) {
         std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
     }
+    try std.testing.expectEqual(@as(usize, 3), server.extension_host.?.registryFramesApplied());
     try std.testing.expect(server.extension_host.?.hasRegisteredCommand("m7.echo"));
 
     try server.handleLine("{\"id\":\"commands\",\"type\":\"get_commands\"}");
@@ -5533,7 +5534,8 @@ test "M7 TS RPC lists extension commands and dispatches slash command without ag
     try server.finish();
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
     defer allocator.free(capture);
-    try expectContains(capture, "{\"type\":\"extension_event\",\"eventId\":\"event-1-command\",\"event\":{\"type\":\"command\",\"name\":\"m7.echo\",\"argument\":\"hello from rpc\",\"source\":\"rpc\"}}\n");
+    try expectContains(capture, "{\"type\":\"extension_event\",\"eventId\":\"");
+    try expectContains(capture, "\",\"event\":{\"type\":\"command\",\"name\":\"m7.echo\",\"argument\":\"hello from rpc\",\"source\":\"rpc\"}}\n");
 }
 
 test "M7 TS RPC reports extension command delivery and workflow execution failures" {

@@ -16,7 +16,7 @@ const native_runtime = @import("native_runtime.zig");
 const sdk = @import("sdk.zig");
 const resources_mod = @import("../resources/resources.zig");
 const tools_common = @import("../tools/common.zig");
-const wasm_host = @import("wasm/wasm_host_spike.zig");
+const wasm_host = @import("wasm/zwasm_host.zig");
 const wasm_manifest = @import("wasm/wasm_manifest.zig");
 const lifecycle_support = @import("lifecycle_support.zig");
 const policy_key_mod = @import("policy_key.zig");
@@ -2096,6 +2096,7 @@ const WasmRuntime = struct {
         errdefer owned_manifest.deinit(allocator);
         var host = try wasm_host.Host.loadFromFile(allocator, io, options.manifest.artifact_absolute_path);
         errdefer host.deinit();
+        host.setToolId(owned_manifest.tool_id);
         try validateWasmArtifactHandoff(allocator, &host, options.manifest);
 
         const runtime = try allocator.create(WasmRuntime);

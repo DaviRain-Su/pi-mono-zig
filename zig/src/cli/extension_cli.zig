@@ -102,6 +102,23 @@ pub const PreparedExtensionCli = struct {
         unknown_flags: ?[]const cli.UnknownFlag,
         stderr: *std.Io.Writer,
     ) !bool {
+        return self.applyUnknownFlagsWithOptions(unknown_flags, stderr, false);
+    }
+
+    pub fn applyUnknownFlagsForRegistryDump(
+        self: *PreparedExtensionCli,
+        unknown_flags: ?[]const cli.UnknownFlag,
+        stderr: *std.Io.Writer,
+    ) !bool {
+        return self.applyUnknownFlagsWithOptions(unknown_flags, stderr, true);
+    }
+
+    fn applyUnknownFlagsWithOptions(
+        self: *PreparedExtensionCli,
+        unknown_flags: ?[]const cli.UnknownFlag,
+        stderr: *std.Io.Writer,
+        allow_registry_diagnostics: bool,
+    ) !bool {
         const raw_unknown_flags = unknown_flags orelse &.{};
 
         const parsed = try self.allocator.alloc(extension_flags.ParsedUnknownFlag, raw_unknown_flags.len);
@@ -125,6 +142,7 @@ pub const PreparedExtensionCli = struct {
 
         var saw_error = false;
         for (apply_result.diagnostics) |diagnostic| {
+            if (allow_registry_diagnostics and self.isRegistryDiagnostic(diagnostic)) continue;
             if (diagnostic.severity == .@"error") saw_error = true;
             try stderr.print(
                 "Error: {s} owner={s} source={s} flag=--{s} reason={s}: {s}\n",
@@ -145,41 +163,6 @@ pub const PreparedExtensionCli = struct {
         }
 
         return true;
-    }
-
-    /// Registry-dump mode is an explicit validation/debug surface. It
-    /// must preserve rejected sidecar diagnostics for the snapshot
-    /// instead of treating them as fatal stderr errors, while still
-    /// plumbing any successfully parsed extension flag values into the
-    /// live runtime registry.
-    pub fn applyUnknownFlagsForRegistryDump(
-        self: *PreparedExtensionCli,
-        unknown_flags: ?[]const cli.UnknownFlag,
-    ) !void {
-        const raw_unknown_flags = unknown_flags orelse &.{};
-
-        const parsed = try self.allocator.alloc(extension_flags.ParsedUnknownFlag, raw_unknown_flags.len);
-        defer self.allocator.free(parsed);
-        for (raw_unknown_flags, 0..) |raw, idx| {
-            parsed[idx] = .{
-                .name = raw.name,
-                .value = switch (raw.value) {
-                    .boolean => |b| .{ .boolean = b },
-                    .string => |s| .{ .string = s },
-                },
-            };
-        }
-
-        var apply_result = try extension_flags.applyUnknownFlags(
-            self.allocator,
-            &self.registry,
-            parsed,
-        );
-        defer apply_result.deinit(self.allocator);
-
-        for (apply_result.values) |entry| {
-            try self.storeParsedCliFlagValue(entry);
-        }
     }
 
     fn storeParsedCliFlagValue(
@@ -213,6 +196,17 @@ pub const PreparedExtensionCli = struct {
                 });
             },
         }
+    }
+
+    fn isRegistryDiagnostic(self: *const PreparedExtensionCli, diagnostic: extension_flags.Diagnostic) bool {
+        for (self.registry.diagnostics.items) |registry_diagnostic| {
+            if (!std.mem.eql(u8, registry_diagnostic.code, diagnostic.code)) continue;
+            if (!std.mem.eql(u8, registry_diagnostic.owner, diagnostic.owner)) continue;
+            if (!std.mem.eql(u8, registry_diagnostic.flag_name, diagnostic.flag_name)) continue;
+            return true;
+        }
+        return false;
+
     }
 
     pub fn parsedCliFlagValues(self: *const PreparedExtensionCli) []const extension_registry.ParsedCliFlag {
@@ -341,48 +335,38 @@ fn snapshotWithRejectedFlagDiagnostics(
 ) ![]u8 {
     if (diagnostics.len == 0) return try allocator.dupe(u8, snapshot);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return try allocator.dupe(u8, snapshot);
+    const trimmed = std.mem.trimEnd(u8, snapshot, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') return try allocator.dupe(u8, snapshot);
 
-    const trimmed = std.mem.trim(u8, snapshot, " \t\r\n");
-    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return try allocator.dupe(u8, snapshot);
-    const body = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
-    if (body.len > 0) try out.writer.writeAll(",");
-    try out.writer.writeAll("\"extensionFlagDiagnostics\":[");
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
+    if (trimmed.len > 2) try writer.writer.writeAll(",");
+    try writer.writer.writeAll("\"extensionFlagDiagnostics\":[");
     for (diagnostics, 0..) |diagnostic, index| {
-        if (index > 0) try out.writer.writeAll(",");
-        try out.writer.writeAll("{\"severity\":");
-        try appendJsonString(allocator, &out.writer, switch (diagnostic.severity) {
+        if (index > 0) try writer.writer.writeAll(",");
+        try writer.writer.writeAll("{\"severity\":");
+        try std.json.Stringify.value(std.json.Value{ .string = switch (diagnostic.severity) {
             .warning => "warning",
             .@"error" => "error",
-        });
-        try out.writer.writeAll(",\"code\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.code);
-        try out.writer.writeAll(",\"owner\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.owner);
-        try out.writer.writeAll(",\"source\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.source);
-        try out.writer.writeAll(",\"flag\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.flag_name);
-        try out.writer.writeAll(",\"reason\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.reason);
-        try out.writer.writeAll(",\"message\":");
-        try appendJsonString(allocator, &out.writer, diagnostic.message);
-        try out.writer.writeAll("}");
+        } }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"code\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.code }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"owner\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.owner }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"source\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.source }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"flag\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.flag_name }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"reason\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.reason }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"message\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.message }, .{}, &writer.writer);
+        try writer.writer.writeAll("}");
     }
-    try out.writer.writeAll("]}");
-    return try out.toOwnedSlice();
-}
+    try writer.writer.writeAll("]}");
+    return try allocator.dupe(u8, writer.writer.buffered());
 
-fn appendJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
-    defer allocator.free(encoded);
-    try writer.writeAll(encoded);
 }
 
 fn isEnabledValue(value: []const u8) bool {

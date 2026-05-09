@@ -115,8 +115,8 @@ pub const Terminal = struct {
     // 7 enables disambiguate, event types, and alternate keys; flags 8/16 stay off.
     pub const KITTY_KEYBOARD_ENABLE = ESC ++ "[>7u";
     pub const KITTY_KEYBOARD_DISABLE = vaxis.ctlseqs.csi_u_pop;
-    pub const MOUSE_ENABLE = ESC ++ "[?1000h" ++ ESC ++ "[?1006h";
-    pub const MOUSE_DISABLE = ESC ++ "[?1006l" ++ ESC ++ "[?1000l";
+    pub const MOUSE_ENABLE = ESC ++ "[?1002h" ++ ESC ++ "[?1006h";
+    pub const MOUSE_DISABLE = ESC ++ "[?1006l" ++ ESC ++ "[?1002l";
     pub const SYNC_OUTPUT_ENABLE = vaxis.ctlseqs.sync_set;
     pub const SYNC_OUTPUT_DISABLE = vaxis.ctlseqs.sync_reset;
     pub const HIDE_CURSOR = vaxis.ctlseqs.hide_cursor;
@@ -270,7 +270,6 @@ fn shouldUseMouseReporting() bool {
 
 fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
     const raw = value orelse return true;
-    if (raw.len == 0) return true;
     if (std.mem.eql(u8, raw, "0") or
         std.ascii.eqlIgnoreCase(raw, "false") or
         std.ascii.eqlIgnoreCase(raw, "no") or
@@ -278,10 +277,7 @@ fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
     {
         return false;
     }
-    return std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "true") or
-        std.ascii.eqlIgnoreCase(raw, "yes") or
-        std.ascii.eqlIgnoreCase(raw, "on");
+    return true;
 }
 
 fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resources_dir: ?[]const u8, term: ?[]const u8) bool {
@@ -460,7 +456,10 @@ fn processLoopEvent(
             };
         },
         .mouse => |mouse| {
-            const parsed = keys.parsedMouseWheelInput(mouse) orelse return null;
+            const parsed = keys.parsedMouseWheelInput(mouse) orelse
+                keys.parsedMouseClickInput(mouse) orelse
+                keys.parsedMouseDragInput(mouse) orelse
+                keys.parsedMouseReleaseInput(mouse) orelse return null;
             return .{ .parsed = parsed };
         },
     }
@@ -712,14 +711,14 @@ test "processLoopEvent forwards owned libvaxis paste events" {
     }, result.parsed);
 }
 
-test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
+test "LoopEvent exposes mouse events and processLoopEvent forwards mouse inputs" {
     comptime try std.testing.expect(@hasField(LoopEvent, "mouse"));
 
     var paste_buffer = std.ArrayList(u8).empty;
     defer paste_buffer.deinit(std.testing.allocator);
     var paste_active = false;
 
-    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+    const click = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
         .mouse = .{
             .col = 4,
             .row = 5,
@@ -727,17 +726,16 @@ test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
             .mods = .{},
             .type = .press,
         },
-    })) == null);
+    })).?;
+    defer click.deinit(std.testing.allocator);
 
-    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
-        .mouse = .{
-            .col = 4,
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_click = .{
             .row = 5,
-            .button = .wheel_up,
-            .mods = .{},
-            .type = .release,
-        },
-    })) == null);
+            .col = 4,
+        } },
+        .consumed = 0,
+    }, click.parsed);
 
     const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
         .mouse = .{
@@ -758,6 +756,44 @@ test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
         } },
         .consumed = 0,
     }, result.parsed);
+
+    const drag = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 10,
+            .row = 11,
+            .button = .left,
+            .mods = .{},
+            .type = .drag,
+        },
+    })).?;
+    defer drag.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_drag = .{
+            .row = 11,
+            .col = 10,
+        } },
+        .consumed = 0,
+    }, drag.parsed);
+
+    const release = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 12,
+            .row = 13,
+            .button = .left,
+            .mods = .{},
+            .type = .release,
+        },
+    })).?;
+    defer release.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_release = .{
+            .row = 13,
+            .col = 12,
+        } },
+        .consumed = 0,
+    }, release.parsed);
 }
 
 test "terminal enters raw mode on startup and restores on exit" {
@@ -777,7 +813,8 @@ test "terminal enters raw mode on startup and restores on exit" {
     );
     try std.testing.expectEqual(expected_use_kitty, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>7u") != null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[>31u") == null);
-    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[0], Terminal.MOUSE_ENABLE) != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1002h") != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1006h") != null);
     try std.testing.expect(std.mem.indexOf(u8, backend.writes.items[0], "\x1b[?1003h") == null);
 
     terminal.stop();
@@ -788,7 +825,8 @@ test "terminal enters raw mode on startup and restores on exit" {
         stopSequence(expected_use_kitty, expected_use_mouse),
         backend.writes.items[1],
     );
-    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[1], Terminal.MOUSE_DISABLE) != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1006l") != null);
+    try std.testing.expectEqual(expected_use_mouse, std.mem.indexOf(u8, backend.writes.items[1], "\x1b[?1002l") != null);
 }
 
 test "terminal restores terminal modes when startup fails" {
@@ -850,7 +888,7 @@ test "terminal mouse reporting is default-on and supports explicit opt-out" {
     try std.testing.expect(!shouldUseMouseReportingForEnv("false"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("no"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("off"));
-    try std.testing.expect(!shouldUseMouseReportingForEnv("unexpected"));
+    try std.testing.expect(shouldUseMouseReportingForEnv("unexpected"));
 }
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {

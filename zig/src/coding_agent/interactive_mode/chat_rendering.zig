@@ -20,6 +20,13 @@ const ItemLayout = struct {
     rows: usize,
 };
 
+pub const SelectionRange = struct {
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+};
+
 /// Renders chat items into `window`, applying scroll offset without allocating
 /// a full-size scratch screen. Only items that overlap the visible area are
 /// rendered, avoiding expensive off-screen markdown processing.
@@ -34,6 +41,8 @@ pub fn drawViewport(
     chat_scroll_offset: usize,
     now_ms: i64,
     all_expanded: bool,
+    selection: ?SelectionRange,
+    selected_text_out: ?*std.ArrayList(u8),
 ) !ViewportMetrics {
     if (start_row >= window.height or height == 0) return .{ .rendered_height = 0, .visible_height = 0 };
 
@@ -76,10 +85,22 @@ pub fn drawViewport(
                 dst, allocator, keybindings, theme,
                 items[item_index], dst_row, slice_height,
                 draw_start, now_ms, all_expanded, width,
+                selection, src_start,
             );
             dst_row += slice_height;
         }
         item_row += entry_rows;
+    }
+
+    // Extract selected text by re-rendering visible items into a scratch screen.
+    if (selected_text_out) |text_out| {
+        if (selection) |sel| {
+            try extractSelectedTextFromItems(
+                allocator, keybindings, theme,
+                items, layout, width,
+                now_ms, all_expanded, sel, text_out,
+            );
+        }
     }
 
     drawScrollIndicators(dst, theme, src_start, rendered_height, visible_height);
@@ -121,6 +142,8 @@ fn renderItemSlice(
     now_ms: i64,
     all_expanded: bool,
     width: usize,
+    selection: ?SelectionRange,
+    viewport_src_start: usize,
 ) !void {
     // Allocate a small scratch screen just for this item.
     const full_height = estimateItemRowsFull(item, width, true);
@@ -142,7 +165,11 @@ fn renderItemSlice(
         .height = @intCast(slice_height),
     });
     const actual_src = @min(src_skip, @as(usize, scratch.height) -| 1);
-    blitScreenRows(&scratch, child, actual_src, slice_height);
+    if (selection) |sel| {
+        blitScreenRowsWithSelection(&scratch, child, actual_src, slice_height, sel, viewport_src_start + dst_row - actual_src);
+    } else {
+        blitScreenRows(&scratch, child, actual_src, slice_height);
+    }
 }
 
 fn drawScrollIndicators(
@@ -460,6 +487,170 @@ fn normalizeCellForBlit(cell: tui.vaxis.Cell) tui.vaxis.Cell {
     return normalized;
 }
 
+fn blitScreenRowsWithSelection(
+    source: *tui.vaxis.Screen,
+    dest: tui.vaxis.Window,
+    source_start_row: usize,
+    height: usize,
+    selection: SelectionRange,
+    dest_abs_row_start: usize,
+) void {
+    const rows = @min(height, @as(usize, dest.height));
+    const cols = @min(@as(usize, source.width), @as(usize, dest.width));
+    for (0..rows) |row| {
+        const abs_row = source_start_row + row;
+        for (0..cols) |col| {
+            var cell = source.readCell(@intCast(col), @intCast(abs_row)) orelse continue;
+            cell = normalizeCellForBlit(cell);
+            const dest_abs_row = dest_abs_row_start + row;
+            if (isCellSelected(dest_abs_row, col, selection)) {
+                const fg = cell.style.fg;
+                cell.style.fg = switch (cell.style.bg) {
+                    .default => .{ .rgb = .{ 200, 200, 200 } },
+                    else => cell.style.bg,
+                };
+                cell.style.bg = switch (fg) {
+                    .default => .{ .rgb = .{ 50, 50, 50 } },
+                    else => fg,
+                };
+            }
+            dest.writeCell(@intCast(col), @intCast(row), cell);
+        }
+    }
+}
+
+fn extractSelectedTextFromItems(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    items: []const ChatItem,
+    layout: Layout,
+    width: usize,
+    now_ms: i64,
+    all_expanded: bool,
+    selection: SelectionRange,
+    output: *std.ArrayList(u8),
+) !void {
+    // Find all items that overlap the selection range (not just the visible viewport).
+    var item_row: usize = 0;
+    for (items, 0..) |item, item_index| {
+        const entry_rows = if (item_index < layout.entries.items.len) layout.entries.items[item_index].rows else estimateItemRowsVisible(item, width, all_expanded);
+        const item_end = item_row + entry_rows;
+
+        // Skip items entirely above or below the selection.
+        if (item_end <= selection.start_row) {
+            item_row = item_end;
+            continue;
+        }
+        if (item_row > selection.end_row) break;
+
+        // Use a generous scratch screen size for text extraction.
+        // estimateItemRowsFull underestimates markdown content (code blocks, headings, etc.),
+        // so the scratch screen needs extra room to avoid truncation.
+        const item_text = displayText(item, all_expanded);
+        const source_lines = countNewlines(item_text) + 1;
+        const generous_rows = @max(entry_rows, source_lines * 2 + 8);
+        var item_scratch = try tui.vaxis.Screen.init(allocator, .{
+            .rows = @intCast(@min(generous_rows, @as(usize, std.math.maxInt(u16)))),
+            .cols = @intCast(@min(width, @as(usize, std.math.maxInt(u16)))),
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer item_scratch.deinit(allocator);
+
+        const item_window = tui.draw.rootWindow(&item_scratch);
+        item_window.clear();
+        _ = try drawItem(item_window, allocator, keybindings, theme, item, 0, now_ms, all_expanded);
+
+        // Extract selected rows from this item's scratch screen.
+        const sel_start_in_item = if (selection.start_row > item_row) selection.start_row - item_row else 0;
+        const sel_end_in_item = if (selection.end_row < item_end) selection.end_row - item_row + 1 else entry_rows;
+        const cols = @min(@as(usize, item_scratch.width), @as(usize, width));
+        var trailing_space: usize = 0;
+        var skip_next: bool = false;
+        for (sel_start_in_item..sel_end_in_item) |local_row| {
+            if (local_row >= @as(usize, item_scratch.height)) break;
+            const abs_row = item_row + local_row;
+            const col_start: usize = if (abs_row == selection.start_row) selection.start_col else 0;
+            const col_end: usize = if (abs_row == selection.end_row) @min(selection.end_col, cols) else cols;
+            for (col_start..col_end) |col| {
+                const cell = item_scratch.readCell(@intCast(col), @intCast(local_row)) orelse continue;
+                if (skip_next) {
+                    skip_next = false;
+                    continue;
+                }
+                const grapheme = cell.char.grapheme;
+                if (cell.char.width > 1) {
+                    for (0..trailing_space) |_| try output.append(allocator, ' ');
+                    trailing_space = 0;
+                    try output.appendSlice(allocator, grapheme);
+                    skip_next = true;
+                } else if (grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ')) {
+                    trailing_space += 1;
+                } else {
+                    for (0..trailing_space) |_| try output.append(allocator, ' ');
+                    trailing_space = 0;
+                    try output.appendSlice(allocator, grapheme);
+                }
+            }
+            if (abs_row < selection.end_row) {
+                try output.append(allocator, '\n');
+                trailing_space = 0;
+            }
+        }
+        item_row = item_end;
+    }
+}
+
+fn isCellSelected(row: usize, col: usize, sel: SelectionRange) bool {
+    if (row < sel.start_row or row > sel.end_row) return false;
+    if (row == sel.start_row and row == sel.end_row) return col >= sel.start_col and col < sel.end_col;
+    if (row == sel.start_row) return col >= sel.start_col;
+    if (row == sel.end_row) return col < sel.end_col;
+    return true;
+}
+
+fn extractSelectedText(
+    allocator: std.mem.Allocator,
+    source: *tui.vaxis.Screen,
+    source_start_row: usize,
+    visible_height: usize,
+    selection: SelectionRange,
+    output: *std.ArrayList(u8),
+) !void {
+    const cols = source.width;
+    const rows = @min(visible_height, @as(usize, source.height));
+    for (0..rows) |row| {
+        const abs_row = source_start_row + row;
+        if (abs_row < selection.start_row or abs_row > selection.end_row) continue;
+        const col_start: usize = if (abs_row == selection.start_row) selection.start_col else 0;
+        const col_end: usize = if (abs_row == selection.end_row) @min(selection.end_col, @as(usize, cols)) else @as(usize, cols);
+        var trailing_space: usize = 0;
+        var skip_next: bool = false;
+        for (col_start..col_end) |col| {
+            const cell = source.readCell(@intCast(col), @intCast(abs_row)) orelse continue;
+            if (skip_next) {
+                skip_next = false;
+                continue;
+            }
+            const grapheme = cell.char.grapheme;
+            if (cell.char.width > 1) {
+                for (0..trailing_space) |_| try output.append(allocator, ' ');
+                trailing_space = 0;
+                try output.appendSlice(allocator, grapheme);
+                skip_next = true;
+            } else if (grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ')) {
+                trailing_space += 1;
+            } else {
+                for (0..trailing_space) |_| try output.append(allocator, ' ');
+                trailing_space = 0;
+                try output.appendSlice(allocator, grapheme);
+            }
+        }
+        if (abs_row < selection.end_row) try output.append(allocator, '\n');
+    }
+}
+
 fn drawWrappedText(
     window: tui.vaxis.Window,
     start_row: usize,
@@ -484,7 +675,15 @@ fn renderedPrintHeight(result: tui.vaxis.Window.PrintResult, had_text: bool, max
     return @min(@max(height, 1), @as(usize, max_height));
 }
 
-pub fn estimateWrappedRows(text: []const u8, width: usize) usize {
+pub fn countNewlines(text: []const u8) usize {
+    var count: usize = 0;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn estimateWrappedRows(text: []const u8, width: usize) usize {
     const effective_width = @max(width, 1);
     if (text.len == 0) return 1;
     var rows: usize = 0;

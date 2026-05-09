@@ -24,6 +24,7 @@ const overlay_panel = @import("overlay_panel.zig");
 const pending_editor_images_mod = @import("pending_editor_images.zig");
 const prompt_rendering = @import("prompt_rendering.zig");
 const render_text = @import("render_text.zig");
+const slash_commands = @import("slash_commands.zig");
 const currentSessionLabel = shared.currentSessionLabel;
 const SelectorOverlay = overlays.SelectorOverlay;
 const ASSISTANT_PREFIX = formatting.ASSISTANT_PREFIX;
@@ -55,6 +56,13 @@ pub const FooterUsageTotals = struct {
 pub const ExtensionWidgetPlacement = extension_ui.WidgetPlacement;
 pub const ExtensionWidget = extension_ui.Widget;
 pub const EXTENSION_WIDGET_TRUNCATION_MARKER = extension_ui.WIDGET_TRUNCATION_MARKER;
+
+pub const SelectionRange = struct {
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+};
 
 pub const ChatRegion = struct {
     row_start: usize = 0,
@@ -169,6 +177,12 @@ pub const AppState = struct {
     chat_visible_rows: usize = 0,
     chat_width: usize = 1,
     chat_region: ChatRegion = .{},
+    scroll_indicator_row: ?usize = null,
+    selection_active: bool = false,
+    selection_start_row: usize = 0,
+    selection_start_col: usize = 0,
+    selection_end_row: usize = 0,
+    selection_end_col: usize = 0,
     all_expanded: bool = false,
     last_streaming_assistant_index: ?usize = null,
     last_streaming_thinking_index: ?usize = null,
@@ -528,6 +542,106 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.chat_scroll_offset = self.chat_scroll_offset -| self.chatScrollPageSizeLocked();
+    }
+
+    pub fn chatScrollToBottom(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.chat_scroll_offset = 0;
+    }
+
+    pub fn handleMouseClick(self: *AppState, click: tui.keys.MouseClickInput) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.scroll_indicator_row) |indicator_row| {
+            if (click.row == @as(i16, @intCast(indicator_row))) {
+                self.chat_scroll_offset = 0;
+                return;
+            }
+        }
+        self.startSelectionLocked(click.row, click.col);
+    }
+
+    pub fn handleMouseDrag(self: *AppState, drag: tui.keys.MouseDragInput) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.selection_active) return;
+        self.updateSelectionEndLocked(drag.row, drag.col);
+    }
+
+    pub fn handleMouseRelease(self: *AppState, release: tui.keys.MouseReleaseInput) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.selection_active) return;
+        self.updateSelectionEndLocked(release.row, release.col);
+        self.selection_active = false;
+    }
+
+    fn startSelectionLocked(self: *AppState, row: i16, col: i16) void {
+        if (!self.chat_region.contains(row, col)) return;
+        const abs_row: usize = @intCast(row);
+        const abs_col: usize = @intCast(col);
+        const rel_row = abs_row - self.chat_region.row_start;
+        const max_offset = self.chat_total_rows -| self.chat_visible_rows;
+        const offset = @min(self.chat_scroll_offset, max_offset);
+        const src_row = (max_offset -| offset) + rel_row;
+        self.selection_active = true;
+        self.selection_start_row = src_row;
+        self.selection_start_col = abs_col;
+        self.selection_end_row = src_row;
+        self.selection_end_col = abs_col;
+    }
+
+    fn updateSelectionEndLocked(self: *AppState, row: i16, col: i16) void {
+        const abs_row: usize = if (row < 0) 0 else @intCast(row);
+        const abs_col: usize = if (col < 0) 0 else @intCast(col);
+        const rel_row = if (abs_row >= self.chat_region.row_start)
+            abs_row - self.chat_region.row_start
+        else
+            0;
+        const max_offset = self.chat_total_rows -| self.chat_visible_rows;
+        const offset = @min(self.chat_scroll_offset, max_offset);
+        const src_row = (max_offset -| offset) + rel_row;
+        self.selection_end_row = @min(src_row, self.chat_total_rows -| 1);
+        self.selection_end_col = abs_col;
+    }
+
+    pub fn getSelectionRange(self: *const AppState) ?SelectionRange {
+        if (self.selection_start_row == self.selection_end_row and
+            self.selection_start_col == self.selection_end_col) return null;
+        var start_row = self.selection_start_row;
+        var start_col = self.selection_start_col;
+        var end_row = self.selection_end_row;
+        var end_col = self.selection_end_col;
+        if (end_row < start_row or (end_row == start_row and end_col < start_col)) {
+            const tmp_r = start_row;
+            const tmp_c = start_col;
+            start_row = end_row;
+            start_col = end_col;
+            end_row = tmp_r;
+            end_col = tmp_c;
+        }
+        return .{
+            .start_row = start_row,
+            .start_col = start_col,
+            .end_row = end_row,
+            .end_col = end_col,
+        };
+    }
+
+    pub fn hasSelection(self: *const AppState) bool {
+        return self.selection_start_row != self.selection_end_row or
+            self.selection_start_col != self.selection_end_col;
+    }
+
+    pub fn clearSelection(self: *AppState) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.selection_active = false;
+        self.selection_start_row = 0;
+        self.selection_start_col = 0;
+        self.selection_end_row = 0;
+        self.selection_end_col = 0;
     }
 
     fn chatScrollPageSizeLocked(self: *const AppState) usize {
@@ -2131,7 +2245,8 @@ pub const ScreenComponent = struct {
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
-        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height;
+        const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
+        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height + scroll_indicator_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
@@ -2149,6 +2264,17 @@ pub const ScreenComponent = struct {
         }
         row += task_panel_height;
 
+        const sel_range: ?chat_rendering.SelectionRange = if (self.state.hasSelection()) blk: {
+            const sr = self.state.getSelectionRange().?;
+            break :blk .{
+                .start_row = sr.start_row,
+                .start_col = sr.start_col,
+                .end_row = sr.end_row,
+                .end_col = sr.end_col,
+            };
+        } else null;
+        var selected_text = std.ArrayList(u8).empty;
+        defer selected_text.deinit(ctx.arena);
         const chat_metrics = try drawChatViewport(
             ctx.arena,
             self.keybindings,
@@ -2160,9 +2286,38 @@ pub const ScreenComponent = struct {
             snapshot.chat_scroll_offset,
             self.now_ms,
             snapshot.all_expanded,
+            sel_range,
+            if (self.state.hasSelection()) &selected_text else null,
         );
+        if (!self.state.selection_active and self.state.hasSelection() and selected_text.items.len > 0) {
+            copySelectedText(ctx.arena, self.state.io, selected_text.items);
+            self.state.clearSelection();
+        }
         self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;
+
+        if (snapshot.chat_scroll_offset > 0 and row < window.height) {
+            self.state.scroll_indicator_row = row;
+            const indicator_text = " \xe2\x86\x91 scrolled  \xe2\x86\x93 Jump to bottom (Ctrl+End) ";
+            const indicator_style = styleForToken(self.theme, .status);
+            const indicator_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = 1,
+            });
+            indicator_window.fill(.{
+                .char = .{ .grapheme = " ", .width = 1 },
+                .style = indicator_style,
+            });
+            const text_width = std.unicode.utf8CountCodepoints(indicator_text) catch indicator_text.len;
+            const x_center: usize = if (width > text_width) (width - text_width) / 2 else 0;
+            _ = indicator_window.printSegment(.{
+                .text = indicator_text,
+                .style = indicator_style,
+            }, .{ .col_offset = @intCast(x_center), .wrap = .none });
+            row += 1;
+        } else {
+            self.state.scroll_indicator_row = null;
+        }
 
         if (queued_height > 0 and row < window.height) {
             const queued_window = window.child(.{
@@ -2252,6 +2407,13 @@ pub const ScreenComponent = struct {
 
 fn styleForToken(theme: ?*const resources_mod.Theme, token: resources_mod.ThemeToken) tui.vaxis.Cell.Style {
     return if (theme) |active_theme| tui.styleFor(active_theme, token) else .{};
+}
+
+fn copySelectedText(allocator: std.mem.Allocator, io: std.Io, text: []const u8) void {
+    if (text.len == 0) return;
+    const owned = allocator.dupe(u8, text) catch return;
+    defer allocator.free(owned);
+    slash_commands.copyTextToClipboard(io, owned) catch {};
 }
 
 fn drawFittedLine(
@@ -2357,9 +2519,9 @@ fn drawTaskPanel(
     snapshot: *const RenderStateSnapshot,
     now_ms: i64,
 ) !tui.DrawSize {
-    const panel_width = @as(usize, window.width);
-    const panel_mode = layoutMode(panel_width);
-    const requested_height = taskPanelHeightForWidth(panel_width);
+    const outer_width = @as(usize, window.width);
+    const requested_height = taskPanelHeightForWidth(outer_width);
+
     const panel_height = @min(requested_height, @as(usize, window.height));
     if (panel_height == 0) return .{ .width = window.width, .height = 0 };
     const border_style = styleForToken(theme, .task_header_separator);
@@ -2389,7 +2551,8 @@ fn drawTaskPanel(
             keybindings,
             snapshot,
             content_width,
-            panel_mode,
+            layoutMode(outer_width),
+
             now_ms,
         );
         _ = panel_inner.printSegment(.{
@@ -2563,8 +2726,10 @@ fn drawChatViewport(
     chat_scroll_offset: usize,
     now_ms: i64,
     all_expanded: bool,
+    selection: ?chat_rendering.SelectionRange,
+    selected_text_out: ?*std.ArrayList(u8),
 ) !ChatViewportMetrics {
-    return chat_rendering.drawViewport(allocator, keybindings, theme, items, window, start_row, height, chat_scroll_offset, now_ms, all_expanded);
+    return chat_rendering.drawViewport(allocator, keybindings, theme, items, window, start_row, height, chat_scroll_offset, now_ms, all_expanded, selection, selected_text_out);
 }
 
 fn drawChatItems(
@@ -4090,7 +4255,7 @@ test "drawChatViewport honors scroll offset and overlays overflow indicators" {
     const window = tui.draw.rootWindow(&screen);
     window.clear();
 
-    const metrics = try drawChatViewport(arena.allocator(), null, null, items[0..], window, 0, 12, 5, 0, true);
+    const metrics = try drawChatViewport(arena.allocator(), null, null, items[0..], window, 0, 12, 5, 0, true, null, null);
     try std.testing.expectEqual(@as(usize, 30), metrics.rendered_height);
     try std.testing.expectEqual(@as(usize, 12), metrics.visible_height);
 
