@@ -2096,28 +2096,11 @@ pub const ScreenComponent = struct {
     terminal_name: []const u8 = "term",
     after_snapshot_hook: ?RenderHook = null,
 
-    pub fn component(self: *const ScreenComponent) tui.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const ScreenComponent) tui.DrawComponent {
         return .{
             .ptr = self,
             .drawFn = drawOpaque,
         };
-    }
-
-    pub fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *tui.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const ScreenComponent = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     pub fn renderInto(
@@ -2126,76 +2109,42 @@ pub const ScreenComponent = struct {
         width: usize,
         lines: *tui.LineList,
     ) std.mem.Allocator.Error!void {
-        self.editor.setTheme(self.theme);
+        var screen = try tui.vaxis.Screen.init(allocator, .{
+            .rows = @intCast(@max(self.height, 1)),
+            .cols = @intCast(@max(width, 1)),
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer screen.deinit(allocator);
 
-        var chat_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &chat_lines);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
 
-        var snapshot = try self.state.snapshotForRender(allocator);
-        defer snapshot.deinit(allocator);
+        const window = tui.draw.rootWindow(&screen);
+        window.clear();
+        _ = try self.draw(window, .{
+            .window = window,
+            .arena = arena.allocator(),
+            .theme = self.theme,
+        });
 
-        if (self.after_snapshot_hook) |hook| hook.run();
-
-        try appendPlainExtensionLines(allocator, self.theme, snapshot.extension_header_lines, width, &chat_lines);
-        for (snapshot.items) |item| {
-            try renderChatItemIntoWithOptions(
-                allocator,
-                @max(width, 1),
-                self.keybindings,
-                self.theme,
-                item,
-                self.now_ms,
-                snapshot.all_expanded,
-                &chat_lines,
-            );
+        for (0..self.height) |row| {
+            var builder = std.ArrayList(u8).empty;
+            errdefer builder.deinit(allocator);
+            var col: usize = 0;
+            while (col < width) {
+                const cell = screen.readCell(@intCast(col), @intCast(row)) orelse break;
+                if (cell.char.grapheme.len > 0) {
+                    try builder.appendSlice(allocator, cell.char.grapheme);
+                    col += if (cell.char.width > 0) @as(usize, cell.char.width) else 1;
+                } else {
+                    try builder.append(allocator, ' ');
+                    col += 1;
+                }
+            }
+            const owned = try builder.toOwnedSlice(allocator);
+            try tui.component.appendOwnedLine(lines, allocator, owned);
         }
-
-        var prompt_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &prompt_lines);
-        try appendWidgetLines(allocator, self.theme, snapshot.extension_widgets, .above_editor, width, &prompt_lines);
-        if (snapshot.extension_editor_label) |label| {
-            const editor_label = try std.fmt.allocPrint(allocator, "Extension editor: {s}", .{label});
-            defer allocator.free(editor_label);
-            try appendPlainExtensionLine(allocator, self.theme, editor_label, width, &prompt_lines);
-        }
-        try renderPromptLines(allocator, self.theme, self.editor, snapshot.pending_editor_images, width, &prompt_lines);
-        try appendWidgetLines(allocator, self.theme, snapshot.extension_widgets, .below_editor, width, &prompt_lines);
-        var queued_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &queued_lines);
-        try renderQueuedMessageLines(allocator, self.keybindings, self.theme, &snapshot, width, &queued_lines);
-        var task_panel_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &task_panel_lines);
-        try renderTaskPanelLines(allocator, self.keybindings, self.theme, &snapshot, width, self.now_ms, &task_panel_lines);
-        const footer_line = if (snapshot.extension_footer_lines.len > 0)
-            try formatExtensionFooterLineWithTerminal(allocator, self.theme, &snapshot, self.terminal_name, width)
-        else
-            try formatFooterLineWithTerminalForDisplay(allocator, self.keybindings, self.theme, &snapshot, self.terminal_name, width, self.now_ms);
-        defer allocator.free(footer_line);
-
-        var autocomplete_lines = tui.LineList.empty;
-        defer freeLinesSafe(allocator, &autocomplete_lines);
-        try self.editor.renderAutocompleteInto(allocator, width, &autocomplete_lines);
-
-        const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + 1 + autocomplete_lines.items.len;
-        const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
-        self.state.updateChatScrollLayout(chat_lines.items.len, chat_capacity, task_panel_lines.items.len, width);
-        for (task_panel_lines.items) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
-        const chat_start = @min(snapshot.chat_scroll_offset, chat_lines.items.len);
-        for (chat_lines.items[chat_start..]) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
-        for (queued_lines.items) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
-        for (prompt_lines.items) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
-        for (autocomplete_lines.items) |line| {
-            try tui.component.appendOwnedLine(lines, allocator, line);
-        }
-        try tui.component.appendOwnedLine(lines, allocator, footer_line);
     }
 
     pub fn drawOpaque(
