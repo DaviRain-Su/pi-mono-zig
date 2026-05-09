@@ -65,16 +65,18 @@ Based on the systematic review in `zig-code-review.md`.
 
 ## B8: Split agent_loop.zig (P1-REVIEW-5)
 - [x] Extracted json_schema.zig (~200 LOC of JSON schema validation)
-- [x] Extracted accumulator.zig (~240 LOC: PartialAssistantAccumulator, PartialContentBlock, PartialToolCallBlock, buildPartialToolCallBlock, emptyJsonObject)
-- [ ] Extract tool_execution.zig (executeToolCalls, prepareToolCall, parallel execution)
-- [ ] Extract streaming.zig (streamAssistantResponse, streamSimpleForAgentLoop)
-- DONE for Phase 1 - remaining extractions are lower priority
+- [x] Extracted accumulator.zig (~240 LOC: PartialAssistantAccumulator, etc.)
+- [x] Extracted content_clone.zig (~154 LOC: cloneToolResult, cloneContentBlocks, etc.)
+- [x] Extracted tool_execution.zig (~770 LOC: executeToolCalls, prepareToolCall, parallel execution)
+- [x] Extracted streaming.zig (~226 LOC: streamAssistantResponse, streamSimpleForAgentLoop)
+- [x] agent_loop.zig: 4562 → 3439 lines (-1123 lines)
+- DONE
 
 ## B9: Split extension_runtime.zig (P2-REVIEW-1)
 - [x] Extracted lifecycle_support.zig (~130 LOC of lifecycle matrix definitions)
-- [ ] Extract policy_key.zig (policy lookup helpers) — blocked by WasmManifestHandoff circular dependency
-- [ ] Extract extension_loader.zig, extension_lifecycle.zig, extension_event_bridge.zig
-- DONE for Phase 1 - remaining extractions require deeper dependency untangling
+- [x] Extracted/integrated policy_key.zig (~150 LOC of policy lookup helpers)
+- [x] extension_runtime.zig: 6156 → 6018 lines (-138 lines)
+- DONE for extractable portions - remaining code is tightly coupled
 
 ## B10: Mark NativeHostApi stubs (P1-REVIEW-3)
 - [x] Added "Permission-gated counter stub" doc comments to all 12 NativeHostApi methods
@@ -83,11 +85,12 @@ Based on the systematic review in `zig-code-review.md`.
 
 ## B11: Refactor StreamOptions (P2-REVIEW-5)
 - [x] Added ProviderStreamOptions union with 7 provider variants
-- [x] Added provider field to StreamOptions (backward-compatible)
 - [x] Migrated toStreamOptions() to populate provider union
-- [x] Migrated ALL providers to read from provider union:
-  - mistral, google (x3), openai_chat_payload, openai_responses,
-    openai_codex_responses, azure_openai_responses, anthropic, bedrock
+- [x] Migrated ALL providers to read from provider union
 - [x] Updated stream.zig to populate provider union
-- [ ] Phase 5: Remove flat fields from StreamOptions (future breaking change)
-- DONE for Phase 1-4 - all providers migrated
+- [x] Phase 5: Removed all flat provider-specific fields from StreamOptions (29 fields)
+- [x] Phase 5: Removed all flat provider-specific fields from SimpleStreamOptions (17 fields)
+- [x] All providers now read exclusively from ProviderStreamOptions union
+- DONE
+
+## ALL REVIEW ITEMS COMPLETE
