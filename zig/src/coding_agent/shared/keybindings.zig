@@ -491,12 +491,28 @@ pub const Keybindings = struct {
         return false;
     }
 
+    pub fn bindingForAction(self: *const Keybindings, action: Action) []const KeySpec {
+        return self.bindings[@intFromEnum(action)];
+    }
+
+    pub fn bindingForEditorAction(self: *const Keybindings, action: EditorAction) []const KeySpec {
+        return self.editor_bindings[@intFromEnum(action)];
+    }
+
     pub fn primaryLabel(self: *const Keybindings, allocator: std.mem.Allocator, action: Action) ![]u8 {
         const binding = self.bindings[@intFromEnum(action)];
         if (binding.len == 0) return allocator.dupe(u8, "Unbound");
         return binding[0].format(allocator);
     }
 };
+
+pub fn actionId(action: Action) []const u8 {
+    return DEFINITIONS[@intFromEnum(action)].id;
+}
+
+pub fn editorActionId(action: EditorAction) []const u8 {
+    return EDITOR_DEFINITIONS[@intFromEnum(action)].id;
+}
 
 pub fn defaultEditorActionForKeyWithModifiers(
     key: tui.Key,

@@ -73,6 +73,10 @@ The Zig Extension SDK and package authoring substrate is complete for standalone
 
 Local extension packages rely on lock/provenance verification, package-root and artifact digests, current-platform native artifact selection, scope discovery through the normal Zig CLI/agent tool registry, digest-bound policy gating, drift/denial/conflict omission diagnostics, runtime handoff, and invocation through normal session tool-call paths. The completed substrate remains Zig-only and does not change production TypeScript source behavior.
 
+Phase 1 TS↔Zig extension parity is complete for the lower-layer extension substrate. The Zig native/session paths forward canonical underscore event names such as `session_start`, `agent_start`, `message_update`, `tool_execution_end`, `resources_discover`, `model_select`, and `thinking_level_select`; extension shortcuts dispatch through the configurable interactive input path; and the lower-layer UI bridge covers `ctx.ui.notify` and `ctx.ui.setStatus` request/response semantics. The `process_jsonl` runtime remains the current compatibility path for the TypeScript extension ecosystem, while WASM and native package authoring are local Zig substrate paths.
+
+Product surfaces that depend on higher-level UI or distribution remain deferred: Web Simulator, Workflow/Wiki/QA/Review presets, marketplace flows, publisher/signing flows, remote package/runtime URLs, direct dynamic-library path authoring as a public product surface, and full selector/editor/overlay/widget UI parity.
+
 Platform CI keeps macOS as the full Zig test runner, Windows as a build target, and Linux as an external-tool smoke gate until the Zig 0.16.0 Linux build-exe SIGSEGV is resolved. `test-ts-rpc-parity` is a local parity gate and requires host `libsimdjson`.
 
 CLI-only validation for this substrate:
@@ -80,8 +84,12 @@ CLI-only validation for this substrate:
 ```bash
 cd zig && zig build test-coding-agent
 cd zig && zig build test-ts-rpc-parity
+cd zig && zig build test-tidy
+cd zig && zig build test
 npm run check
 ```
+
+Local extension-substrate validation requires Zig 0.16.0, Node/npm dependencies installed, `rg` and `fd` on `PATH`, and host `libsimdjson` for the standalone TS-RPC parity target. No provider credentials, web servers, package registries, signing services, marketplace endpoints, or browser/Web Simulator services are required.
 
 ## Chat bot workflows
 

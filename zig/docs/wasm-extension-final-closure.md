@@ -80,8 +80,11 @@ tests.
 
 ### Default-Deny Capability Policy
 
-The canonical capability ids are `file.read`, `file.write`, `network`, `shell`,
-`env`, `model`, `session`, and `ui.notify`. The native validator maps each id to
+The canonical capability grants are `file.read`, `file.write`,
+`network.request`, `shell.run`, `env.read`, `model.call`, `session.read`,
+`session.write`, `ui.notify`, `tool.use`, `agent.spawn`, and `agent.delegate`.
+Earlier shorthand ids such as `network`, `shell`, `env`, `model`, and `session`
+are historical only and are not normative manifest/policy vocabulary. The native validator maps each grant to
 an explicit enforcement branch, rejects unknown ids, and emits
 `denied_capability` for requested-but-unapproved and runtime/import attempts.
 The browser harness denies shell and local filesystem requests in both

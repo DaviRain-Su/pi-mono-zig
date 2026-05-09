@@ -196,6 +196,10 @@ pub const PartialAssistantAccumulator = struct {
         }
     }
 
+    pub fn hasOnlyLeadingToolCall(self: *const PartialAssistantAccumulator) bool {
+        return self.blocks.items.len == 1 and self.blocks.items[0] == .tool_call;
+    }
+
     pub fn buildMessage(
         self: *PartialAssistantAccumulator,
         allocator: std.mem.Allocator,

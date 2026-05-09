@@ -289,7 +289,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Op[Operation<br/>file_read / shell_run...] --> Req[requiredGrant]
+    Op[Operation<br/>file.read / shell.run...] --> Req[requiredGrant]
     Req --> Check{principal.policy<br/>有这个 grant 吗?}
     Check -->|是| Ok[执行 + 累计 usage]
     Check -->|否| Deny[拒绝 + denied++]
@@ -316,7 +316,11 @@ pub const Operation = enum {
 };
 ```
 
-每一个映射到一个 **`Grant`**——`Grant` 实际上是 `wasm_manifest.Capability` 的别名（`enforcement.zig:4`）：
+这些 underscore 标识符是 Zig 内部 enum case 名，不是 manifest/policy vocabulary。每一个映射到一个 canonical **`Grant`**：
+
+`file.read`, `file.write`, `network.request`, `shell.run`, `env.read`, `model.call`, `session.read`, `session.write`, `ui.notify`, `tool.use`, `agent.spawn`, `agent.delegate`。
+
+`Grant` 实际上是 `wasm_manifest.Capability` 的别名（`enforcement.zig:4`）：
 
 ```zig
 pub const Grant = wasm_manifest.Capability;

@@ -319,19 +319,19 @@ LLM 一次输出可以包含多个 tool_use 块——"读 foo.txt 然后 grep TO
 不是每个 tool_call 都"应该被允许"。**`bash` 工具能跑任何命令——你想给 LLM 这个权力吗**？
 :::
 
-pi-mono-zig 用 [coding_agent 卷宗 §6](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界) 的 12 个 **capability** 控制：
+pi-mono-zig 用 [coding_agent 卷宗 §6](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界) 的 12 个 canonical **capability grants** 控制：
 
 ```
-file_read    file_write    network_request    shell_run
-env_read     model_call    session_read       session_write
-ui_notify    tool_use      agent_spawn        agent_delegate
+file.read      file.write      network.request  shell.run
+env.read       model.call      session.read     session.write
+ui.notify      tool.use        agent.spawn      agent.delegate
 ```
 
-每次 tool 执行时，框架检查"这个 principal 有没有需要的 grant"——没有就拒绝。**SDK 用户可以构造一个"只有 file_read"的 principal，把 agent 限制成只读模式**。
+每次 tool 执行时，框架检查"这个 principal 有没有需要的 grant"——没有就拒绝。**SDK 用户可以构造一个"只有 `file.read`"的 principal，把 agent 限制成只读模式**。
 
 ```mermaid
 flowchart LR
-    Call[LLM 想调 bash] --> Check{principal 有<br/>shell_run grant?}
+    Call[LLM 想调 bash] --> Check{principal 有<br/>shell.run grant?}
     Check -->|是| Exec[执行]
     Check -->|否| Deny[is_error: true<br/>"Permission denied"]
 ```

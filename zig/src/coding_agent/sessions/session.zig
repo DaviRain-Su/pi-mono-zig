@@ -481,12 +481,17 @@ pub const AgentSession = struct {
     }
 
     pub fn setThinkingLevel(self: *AgentSession, thinking_level: agent.ThinkingLevel) !void {
+        try self.setThinkingLevelWithSource(thinking_level, "agent_session");
+    }
+
+    pub fn setThinkingLevelWithSource(self: *AgentSession, thinking_level: agent.ThinkingLevel, source: []const u8) !void {
         const previous = self.agent.getThinkingLevel();
         self.agent.setThinkingLevel(thinking_level);
         _ = try self.session_manager.appendThinkingLevelChange(thinking_level);
         if (self.extension_hook_context) |ctx| {
             try emitThinkingLevelSelectHook(self.allocator, ctx, thinking_level, previous);
         }
+        _ = source;
     }
 
     pub fn setModel(self: *AgentSession, model: ai.Model) !void {

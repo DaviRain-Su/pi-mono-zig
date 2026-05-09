@@ -251,7 +251,7 @@ const TsRpcSessionHost = struct {
             try session_manager_mod.SessionManager.inMemory(self.server.allocator, self.server.io, old.cwd);
         errdefer manager.deinit();
 
-        try self.replaceWithManager(manager, manager.getCwd());
+        try self.replaceWithManager(manager, manager.getCwd(), "new", null);
         return .{ .cancelled = false };
     }
 
@@ -275,7 +275,7 @@ const TsRpcSessionHost = struct {
             return error.MissingSessionCwd;
         }
 
-        try self.replaceWithManager(manager, manager.getCwd());
+        try self.replaceWithManager(manager, manager.getCwd(), "resume", session_path);
         return .{ .cancelled = false };
     }
 
@@ -312,7 +312,7 @@ const TsRpcSessionHost = struct {
             try session_manager_mod.SessionManager.inMemory(self.server.allocator, self.server.io, old.cwd);
         errdefer manager.deinit();
 
-        try self.replaceWithManager(manager, manager.getCwd());
+        try self.replaceWithManager(manager, manager.getCwd(), "fork", null);
         return .{ .cancelled = false, .selected_text = selected_text };
     }
 
@@ -325,8 +325,13 @@ const TsRpcSessionHost = struct {
         self: *TsRpcSessionHost,
         manager: *session_manager_mod.SessionManager,
         cwd: []const u8,
+        reason: []const u8,
+        explicit_target_session_file: ?[]const u8,
     ) !void {
         const old = self.current();
+        const previous_session_file = if (old.session_manager.getSessionFile()) |file| try self.server.allocator.dupe(u8, file) else null;
+        defer if (previous_session_file) |file| self.server.allocator.free(file);
+        const target_session_file = explicit_target_session_file orelse manager.getSessionFile();
         const old_model = old.agent.getModel();
         const replacement_model = ai.model_registry.getDefault().find(old_model.provider, old_model.id) orelse old_model;
         const options = session_mod.AgentSession.ManagedOptions{
@@ -355,10 +360,16 @@ const TsRpcSessionHost = struct {
 
         self.server.cancelAndJoinPromptTasks();
         self.server.cancelAndJoinBashTasks();
+        if (self.server.extension_host) |ext_host| {
+            self.server.emitSessionShutdownEvent(ext_host, reason, previous_session_file, target_session_file);
+        }
         self.server.detachFromCurrentSession();
         old.deinit();
         old.* = replacement;
         try self.server.attachToCurrentSession();
+        if (self.server.extension_host) |ext_host| {
+            self.server.emitSessionStartEvent(ext_host, reason, previous_session_file, old.session_manager.getSessionFile());
+        }
     }
 };
 
@@ -460,7 +471,8 @@ const TsRpcServer = struct {
         self.deferred_responses = .empty;
         self.bash_manager.deinit();
         if (self.extension_host) |host| {
-            self.emitSessionShutdownEvent(host, "quit", null);
+            const previous_session_file = if (self.session) |session| session.session_manager.getSessionFile() else null;
+            self.emitSessionShutdownEvent(host, "quit", previous_session_file, null);
             host.deinit();
             self.extension_host = null;
         }
@@ -972,7 +984,6 @@ const TsRpcServer = struct {
                 // doesn't exist yet). parentSession is the old session being shut down,
                 // not the target for the switch event.
                 self.emitSessionBeforeSwitchEvent(ext_host, "new", null);
-                self.emitSessionShutdownEvent(ext_host, "new", parent_session);
             }
             var host = TsRpcSessionHost.init(self);
             const result = host.newSession(parent_session) catch |err| {
@@ -1007,11 +1018,14 @@ const TsRpcServer = struct {
                 return;
             };
             const prev_model = session.agent.getModel();
+            const changed = !modelsEqual(prev_model, model);
             session.setModel(model) catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, model, prev_model, "set");
+            if (changed) {
+                if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, session.agent.getModel(), prev_model, "set");
+            }
             const data = try ts_rpc_state_json.buildModelJson(self.allocator, model);
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
@@ -1036,11 +1050,14 @@ const TsRpcServer = struct {
                 return;
             };
             const prev_level = session.agent.getThinkingLevel();
-            session.setThinkingLevel(level) catch |err| {
+            const effective_level = clampAgentThinkingLevel(session.agent.getModel(), level);
+            session.setThinkingLevelWithSource(effective_level, "set") catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, level, prev_level);
+            if (effective_level != prev_level) {
+                if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, effective_level, prev_level, "set");
+            }
             try self.writeSuccessResponseNoData(id, command);
             return;
         }
@@ -1053,11 +1070,13 @@ const TsRpcServer = struct {
             }
             const prev_level = session.agent.getThinkingLevel();
             const next_level = ts_rpc_state_json.nextSupportedThinkingLevel(model, prev_level);
-            session.setThinkingLevel(next_level) catch |err| {
+            session.setThinkingLevelWithSource(next_level, "cycle") catch |err| {
                 try self.writeCommandError(id, command, err);
                 return;
             };
-            if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level);
+            if (next_level != prev_level) {
+                if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level, "cycle");
+            }
             const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{ts_rpc_state_json.thinkingLevelName(next_level)});
             defer self.allocator.free(data);
             try self.writeSuccessResponseRawData(id, command, data);
@@ -1179,7 +1198,6 @@ const TsRpcServer = struct {
             };
             if (self.extension_host) |ext_host| {
                 self.emitSessionBeforeSwitchEvent(ext_host, "resume", session_path);
-                self.emitSessionShutdownEvent(ext_host, "resume", session_path);
             }
             var host = TsRpcSessionHost.init(self);
             var result = host.switchSession(session_path) catch |err| {
@@ -1198,7 +1216,6 @@ const TsRpcServer = struct {
             };
             if (self.extension_host) |ext_host| {
                 self.emitSessionBeforeForkEvent(ext_host, entry_id, "before");
-                self.emitSessionShutdownEvent(ext_host, "fork", null);
             }
             var host = TsRpcSessionHost.init(self);
             var result = host.fork(entry_id, .before) catch |err| {
@@ -1216,6 +1233,11 @@ const TsRpcServer = struct {
         }
 
         if (std.mem.eql(u8, command, "clone")) {
+            if (self.extension_host) |ext_host| {
+                if (session.session_manager.getLeafId()) |leaf_id| {
+                    self.emitSessionBeforeForkEvent(ext_host, leaf_id, "at");
+                }
+            }
             var host = TsRpcSessionHost.init(self);
             var result = host.clone() catch |err| {
                 try self.writeCommandError(id, command, err);
@@ -1998,13 +2020,15 @@ const TsRpcServer = struct {
 
     /// Emit a `thinking_level_select` extension event frame when the thinking level changes.
     /// Mirrors the TS `ThinkingLevelSelectEvent` wire format.
-    fn emitExtensionThinkingLevelSelectEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, level: agent.ThinkingLevel, prev_level: agent.ThinkingLevel) void {
+    fn emitExtensionThinkingLevelSelectEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, level: agent.ThinkingLevel, prev_level: agent.ThinkingLevel, source: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"thinking_level_select\",\"level\":") catch return;
         writeJsonString(self.allocator, &out.writer, ts_rpc_state_json.thinkingLevelName(level)) catch return;
         out.writer.writeAll(",\"previousLevel\":") catch return;
         writeJsonString(self.allocator, &out.writer, ts_rpc_state_json.thinkingLevelName(prev_level)) catch return;
+        out.writer.writeAll(",\"source\":") catch return;
+        writeJsonString(self.allocator, &out.writer, source) catch return;
         out.writer.writeAll("}") catch return;
         host.sendExtensionEventFrame(out.written());
     }
@@ -2074,13 +2098,36 @@ const TsRpcServer = struct {
         host.sendExtensionEventFrame(out.written());
     }
 
+    /// Emit session_start to extension host after the new session is active.
+    /// reason: "startup" | "reload" | "new" | "resume" | "fork"
+    fn emitSessionStartEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, previous_file: ?[]const u8, target_file: ?[]const u8) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":\"session_start\",\"reason\":") catch return;
+        writeJsonString(self.allocator, &out.writer, reason) catch return;
+        if (previous_file) |file| {
+            out.writer.writeAll(",\"previousSessionFile\":") catch return;
+            writeJsonString(self.allocator, &out.writer, file) catch return;
+        }
+        if (target_file) |file| {
+            out.writer.writeAll(",\"targetSessionFile\":") catch return;
+            writeJsonString(self.allocator, &out.writer, file) catch return;
+        }
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
     /// Emit session_shutdown to extension host.
     /// reason: "quit" | "reload" | "new" | "resume" | "fork"
-    fn emitSessionShutdownEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, target_file: ?[]const u8) void {
+    fn emitSessionShutdownEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, previous_file: ?[]const u8, target_file: ?[]const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
         out.writer.writeAll("{\"type\":\"session_shutdown\",\"reason\":") catch return;
         writeJsonString(self.allocator, &out.writer, reason) catch return;
+        if (previous_file) |file| {
+            out.writer.writeAll(",\"previousSessionFile\":") catch return;
+            writeJsonString(self.allocator, &out.writer, file) catch return;
+        }
         if (target_file) |file| {
             out.writer.writeAll(",\"targetSessionFile\":") catch return;
             writeJsonString(self.allocator, &out.writer, file) catch return;
@@ -2653,6 +2700,34 @@ fn optionalBool(object: std.json.ObjectMap, key: []const u8) ?bool {
     return switch (value) {
         .bool => |boolean| boolean,
         else => null,
+    };
+}
+
+fn modelsEqual(lhs: ai.Model, rhs: ai.Model) bool {
+    return std.mem.eql(u8, lhs.provider, rhs.provider) and
+        std.mem.eql(u8, lhs.id, rhs.id) and
+        std.mem.eql(u8, lhs.api, rhs.api);
+}
+
+fn clampAgentThinkingLevel(model: ai.Model, requested: agent.ThinkingLevel) agent.ThinkingLevel {
+    return switch (ai.model_registry.clampThinkingLevel(model, agentThinkingLevelToModel(requested))) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
+fn agentThinkingLevelToModel(level: agent.ThinkingLevel) ai.ModelThinkingLevel {
+    return switch (level) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
     };
 }
 
@@ -5936,6 +6011,184 @@ fn sessionLifecycleCaptureScript(allocator: std.mem.Allocator, capture_path: []c
             "done",
         .{capture_path},
     );
+}
+
+fn countCapturedEvents(capture: []const u8, event_type: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, capture, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"type\":") == null) continue;
+        if (std.mem.indexOf(u8, line, event_type) != null) count += 1;
+    }
+    return count;
+}
+
+fn findEventLine(capture: []const u8, event_type: []const u8, reason: []const u8) ?[]const u8 {
+    var lines = std.mem.tokenizeScalar(u8, capture, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, event_type) == null) continue;
+        const reason_fragment = std.fmt.allocPrint(std.testing.allocator, "\"reason\":\"{s}\"", .{reason}) catch return null;
+        defer std.testing.allocator.free(reason_fragment);
+        if (std.mem.indexOf(u8, line, reason_fragment) != null) return line;
+    }
+    return null;
+}
+
+fn expectEventOrder(capture: []const u8, before: []const u8, after: []const u8) !void {
+    const before_index = std.mem.indexOf(u8, capture, before) orelse return error.ExpectedEventNotFound;
+    const after_index = std.mem.indexOf(u8, capture, after) orelse return error.ExpectedEventNotFound;
+    try std.testing.expect(before_index < after_index);
+}
+
+test "selection_events: model and thinking events emit only on effective changes" {
+    const allocator = std.testing.allocator;
+    const capture_path = "/tmp/pi-selection-events.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-selection-events" };
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/selection-events",
+        .system_prompt = "system",
+        .model = ai.model_registry.getDefault().find("faux", "faux-1").?,
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-selection-events",
+        .fixture = "selection-events",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    try server.handleLine("{\"id\":\"model1\",\"type\":\"set_model\",\"provider\":\"deepseek\",\"modelId\":\"deepseek-v4-pro\"}");
+    try server.handleLine("{\"id\":\"model2\",\"type\":\"set_model\",\"provider\":\"deepseek\",\"modelId\":\"deepseek-v4-pro\"}");
+    try server.handleLine("{\"id\":\"think1\",\"type\":\"set_thinking_level\",\"level\":\"low\"}");
+    try server.handleLine("{\"id\":\"think2\",\"type\":\"set_thinking_level\",\"level\":\"low\"}");
+    try server.handleLine("{\"id\":\"cycle\",\"type\":\"cycle_thinking_level\"}");
+    try server.handleLine("{\"id\":\"think3\",\"type\":\"set_thinking_level\",\"level\":\"xhigh\"}");
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    try std.testing.expectEqual(@as(usize, 1), countCapturedEvents(capture, "\"model_select\""));
+    try std.testing.expectEqual(@as(usize, 2), countCapturedEvents(capture, "\"thinking_level_select\""));
+    try expectContains(capture, "\"type\":\"model_select\"");
+    try expectContains(capture, "\"previousModel\":{\"id\":\"faux-1\"");
+    try expectContains(capture, "\"model\":{\"id\":\"deepseek-v4-pro\"");
+    try expectContains(capture, "\"source\":\"set\"");
+    try expectContains(capture, "\"type\":\"thinking_level_select\",\"level\":\"high\",\"previousLevel\":\"off\",\"source\":\"set\"");
+    try expectContains(capture, "\"type\":\"thinking_level_select\",\"level\":\"xhigh\",\"previousLevel\":\"high\",\"source\":\"cycle\"");
+    try std.testing.expectEqual(agent.ThinkingLevel.xhigh, session.agent.getThinkingLevel());
+}
+
+test "session_lifecycle: replacements emit shutdown before start with previous and target files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project-cwd");
+
+    const repo_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(repo_cwd);
+    const project_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "project-cwd",
+    });
+    defer allocator.free(project_relative);
+    const project_cwd = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, project_relative });
+    defer allocator.free(project_cwd);
+    const session_relative = try std.fs.path.join(allocator, &[_][]const u8{
+        ".zig-cache", "tmp", &tmp.sub_path, "sessions",
+    });
+    defer allocator.free(session_relative);
+    const session_dir = try std.fs.path.join(allocator, &[_][]const u8{ repo_cwd, session_relative });
+    defer allocator.free(session_dir);
+
+    const model = ai.model_registry.getDefault().find("faux", "faux-1").?;
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_cwd,
+        .system_prompt = "system",
+        .model = model,
+        .session_dir = session_dir,
+    });
+    defer session.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const user_content = try arena.allocator().alloc(ai.ContentBlock, 1);
+    user_content[0] = .{ .text = .{ .text = "fork prompt" } };
+    const fork_entry_id = try session.session_manager.appendMessage(.{ .user = .{ .content = user_content, .timestamp = 11 } });
+    const fork_entry_id_owned = try allocator.dupe(u8, fork_entry_id);
+    defer allocator.free(fork_entry_id_owned);
+    const original_session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(original_session_file);
+
+    const capture_path = "/tmp/pi-session-replacement-lifecycle.jsonl";
+    std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, capture_path) catch {};
+    const script = try sessionLifecycleCaptureScript(allocator, capture_path);
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-session-replacement-lifecycle" };
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    var server = TsRpcServer.init(allocator, std.testing.io, &session, &stdout_capture.writer, &stderr_capture.writer);
+    try server.start();
+    defer server.finish() catch {};
+    try server.startExtensionHost(.{
+        .argv = &argv,
+        .marker = "pi-session-replacement-lifecycle",
+        .fixture = "session-replacement-lifecycle",
+        .ready_timeout_ms = 500,
+        .shutdown_timeout_ms = 500,
+    });
+
+    try server.handleLine("{\"id\":\"new\",\"type\":\"new_session\"}");
+    const switch_command = try std.fmt.allocPrint(allocator, "{{\"id\":\"resume\",\"type\":\"switch_session\",\"sessionPath\":\"{s}\"}}", .{original_session_file});
+    defer allocator.free(switch_command);
+    try server.handleLine(switch_command);
+    const fork_command = try std.fmt.allocPrint(allocator, "{{\"id\":\"fork\",\"type\":\"fork\",\"entryId\":\"{s}\"}}", .{fork_entry_id_owned});
+    defer allocator.free(fork_command);
+    try server.handleLine(fork_command);
+    try server.handleLine("{\"id\":\"clone\",\"type\":\"clone\"}");
+    try server.finish();
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+
+    try expectEventOrder(capture, "\"type\":\"session_shutdown\",\"reason\":\"new\"", "\"type\":\"session_start\",\"reason\":\"new\"");
+    try expectEventOrder(capture, "\"type\":\"session_shutdown\",\"reason\":\"resume\"", "\"type\":\"session_start\",\"reason\":\"resume\"");
+    try expectEventOrder(capture, "\"type\":\"session_shutdown\",\"reason\":\"fork\"", "\"type\":\"session_start\",\"reason\":\"fork\"");
+
+    const new_shutdown = findEventLine(capture, "\"session_shutdown\"", "new") orelse return error.ExpectedEventNotFound;
+    const new_start = findEventLine(capture, "\"session_start\"", "new") orelse return error.ExpectedEventNotFound;
+    const resume_shutdown = findEventLine(capture, "\"session_shutdown\"", "resume") orelse return error.ExpectedEventNotFound;
+    const resume_start = findEventLine(capture, "\"session_start\"", "resume") orelse return error.ExpectedEventNotFound;
+    const fork_shutdown = findEventLine(capture, "\"session_shutdown\"", "fork") orelse return error.ExpectedEventNotFound;
+    const fork_start = findEventLine(capture, "\"session_start\"", "fork") orelse return error.ExpectedEventNotFound;
+
+    for ([_][]const u8{ new_shutdown, new_start, resume_shutdown, resume_start, fork_shutdown, fork_start }) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"previousSessionFile\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"targetSessionFile\"") != null);
+    }
+    try expectContains(resume_shutdown, original_session_file);
+    try expectContains(resume_start, original_session_file);
+    try std.testing.expect(countCapturedEvents(capture, "\"session_start\"") >= 4);
 }
 
 test "session_lifecycle: new_session emits session_before_switch and session_shutdown" {

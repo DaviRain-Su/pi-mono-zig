@@ -315,16 +315,7 @@ pub fn buildRequestPayload(
     }
 
     if (options) |stream_options| {
-        var anthropic_opts: types.AnthropicStreamOptions = .{};
-        if (stream_options.provider == .anthropic) {
-            anthropic_opts = stream_options.provider.anthropic;
-        } else {
-            anthropic_opts.thinking_enabled = stream_options.anthropic_thinking_enabled;
-            anthropic_opts.thinking_budget_tokens = stream_options.anthropic_thinking_budget_tokens;
-            anthropic_opts.thinking_display = stream_options.anthropic_thinking_display;
-            anthropic_opts.effort = stream_options.anthropic_effort;
-            anthropic_opts.tool_choice = stream_options.anthropic_tool_choice;
-        }
+        const anthropic_opts = stream_options.anthropicOptions();
         if (stream_options.temperature) |temperature| {
             if (anthropic_opts.thinking_enabled != true) {
                 try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
@@ -2899,12 +2890,7 @@ fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Cont
 fn shouldUseInterleavedThinkingBeta(model: types.Model, options: ?types.StreamOptions) bool {
     if (supportsAdaptiveThinking(model)) return false;
     if (options) |stream_options| {
-        var anthropic_opts: types.AnthropicStreamOptions = .{};
-        if (stream_options.provider == .anthropic) {
-            anthropic_opts = stream_options.provider.anthropic;
-        } else {
-            anthropic_opts.interleaved_thinking = stream_options.anthropic_interleaved_thinking;
-        }
+        const anthropic_opts = stream_options.anthropicOptions();
         return anthropic_opts.interleaved_thinking orelse true;
     }
     return true;

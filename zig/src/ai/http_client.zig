@@ -1514,7 +1514,7 @@ const TestPreHeaderStallServer = struct {
 
     fn run(self: *TestPreHeaderStallServer) void {
         const stream = self.server.accept(self.io) catch |err| switch (err) {
-            error.SocketNotListening, error.Canceled => return,
+            error.SocketNotListening, error.Canceled, error.ConnectionAborted => return,
             else => std.debug.panic("test server accept failed: {}", .{err}),
         };
         defer stream.close(self.io);

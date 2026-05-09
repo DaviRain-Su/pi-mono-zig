@@ -165,6 +165,18 @@ pub const BedrockProvider = struct {
         options: ?types.StreamOptions,
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
+        if (isAbortRequested(options)) {
+            var output = initOutput(model);
+            var content_blocks = std.ArrayList(types.ContentBlock).empty;
+            defer content_blocks.deinit(allocator);
+            var tool_calls = std.ArrayList(types.ToolCall).empty;
+            defer tool_calls.deinit(allocator);
+            var active_blocks = std.ArrayList(BlockEntry).empty;
+            defer active_blocks.deinit(allocator);
+            try emitRuntimeFailure(allocator, stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model, error.RequestAborted);
+            return;
+        }
+
         const auth = resolveBedrockAuth(allocator, options) catch |err| {
             try emitAuthError(allocator, stream_instance, model, authErrorMessage(err));
             return;
@@ -204,14 +216,27 @@ pub const BedrockProvider = struct {
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
 
-        var response = try client.requestStreaming(.{
+        var response = client.requestStreaming(.{
             .method = .POST,
             .url = url,
             .headers = headers,
             .body = json_body,
             .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
             .aborted = if (options) |stream_options| stream_options.signal else null,
-        });
+        }) catch |err| switch (err) {
+            error.RequestAborted => {
+                var output = initOutput(model);
+                var content_blocks = std.ArrayList(types.ContentBlock).empty;
+                defer content_blocks.deinit(allocator);
+                var tool_calls = std.ArrayList(types.ToolCall).empty;
+                defer tool_calls.deinit(allocator);
+                var active_blocks = std.ArrayList(BlockEntry).empty;
+                defer active_blocks.deinit(allocator);
+                try emitRuntimeFailure(allocator, stream_instance, &output, &content_blocks, &tool_calls, &active_blocks, model, err);
+                return;
+            },
+            else => return err,
+        };
         defer response.deinit();
 
         if (options) |stream_options| {
@@ -275,13 +300,7 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
         .bedrock_request_metadata = stream_options.bedrock_request_metadata,
     };
 
-    var bedrock_opts: types.BedrockStreamOptions = .{};
-    if (stream_options.provider == .bedrock) {
-        bedrock_opts = stream_options.provider.bedrock;
-    } else {
-        bedrock_opts.reasoning = stream_options.bedrock_reasoning;
-        bedrock_opts.thinking_budgets = stream_options.bedrock_thinking_budgets;
-    }
+    const bedrock_opts = stream_options.bedrockOptions();
     const reasoning = bedrock_opts.reasoning orelse return base;
     if (isAnthropicClaudeModel(model)) {
         if (supportsAdaptiveThinking(model.id, model.name)) {
@@ -357,12 +376,7 @@ fn buildRequestPayloadWithFixtureEnv(
     }
 
     if (options) |stream_options| {
-        var bedrock_opts: types.BedrockStreamOptions = .{};
-        if (stream_options.provider == .bedrock) {
-            bedrock_opts = stream_options.provider.bedrock;
-        } else {
-            bedrock_opts.request_metadata = stream_options.bedrock_request_metadata;
-        }
+        const bedrock_opts = stream_options.bedrockOptions();
         if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |request_metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
         }
@@ -478,12 +492,7 @@ pub fn buildRequestSurfaceSnapshotValue(
 
     var client_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     if (options) |stream_options| {
-        var bedrock_opts: types.BedrockStreamOptions = .{};
-        if (stream_options.provider == .bedrock) {
-            bedrock_opts = stream_options.provider.bedrock;
-        } else {
-            bedrock_opts.profile = stream_options.bedrock_profile;
-        }
+        const bedrock_opts = stream_options.bedrockOptions();
         if (bedrock_opts.profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
     }
     if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
@@ -780,12 +789,7 @@ fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions, fix
 }
 
 fn configuredBedrockRegion(options: types.StreamOptions, fixture_env: ?FixtureEnv) ?[]const u8 {
-    var bedrock_opts: types.BedrockStreamOptions = .{};
-    if (options.provider == .bedrock) {
-        bedrock_opts = options.provider.bedrock;
-    } else {
-        bedrock_opts.region = options.bedrock_region;
-    }
+    const bedrock_opts = options.bedrockOptions();
     if (bedrock_opts.region) |region| return region;
     if (fixture_env) |env| {
         if (nonEmpty(env.aws_region)) |region| return region;
@@ -823,15 +827,7 @@ fn buildAdditionalModelRequestFieldsValue(
     options: types.StreamOptions,
     fixture_env: ?FixtureEnv,
 ) !?std.json.Value {
-    var bedrock_opts: types.BedrockStreamOptions = .{};
-    if (options.provider == .bedrock) {
-        bedrock_opts = options.provider.bedrock;
-    } else {
-        bedrock_opts.reasoning = options.bedrock_reasoning;
-        bedrock_opts.thinking_budgets = options.bedrock_thinking_budgets;
-        bedrock_opts.thinking_display = options.bedrock_thinking_display;
-        bedrock_opts.interleaved_thinking = options.bedrock_interleaved_thinking;
-    }
+    const bedrock_opts = options.bedrockOptions();
     const reasoning = bedrock_opts.reasoning orelse return null;
     if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
 
@@ -1079,12 +1075,7 @@ fn buildToolConfigValue(
     options: ?types.StreamOptions,
 ) !?std.json.Value {
     if (options) |stream_options| {
-        var bedrock_opts: types.BedrockStreamOptions = .{};
-        if (stream_options.provider == .bedrock) {
-            bedrock_opts = stream_options.provider.bedrock;
-        } else {
-            bedrock_opts.tool_choice = stream_options.bedrock_tool_choice;
-        }
+        const bedrock_opts = stream_options.bedrockOptions();
         if (bedrock_opts.tool_choice) |tool_choice| {
             if (tool_choice == .none) return null;
         }
@@ -1110,12 +1101,7 @@ fn buildToolConfigValue(
     try config.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tool_entries });
 
     if (options) |stream_options| {
-        var bedrock_opts: types.BedrockStreamOptions = .{};
-        if (stream_options.provider == .bedrock) {
-            bedrock_opts = stream_options.provider.bedrock;
-        } else {
-            bedrock_opts.tool_choice = stream_options.bedrock_tool_choice;
-        }
+        const bedrock_opts = stream_options.bedrockOptions();
         if (bedrock_opts.tool_choice) |tool_choice| {
             if (try buildToolChoiceValue(allocator, tool_choice)) |choice_value| {
                 try config.put(allocator, try allocator.dupe(u8, "toolChoice"), choice_value);
@@ -1170,7 +1156,7 @@ fn resolveAwsCredentials(allocator: std.mem.Allocator) !AwsCredentials {
     };
 }
 
-fn resolveBedrockAuth(allocator: std.mem.Allocator, _: ?types.StreamOptions) !BedrockAuth {
+fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOptions) !BedrockAuth {
     const skip_auth = if (try loadEnvOptional(allocator, "AWS_BEDROCK_SKIP_AUTH")) |value| blk: {
         defer allocator.free(value);
         break :blk std.mem.eql(u8, value, "1");
@@ -1181,6 +1167,18 @@ fn resolveBedrockAuth(allocator: std.mem.Allocator, _: ?types.StreamOptions) !Be
             .access_key_id = try allocator.dupe(u8, "dummy-access-key"),
             .secret_access_key = try allocator.dupe(u8, "dummy-secret-key"),
         } };
+    }
+
+    if (options) |stream_options| {
+        const bedrock_opts = stream_options.bedrockOptions();
+        if (bedrock_opts.bearer_token) |token| {
+            if (std.mem.trim(u8, token, " \t\r\n").len > 0) {
+                return .{ .bearer = try allocator.dupe(u8, token) };
+            }
+        }
+        if (bedrock_opts.profile) |profile| {
+            if (std.mem.trim(u8, profile, " \t\r\n").len > 0) return .profile;
+        }
     }
 
     if (try loadEnvOptional(allocator, "AWS_BEARER_TOKEN_BEDROCK")) |token| {

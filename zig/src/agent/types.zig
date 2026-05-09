@@ -192,6 +192,13 @@ pub const TransformContextFn = *const fn (
     transform_context: ?*anyopaque,
 ) anyerror![]AgentMessage;
 
+pub const MessageEndTransformFn = *const fn (
+    allocator: std.mem.Allocator,
+    message: AgentMessage,
+    transform_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+) anyerror!?AgentMessage;
+
 pub const PendingMessagesFn = *const fn (
     allocator: std.mem.Allocator,
     context: ?*anyopaque,

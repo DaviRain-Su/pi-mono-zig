@@ -250,7 +250,7 @@ flowchart TB
     classDef center fill:#7c2d12,stroke:#ea580c,color:#fff
     classDef leaf fill:#1a3a5c,stroke:#3b82f6,color:#fff
 
-    Center[Agent event stream<br/>(message_update, tool.call, ...)]:::center
+    Center[Agent event stream<br/>(message_update, tool_call, ...)]:::center
 
     Center --> Render[Streaming render]:::leaf
     Center --> Persist[JSONL persistence]:::leaf

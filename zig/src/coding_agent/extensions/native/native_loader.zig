@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const native_abi_contract = @import("native_abi_contract.zig");
 const native_manifest = @import("native_manifest.zig");
 const native_sdk = @import("pi_native_extension_sdk.zig");
+const dynamic_library = @import("../native_dynamic_library.zig");
 
 pub const Diagnostic = struct {
     phase: []const u8,
@@ -15,13 +16,8 @@ pub const Diagnostic = struct {
     actual: ?[]const u8 = null,
 };
 
-const PlatformDynLib = if (builtin.os.tag == .windows) struct {
-    pub fn close(_: *@This()) void {}
-    pub fn lookup(_: *@This(), comptime T: type, _: []const u8) ?T { return null; }
-} else std.DynLib;
-
 pub const LoadedLibrary = struct {
-    library: PlatformDynLib,
+    library: dynamic_library.Handle,
     artifact_path: []u8,
     functions: native_abi_contract.FunctionTable,
     unloaded: bool = false,
@@ -157,7 +153,7 @@ const SymbolResolve = union(enum) {
     diagnostic: Diagnostic,
 };
 
-fn resolveFunctionTable(library: *PlatformDynLib, artifact_path: []const u8) SymbolResolve {
+fn resolveFunctionTable(library: *dynamic_library.Handle, artifact_path: []const u8) SymbolResolve {
     return .{ .table = .{
         .abi_version = library.lookup(native_abi_contract.AbiVersionFn, "pi_native_extension_abi_version") orelse return missingSymbol("pi_native_extension_abi_version", "fn() callconv(.c) u32", artifact_path),
         .abi_name_ptr = library.lookup(native_abi_contract.PtrFn, "pi_native_extension_abi_name_ptr") orelse return missingSymbol("pi_native_extension_abi_name_ptr", "fn() callconv(.c) [*]const u8", artifact_path),
@@ -234,12 +230,8 @@ pub fn unsupportedPlatformReasonForTesting() ?[]const u8 {
     return unsupportedPlatformReason();
 }
 
-fn openPlatformLibrary(path: []const u8) !PlatformDynLib {
-    return switch (builtin.os.tag) {
-        .windows => error.UnsupportedNativeRuntimePlatform,
-        .macos, .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => PlatformDynLib.open(path),
-        else => error.UnsupportedNativeRuntimePlatform,
-    };
+fn openPlatformLibrary(path: []const u8) !dynamic_library.Handle {
+    return dynamic_library.open(path);
 }
 
 fn pathWithin(root: []const u8, candidate: []const u8) bool {

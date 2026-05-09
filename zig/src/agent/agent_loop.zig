@@ -571,17 +571,6 @@ fn crossPartialUpdateStreamForAgentLoopTest(
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
     const result_allocator = allocator;
-    var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    try args_object.put(
-        result_allocator,
-        try result_allocator.dupe(u8, "query"),
-        .{ .string = try result_allocator.dupe(u8, "partial") },
-    );
-    const tool_call = ai.ToolCall{
-        .id = try result_allocator.dupe(u8, "call_1"),
-        .name = try result_allocator.dupe(u8, "lookup"),
-        .arguments = .{ .object = args_object },
-    };
     var content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
     try content_args_object.put(
         result_allocator,
@@ -627,7 +616,7 @@ fn crossPartialUpdateStreamForAgentLoopTest(
     stream.push(.{ .event_type = .text_end, .content_index = 1, .content = "prior text" });
     stream.push(.{ .event_type = .toolcall_start, .content_index = 2 });
     stream.push(.{ .event_type = .toolcall_delta, .content_index = 2, .delta = "{\"query\":\"par" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 2, .tool_call = tool_call });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 2, .tool_call = content[2].tool_call });
     stream.push(.{ .event_type = .done, .message = final_message });
     return stream;
 }
@@ -806,12 +795,6 @@ fn malformedPartialToolCallStreamForAgentLoopTest(
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
     const result_allocator = allocator;
-    const final_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    const tool_call = ai.ToolCall{
-        .id = try result_allocator.dupe(u8, "call_bad_args"),
-        .name = try result_allocator.dupe(u8, "lookup"),
-        .arguments = .{ .object = final_args_object },
-    };
     const content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
     const content = try result_allocator.alloc(ai.ContentBlock, 2);
     content[0] = .{ .text = .{ .text = try result_allocator.dupe(u8, "before tool") } };
@@ -846,7 +829,7 @@ fn malformedPartialToolCallStreamForAgentLoopTest(
     stream.push(.{ .event_type = .text_end, .content_index = 0, .content = "before tool" });
     stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
     stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "not-json" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = tool_call });
+    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = content[1].tool_call });
     stream.push(.{ .event_type = .done, .message = final_message });
     return stream;
 }
@@ -1827,12 +1810,9 @@ test "streamAssistantResponse frees owned streaming deltas after consumption" {
         null,
         ownedDeltaStreamForAgentLoopTest,
     );
+    defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
     try std.testing.expectEqualStrings("streamed response", assistant.content[0].text.text);
-    defer {
-        content_clone.deinitContentBlocks(std.testing.allocator, assistant.content);
-        std.testing.allocator.free(assistant.content);
-    }
 }
 
 test "route-a m1 streamAssistantResponse emits toolcall message updates" {
@@ -1867,6 +1847,7 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
         null,
         toolCallStreamForAgentLoopTest,
     );
+    defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
     try std.testing.expectEqual(@as(usize, 1), assistant.tool_calls.?.len);
     try std.testing.expectEqual(@as(usize, 1), assistant.content.len);
@@ -1887,14 +1868,6 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
         }
     }
     try std.testing.expectEqual(expected.len, next_expected);
-    defer {
-        content_clone.deinitContentBlocks(std.testing.allocator, assistant.content);
-        std.testing.allocator.free(assistant.content);
-        if (assistant.tool_calls) |tool_calls| {
-            for (tool_calls) |tc| content_clone.deinitToolCall(std.testing.allocator, tc);
-            std.testing.allocator.free(tool_calls);
-        }
-    }
 }
 
 test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content while tool JSON repairs" {
@@ -1927,6 +1900,7 @@ test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content 
         null,
         crossPartialUpdateStreamForAgentLoopTest,
     );
+    defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
     try std.testing.expect(capture.saw_thinking_delta);
     try std.testing.expect(capture.saw_thinking_end);
@@ -1971,6 +1945,7 @@ test "VAL-REVIEW-M8-001 streaming message_update snapshots cover partial tool-ca
         null,
         crossPartialUpdateStreamForAgentLoopTest,
     );
+    defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
     const expected = [_][]const u8{
         "event=thinking_start|index=0|message=[thinking:]",
@@ -2025,6 +2000,7 @@ test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty obj
         null,
         malformedPartialToolCallStreamForAgentLoopTest,
     );
+    defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
     try std.testing.expect(capture.saw_malformed_toolcall_delta);
     try std.testing.expectEqual(@as(usize, 2), assistant.content.len);

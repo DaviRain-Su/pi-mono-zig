@@ -127,6 +127,8 @@ pub const AgentOptions = struct {
     convert_to_llm_context: ?*anyopaque = null,
     transform_context: ?types.TransformContextFn = null,
     transform_context_context: ?*anyopaque = null,
+    message_end_transform: ?types.MessageEndTransformFn = null,
+    message_end_transform_context: ?*anyopaque = null,
     extension_hook_context: ?*anyopaque = null,
     before_tool_call: ?types.BeforeToolCallFn = null,
     after_tool_call: ?types.AfterToolCallFn = null,
@@ -170,6 +172,8 @@ pub const Agent = struct {
     convert_to_llm_context: ?*anyopaque,
     transform_context: ?types.TransformContextFn,
     transform_context_context: ?*anyopaque,
+    message_end_transform: ?types.MessageEndTransformFn,
+    message_end_transform_context: ?*anyopaque,
     extension_hook_context: ?*anyopaque,
     before_tool_call: ?types.BeforeToolCallFn,
     after_tool_call: ?types.AfterToolCallFn,
@@ -201,6 +205,8 @@ pub const Agent = struct {
             .convert_to_llm_context = options.convert_to_llm_context,
             .transform_context = options.transform_context,
             .transform_context_context = options.transform_context_context,
+            .message_end_transform = options.message_end_transform,
+            .message_end_transform_context = options.message_end_transform_context,
             .extension_hook_context = options.extension_hook_context,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
@@ -574,31 +580,43 @@ pub const Agent = struct {
     }
 
     fn processEvent(self: *Agent, event: types.AgentEvent) !void {
-        switch (event.event_type) {
+        var event_to_emit = event;
+        var transformed_message: ?types.AgentMessage = null;
+        defer if (transformed_message) |*message| deinitMessage(self.allocator, message);
+
+        switch (event_to_emit.event_type) {
             .message_start => {
-                self.streaming_message = event.message;
+                self.streaming_message = event_to_emit.message;
             },
             .message_update => {
-                self.streaming_message = event.message;
+                self.streaming_message = event_to_emit.message;
             },
             .message_end => {
+                if (event_to_emit.message) |message| {
+                    if (self.message_end_transform) |transform| {
+                        if (try transform(self.allocator, message, self.message_end_transform_context, self.active_abort_signal)) |replacement| {
+                            transformed_message = replacement;
+                            event_to_emit.message = replacement;
+                        }
+                    }
+                }
                 self.streaming_message = null;
-                if (event.message) |message| {
+                if (event_to_emit.message) |message| {
                     try self.appendMessage(message);
                 }
             },
             .tool_execution_start => {
-                if (event.tool_call_id) |tool_call_id| {
+                if (event_to_emit.tool_call_id) |tool_call_id| {
                     try self.addPendingToolCall(tool_call_id);
                 }
             },
             .tool_execution_end => {
-                if (event.tool_call_id) |tool_call_id| {
+                if (event_to_emit.tool_call_id) |tool_call_id| {
                     _ = self.removePendingToolCall(tool_call_id);
                 }
             },
             .turn_end => {
-                if (event.message) |message| {
+                if (event_to_emit.message) |message| {
                     switch (message) {
                         .assistant => |assistant| {
                             if (assistant.error_message) |error_message| {
@@ -616,7 +634,7 @@ pub const Agent = struct {
         }
 
         for (self.listeners.items) |subscriber| {
-            try subscriber.callback(subscriber.context, event);
+            try subscriber.callback(subscriber.context, event_to_emit);
         }
     }
 };

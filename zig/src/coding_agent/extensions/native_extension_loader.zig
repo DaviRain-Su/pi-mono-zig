@@ -48,7 +48,7 @@ pub fn loadNativeFromManifest(
 
 const DescriptorBuildResult = struct {
     descriptor: native_runtime.NativeDescriptor,
-    dyn_lib: ?native_loader.NativeLibrary,
+    dyn_lib: ?native_loader.DynamicLibraryHandle,
 };
 
 fn buildNativeDescriptor(
@@ -83,7 +83,7 @@ fn buildNativeDescriptor(
 
     var dynamic_library_path: ?[]const u8 = null;
     var start_fn: native_runtime.NativeStartFn = native_runtime.defaultNativeStart;
-    var dyn_lib: ?native_loader.NativeLibrary = null;
+    var dyn_lib: ?native_loader.DynamicLibraryHandle = null;
     if (manifest.runtime_entrypoint == .object) {
         if (manifest.runtime_entrypoint.object.get("dynamic_library_path")) |dl| {
             if (dl == .string and dl.string.len > 0) {
@@ -119,7 +119,7 @@ fn buildNativeDescriptor(
                 } else if (lib.lookupStartFn()) |sf| {
                     start_fn = sf;
                 }
-                dyn_lib = lib;
+                dyn_lib = lib.dyn_lib;
             }
         }
     }
@@ -313,7 +313,7 @@ fn jsonStringifyField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key
 test "buildNativeDescriptor with missing dynamic_library_path falls back gracefully" {
     const allocator = std.testing.allocator;
     const manifest_text =
-        \\"{"schemaVersion":"pi-extension.v1","id":"com.pi.native-dl","name":"Native DL","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"dynamic_library_path":"libnonexistent.dylib"}},"tools":[{"name":"native.dl.tool","description":"DL tool","inputSchema":{"type":"object"}}]}
+        \\{"schemaVersion":"pi-extension.v1","id":"com.pi.native-dl","name":"Native DL","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"dynamic_library_path":"libnonexistent.dylib"}},"tools":[{"name":"native.dl.tool","description":"DL tool","inputSchema":{"type":"object"}}]}
     ;
     var result = try extension_manifest.parseManifestText(allocator, "/tmp/pkg", "/tmp/pkg/pi-extension.json", manifest_text);
     defer result.deinit(allocator);

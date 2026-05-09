@@ -739,6 +739,10 @@ fn emitAbort(plan: *StreamPlan) void {
         .message = aborted,
     });
     plan.stream.end(aborted);
+    deinitAssistantMessage(plan.allocator, &plan.final_message);
+    plan.final_message.content = &[_]types.ContentBlock{};
+    plan.final_message.tool_calls = null;
+    plan.final_message.response_id = null;
 }
 
 fn runStreamPlan(plan: *StreamPlan) void {
@@ -769,7 +773,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
         switch (block) {
             .thinking => |thinking| {
                 plan.stream.push(.{ .event_type = .thinking_start, .content_index = @as(u32, @intCast(index)) });
-                if (!emitChunks(plan, .thinking_delta, index, thinking, false)) {
+                if (!emitChunks(plan, .thinking_delta, index, thinking, plan.signal != null)) {
                     emitAbort(plan);
                     return;
                 }
@@ -781,7 +785,7 @@ fn runStreamPlan(plan: *StreamPlan) void {
             },
             .text => |text| {
                 plan.stream.push(.{ .event_type = .text_start, .content_index = @as(u32, @intCast(index)) });
-                if (!emitChunks(plan, .text_delta, index, text, false)) {
+                if (!emitChunks(plan, .text_delta, index, text, plan.signal != null)) {
                     emitAbort(plan);
                     return;
                 }

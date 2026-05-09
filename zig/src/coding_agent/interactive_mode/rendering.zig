@@ -855,8 +855,24 @@ pub const AppState = struct {
         try self.setExtensionFooterStatusLocked(key, text);
     }
 
+    pub fn clearExtensionFooterStatus(self: *AppState, key: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.clearExtensionFooterStatusLocked(key);
+    }
+
     fn setExtensionFooterStatusLocked(self: *AppState, key: []const u8, text: ?[]const u8) !void {
         return extension_ui.setFooterStatus(self.allocator, &self.extension_footer_statuses, key, text);
+    }
+
+    fn clearExtensionFooterStatusLocked(self: *AppState, key: []const u8) !void {
+        if (key.len == 0) return;
+        if (self.extension_footer_statuses.fetchRemove(key)) |removed| {
+            const clears_current_status = std.mem.eql(u8, self.status, removed.value);
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value);
+            if (clears_current_status) try self.replaceLabelLocked(&self.status, "idle");
+        }
     }
 
     fn setActiveOperationLocked(

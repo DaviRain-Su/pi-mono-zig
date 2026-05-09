@@ -27,6 +27,7 @@ pub const enforcement = @import("extensions/enforcement.zig");
 pub const capability = @import("extensions/capability.zig");
 pub const manifest = @import("extensions/manifest.zig");
 pub const native_process = @import("extensions/native_process.zig");
+pub const native_dynamic_library = @import("extensions/native_dynamic_library.zig");
 pub const native_loader = @import("extensions/native_loader.zig");
 pub const sdk = @import("extensions/sdk.zig");
 pub const subagent = @import("extensions/subagent.zig");
@@ -130,6 +131,7 @@ test {
     _ = @import("extensions/capability.zig");
     _ = @import("extensions/manifest.zig");
     _ = @import("extensions/native_process.zig");
+    _ = @import("extensions/native_dynamic_library.zig");
     _ = @import("extensions/native_loader.zig");
     _ = @import("extensions/native_extension_loader.zig");
     _ = @import("extensions/sdk.zig");

@@ -9,7 +9,7 @@ const enforcement = @import("enforcement.zig");
 const tools_common = @import("../tools/common.zig");
 const capability = @import("capability.zig");
 const sdk = @import("sdk.zig");
-const native_loader = @import("native_loader.zig");
+const dynamic_library = @import("native_dynamic_library.zig");
 const native_process = @import("native_process.zig");
 
 pub const Registry = extension_registry.Registry;
@@ -169,7 +169,7 @@ pub const NativeOptions = struct {
     /// shared objects. NativeRuntime takes ownership only after successful
     /// start; callers remain responsible for closing it when start returns an
     /// error before ownership transfer.
-    dyn_lib: ?native_loader.NativeLibrary = null,
+    dyn_lib: ?dynamic_library.Handle = null,
 };
 
 pub const NativeHostEffects = struct {
@@ -186,6 +186,7 @@ pub const NativeHostEffects = struct {
     tool_uses: u64 = 0,
     agent_spawns: u64 = 0,
     agent_delegations: u64 = 0,
+    extension_event_invocations: u64 = 0,
 
     fn ensureSandboxPath(self: NativeHostEffects, path: []const u8) !void {
         const root = self.sandbox_root orelse return;
@@ -614,7 +615,7 @@ pub const NativeRuntime = struct {
     owned_descriptor: ?*NativeDescriptor = null,
     owned_descriptor_allocator: ?std.mem.Allocator = null,
     /// Dynamic library handle loaded by native_extension_loader. Closed on deinit.
-    dyn_lib: ?native_loader.NativeLibrary = null,
+    dyn_lib: ?dynamic_library.Handle = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
@@ -793,6 +794,7 @@ pub const NativeRuntime = struct {
             return null;
         }
         if (!self.state.registry.hasHook(event_name)) return null;
+        if (self.host_effects) |effects| effects.extension_event_invocations += 1;
         if (eventFailsRuntime(event, "native")) {
             try self.state.addDiagnostic(.host_error, .warning, "native hook returned configured non-fatal error");
             return null;

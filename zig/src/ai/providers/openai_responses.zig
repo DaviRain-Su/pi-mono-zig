@@ -243,13 +243,7 @@ pub fn buildRequestPayload(
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), .{ .string = try allocator.dupe(u8, "24h") });
             }
         }
-        var responses_opts: types.ResponsesStreamOptions = .{};
-        if (stream_options.provider == .responses) {
-            responses_opts = stream_options.provider.responses;
-        } else {
-
-
-        }
+        const responses_opts = stream_options.responsesOptions();
         if (responses_opts.service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
         }

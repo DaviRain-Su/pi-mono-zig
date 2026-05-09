@@ -604,21 +604,18 @@ fn requireAllowedStringField(
 fn missingField(allocator: std.mem.Allocator, parent_path: []const u8, field_name: []const u8) !void {
     const message = try std.fmt.allocPrint(allocator, "{s}.{s}: missing required field", .{ parent_path, field_name });
     defer allocator.free(message);
-    std.debug.print("JSON schema validation failed: {s}\n", .{message});
     return error.InvalidJsonSchema;
 }
 
 fn invalidType(allocator: std.mem.Allocator, path: []const u8, expected: []const u8, actual: std.json.Value) !void {
     const message = try std.fmt.allocPrint(allocator, "{s}: expected {s}, found {s}", .{ path, expected, jsonTypeName(actual) });
     defer allocator.free(message);
-    std.debug.print("JSON schema validation failed: {s}\n", .{message});
     return error.InvalidJsonSchema;
 }
 
 fn invalidValue(allocator: std.mem.Allocator, parent_path: []const u8, field_name: []const u8, actual: []const u8, expected: []const u8) !void {
     const message = try std.fmt.allocPrint(allocator, "{s}.{s}: invalid value '{s}', expected {s}", .{ parent_path, field_name, actual, expected });
     defer allocator.free(message);
-    std.debug.print("JSON schema validation failed: {s}\n", .{message});
     return error.InvalidJsonSchema;
 }
 
@@ -637,7 +634,6 @@ fn mismatchedValue(
         .{ parent_path, field_name, actual, expected_parent_path, expected_field_name, expected },
     );
     defer allocator.free(message);
-    std.debug.print("JSON schema validation failed: {s}\n", .{message});
     return error.InvalidJsonSchema;
 }
 

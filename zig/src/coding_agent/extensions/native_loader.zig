@@ -1,34 +1,20 @@
 const std = @import("std");
+const dynamic_library = @import("native_dynamic_library.zig");
 const native_runtime = @import("native_runtime.zig");
-const builtin = @import("builtin");
 
 /// Cross-platform dynamic library wrapper for native extension loading.
-/// Uses std.DynLib (POSIX dlopen / Windows LoadLibrary) under the hood.
-/// On Windows, std.DynLib is not supported in Zig 0.16, so we provide a stub.
-pub const NativeLibrary = if (builtin.os.tag == .windows) struct {
-    pub const Error = error{ UnsupportedPlatform, FileNotFound };
+/// Uses std.DynLib on supported platforms and a compile-safe unsupported
+/// handle on build-only platforms such as Windows.
+pub const DynamicLibraryHandle = dynamic_library.Handle;
 
-    pub fn open(_: []const u8) Error!NativeLibrary {
-        return error.UnsupportedPlatform;
-    }
+pub const NativeLibrary = struct {
+    dyn_lib: DynamicLibraryHandle,
 
-    pub fn close(_: *NativeLibrary) void {}
-
-    pub fn lookupDescriptor(_: *NativeLibrary) ?*const native_runtime.NativeDescriptor {
-        return null;
-    }
-
-    pub fn lookupStartFn(_: *NativeLibrary) ?native_runtime.NativeStartFn {
-        return null;
-    }
-} else struct {
-    dyn_lib: std.DynLib,
-
-    pub const Error = std.DynLib.Error;
+    pub const Error = dynamic_library.Error;
 
     /// Open the shared library at `path`. The path must be absolute.
     pub fn open(path: []const u8) Error!NativeLibrary {
-        return .{ .dyn_lib = try std.DynLib.open(path) };
+        return .{ .dyn_lib = try dynamic_library.open(path) };
     }
 
     /// Release the library handle.
@@ -50,9 +36,9 @@ pub const NativeLibrary = if (builtin.os.tag == .windows) struct {
 };
 
 test "NativeLibrary open nonexistent returns error" {
-    if (builtin.os.tag == .windows) {
-        try std.testing.expectError(error.UnsupportedPlatform, NativeLibrary.open("/nonexistent/library.so"));
-    } else {
-        try std.testing.expectError(error.FileNotFound, NativeLibrary.open("/nonexistent/library.so"));
-    }
+    const expected_error = if (dynamic_library.supported)
+        error.FileNotFound
+    else
+        error.UnsupportedNativeRuntimePlatform;
+    try std.testing.expectError(expected_error, NativeLibrary.open("/nonexistent/library.so"));
 }

@@ -166,20 +166,22 @@ sequenceDiagram
 
 | 组 | 数量 | 代表钩子 | 用途 |
 | --- | --- | --- | --- |
-| `session.*` | 8 | `session.start`, `session.before_compact` | 会话切换/fork/压缩生命周期 |
-| `agent.*` | 5 | `agent.start`, `agent.end`, `agent.model_select` | Agent 整体生命周期 |
-| `turn.*` | 5 | `turn.start`, `turn.end`, `message.update` | 单轮对话生命周期 |
-| `tool.*` | 7 | `tool.call`, `tool.result`, `tool.execution_*` | 工具执行 |
-| `input.*` | 2 | `input.user_text`, `input.user_bash` | 用户输入拦截 |
-| `provider.*` | 3 | `provider.before_request`, `context` | LLM 请求/响应 |
-| `resources.*` | 1 | `resources.discover` | 启动时贡献资源 |
+| Session | 8 | `session_start`, `session_before_compact` | 会话切换/fork/压缩生命周期 |
+| Agent | 5 | `agent_start`, `agent_end`, `model_select` | Agent 整体生命周期 |
+| Turn | 5 | `turn_start`, `turn_end`, `message_update` | 单轮对话生命周期 |
+| Tool | 7 | `tool_call`, `tool_result`, `tool_execution_*` | 工具执行 |
+| Input | 2 | `input`, `user_bash` | 用户输入拦截 |
+| Provider | 3 | `before_provider_request`, `context` | LLM 请求/响应 |
+| Resources | 1 | `resources_discover` | 启动时贡献资源 |
+
+underscore 名称是规范 extension API 和 JSONL/RPC wire spelling。`tool.call` 这样的点号形式只可作为历史或概念分组标签出现，不能作为 subscriber 名称或 event `type` 值。
 
 ### 7.5.1 钩子的两种类型
 
-**通知型**（`X.Y`）：handler 知道发生了什么，但**不能改变结果**。
+**通知型**（规范 underscore event name）：handler 知道发生了什么，但**不能改变结果**。
 
 ```c
-// 比如 turn.end —— 通知一轮结束了，扩展记录下 token 数
+// 比如 turn_end —— 通知一轮结束了，扩展记录下 token 数
 int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e, ...) {
     if (t == PI_HOOK_TURN_END) {
         my_telemetry.record_tokens(...);
@@ -188,10 +190,10 @@ int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e, ...) {
 }
 ```
 
-**拦截型**（`X.before_Y`）：handler 可以**取消操作或修改参数**。
+**拦截型**（`*_before_*`、`before_*` 或 `tool_call` 这类 mutating hook）：handler 可以**取消操作或修改参数**。
 
 ```c
-// 比如 tool.call —— 在工具执行前拦截
+// 比如 tool_call —— 在工具执行前拦截
 int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e,
             pi_hook_result_t* out) {
     if (t == PI_HOOK_TOOL_CALL) {
@@ -211,11 +213,11 @@ int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e,
 1. **顺序**：按扩展加载顺序串行调用
 2. **异步**：每个 handler 等到完成才走下一个
 3. **错误隔离**：一个 handler 抛错不影响其他扩展，仅记录日志
-4. **结果链式**：`context` / `tool.call` 等钩子，后一个 handler 看到的是前一个的修改后版本
+4. **结果链式**：`context` / `tool_call` 等钩子，后一个 handler 看到的是前一个的修改后版本
 
 ## 7.6 工具拦截——扩展系统的"杀手级特性"
 
-如果只能保留两个钩子，**`tool.call` 和 `tool.result` 必须留下**。它们让扩展拥有"治理"能力——这是扩展系统从"玩具"变成"产品"的分水岭。
+如果只能保留两个钩子，**`tool_call` 和 `tool_result` 必须留下**。它们让扩展拥有"治理"能力——这是扩展系统从"玩具"变成"产品"的分水岭。
 
 ### 7.6.1 拦截能做什么
 
@@ -225,7 +227,7 @@ flowchart LR
     classDef block fill:#7f1d1d,stroke:#dc2626,color:#fff
     classDef mod fill:#78350f,stroke:#d97706,color:#fff
 
-    LLM[LLM 想调<br/>bash 'rm -rf /'] --> Hook[tool.call hook]
+    LLM[LLM 想调<br/>bash 'rm -rf /'] --> Hook[tool_call hook]
     Hook --> Decide{扩展决定}
     Decide -->|放行| Pass[执行]:::good
     Decide -->|拦截| Block[返回错误]:::block
@@ -238,7 +240,7 @@ flowchart LR
 ```typescript
 // permission-gate.ts (简化)
 export default (api) => {
-  api.on('tool.call', async (event) => {
+  api.on('tool_call', async (event) => {
     if (event.tool_name === 'bash' && containsDangerous(event.args)) {
       const ok = await api.ui.confirm({
         title: '检测到危险命令',
@@ -256,11 +258,11 @@ export default (api) => {
 
 ### 7.6.3 拦截链：多个扩展叠加
 
-如果 5 个扩展都订阅了 `tool.call`，它们按加载顺序依次跑——任何一个返回 `cancel: true` 都会短路：
+如果 5 个扩展都订阅了 `tool_call`，它们按加载顺序依次跑——任何一个返回 `cancel: true` 都会短路：
 
 ```mermaid
 flowchart LR
-    Call[tool.call 触发] --> E1[扩展 1: 检查权限]
+    Call[tool_call 触发] --> E1[扩展 1: 检查权限]
     E1 -->|放行| E2[扩展 2: 改写参数]
     E2 -->|改后| E3[扩展 3: 记录日志]
     E3 -->|放行| E4[扩展 4: 弹确认框]
@@ -273,7 +275,7 @@ flowchart LR
 
 ## 7.7 能力边界与扩展加载
 
-回顾 [coding_agent 卷宗](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界)：12 个 capability（`file.read` / `shell.run` / `network.request` / ...）。扩展系统在两个时机检查它们：
+回顾 [coding_agent 卷宗](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界)：12 个 canonical grants（`file.read`, `file.write`, `network.request`, `shell.run`, `env.read`, `model.call`, `session.read`, `session.write`, `ui.notify`, `tool.use`, `agent.spawn`, `agent.delegate`）。扩展系统在两个时机检查它们：
 
 ```mermaid
 flowchart TB
@@ -303,7 +305,7 @@ host 启动子进程，连接 stdin/stdout 双向 pipe
   {"method":"ready"}
   {"method":"register_tool","name":"my_tool","label":"...","description":"...","parameters":{...}}
   {"method":"register_command","name":"slash_foo","handler_id":"h1"}
-  {"method":"subscribe_hook","hook":"tool.call","handler_id":"h2"}
+  {"method":"subscribe_hook","hook":"tool_call","handler_id":"h2"}
 
 host 通过 stdin 发：
   {"method":"invoke_tool","name":"my_tool","args":{...},"id":42}
@@ -311,7 +313,7 @@ host 通过 stdin 发：
   {"method":"tool_result","id":42,"content":[...],"is_error":false}
 
 host 触发钩子：
-  {"method":"hook","handler_id":"h2","event":{"type":"tool.call","args":{...}},"id":43}
+  {"method":"hook","handler_id":"h2","event":{"type":"tool_call","args":{...}},"id":43}
 扩展回：
   {"method":"hook_result","id":43,"cancel":false}
 
@@ -391,8 +393,8 @@ api.events.on('my-app.user-action', (data) => {
 | --- | --- |
 | 三层扩展模型 | Native / Process_JSONL / WASM 三种 runtime |
 | 生命周期钩子 | 35 个事件订阅点，分 7 组 |
-| 拦截型钩子 | `X.before_Y` 命名，可取消或改参数 |
-| 通知型钩子 | `X.Y` 命名，仅观察不改变 |
+| 拦截型钩子 | `*_before_*`、`before_*` 或 `tool_call` 这类 mutating hook，可取消或改参数 |
+| 通知型钩子 | 规范 underscore event name，仅观察不改变 |
 | capability | 12 个权限项，加载时与运行时双重检查 |
 | process_jsonl | 子进程 + JSONL stdio 协议，跨语言主路径 |
 | 事件总线 | 扩展间软耦合 pub/sub 通信 |

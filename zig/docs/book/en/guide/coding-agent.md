@@ -97,7 +97,7 @@ Args:
 Behavior:
   Execute in cwd; kill process group on timeout
   Truncated stdout/stderr merged
-  Capability check: shell_run
+  Capability check: shell.run
 ```
 
 ::: tip Why description is required
@@ -186,16 +186,16 @@ sequenceDiagram
     autonumber
     participant LLM
     participant Loop as agent_loop
-    participant Hook as tool.call hook<br/>(optional extension)
+    participant Hook as tool_call hook<br/>(optional extension)
     participant Cap as enforcement
     participant Queue as file_mutation_queue
     participant Edit as edit tool
     participant FS as filesystem
 
     LLM-->>Loop: tool_use {name:"edit", input:{path, old, new}}
-    Loop->>Hook: fire tool.call (Phase 1 hook)
+    Loop->>Hook: fire tool_call (Phase 1 hook)
     Hook-->>Loop: pass / cancel / modify args
-    Loop->>Cap: principal has file_write?
+    Loop->>Cap: principal has file.write?
     Cap-->>Loop: yes
     Loop->>Queue: acquire('src/main.zig')
     Queue-->>Loop: guard
@@ -207,7 +207,7 @@ sequenceDiagram
     FS-->>Edit: ok
     Edit-->>Loop: ExecutionResult { content, is_error: false }
     Loop->>Queue: release('src/main.zig')
-    Loop->>Hook: fire tool.result (Phase 1 hook)
+    Loop->>Hook: fire tool_result (Phase 1 hook)
     Hook-->>Loop: pass / rewrite result
     Loop->>LLM: tool_result {tool_use_id, content, is_error: false}
     LLM-->>LLM: sees result, decides next move
@@ -217,7 +217,7 @@ sequenceDiagram
 
 - Chapter 3's tool_use → tool_result protocol
 - Chapter 5's agent loop + 4 hook positions
-- Chapter 7's tool.call / tool.result interception
+- Chapter 7's `tool_call` / `tool_result` interception
 - This chapter's file_mutation_queue + capability check
 
 ## 6.5 The "three-layer defense"
@@ -231,9 +231,9 @@ flowchart TB
     classDef l3 fill:#7f1d1d,stroke:#dc2626,color:#fff
 
     L1[Layer 1: capability check]:::l1
-    L1 --> L1d["Principal lacks shell_run grant?<br/>Deny immediately, never reach the bash tool"]
+    L1 --> L1d["Principal lacks shell.run grant?<br/>Deny immediately, never reach the bash tool"]
 
-    L2[Layer 2: extension interception<br/>(tool.call hook)]:::l2
+    L2[Layer 2: extension interception<br/>(tool_call hook)]:::l2
     L2 --> L2d["Extensions inspect args:<br/>'rm -rf /' commands cancel directly"]
 
     L3[Layer 3: tool internals]:::l3
