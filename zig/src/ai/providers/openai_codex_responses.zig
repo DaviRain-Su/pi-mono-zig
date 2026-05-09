@@ -209,7 +209,6 @@ pub fn buildRequestPayload(
         if (stream_options.provider == .responses) {
             responses_opts = stream_options.provider.responses;
         } else {
-            responses_opts.text_verbosity = stream_options.responses_text_verbosity;
         }
     }
     const text_verbosity = responses_opts.text_verbosity orelse "low";
@@ -233,9 +232,8 @@ pub fn buildRequestPayload(
         if (stream_options.provider == .responses) {
             responses_opts = stream_options.provider.responses;
         } else {
-            responses_opts.service_tier = stream_options.responses_service_tier;
-            responses_opts.reasoning_effort = stream_options.responses_reasoning_effort;
-            responses_opts.reasoning_summary = stream_options.responses_reasoning_summary;
+
+
         }
         if (stream_options.temperature) |temperature| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });

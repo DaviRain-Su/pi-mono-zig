@@ -133,7 +133,6 @@ pub fn buildRequestPayload(
                 if (stream_options.provider == .google) {
                     google_opts = stream_options.provider.google;
                 } else {
-                    google_opts.tool_choice = stream_options.google_tool_choice;
                 }
                 if (google_opts.tool_choice) |tool_choice| {
                     try payload.put(allocator, try allocator.dupe(u8, "toolConfig"), try buildToolConfigValue(allocator, tool_choice));
@@ -569,7 +568,6 @@ fn buildGenerationConfigValue(
         if (stream_options.provider == .google) {
             google_opts = stream_options.provider.google;
         } else {
-            google_opts.thinking = stream_options.google_thinking;
         }
         if (google_opts.thinking) |thinking| {
             if (model.reasoning) {

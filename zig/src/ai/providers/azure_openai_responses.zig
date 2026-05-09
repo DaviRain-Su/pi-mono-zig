@@ -286,7 +286,6 @@ fn resolveDeploymentNameWithEnv(
         if (stream_options.provider == .azure) {
             azure_opts = stream_options.provider.azure;
         } else {
-            azure_opts.deployment_name = stream_options.azure_deployment_name;
         }
         if (azure_opts.deployment_name) |deployment_name| {
             if (deployment_name.len > 0) return try allocator.dupe(u8, deployment_name);
@@ -331,8 +330,7 @@ fn resolveAzureBaseUrlWithEnv(
         if (stream_options.provider == .azure) {
             azure_opts = stream_options.provider.azure;
         } else {
-            azure_opts.base_url = stream_options.azure_base_url;
-            azure_opts.resource_name = stream_options.azure_resource_name;
+
         }
         if (azure_opts.base_url) |value| {
             if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
@@ -391,7 +389,6 @@ fn resolveAzureApiVersionWithEnv(
         if (stream_options.provider == .azure) {
             azure_opts = stream_options.provider.azure;
         } else {
-            azure_opts.api_version = stream_options.azure_api_version;
         }
         if (azure_opts.api_version) |value| {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");

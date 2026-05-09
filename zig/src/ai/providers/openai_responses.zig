@@ -247,9 +247,8 @@ pub fn buildRequestPayload(
         if (stream_options.provider == .responses) {
             responses_opts = stream_options.provider.responses;
         } else {
-            responses_opts.service_tier = stream_options.responses_service_tier;
-            responses_opts.reasoning_effort = stream_options.responses_reasoning_effort;
-            responses_opts.reasoning_summary = stream_options.responses_reasoning_summary;
+
+
         }
         if (responses_opts.service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });

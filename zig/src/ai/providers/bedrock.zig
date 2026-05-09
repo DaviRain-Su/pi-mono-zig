@@ -1170,7 +1170,7 @@ fn resolveAwsCredentials(allocator: std.mem.Allocator) !AwsCredentials {
     };
 }
 
-fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOptions) !BedrockAuth {
+fn resolveBedrockAuth(allocator: std.mem.Allocator, _: ?types.StreamOptions) !BedrockAuth {
     const skip_auth = if (try loadEnvOptional(allocator, "AWS_BEDROCK_SKIP_AUTH")) |value| blk: {
         defer allocator.free(value);
         break :blk std.mem.eql(u8, value, "1");
@@ -1183,18 +1183,10 @@ fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOption
         } };
     }
 
-    if (options) |stream_options| {
-        if (stream_options.bedrock_bearer_token) |token| {
-            return .{ .bearer = try allocator.dupe(u8, token) };
-        }
-    }
     if (try loadEnvOptional(allocator, "AWS_BEARER_TOKEN_BEDROCK")) |token| {
         return .{ .bearer = token };
     }
 
-    if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrock_profile) != null) return .profile;
-    }
     if (try loadEnvOptional(allocator, "AWS_PROFILE")) |profile| {
         allocator.free(profile);
         return .profile;

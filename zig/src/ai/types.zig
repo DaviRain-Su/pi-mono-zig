@@ -713,9 +713,6 @@ pub const SimpleStreamOptions = struct {
     ///
     /// Same-named fields are copied via comptime field iteration so adding
     /// a field on either struct keeps the two in sync without manual edits.
-    /// Fields without a same-named twin (anthropic_*, responses_reasoning_summary,
-    /// responses_service_tier, responses_text_verbosity) keep StreamOptions'
-    /// own defaults. Special mappings live below the loop.
     pub fn toStreamOptions(self: SimpleStreamOptions) StreamOptions {
         var opts: StreamOptions = .{};
         inline for (@typeInfo(SimpleStreamOptions).@"struct".fields) |field| {
