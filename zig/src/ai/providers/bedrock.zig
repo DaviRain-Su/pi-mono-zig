@@ -2210,7 +2210,7 @@ fn updateUsage(output: *types.AssistantMessage, metadata_value: std.json.Value, 
         const total = getJsonU32(usage_value.object.get("totalTokens"));
         break :blk if (total > 0) total else output.usage.input + output.usage.output;
     };
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
 }
 
 fn getJsonU32(value: ?std.json.Value) u32 {
@@ -2218,14 +2218,6 @@ fn getJsonU32(value: ?std.json.Value) u32 {
         if (json_value == .integer and json_value.integer >= 0) return @intCast(json_value.integer);
     }
     return 0;
-}
-
-fn calculateCost(model: types.Model, usage: *types.Usage) void {
-    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
-    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
-    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
-    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 fn finalizeOutputFromPartials(

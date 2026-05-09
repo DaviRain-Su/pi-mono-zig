@@ -2211,7 +2211,7 @@ fn finalizeCollectedOutput(
         .total_tokens = .preserve_or_full_usage,
         .coerce_stop_reason_for_tool_calls = coerce_stop_reason_for_tool_calls,
     });
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
 }
 
 fn emitRuntimeFailure(
@@ -3050,14 +3050,6 @@ fn updateUsage(usage: *types.Usage, usage_value: std.json.Value) void {
         if (value == .integer) usage.cache_write = @intCast(value.integer);
     }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-}
-
-fn calculateCost(model: types.Model, usage: *types.Usage) void {
-    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
-    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
-    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
-    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 fn findActiveBlock(active_blocks: *std.ArrayList(BlockEntry), value: std.json.Value) !*BlockEntry {

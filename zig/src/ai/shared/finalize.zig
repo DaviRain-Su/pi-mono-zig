@@ -4,6 +4,16 @@ const provider_json = @import("provider_json.zig");
 const provider_error = @import("provider_error.zig");
 const types = @import("../types.zig");
 
+/// Calculate per-token cost from usage counts and model pricing.
+/// Per-million-token pricing is the convention across all providers.
+pub fn calculateCost(model: types.Model, usage: *types.Usage) void {
+    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
+    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
+    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
+    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
+    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+}
+
 pub const FinalizeState = struct {
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),

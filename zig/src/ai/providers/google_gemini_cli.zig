@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
@@ -318,7 +319,7 @@ fn parseSseStreamLines(
     }
 
     try finishCurrentBlock(allocator, &current_block, &content_blocks, stream_ptr);
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
     output.content = try content_blocks.toOwnedSlice(allocator);
 
     stream_ptr.push(.{
@@ -409,7 +410,7 @@ fn processGeminiCliSseData(
 
     if (response_value.object.get("usageMetadata")) |usage_metadata| {
         updateUsage(&output.usage, usage_metadata);
-        calculateCost(model, &output.usage);
+        finalize.calculateCost(model, &output.usage);
     }
 
     const candidates_value = response_value.object.get("candidates") orelse return true;
@@ -569,7 +570,7 @@ fn finalizeOutputFromPartials(
     model: types.Model,
 ) !void {
     try finishCurrentBlock(allocator, current_block, content_blocks, stream_ptr);
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_blocks.items.len > 0) {
         output.content = try content_blocks.toOwnedSlice(allocator);
     }
@@ -1032,14 +1033,6 @@ fn getJsonU32(value: ?std.json.Value) u32 {
         }
     }
     return 0;
-}
-
-fn calculateCost(model: types.Model, usage: *types.Usage) void {
-    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
-    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
-    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
-    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 fn extractErrorMessage(body: []const u8) []const u8 {

@@ -403,7 +403,7 @@ fn parseSseStreamLines(
     try finalizeCollectedOutput(allocator, &output, &content_blocks, &tool_calls, .always, .preserve_or_full_usage, true);
     // Tool calls live inline in output.content; legacy field intentionally null.
 
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -1799,7 +1799,7 @@ fn updateCompletedResponse(
 
     if (response_value.object.get("usage")) |usage_value| {
         output.usage = parseUsage(usage_value);
-        calculateCost(model, &output.usage);
+        finalize.calculateCost(model, &output.usage);
     }
 
     if (extractStringField(response_value, "status")) |status| {
@@ -1886,14 +1886,6 @@ fn jsonIntegerToU32(maybe_value: ?std.json.Value) u32 {
         .integer => |integer| @intCast(@max(@as(i64, 0), integer)),
         else => 0,
     };
-}
-
-fn calculateCost(model: types.Model, usage: *types.Usage) void {
-    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
-    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
-    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
-    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 fn getCompat(model: types.Model) ResponsesCompat {

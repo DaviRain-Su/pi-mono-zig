@@ -6,6 +6,7 @@ const event_stream = @import("../event_stream.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
+const finalize = @import("../shared/finalize.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
@@ -345,7 +346,7 @@ fn parseSseStreamLines(
         });
     }
 
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
     output.content = try materializeContent(allocator, content_slots.items);
     output.stop_reason = provider_error.coerceStopReasonForToolCalls(output.stop_reason, tool_calls.items.len > 0);
 
@@ -584,7 +585,7 @@ fn finalizeOutputFromPartials(
     }
     active_tool_calls.clearRetainingCapacity();
 
-    calculateCost(model, &output.usage);
+    finalize.calculateCost(model, &output.usage);
     if (output.content.len == 0 and content_slots.items.len > 0) {
         output.content = try materializeContent(allocator, content_slots.items);
     }
@@ -1137,14 +1138,6 @@ fn updateUsage(usage: *types.Usage, usage_value: std.json.Value) void {
     usage.cache_read = 0;
     usage.cache_write = 0;
     usage.total_tokens = if (tt > 0) tt else pt + ct;
-}
-
-fn calculateCost(model: types.Model, usage: *types.Usage) void {
-    usage.cost.input = (@as(f64, @floatFromInt(usage.input)) / 1_000_000.0) * model.cost.input;
-    usage.cost.output = (@as(f64, @floatFromInt(usage.output)) / 1_000_000.0) * model.cost.output;
-    usage.cost.cache_read = (@as(f64, @floatFromInt(usage.cache_read)) / 1_000_000.0) * model.cost.cache_read;
-    usage.cost.cache_write = (@as(f64, @floatFromInt(usage.cache_write)) / 1_000_000.0) * model.cost.cache_write;
-    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
 fn modelSupportsImages(model: types.Model) bool {
