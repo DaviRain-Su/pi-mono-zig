@@ -322,10 +322,9 @@ pub const NativeHostApi = struct {
         });
     }
 
-    /// Permission-gated counter stub. Enforces capability checks and records
-    /// the operation via host_effects, but does not perform actual file I/O.
-    /// Real file reads are handled by the extension protocol message loop.
-    pub fn readFile(self: *NativeHostApi, path: []const u8) !void {
+    /// Read a file from the filesystem. Enforces `file_read` capability and
+    /// sandbox boundaries before performing I/O.
+    pub fn readFile(self: *NativeHostApi, path: []const u8) ![]u8 {
         try self.enforceOperation(.file_read, .{ .id = path }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| {
             effects.recordFileRead(path) catch |err| switch (err) {
@@ -336,12 +335,12 @@ pub const NativeHostApi = struct {
                 },
             };
         }
+        return std.Io.Dir.readFileAlloc(.cwd(), self.runtime.io, path, self.runtime.allocator, .unlimited);
     }
 
-    /// Permission-gated counter stub. Enforces capability checks and records
-    /// the operation via host_effects, but does not perform actual file I/O.
+    /// Write a file to the filesystem. Enforces `file_write` capability and
+    /// sandbox boundaries before performing I/O.
     pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
-        _ = contents;
         try self.enforceOperation(.file_write, .{ .id = path }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| {
             effects.recordFileWrite(path) catch |err| switch (err) {
@@ -352,6 +351,7 @@ pub const NativeHostApi = struct {
                 },
             };
         }
+        return std.Io.Dir.writeFile(.cwd(), self.runtime.io, .{ .sub_path = path, .data = contents });
     }
 
     /// Permission-gated counter stub. Enforces capability checks and records
@@ -938,7 +938,8 @@ fn nativeAllowedOperationMatrixStart(api: *NativeHostApi) !void {
     const write_path = try nativeSandboxPath(api.runtime.allocator, api.runtime.host_effects, "write.txt");
     defer api.runtime.allocator.free(write_path);
 
-    try api.readFile(read_path);
+    const read_data = try api.readFile(read_path);
+    defer api.runtime.allocator.free(read_data);
     try api.writeFile(write_path, "allowed");
     try api.requestNetwork("fake://network/request");
     try api.runShell("fake-shell --no-side-effects");
@@ -1118,6 +1119,11 @@ test "native host operation gates allow only fake and sandbox side effects" {
     const sandbox_root = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox");
     defer allocator.free(sandbox_root);
 
+    // Create test fixture files so real I/O succeeds within the sandbox.
+    const read_fixture_path = try std.fs.path.join(allocator, &.{ sandbox_root, "read.txt" });
+    defer allocator.free(read_fixture_path);
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = read_fixture_path, .data = "hello from sandbox" });
+
     var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
     const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
         .descriptor = &native_allowed_operation_matrix_descriptor,
@@ -1243,7 +1249,6 @@ test "native agent host operation gates enforce exact and exceeded resource boun
     try std.testing.expect(turns_denial);
 }
 
-
 const tool_context_test_descriptor: NativeDescriptor = .{
     .id = "com.pi.tool-context-test",
     .name = "Tool Context Test",
@@ -1268,10 +1273,13 @@ fn toolContextProbeStart(api: *NativeHostApi) !void {
 }
 
 fn toolContextProbeExecute(ctx: *ToolContext) !agent.AgentToolResult {
-    const value = if (ctx.params == .object)
-        (ctx.params.object.get("value") orelse .null).string
-    else
-        "no-value";
+    const value = if (ctx.params == .object) blk: {
+        const field = ctx.params.object.get("value") orelse break :blk "no-value";
+        break :blk switch (field) {
+            .string => |text| text,
+            else => "no-value",
+        };
+    } else "no-value";
 
     const text = try std.fmt.allocPrint(ctx.allocator, "id={s} value={s}", .{ ctx.tool_call_id, value });
     errdefer ctx.allocator.free(text);
@@ -1306,8 +1314,7 @@ test "native tool execute receives full ToolContext" {
         tools_common.deinitJsonValue(allocator, t.parameters);
     };
 
-    const args = try std.json.parseFromSlice(std.json.Value, allocator,
-        "{\"value\":\"hello-context\"}", .{});
+    const args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"hello-context\"}", .{});
     defer args.deinit();
 
     const result = try tool.?.execute.?(allocator, "call-123", args.value, tool.?.execute_context, null, null, null);
