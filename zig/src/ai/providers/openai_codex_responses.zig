@@ -204,10 +204,15 @@ pub fn buildRequestPayload(
 
     var text_config = try initObject(allocator);
     errdefer text_config.deinit(allocator);
-    const text_verbosity = if (options) |stream_options|
-        stream_options.responses_text_verbosity orelse "low"
-    else
-        "low";
+    var responses_opts: types.ResponsesStreamOptions = .{};
+    if (options) |stream_options| {
+        if (stream_options.provider == .responses) {
+            responses_opts = stream_options.provider.responses;
+        } else {
+            responses_opts.text_verbosity = stream_options.responses_text_verbosity;
+        }
+    }
+    const text_verbosity = responses_opts.text_verbosity orelse "low";
     try text_config.put(allocator, try allocator.dupe(u8, "verbosity"), .{ .string = try allocator.dupe(u8, text_verbosity) });
     try payload.put(allocator, try allocator.dupe(u8, "text"), .{ .object = text_config });
 
@@ -225,21 +230,28 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
 
     if (options) |stream_options| {
+        if (stream_options.provider == .responses) {
+            responses_opts = stream_options.provider.responses;
+        } else {
+            responses_opts.service_tier = stream_options.responses_service_tier;
+            responses_opts.reasoning_effort = stream_options.responses_reasoning_effort;
+            responses_opts.reasoning_summary = stream_options.responses_reasoning_summary;
+        }
         if (stream_options.temperature) |temperature| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }
-        if (stream_options.responses_service_tier) |service_tier| {
+        if (responses_opts.service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
         }
         if (stream_options.session_id) |session_id| {
             try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_key"), .{ .string = try allocator.dupe(u8, session_id) });
         }
         if (model.reasoning) {
-            if (stream_options.responses_reasoning_effort) |reasoning_effort| {
+            if (responses_opts.reasoning_effort) |reasoning_effort| {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
                 try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, thinkingLevelString(reasoning_effort)) });
-                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, stream_options.responses_reasoning_summary orelse "auto") });
+                try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, responses_opts.reasoning_summary orelse "auto") });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
             }
         }

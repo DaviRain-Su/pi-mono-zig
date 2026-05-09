@@ -243,18 +243,26 @@ pub fn buildRequestPayload(
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), .{ .string = try allocator.dupe(u8, "24h") });
             }
         }
-        if (stream_options.responses_service_tier) |service_tier| {
+        var responses_opts: types.ResponsesStreamOptions = .{};
+        if (stream_options.provider == .responses) {
+            responses_opts = stream_options.provider.responses;
+        } else {
+            responses_opts.service_tier = stream_options.responses_service_tier;
+            responses_opts.reasoning_effort = stream_options.responses_reasoning_effort;
+            responses_opts.reasoning_summary = stream_options.responses_reasoning_summary;
+        }
+        if (responses_opts.service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
         }
         if (model.reasoning) {
-            if (stream_options.responses_reasoning_effort != null or stream_options.responses_reasoning_summary != null) {
+            if (responses_opts.reasoning_effort != null or responses_opts.reasoning_summary != null) {
                 var reasoning = try initObject(allocator);
                 errdefer reasoning.deinit(allocator);
-                const effort = if (stream_options.responses_reasoning_effort) |reasoning_effort|
+                const effort = if (responses_opts.reasoning_effort) |reasoning_effort|
                     model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse thinkingLevelString(reasoning_effort)
                 else
                     "medium";
-                const summary = stream_options.responses_reasoning_summary orelse "auto";
+                const summary = responses_opts.reasoning_summary orelse "auto";
                 try reasoning.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, effort) });
                 try reasoning.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, summary) });
                 try payload.put(allocator, try allocator.dupe(u8, "reasoning"), .{ .object = reasoning });
