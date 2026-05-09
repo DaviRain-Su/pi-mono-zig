@@ -260,47 +260,6 @@ fn renderedLineCount(result: vaxis.Window.PrintResult, had_text: bool, max_heigh
     return @min(max_height, result.row + if (result.col > 0) @as(u16, 1) else 0);
 }
 
-fn renderWrappedText(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-    width: usize,
-    padding_x: usize,
-    padding_y: usize,
-    lines: *component_mod.LineList,
-) std.mem.Allocator.Error!void {
-    const effective_width = @max(width, 1);
-    const content_width = @max(effective_width, padding_x * 2 + 1) - padding_x * 2;
-
-    var wrapped = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &wrapped);
-    try ansi.wrapTextAlloc(allocator, text, content_width, &wrapped);
-
-    const blank_line = try allocator.alloc(u8, effective_width);
-    defer allocator.free(blank_line);
-    @memset(blank_line, ' ');
-
-    for (0..padding_y) |_| {
-        try component_mod.appendOwnedLine(lines, allocator, blank_line);
-    }
-
-    for (wrapped.items) |line| {
-        var builder = std.ArrayList(u8).empty;
-        errdefer builder.deinit(allocator);
-
-        try builder.appendNTimes(allocator, ' ', padding_x);
-        try builder.appendSlice(allocator, line);
-
-        const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-        defer allocator.free(padded);
-        try component_mod.appendOwnedLine(lines, allocator, padded);
-        builder.deinit(allocator);
-    }
-
-    for (0..padding_y) |_| {
-        try component_mod.appendOwnedLine(lines, allocator, blank_line);
-    }
-}
-
 test "loader renders animated spinner frames" {
     var loader = Loader{ .message = "Loading..." };
 

@@ -96,7 +96,7 @@ pub const Image = struct {
         };
     }
 
-    pub fn renderInto(
+    fn renderInto(
         self: *const Image,
         allocator: std.mem.Allocator,
         width: usize,
