@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' file:; script-src 'self' 'unsafe-inline' file:; style-src 'self' 'unsafe-inline' file:; img-src 'self' data: file:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pi WebView</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #101216;
+        color: #f2f5f8;
+      }
+      main {
+        display: grid;
+        grid-template-rows: auto auto 1fr auto;
+        min-height: 100vh;
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 24px;
+        gap: 16px;
+        box-sizing: border-box;
+      }
+      h1 {
+        margin: 0;
+        font-size: 24px;
+      }
+      p,
+      pre {
+        margin: 0;
+        line-height: 1.5;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      #status,
+      #initial-input {
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.06);
+      }
+      #messages {
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding: 4px;
+      }
+      .message,
+      .event {
+        padding: 12px 14px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.06);
+        white-space: pre-wrap;
+      }
+      .message.user {
+        background: rgba(88, 166, 255, 0.16);
+      }
+      .message.assistant {
+        background: rgba(63, 185, 80, 0.14);
+      }
+      .event {
+        color: #c9d1d9;
+        font-size: 13px;
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+      }
+      textarea,
+      button {
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.08);
+        color: inherit;
+        font: inherit;
+      }
+      textarea {
+        min-height: 58px;
+        padding: 10px;
+        resize: vertical;
+      }
+      button {
+        padding: 0 16px;
+      }
+      button:disabled,
+      textarea:disabled {
+        opacity: 0.55;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>pi WebView</h1>
+      <p id="status"><code>bridge: initializing</code></p>
+      <pre id="initial-input" hidden></pre>
+      <section id="messages" aria-live="polite"></section>
+      <form id="prompt-form">
+        <textarea id="prompt-input" name="prompt" placeholder="Ask pi…" autocomplete="off"></textarea>
+        <button id="submit-button" type="submit">Send</button>
+        <button id="abort-button" type="button">Abort</button>
+      </form>
+    </main>
+    <script>
+      window.piWebViewReady = false;
+      const state = {
+        requestId: 0,
+        pending: new Map(),
+        activeTurnId: null,
+        lastSequenceByTurn: new Map(),
+      };
+      const statusEl = document.getElementById("status");
+      const messagesEl = document.getElementById("messages");
+      const initialInputEl = document.getElementById("initial-input");
+      const formEl = document.getElementById("prompt-form");
+      const promptInputEl = document.getElementById("prompt-input");
+      const submitButtonEl = document.getElementById("submit-button");
+      const abortButtonEl = document.getElementById("abort-button");
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function appendBlock(className, label, text) {
+        const block = document.createElement("article");
+        block.className = className;
+        const strong = document.createElement("strong");
+        strong.textContent = label;
+        const body = document.createElement("div");
+        body.textContent = text;
+        block.append(strong, document.createTextNode("\n"), body);
+        messagesEl.append(block);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      function renderMessages(messages) {
+        messagesEl.textContent = "";
+        for (const message of messages) {
+          appendBlock(`message ${message.role}`, message.role, message.text || "");
+        }
+      }
+
+      function renderEvent(frame) {
+        if (!frame || !frame.turnId) return;
+        if (state.activeTurnId && frame.turnId !== state.activeTurnId) return;
+        const lastSequence = state.lastSequenceByTurn.get(frame.turnId) || 0;
+        if (frame.sequence <= lastSequence) return;
+        if (frame.sequence !== lastSequence + 1) {
+          appendBlock("event", "event gap", `${frame.turnId} expected ${lastSequence + 1} got ${frame.sequence}`);
+        }
+        state.lastSequenceByTurn.set(frame.turnId, frame.sequence);
+        const event = frame.event || {};
+        const assistant = event.assistantMessageEvent || {};
+        if (assistant.delta) {
+          appendBlock("event", `${frame.sequence} ${frame.type}`, assistant.delta);
+        } else if (frame.terminal) {
+          appendBlock("event", `${frame.sequence} terminal`, frame.terminalOutcome || "done");
+        } else {
+          appendBlock("event", `${frame.sequence} ${frame.type}`, event.type || "");
+        }
+        if (frame.terminal) {
+          state.activeTurnId = null;
+          promptInputEl.disabled = false;
+          submitButtonEl.disabled = false;
+        }
+      }
+
+      function sendBridge(command, payload = undefined) {
+        const id = `webview-${++state.requestId}`;
+        const request = { id, command };
+        if (payload !== undefined) request.payload = payload;
+        return new Promise((resolve, reject) => {
+          state.pending.set(id, { resolve, reject });
+          if (window.webkit?.messageHandlers?.pi) {
+            window.webkit.messageHandlers.pi.postMessage(request);
+          } else {
+            state.pending.delete(id);
+            reject(new Error("Zig bridge is unavailable"));
+          }
+        });
+      }
+
+      window.piBridgeReceive = (response) => {
+        const pending = state.pending.get(response?.id);
+        if (!pending) return;
+        state.pending.delete(response.id);
+        if (response.ok) {
+          pending.resolve(response.result);
+        } else {
+          pending.reject(new Error(response.error?.message || response.error?.code || "Bridge error"));
+        }
+      };
+
+      async function hydrate() {
+        const bridgeState = await sendBridge("get_state");
+        setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId}`);
+        if (bridgeState.initialInput) {
+          initialInputEl.hidden = false;
+          initialInputEl.textContent = `prepared input: ${bridgeState.initialInput.prompt || ""}\nmessages: ${bridgeState.initialInput.messages.length}\nimages: ${bridgeState.initialInput.imagesCount}`;
+          if (bridgeState.initialInput.prompt) promptInputEl.value = bridgeState.initialInput.prompt;
+        }
+        const transcript = await sendBridge("get_messages");
+        renderMessages(transcript.messages || []);
+      }
+
+      formEl.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const text = promptInputEl.value;
+        if (!text.trim()) return;
+        promptInputEl.disabled = true;
+        submitButtonEl.disabled = true;
+        try {
+          appendBlock("message user", "user", text);
+          const result = await sendBridge("prompt", { text });
+          state.activeTurnId = result.turnId;
+          for (const frame of result.events || []) renderEvent(frame);
+          const transcript = await sendBridge("get_messages");
+          renderMessages(transcript.messages || []);
+          promptInputEl.value = "";
+        } catch (error) {
+          appendBlock("event", "error", String(error.message || error));
+        } finally {
+          state.activeTurnId = null;
+          promptInputEl.disabled = false;
+          submitButtonEl.disabled = false;
+        }
+      });
+
+      abortButtonEl.addEventListener("click", async () => {
+        try {
+          const result = await sendBridge("abort");
+          appendBlock("event", "abort", result.status);
+        } catch (error) {
+          appendBlock("event", "abort error", String(error.message || error));
+        }
+      });
+
+      window.addEventListener("DOMContentLoaded", () => {
+        window.piWebViewReady = true;
+        setStatus("bridge: ready");
+        if (window.webkit?.messageHandlers?.pi) {
+          window.webkit.messageHandlers.pi.postMessage({
+            type: "frontend_ready",
+          });
+        }
+        hydrate().catch((error) => {
+          setStatus(`bridge error: ${error.message || error}`);
+        });
+      });
+    </script>
+  </body>
+</html>

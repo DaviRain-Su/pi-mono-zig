@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 static char pi_webview_last_error_buffer[1024] = {0};
+typedef char *(*PiWebViewHandleRequestFn)(void *context, const char *json, const char *origin);
+typedef void (*PiWebViewFreeResponseFn)(void *context, char *response);
 
 static void pi_webview_set_last_error(NSString *message) {
     const char *utf8 = message ? [message UTF8String] : "unknown error";
@@ -59,13 +61,68 @@ static void pi_webview_stop_app(void) {
 }
 
 @interface PiWebViewBridgeHandler : NSObject <WKScriptMessageHandler>
+@property(nonatomic) void *bridgeContext;
+@property(nonatomic) PiWebViewHandleRequestFn handleRequest;
+@property(nonatomic) PiWebViewFreeResponseFn freeResponse;
+@property(nonatomic, weak) WKWebView *webView;
 @end
 
 @implementation PiWebViewBridgeHandler
+- (NSString *)jsonStringForMessageBody:(id)body {
+    if ([body isKindOfClass:[NSString class]]) {
+        return (NSString *)body;
+    }
+    if (![NSJSONSerialization isValidJSONObject:body]) {
+        return nil;
+    }
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:&error];
+    if (data == nil || error != nil) {
+        return nil;
+    }
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
 - (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)userContentController;
     if ([message.name isEqualToString:@"pi"]) {
-        fprintf(stderr, "PI_WEBVIEW_BRIDGE_READY pid=%d\n", getpid());
+        WKWebView *webView = self.webView;
+        NSString *requestJson = [self jsonStringForMessageBody:message.body];
+        if (requestJson == nil || self.handleRequest == NULL) {
+            fprintf(stderr, "PI_WEBVIEW_BRIDGE_ERROR pid=%d reason=invalid_request\n", getpid());
+            fflush(stderr);
+            return;
+        }
+
+        if ([requestJson containsString:@"frontend_ready"]) {
+            fprintf(stderr, "PI_WEBVIEW_BRIDGE_READY pid=%d\n", getpid());
+            fflush(stderr);
+            return;
+        }
+
+        const char *requestUtf8 = [requestJson UTF8String];
+        char *response = self.handleRequest(self.bridgeContext, requestUtf8, "pi-webview://bundle");
+        if (response == NULL) {
+            fprintf(stderr, "PI_WEBVIEW_BRIDGE_ERROR pid=%d reason=handler_returned_null\n", getpid());
+            fflush(stderr);
+            return;
+        }
+
+        NSString *responseJson = [NSString stringWithUTF8String:response];
+        if (responseJson != nil && webView != nil) {
+            NSString *script = [NSString stringWithFormat:@"window.piBridgeReceive && window.piBridgeReceive(%@);", responseJson];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+                    (void)result;
+                    if (error != nil) {
+                        fprintf(stderr, "PI_WEBVIEW_BRIDGE_EVAL_FAILED pid=%d error=%s\n", getpid(), [[error localizedDescription] UTF8String]);
+                        fflush(stderr);
+                    }
+                }];
+            });
+        }
+        self.freeResponse(self.bridgeContext, response);
+        fprintf(stderr, "PI_WEBVIEW_BRIDGE_REQUEST pid=%d bytes=%lu\n", getpid(), (unsigned long)[requestJson length]);
         fflush(stderr);
     }
 }
@@ -175,7 +232,14 @@ static void pi_webview_stop_app(void) {
 }
 @end
 
-int pi_webview_macos_run(const char *asset_path, const char *window_title, int auto_close_ms) {
+int pi_webview_macos_run(
+    const char *asset_path,
+    const char *window_title,
+    int auto_close_ms,
+    void *bridge_context,
+    PiWebViewHandleRequestFn handle_request,
+    PiWebViewFreeResponseFn free_response
+) {
     pi_webview_last_error_buffer[0] = '\0';
 
     @autoreleasepool {
@@ -207,6 +271,9 @@ int pi_webview_macos_run(const char *asset_path, const char *window_title, int a
         WKWebViewConfiguration *configuration = [[WKWebViewConfiguration alloc] init];
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = NO;
         PiWebViewBridgeHandler *bridgeHandler = [[PiWebViewBridgeHandler alloc] init];
+        bridgeHandler.bridgeContext = bridge_context;
+        bridgeHandler.handleRequest = handle_request;
+        bridgeHandler.freeResponse = free_response;
         [configuration.userContentController addScriptMessageHandler:bridgeHandler name:@"pi"];
 
         NSRect frame = NSMakeRect(0, 0, 1100, 760);
@@ -219,6 +286,7 @@ int pi_webview_macos_run(const char *asset_path, const char *window_title, int a
         [window center];
 
         WKWebView *webView = [[WKWebView alloc] initWithFrame:frame configuration:configuration];
+        bridgeHandler.webView = webView;
         PiWebViewNavigationDelegate *navigationDelegate = [[PiWebViewNavigationDelegate alloc] init];
         navigationDelegate.assetPath = assetPath;
         navigationDelegate.assetRootPath = [assetPath stringByDeletingLastPathComponent];

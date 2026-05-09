@@ -13,6 +13,7 @@ const extension_manifest = @import("extension_manifest.zig");
 const extension_registry = @import("extension_registry.zig");
 const workflow_execution = @import("workflow_execution.zig");
 const native_runtime = @import("native_runtime.zig");
+const sdk = @import("sdk.zig");
 const resources_mod = @import("../resources/resources.zig");
 const tools_common = @import("../tools/common.zig");
 const wasm_host = @import("wasm/wasm_host_spike.zig");
@@ -3296,7 +3297,7 @@ const native_partial_failure_tool: NativeToolDefinition = .{
     .extension_path = "native://fixture/partial-failure",
 };
 
-fn nativeFixtureEchoExecute(ctx: *native_runtime.ToolContext) !agent.AgentToolResult {
+fn nativeFixtureEchoExecute(ctx: *sdk.ToolContext) !agent.AgentToolResult {
     const allocator = ctx.allocator;
     const params = ctx.params;
     if (params != .object) return error.InvalidNativeToolInput;

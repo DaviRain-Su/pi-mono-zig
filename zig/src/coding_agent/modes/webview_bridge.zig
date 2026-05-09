@@ -1,5 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
+const agent = @import("agent");
+const json_event_wire = @import("json_event_wire.zig");
 const session_mod = @import("../sessions/session.zig");
 const tool_selection = @import("../tool_selection.zig");
 
@@ -47,7 +49,10 @@ pub const BridgeContext = struct {
     api_key_present: bool,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
-    session: *const session_mod.AgentSession,
+    session: *session_mod.AgentSession,
+    initial_prompt: ?[]const u8 = null,
+    initial_messages: []const []const u8 = &.{},
+    initial_images_count: usize = 0,
 };
 
 pub const DispatchCounters = struct {
@@ -75,6 +80,8 @@ pub const BridgeHost = struct {
     limits: Limits = .{},
     dispatch_counters: ?*DispatchCounters = null,
     injected_handler_error: ?anyerror = null,
+    active_turn_id: ?[]const u8 = null,
+    next_turn_index: usize = 0,
 
     pub fn init(context: BridgeContext) BridgeHost {
         return .{ .context = context };
@@ -217,8 +224,8 @@ pub const BridgeHost = struct {
         switch (command) {
             .get_state => try self.writeStateResult(allocator, &writer.writer),
             .get_messages => try self.writeMessagesResult(allocator, &writer.writer),
-            .prompt => try writePromptResult(allocator, &writer.writer, payload.?),
-            .abort => try writer.writer.writeAll("{\"status\":\"not_running\",\"aborted\":false}"),
+            .prompt => try self.writePromptResult(allocator, &writer.writer, payload.?),
+            .abort => try self.writeAbortResult(&writer.writer),
         }
 
         try writer.writer.writeAll("}");
@@ -238,6 +245,14 @@ pub const BridgeHost = struct {
         try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
+        try writeBoolField(writer, "busy", self.active_turn_id != null or self.context.session.isStreaming(), true);
+        if (self.context.initial_prompt != null or self.context.initial_messages.len > 0 or self.context.initial_images_count > 0) {
+            try writer.writeAll(",\"initialInput\":{");
+            try writeOptionalStringField(allocator, writer, "prompt", self.context.initial_prompt, false);
+            try writeStringArrayField(allocator, writer, "messages", self.context.initial_messages, true);
+            try writeUsizeField(writer, "imagesCount", self.context.initial_images_count, true);
+            try writer.writeAll("}");
+        }
         try writer.writeAll("}");
     }
 
@@ -255,6 +270,98 @@ pub const BridgeHost = struct {
             try writeMessageSummary(allocator, writer, message);
         }
         try writer.writeAll("]}");
+    }
+
+    fn writePromptResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const text = payload.object.get("text").?.string;
+        if (self.active_turn_id != null or self.context.session.isStreaming()) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"queued\":false,\"message\":");
+            try writeJsonString(allocator, writer, "Agent is already processing a WebView prompt");
+            try writer.writeAll("}");
+            return;
+        }
+
+        const turn_id = try std.fmt.allocPrint(allocator, "webview-turn-{d}", .{self.next_turn_index});
+        defer allocator.free(turn_id);
+        self.next_turn_index += 1;
+        self.active_turn_id = turn_id;
+        defer {
+            self.active_turn_id = null;
+        }
+
+        var capture = PromptEventCapture.init(
+            allocator,
+            self.context.session.session_manager.getSessionId(),
+            turn_id,
+        );
+        defer capture.deinit();
+
+        const subscriber = agent.AgentSubscriber{
+            .context = &capture,
+            .callback = handleWebViewPromptEvent,
+        };
+        try self.context.session.agent.subscribe(subscriber);
+        defer {
+            _ = self.context.session.agent.unsubscribe(subscriber);
+        }
+
+        var acceptance = PromptAcceptance{};
+        const accepted_callback = agent.PromptAcceptedCallback{
+            .context = &acceptance,
+            .callback = markPromptAccepted,
+        };
+
+        const prompt_result = self.context.session.promptWithAcceptedCallback(
+            .{ .text = text, .images = &[_]ai.ImageContent{} },
+            accepted_callback,
+        );
+        if (prompt_result) |_| {
+            if (!capture.terminal_seen) {
+                try capture.appendSyntheticTerminal("success", "prompt completed without an agent_end event");
+            }
+            try writer.writeAll("{\"status\":\"completed\",\"accepted\":");
+            try writer.writeAll(if (acceptance.accepted) "true" else "false");
+            try writer.writeAll(",\"queued\":false,\"sessionId\":");
+            try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+            try writer.writeAll(",\"turnId\":");
+            try writeJsonString(allocator, writer, turn_id);
+            try writer.writeAll(",\"terminalOutcome\":\"success\",\"events\":[");
+            try capture.writeFrames(writer);
+            try writer.writeAll("]}");
+        } else |err| {
+            if (!capture.terminal_seen) {
+                try capture.appendSyntheticTerminal("setup_failure", @errorName(err));
+            }
+            try writer.writeAll("{\"status\":\"failed\",\"accepted\":");
+            try writer.writeAll(if (acceptance.accepted) "true" else "false");
+            try writer.writeAll(",\"queued\":false,\"sessionId\":");
+            try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+            try writer.writeAll(",\"turnId\":");
+            try writeJsonString(allocator, writer, turn_id);
+            try writer.writeAll(",\"terminalOutcome\":\"setup_failure\",\"error\":");
+            try writeJsonString(allocator, writer, @errorName(err));
+            try writer.writeAll(",\"events\":[");
+            try capture.writeFrames(writer);
+            try writer.writeAll("]}");
+        }
+    }
+
+    fn writeAbortResult(
+        self: *BridgeHost,
+        writer: *std.Io.Writer,
+    ) !void {
+        if (self.active_turn_id == null and !self.context.session.isStreaming()) {
+            try writer.writeAll("{\"status\":\"not_running\",\"aborted\":false}");
+            return;
+        }
+        self.context.session.abortRetry();
+        self.context.session.agent.abort();
+        try writer.writeAll("{\"status\":\"abort_requested\",\"aborted\":true}");
     }
 };
 
@@ -391,19 +498,6 @@ fn writeErrorResponseAlloc(
     return try writer.toOwnedSlice();
 }
 
-fn writePromptResult(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    payload: std.json.Value,
-) !void {
-    const text = payload.object.get("text").?.string;
-    try writer.writeAll("{\"status\":\"accepted_by_bridge\",\"queued\":false,\"implemented\":false,\"textLength\":");
-    try writer.print("{d}", .{text.len});
-    try writer.writeAll(",\"message\":");
-    try writeJsonString(allocator, writer, "Prompt command is exposed but agent execution is implemented by the chat milestone");
-    try writer.writeAll("}");
-}
-
 fn writeMessageSummary(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -458,6 +552,40 @@ fn writeStringField(
     try writeJsonString(allocator, writer, name);
     try writer.writeAll(":");
     try writeJsonString(allocator, writer, value);
+}
+
+fn writeOptionalStringField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    name: []const u8,
+    value: ?[]const u8,
+    comma: bool,
+) !void {
+    if (comma) try writer.writeAll(",");
+    try writeJsonString(allocator, writer, name);
+    try writer.writeAll(":");
+    if (value) |text| {
+        try writeJsonString(allocator, writer, text);
+    } else {
+        try writer.writeAll("null");
+    }
+}
+
+fn writeStringArrayField(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    name: []const u8,
+    values: []const []const u8,
+    comma: bool,
+) !void {
+    if (comma) try writer.writeAll(",");
+    try writeJsonString(allocator, writer, name);
+    try writer.writeAll(":[");
+    for (values, 0..) |value, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writeJsonString(allocator, writer, value);
+    }
+    try writer.writeAll("]");
 }
 
 fn writeBoolField(
@@ -525,13 +653,17 @@ fn testModel() ai.Model {
 }
 
 fn testSession(allocator: std.mem.Allocator) !session_mod.AgentSession {
+    return try testSessionWithModel(allocator, testModel());
+}
+
+fn testSessionWithModel(allocator: std.mem.Allocator, model: ai.Model) !session_mod.AgentSession {
     return try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp/pi-webview-assets",
-        .model = testModel(),
+        .model = model,
     });
 }
 
-fn testBridge(session: *const session_mod.AgentSession) BridgeHost {
+fn testBridge(session: *session_mod.AgentSession) BridgeHost {
     const model = ai.Model{
         .id = "faux-model",
         .name = "Faux Model",
@@ -553,6 +685,94 @@ fn testBridge(session: *const session_mod.AgentSession) BridgeHost {
         .active_tool_count = 0,
         .session = session,
     });
+}
+
+const PromptAcceptance = struct {
+    accepted: bool = false,
+};
+
+fn markPromptAccepted(context: ?*anyopaque) !void {
+    const acceptance: *PromptAcceptance = @ptrCast(@alignCast(context.?));
+    acceptance.accepted = true;
+}
+
+const PromptEventCapture = struct {
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    turn_id: []const u8,
+    frames: std.ArrayList([]u8) = .empty,
+    next_sequence: usize = 1,
+    terminal_seen: bool = false,
+
+    fn init(allocator: std.mem.Allocator, session_id: []const u8, turn_id: []const u8) PromptEventCapture {
+        return .{
+            .allocator = allocator,
+            .session_id = session_id,
+            .turn_id = turn_id,
+        };
+    }
+
+    fn deinit(self: *PromptEventCapture) void {
+        for (self.frames.items) |frame| self.allocator.free(frame);
+        self.frames.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn appendEvent(self: *PromptEventCapture, event: agent.AgentEvent) !void {
+        const terminal = event.event_type == .agent_end;
+        if (terminal and self.terminal_seen) return;
+        if (terminal) self.terminal_seen = true;
+
+        const event_json = try json_event_wire.stringifyAgentEventLine(self.allocator, event);
+        defer self.allocator.free(event_json);
+
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        try writer.writer.writeAll("{\"sessionId\":");
+        try writeJsonString(self.allocator, &writer.writer, self.session_id);
+        try writer.writer.writeAll(",\"turnId\":");
+        try writeJsonString(self.allocator, &writer.writer, self.turn_id);
+        try writer.writer.print(",\"sequence\":{d},\"type\":", .{self.next_sequence});
+        try writeJsonString(self.allocator, &writer.writer, @tagName(event.event_type));
+        try writer.writer.writeAll(",\"terminal\":");
+        try writer.writer.writeAll(if (terminal) "true" else "false");
+        if (terminal) try writer.writer.writeAll(",\"terminalOutcome\":\"success\"");
+        try writer.writer.writeAll(",\"event\":");
+        try writer.writer.writeAll(event_json);
+        try writer.writer.writeAll("}");
+        self.next_sequence += 1;
+        try self.frames.append(self.allocator, try writer.toOwnedSlice());
+    }
+
+    fn appendSyntheticTerminal(self: *PromptEventCapture, outcome: []const u8, message: []const u8) !void {
+        if (self.terminal_seen) return;
+        self.terminal_seen = true;
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer writer.deinit();
+        try writer.writer.writeAll("{\"sessionId\":");
+        try writeJsonString(self.allocator, &writer.writer, self.session_id);
+        try writer.writer.writeAll(",\"turnId\":");
+        try writeJsonString(self.allocator, &writer.writer, self.turn_id);
+        try writer.writer.print(",\"sequence\":{d},\"type\":\"terminal\",\"terminal\":true,\"terminalOutcome\":", .{self.next_sequence});
+        try writeJsonString(self.allocator, &writer.writer, outcome);
+        try writer.writer.writeAll(",\"event\":{\"type\":\"terminal\",\"message\":");
+        try writeJsonString(self.allocator, &writer.writer, message);
+        try writer.writer.writeAll("}}");
+        self.next_sequence += 1;
+        try self.frames.append(self.allocator, try writer.toOwnedSlice());
+    }
+
+    fn writeFrames(self: *const PromptEventCapture, writer: *std.Io.Writer) !void {
+        for (self.frames.items, 0..) |frame, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll(frame);
+        }
+    }
+};
+
+fn handleWebViewPromptEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
+    const capture: *PromptEventCapture = @ptrCast(@alignCast(context.?));
+    try capture.appendEvent(event);
 }
 
 test "bridge command table exposes only approved skeleton commands" {
@@ -584,7 +804,7 @@ test "bridge dispatches every approved skeleton command through command table" {
     const prompt = try bridge.handleRequestJson(allocator, "{\"id\":\"prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"hello\"}}", trusted_bundle_origin);
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"id\":\"prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted_by_bridge\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":") != null);
 
     const abort = try bridge.handleRequestJson(allocator, "{\"id\":\"abort\",\"command\":\"abort\"}", trusted_bundle_origin);
     defer allocator.free(abort);
@@ -595,6 +815,84 @@ test "bridge dispatches every approved skeleton command through command table" {
     try std.testing.expectEqual(@as(usize, 1), counters.get_messages);
     try std.testing.expectEqual(@as(usize, 1), counters.prompt);
     try std.testing.expectEqual(@as(usize, 1), counters.abort);
+}
+
+test "webview prompt runs through AgentSession and returns ordered correlated events" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("webview answer")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{}) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.model = registration.getModel();
+
+    const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "\"messages\":[]") != null);
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"hello from webview\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"id\":\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"turnId\":\"webview-turn-0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminal\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "webview answer") != null);
+
+    const after = try bridge.handleRequestJson(allocator, "{\"id\":\"after\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "hello from webview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "webview answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "webview-turn-0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"sequence\"") == null);
+}
+
+test "webview prompt denies concurrent active turn deterministically" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.active_turn_id = "active-turn";
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"busy\",\"command\":\"prompt\",\"payload\":{\"text\":\"second\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"status\":\"busy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"accepted\":false") != null);
+}
+
+test "webview state surfaces prepared initial input without bridge metadata" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.initial_prompt = "draft prompt";
+    bridge.context.initial_messages = &[_][]const u8{ "positional one", "positional two" };
+    bridge.context.initial_images_count = 1;
+
+    const response = try bridge.handleRequestJson(allocator, "{\"id\":\"state\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"initialInput\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "draft prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"imagesCount\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"turnId\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"sequence\"") == null);
 }
 
 test "bridge envelopes correlate success responses and omit secrets" {
