@@ -362,6 +362,8 @@ pub const InputLoop = struct {
     paste_buffer: std.ArrayList(u8) = .empty,
     paste_active: bool = false,
     started: bool = false,
+    pending_result: ?InputLoopResult = null,
+    has_pending_null: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -392,6 +394,8 @@ pub const InputLoop = struct {
 
     pub fn deinit(self: *InputLoop) void {
         const allocator = self.allocator;
+        if (self.pending_result) |r| r.deinit(allocator);
+        self.has_pending_null = false;
         self.paste_buffer.deinit(self.allocator);
         if (self.started) {
             self.loop.should_quit = true;
@@ -408,11 +412,76 @@ pub const InputLoop = struct {
     }
 
     pub fn tryInputEvent(self: *InputLoop) !?InputLoopResult {
+        if (builtin.os.tag == .windows) {
+            return self.tryInputEventWithImplicitPaste();
+        }
         while (try self.loop.tryEvent()) |event| {
             if (try processLoopEvent(self.allocator, &self.paste_buffer, &self.paste_active, event)) |result| {
                 return result;
             }
         }
+        return null;
+    }
+
+    /// On Windows, bracketed paste may not work (ReadConsoleInputW delivers
+    /// individual key events). Detect paste by checking if multiple key events
+    /// are queued without blocking — pasted text arrives as a burst.
+    pub fn tryInputEventWithImplicitPaste(self: *InputLoop) !?InputLoopResult {
+        // Return any pending result from a previous batch
+        if (self.has_pending_null) {
+            self.has_pending_null = false;
+            return null;
+        }
+        if (self.pending_result) |r| {
+            self.pending_result = null;
+            return r;
+        }
+
+        const first_event = (try self.loop.tryEvent()) orelse return null;
+
+        // Pass through non-key events and paste events directly
+        if (first_event != .key_press) {
+            return try processLoopEvent(self.allocator, &self.paste_buffer, &self.paste_active, first_event);
+        }
+
+        // Accumulate text from consecutive key events that are immediately available
+        var implicit_buf: std.ArrayList(u8) = .empty;
+        defer implicit_buf.deinit(self.allocator);
+
+        try appendPasteKeyText(self.allocator, &implicit_buf, first_event.key_press);
+
+        // Drain any immediately-queued events (non-blocking)
+        while (try self.loop.tryEvent()) |event| {
+            if (event != .key_press) {
+                // Non-key event encountered — stash it for next call
+                const result = try processLoopEvent(
+                    self.allocator, &self.paste_buffer, &self.paste_active, event,
+                );
+                if (result) |r| {
+                    self.pending_result = r;
+                } else {
+                    self.has_pending_null = true;
+                }
+                break;
+            }
+            try appendPasteKeyText(self.allocator, &implicit_buf, event.key_press);
+        }
+
+        // If multiple chars accumulated, treat as paste
+        if (implicit_buf.items.len > 1) {
+            const owned = try self.allocator.dupe(u8, implicit_buf.items);
+            return .{
+                .parsed = keys.parsedPasteInput(owned),
+                .owned_paste = owned,
+            };
+        }
+
+        // Single character — process as normal key event
+        if (implicit_buf.items.len == 1) {
+            const parsed = keys.parsedInputFromVaxisKey(first_event.key_press, .press) orelse return null;
+            return .{ .parsed = parsed };
+        }
+
         return null;
     }
 };

@@ -216,7 +216,6 @@ pub const WindowsTty = struct {
         .WINDOW_INPUT = 1, // resize events
         .MOUSE_INPUT = 1,
         .EXTENDED_FLAGS = 1, // allow mouse events
-        .VIRTUAL_TERMINAL_INPUT = 1, // VT sequences for bracketed paste and mouse
     };
 
     /// The output mode set by init

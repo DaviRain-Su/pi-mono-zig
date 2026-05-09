@@ -154,32 +154,9 @@ pub fn Loop(comptime T: type) type {
             switch (builtin.os.tag) {
                 .windows => {
                     var parser: Parser = .{};
-
-                    var buf: [1024]u8 = undefined;
-                    var read_start: usize = 0;
-                    read_loop: while (!self.should_quit) {
-                        const n = try self.tty.read(buf[read_start..]);
-                        const total = read_start + n;
-                        var seq_start: usize = 0;
-                        while (seq_start < total) {
-                            const result = parser.parse(buf[seq_start..total], paste_allocator) catch |err| switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => {
-                                    seq_start += 1;
-                                    read_start = 0;
-                                    continue;
-                                },
-                            };
-                            if (result.n == 0) {
-                                read_start = carryPendingBytes(buf[0..], seq_start, total);
-                                continue :read_loop;
-                            }
-                            read_start = 0;
-                            seq_start += result.n;
-
-                            const event = result.event orelse continue;
-                            try handleEventGeneric(self, self.vaxis, &cache, Event, event, paste_allocator);
-                        }
+                    while (!self.should_quit) {
+                        const event = try self.tty.nextEvent(&parser, paste_allocator);
+                        try handleEventGeneric(self, self.vaxis, &cache, Event, event, null);
                     }
                 },
                 else => {
