@@ -249,7 +249,7 @@ const DEFINITIONS = [_]BindingDefinition{
     .{ .action = .message_followUp, .id = "app.message.followUp", .defaults = &.{"alt+enter"} },
     .{ .action = .message_dequeue, .id = "app.message.dequeue", .defaults = &.{"alt+up"} },
     .{ .action = .chat_scrollToBottom, .id = "app.chat.scrollToBottom", .defaults = &.{"ctrl+end"} },
-    .{ .action = .clipboard_pasteImage, .id = "app.clipboard.pasteImage", .defaults = &.{"ctrl+v"} },
+    .{ .action = .clipboard_pasteImage, .id = "app.clipboard.pasteImage", .defaults = &.{"alt+v"} },
     .{ .action = .session_new, .id = "app.session.new", .defaults = &.{} },
     .{ .action = .session_tree, .id = "app.session.tree", .defaults = &.{} },
     .{ .action = .session_fork, .id = "app.session.fork", .defaults = &.{} },
@@ -762,8 +762,8 @@ test "keybinding new defaults match TS" {
     // app.message.dequeue → alt+up
     try std.testing.expectEqual(Action.message_dequeue, defaults.actionForKeyWithModifiers(.up, .{ .alt = true }).?);
 
-    // app.clipboard.pasteImage → ctrl+v
-    try std.testing.expectEqual(Action.clipboard_pasteImage, defaults.actionForKey(.{ .ctrl = 'v' }).?);
+    // app.clipboard.pasteImage → alt+v
+    try std.testing.expectEqual(Action.clipboard_pasteImage, defaults.actionForKeyWithModifiers(.{ .printable = tui.keys.PrintableKey.fromSlice("v") }, .{ .alt = true }).?);
 
     // app.session.new/tree/fork/resume → empty defaults
     try std.testing.expectEqual(@as(usize, 0), defaults.bindings[@intFromEnum(Action.session_new)].len);

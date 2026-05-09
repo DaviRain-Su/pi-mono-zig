@@ -2135,7 +2135,7 @@ test "protocol events update kitty state through app context" {
 }
 
 test "legacy app actions include clipboard image paste" {
-    try std.testing.expectEqual(keybindings_mod.Action.clipboard_pasteImage, legacyAppActionForKey(.{ .ctrl = 'v' }).?);
+    try std.testing.expectEqual(keybindings_mod.Action.clipboard_pasteImage, legacyParsedAppActionForKey(.{ .printable = tui.keys.PrintableKey.fromSlice("v") }, .{ .alt = true }).?);
     try std.testing.expectEqual(keybindings_mod.Action.editor_external, legacyAppActionForKey(.{ .ctrl = 'g' }).?);
     try std.testing.expect(legacyAppActionForKey(.{ .ctrl = 'r' }) == null);
 }
