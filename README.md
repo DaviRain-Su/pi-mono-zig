@@ -69,7 +69,11 @@ Package-backed policies are bound to the locked digest identity, so stale, cross
 
 Extension lifecycle hardening keeps capabilities in the extension layer while the core exposes only neutral substrate boundaries. Startup, teardown, cleanup, and timeout ordering are deterministic; extension-host APIs require policy gates; runtime adapters enforce declared capabilities; reserved sub-agent names and unsupported schema versions fail closed; and diagnostics use canonical envelopes with secret redaction.
 
-The Zig Extension SDK and package authoring substrate is complete for WASM-first standalone extensions: authors can copy the template, build a plugin, install/update/remove it locally, and rely on lock/provenance verification, scope discovery through the normal Zig CLI/agent tool registry, digest-bound policy gating, drift/denial/conflict omission diagnostics, runtime handoff, and invocation through normal session tool-call paths. The completed substrate remains Zig-only and does not change production TypeScript source behavior.
+The Zig Extension SDK and package authoring substrate is complete for standalone extensions. Authors can start from the Zig SDK template for WASM component tools or ship native dynamic packages with per-platform artifacts, then install, update, and remove them locally through the package lifecycle.
+
+Local extension packages rely on lock/provenance verification, package-root and artifact digests, current-platform native artifact selection, scope discovery through the normal Zig CLI/agent tool registry, digest-bound policy gating, drift/denial/conflict omission diagnostics, runtime handoff, and invocation through normal session tool-call paths. The completed substrate remains Zig-only and does not change production TypeScript source behavior.
+
+Platform CI keeps macOS as the full Zig test runner, Windows as a build target, and Linux as an external-tool smoke gate until the Zig 0.16.0 Linux build-exe SIGSEGV is resolved. `test-ts-rpc-parity` is a local parity gate and requires host `libsimdjson`.
 
 CLI-only validation for this substrate:
 
