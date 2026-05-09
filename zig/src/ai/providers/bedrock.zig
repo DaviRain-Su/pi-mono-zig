@@ -478,7 +478,13 @@ pub fn buildRequestSurfaceSnapshotValue(
 
     var client_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     if (options) |stream_options| {
-        if (stream_options.bedrock_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
+        var bedrock_opts: types.BedrockStreamOptions = .{};
+        if (stream_options.provider == .bedrock) {
+            bedrock_opts = stream_options.provider.bedrock;
+        } else {
+            bedrock_opts.profile = stream_options.bedrock_profile;
+        }
+        if (bedrock_opts.profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
     }
     if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
     if (!use_http_boundary and std.mem.eql(u8, surface_endpoint.mode, "explicit")) {
@@ -774,7 +780,13 @@ fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions, fix
 }
 
 fn configuredBedrockRegion(options: types.StreamOptions, fixture_env: ?FixtureEnv) ?[]const u8 {
-    if (options.bedrock_region) |region| return region;
+    var bedrock_opts: types.BedrockStreamOptions = .{};
+    if (options.provider == .bedrock) {
+        bedrock_opts = options.provider.bedrock;
+    } else {
+        bedrock_opts.region = options.bedrock_region;
+    }
+    if (bedrock_opts.region) |region| return region;
     if (fixture_env) |env| {
         if (nonEmpty(env.aws_region)) |region| return region;
         if (nonEmpty(env.aws_default_region)) |region| return region;
@@ -811,10 +823,19 @@ fn buildAdditionalModelRequestFieldsValue(
     options: types.StreamOptions,
     fixture_env: ?FixtureEnv,
 ) !?std.json.Value {
-    const reasoning = options.bedrock_reasoning orelse return null;
+    var bedrock_opts: types.BedrockStreamOptions = .{};
+    if (options.provider == .bedrock) {
+        bedrock_opts = options.provider.bedrock;
+    } else {
+        bedrock_opts.reasoning = options.bedrock_reasoning;
+        bedrock_opts.thinking_budgets = options.bedrock_thinking_budgets;
+        bedrock_opts.thinking_display = options.bedrock_thinking_display;
+        bedrock_opts.interleaved_thinking = options.bedrock_interleaved_thinking;
+    }
+    const reasoning = bedrock_opts.reasoning orelse return null;
     if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
 
-    const display = if (isGovCloudBedrockTarget(model, options, fixture_env)) null else options.bedrock_thinking_display orelse .summarized;
+    const display = if (isGovCloudBedrockTarget(model, options, fixture_env)) null else bedrock_opts.thinking_display orelse .summarized;
     var result = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer result.deinit(allocator);
 
@@ -830,7 +851,7 @@ fn buildAdditionalModelRequestFieldsValue(
         try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, mapThinkingLevelToEffort(reasoning, model)) });
         try result.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
     } else {
-        const budgets = options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+        const budgets = bedrock_opts.thinking_budgets orelse types.ThinkingBudgets{};
         const budget = switch (reasoning) {
             .minimal => budgets.minimal,
             .low => budgets.low,
@@ -844,7 +865,7 @@ fn buildAdditionalModelRequestFieldsValue(
             try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, thinkingDisplayString(display_value)) });
         }
         try result.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
-        if (options.bedrock_interleaved_thinking orelse true) {
+        if (bedrock_opts.interleaved_thinking orelse true) {
             var beta = std.json.Array.init(allocator);
             try beta.append(.{ .string = try allocator.dupe(u8, "interleaved-thinking-2025-05-14") });
             try result.put(allocator, try allocator.dupe(u8, "anthropic_beta"), .{ .array = beta });
@@ -1058,7 +1079,13 @@ fn buildToolConfigValue(
     options: ?types.StreamOptions,
 ) !?std.json.Value {
     if (options) |stream_options| {
-        if (stream_options.bedrock_tool_choice) |tool_choice| {
+        var bedrock_opts: types.BedrockStreamOptions = .{};
+        if (stream_options.provider == .bedrock) {
+            bedrock_opts = stream_options.provider.bedrock;
+        } else {
+            bedrock_opts.tool_choice = stream_options.bedrock_tool_choice;
+        }
+        if (bedrock_opts.tool_choice) |tool_choice| {
             if (tool_choice == .none) return null;
         }
     }
@@ -1083,7 +1110,13 @@ fn buildToolConfigValue(
     try config.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tool_entries });
 
     if (options) |stream_options| {
-        if (stream_options.bedrock_tool_choice) |tool_choice| {
+        var bedrock_opts: types.BedrockStreamOptions = .{};
+        if (stream_options.provider == .bedrock) {
+            bedrock_opts = stream_options.provider.bedrock;
+        } else {
+            bedrock_opts.tool_choice = stream_options.bedrock_tool_choice;
+        }
+        if (bedrock_opts.tool_choice) |tool_choice| {
             if (try buildToolChoiceValue(allocator, tool_choice)) |choice_value| {
                 try config.put(allocator, try allocator.dupe(u8, "toolChoice"), choice_value);
             }
