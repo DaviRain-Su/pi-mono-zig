@@ -231,11 +231,23 @@ pub const Editor = struct {
     pub fn renderAutocompleteInto(
         self: *const Editor,
         allocator: std.mem.Allocator,
-        width: usize,
+        _: usize,
         lines: *component_mod.LineList,
     ) std.mem.Allocator.Error!void {
         const list = self.autocomplete_list orelse return;
-        try list.renderInto(allocator, width, lines);
+        const start = list.visibleStartIndex();
+        const end = @min(start + @max(list.max_visible, 1), list.items.len);
+        for (start..end) |index| {
+            const prefix = if (index == list.selectedIndex()) "> " else "  ";
+            const line_text = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, list.items[index].display() });
+            errdefer allocator.free(line_text);
+            try component_mod.appendOwnedLine(lines, allocator, line_text);
+        }
+        if (list.items.len > @max(list.max_visible, 1)) {
+            const info = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ list.selectedIndex() + 1, list.items.len });
+            errdefer allocator.free(info);
+            try component_mod.appendOwnedLine(lines, allocator, info);
+        }
     }
 
     pub fn drawAutocomplete(
