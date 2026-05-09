@@ -282,7 +282,13 @@ fn resolveDeploymentNameWithEnv(
     env_deployment_map: ?[]const u8,
 ) ![]const u8 {
     if (options) |stream_options| {
-        if (stream_options.azure_deployment_name) |deployment_name| {
+        var azure_opts: types.AzureStreamOptions = .{};
+        if (stream_options.provider == .azure) {
+            azure_opts = stream_options.provider.azure;
+        } else {
+            azure_opts.deployment_name = stream_options.azure_deployment_name;
+        }
+        if (azure_opts.deployment_name) |deployment_name| {
             if (deployment_name.len > 0) return try allocator.dupe(u8, deployment_name);
         }
     }
@@ -321,9 +327,22 @@ fn resolveAzureBaseUrlWithEnv(
     env_resource_name: ?[]const u8,
 ) ![]const u8 {
     if (options) |stream_options| {
-        if (stream_options.azure_base_url) |value| {
+        var azure_opts: types.AzureStreamOptions = .{};
+        if (stream_options.provider == .azure) {
+            azure_opts = stream_options.provider.azure;
+        } else {
+            azure_opts.base_url = stream_options.azure_base_url;
+            azure_opts.resource_name = stream_options.azure_resource_name;
+        }
+        if (azure_opts.base_url) |value| {
             if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
                 return try normalizeAzureBaseUrl(allocator, value);
+            }
+        }
+        if (azure_opts.resource_name) |value| {
+            const resource_name = std.mem.trim(u8, value, " \t\r\n");
+            if (resource_name.len > 0) {
+                return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource_name});
             }
         }
     }
@@ -334,12 +353,10 @@ fn resolveAzureBaseUrlWithEnv(
         }
     }
 
-    if (options) |stream_options| {
-        if (stream_options.azure_resource_name) |value| {
-            const resource_name = std.mem.trim(u8, value, " \t\r\n");
-            if (resource_name.len > 0) {
-                return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource_name});
-            }
+    if (env_resource_name) |value| {
+        const resource_name = std.mem.trim(u8, value, " \t\r\n");
+        if (resource_name.len > 0) {
+            return try std.fmt.allocPrint(allocator, "https://{s}.openai.azure.com/openai/v1", .{resource_name});
         }
     }
 
@@ -370,7 +387,13 @@ fn resolveAzureApiVersionWithEnv(
     env_api_version: ?[]const u8,
 ) !ResolvedApiVersion {
     if (options) |stream_options| {
-        if (stream_options.azure_api_version) |value| {
+        var azure_opts: types.AzureStreamOptions = .{};
+        if (stream_options.provider == .azure) {
+            azure_opts = stream_options.provider.azure;
+        } else {
+            azure_opts.api_version = stream_options.azure_api_version;
+        }
+        if (azure_opts.api_version) |value| {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) return .{ .value = trimmed, .owned = false };
         }
