@@ -1,3 +1,7 @@
+// TODO(review-B9): This file is 6286 LOC and covers too many concerns
+// (extension discovery, Bun host, native extension, WASM, event bridge,
+// JSON-RPC, workflow, package install). Split into extension_loader.zig,
+// extension_lifecycle.zig, extension_event_bridge.zig.
 const std = @import("std");
 const agent = @import("agent");
 const ai = @import("ai");

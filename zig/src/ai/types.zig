@@ -517,6 +517,9 @@ pub const GoogleThinkingOptions = struct {
     level: ?[]const u8 = null,
 };
 
+// TODO(review-B11): StreamOptions has 42+ fields, many provider-specific.
+// Split provider-specific options into per-provider structs; keep only
+// generic fields here plus a provider_options union or json.Value.
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,

@@ -10,8 +10,11 @@ Based on the systematic review in `zig-code-review.md`.
 ## B1: Add TODO comments (P2-REVIEW-8)
 - [x] Added plan document tracking all review items
 - [x] NativeHostApi stubs documented with "Permission-gated counter stub" doc comments
-- [ ] Add `// TODO(review-xxx):` annotations at remaining issue sites (SSE loops, file splits)
-- Zero risk, informational only
+- [x] TODO(review-B7) on parseSseStreamLines (azure_openai_responses.zig)
+- [x] TODO(review-B8) on agent_loop.zig
+- [x] TODO(review-B9) on extension_runtime.zig
+- [x] TODO(review-B11) on StreamOptions in types.zig
+- DONE
 
 ## B2: Unify emitRuntimeFailure (P2-REVIEW-4)
 - [x] Verified: all 11 providers already call `provider_error.emitTerminalRuntimeFailure`

@@ -1,3 +1,7 @@
+// TODO(review-B8): This file is 5015 LOC and covers too many concerns
+// (accumulator, tool execution, streaming, JSON utilities).
+// Split into agent_loop/accumulator.zig, agent_loop/tool_execution.zig,
+// agent_loop/streaming.zig.
 const std = @import("std");
 const ai = @import("ai");
 const provider_json = ai.provider_json;
