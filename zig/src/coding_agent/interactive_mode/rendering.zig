@@ -2287,10 +2287,11 @@ pub const ScreenComponent = struct {
             self.now_ms,
             snapshot.all_expanded,
             sel_range,
-            if (self.state.selection_active) &selected_text else null,
+            if (self.state.hasSelection()) &selected_text else null,
         );
-        if (!self.state.selection_active and selected_text.items.len > 0) {
+        if (!self.state.selection_active and self.state.hasSelection() and selected_text.items.len > 0) {
             copySelectedText(ctx.arena, self.state.io, selected_text.items);
+            self.state.clearSelection();
         }
         self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
         row += chat_capacity;

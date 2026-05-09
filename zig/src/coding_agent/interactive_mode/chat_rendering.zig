@@ -592,7 +592,7 @@ fn extractSelectedTextFromItems(
         item_row += entry_rows;
     }
 
-    extractSelectedText(allocator, &scratch, 0, visible_height, selection, output);
+    try extractSelectedText(allocator, &scratch, 0, visible_height, selection, output);
 }
 
 fn isCellSelected(row: usize, col: usize, sel: SelectionRange) bool {
