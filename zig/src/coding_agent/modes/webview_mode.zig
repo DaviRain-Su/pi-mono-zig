@@ -129,7 +129,7 @@ pub fn runWebViewMode(
     try stderr.print(
         "PI_WEBVIEW_START pid={d} provider={s} model={s} backend={s} asset={s} asset_source={s}\n",
         .{
-            if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid(),
+            currentProcessIdForLog(),
             options.provider,
             options.model.id,
             @tagName(options.backend.backend),
@@ -585,6 +585,13 @@ fn injectedFailureStage(env_map: *const std.process.Environ.Map) ?StartupFailure
 
 fn boolText(value: bool) []const u8 {
     return if (value) "true" else "false";
+}
+
+fn currentProcessIdForLog() u64 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
 }
 
 fn writeLaunchContextJson(

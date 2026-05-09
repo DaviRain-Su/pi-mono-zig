@@ -840,7 +840,7 @@ fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
 
 fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (builtin.os.tag == .windows) {
-        return std.fs.path.resolve(allocator, &.{path});
+        return std.fs.path.resolve(allocator, &.{path}) catch return error.FileNotFound;
     }
     const z_path = try allocator.dupeZ(u8, path);
     defer allocator.free(z_path);
