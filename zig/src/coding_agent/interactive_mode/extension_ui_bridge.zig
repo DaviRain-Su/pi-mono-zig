@@ -1,7 +1,9 @@
 const std = @import("std");
 const tui = @import("tui");
 const session_mod = @import("../sessions/session.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
 const shared = @import("shared.zig");
 const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
@@ -66,6 +68,13 @@ pub const Bridge = struct {
         return .{
             .context = self,
             .callback = dispatchSlashCommand,
+        };
+    }
+
+    pub fn shortcutSink(self: *Bridge) shared.ExtensionShortcutSink {
+        return .{
+            .context = self,
+            .callback = dispatchShortcutCommand,
         };
     }
 
@@ -381,6 +390,10 @@ fn dialogFromRequest(allocator: std.mem.Allocator, request: extension_runtime.Ex
 
 fn dispatchSlashCommand(context: ?*anyopaque, raw_command: []const u8) anyerror!bool {
     const self: *Bridge = @ptrCast(@alignCast(context orelse return false));
+    return dispatchBridgeSlashCommand(self, raw_command);
+}
+
+fn dispatchBridgeSlashCommand(self: *Bridge, raw_command: []const u8) anyerror!bool {
     const host = self.host orelse return false;
     const command_name = slashCommandName(raw_command) orelse return false;
     if (!host.hasRegisteredCommand(command_name)) return false;
@@ -407,6 +420,75 @@ fn dispatchSlashCommand(context: ?*anyopaque, raw_command: []const u8) anyerror!
     try out.writer.writeAll("}");
     host.sendExtensionEventFrame(out.written());
     return true;
+}
+
+fn dispatchShortcutCommand(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+) anyerror!bool {
+    const self: *Bridge = @ptrCast(@alignCast(context orelse return false));
+    const host = self.host orelse return false;
+    if (host.registryFramesApplied() == 0) return false;
+
+    var match_context = ShortcutMatchContext{
+        .allocator = allocator,
+        .key = key,
+        .modifiers = modifiers,
+        .builtin_keybindings = builtin_keybindings,
+    };
+    defer match_context.deinit();
+    try host.withRegistry(&match_context, resolveShortcutCommandCallback);
+    const raw_command = match_context.raw_command orelse return false;
+    return try dispatchBridgeSlashCommand(self, raw_command);
+}
+
+const ShortcutMatchContext = struct {
+    allocator: std.mem.Allocator,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+    raw_command: ?[]u8 = null,
+
+    fn deinit(self: *ShortcutMatchContext) void {
+        if (self.raw_command) |command| self.allocator.free(command);
+        self.raw_command = null;
+    }
+};
+
+fn resolveShortcutCommandCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const match_context: *ShortcutMatchContext = @ptrCast(@alignCast(context.?));
+    match_context.raw_command = try resolveShortcutCommand(
+        match_context.allocator,
+        registry,
+        match_context.key,
+        match_context.modifiers,
+        match_context.builtin_keybindings,
+    );
+}
+
+pub fn resolveShortcutCommand(
+    allocator: std.mem.Allocator,
+    registry: *const extension_runtime.Registry,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+) !?[]u8 {
+    const resolution = try registry.resolveShortcuts(allocator, builtin_keybindings);
+    defer {
+        var mutable = resolution;
+        mutable.deinit(allocator);
+    }
+
+    for (resolution.shortcuts) |shortcut| {
+        const command = shortcut.command orelse continue;
+        const spec = keybindings_mod.parseKeySpec(shortcut.shortcut) orelse continue;
+        if (!spec.matches(key, modifiers)) continue;
+        return try std.fmt.allocPrint(allocator, "/{s}", .{command});
+    }
+    return null;
 }
 
 const WorkflowCommandDispatchContext = struct {

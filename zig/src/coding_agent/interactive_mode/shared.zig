@@ -1,7 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const tui = @import("tui");
 const config_mod = @import("../config/config.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
 const context_files_mod = @import("../resources/context_files.zig");
 const provider_config = @import("../providers/provider_config.zig");
@@ -32,6 +34,17 @@ pub const AppContext = struct {
 pub const ExtensionCommandSink = struct {
     context: ?*anyopaque = null,
     callback: *const fn (context: ?*anyopaque, raw_command: []const u8) anyerror!bool,
+};
+
+pub const ExtensionShortcutSink = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+        builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+    ) anyerror!bool,
 };
 
 /// Controls how a stored session cwd that no longer exists is handled when
@@ -114,6 +127,7 @@ pub const LiveResources = struct {
     theme: ?*const resources_mod.Theme,
     terminal_name: []const u8,
     extension_command_sink: ?ExtensionCommandSink = null,
+    extension_shortcut_sink: ?ExtensionShortcutSink = null,
     reload_extension_tools_sink: ?ReloadExtensionToolsSink = null,
     startup_cli_extensions: []const []const u8,
     include_default_extensions: bool,
@@ -137,6 +151,17 @@ pub const LiveResources = struct {
     pub fn dispatchExtensionCommand(self: *LiveResources, raw_command: []const u8) !bool {
         const sink = self.extension_command_sink orelse return false;
         return try sink.callback(sink.context, raw_command);
+    }
+
+    pub fn dispatchExtensionShortcut(
+        self: *LiveResources,
+        allocator: std.mem.Allocator,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+        builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+    ) !bool {
+        const sink = self.extension_shortcut_sink orelse return false;
+        return try sink.callback(sink.context, allocator, key, modifiers, builtin_keybindings);
     }
 
     pub fn deinit(self: *LiveResources, allocator: std.mem.Allocator) void {

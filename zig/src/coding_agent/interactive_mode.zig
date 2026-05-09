@@ -429,6 +429,7 @@ pub fn runInteractiveMode(
     var extension_bridge = ExtensionUiBridge.init(allocator, io);
     defer extension_bridge.deinit();
     live_resources.extension_command_sink = extension_bridge.commandSink();
+    live_resources.extension_shortcut_sink = extension_bridge.shortcutSink();
     var reload_tools_context = ReloadExtensionToolsContext{
         .bootstrap = &bootstrap,
         .app_context = &app_context,

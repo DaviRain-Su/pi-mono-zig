@@ -4,6 +4,7 @@ const ai = @import("ai");
 const auth = @import("../auth/auth.zig");
 const tui = @import("tui");
 const config_mod = @import("../config/config.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -19,6 +20,7 @@ const overlay_input = @import("overlay_input.zig");
 const auth_flow_mod = @import("auth_flow.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
 const extension_dialog = @import("extension_dialog.zig");
+const extension_ui_bridge = @import("extension_ui_bridge.zig");
 const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 const LiveResources = shared.LiveResources;
 const SelectorOverlay = overlays.SelectorOverlay;
@@ -475,6 +477,17 @@ pub fn handleInputKeyWithModifiers(
         return;
     }
 
+    if (try dispatchExtensionShortcutIfActive(
+        allocator,
+        key,
+        modifiers,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        live_resources,
+    )) return;
+
     try executeResolvedInputKey(
         allocator,
         io,
@@ -609,6 +622,110 @@ fn executeResolvedInputKey(
             }
         },
     }
+}
+
+fn dispatchExtensionShortcutIfActive(
+    allocator: std.mem.Allocator,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    live_resources: *LiveResources,
+) !bool {
+    if (overlay.* != null or auth_flow.* != null or editor.isShowingAutocomplete()) return false;
+
+    var default_keybindings: ?keybindings_mod.Keybindings = null;
+    defer if (default_keybindings) |*bindings| bindings.deinit();
+    const active_keybindings = live_resources.keybindings orelse blk: {
+        default_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+        break :blk &default_keybindings.?;
+    };
+
+    const builtins = try collectBuiltinShortcutBindings(allocator, active_keybindings);
+    defer freeBuiltinShortcutBindings(allocator, builtins);
+
+    const dispatched = live_resources.dispatchExtensionShortcut(allocator, key, modifiers, builtins) catch |err| {
+        const message = try std.fmt.allocPrint(allocator, "extension shortcut failed: {s}", .{@errorName(err)});
+        defer allocator.free(message);
+        try app_state.setStatus(message);
+        return true;
+    };
+    if (!dispatched) return false;
+    try app_state.setStatus("extension command dispatched");
+    return true;
+}
+
+fn collectBuiltinShortcutBindings(
+    allocator: std.mem.Allocator,
+    keybindings: *const keybindings_mod.Keybindings,
+) ![]extension_registry.BuiltinShortcutBinding {
+    var bindings = std.ArrayList(extension_registry.BuiltinShortcutBinding).empty;
+    errdefer {
+        for (bindings.items) |binding| allocator.free(@constCast(binding.shortcut));
+        bindings.deinit(allocator);
+    }
+
+    inline for (std.meta.fields(keybindings_mod.Action)) |field| {
+        const action = @field(keybindings_mod.Action, field.name);
+        const restrict_override = restrictOverrideForAppAction(action);
+        for (keybindings.bindingForAction(action)) |spec| {
+            const shortcut = try spec.formatForOs(allocator, .linux);
+            errdefer allocator.free(shortcut);
+            try bindings.append(allocator, .{
+                .shortcut = shortcut,
+                .keybinding = keybindings_mod.actionId(action),
+                .restrict_override = restrict_override,
+            });
+        }
+    }
+
+    inline for (std.meta.fields(keybindings_mod.EditorAction)) |field| {
+        const action = @field(keybindings_mod.EditorAction, field.name);
+        const restrict_override = restrictOverrideForEditorAction(action);
+        for (keybindings.bindingForEditorAction(action)) |spec| {
+            const shortcut = try spec.formatForOs(allocator, .linux);
+            errdefer allocator.free(shortcut);
+            try bindings.append(allocator, .{
+                .shortcut = shortcut,
+                .keybinding = keybindings_mod.editorActionId(action),
+                .restrict_override = restrict_override,
+            });
+        }
+    }
+
+    return try bindings.toOwnedSlice(allocator);
+}
+
+fn freeBuiltinShortcutBindings(
+    allocator: std.mem.Allocator,
+    bindings: []extension_registry.BuiltinShortcutBinding,
+) void {
+    for (bindings) |binding| allocator.free(@constCast(binding.shortcut));
+    allocator.free(bindings);
+}
+
+fn restrictOverrideForAppAction(action: keybindings_mod.Action) bool {
+    return switch (action) {
+        .interrupt,
+        .clear,
+        .exit,
+        .app_suspend,
+        => true,
+        else => false,
+    };
+}
+
+fn restrictOverrideForEditorAction(action: keybindings_mod.EditorAction) bool {
+    return switch (action) {
+        .input_submit,
+        .input_copy,
+        .select_confirm,
+        .select_cancel,
+        => true,
+        else => false,
+    };
 }
 
 fn effectiveScopedModelPatterns(
@@ -1228,6 +1345,20 @@ fn dispatchKeyInputEvent(
     logKeyInputDebug(context, "before", parsed, key, editor_len_before, editor_len_before);
 
     if (parsed.event_type == .release) {
+        logKeyInputDebug(context, "after", parsed, key, editor_len_before, context.editor.text().len);
+        return;
+    }
+
+    if (try dispatchExtensionShortcutIfActive(
+        context.allocator,
+        key,
+        parsed.modifiers,
+        context.app_state,
+        context.editor,
+        context.overlay,
+        context.auth_flow,
+        context.live_resources,
+    )) {
         logKeyInputDebug(context, "after", parsed, key, editor_len_before, context.editor.text().len);
         return;
     }
@@ -2583,6 +2714,205 @@ const BashSubmitHarness = struct {
         );
     }
 };
+
+const ShortcutTestSink = struct {
+    allocator: std.mem.Allocator,
+    registry: extension_registry.Registry,
+    invocation_count: usize = 0,
+    last_raw_command: ?[]u8 = null,
+    fail_matching_dispatch: bool = false,
+
+    fn init(allocator: std.mem.Allocator) ShortcutTestSink {
+        return .{
+            .allocator = allocator,
+            .registry = extension_registry.Registry.init(allocator),
+        };
+    }
+
+    fn deinit(self: *ShortcutTestSink) void {
+        if (self.last_raw_command) |command| self.allocator.free(command);
+        self.registry.deinit();
+    }
+
+    fn sink(self: *ShortcutTestSink) shared.ExtensionShortcutSink {
+        return .{
+            .context = self,
+            .callback = dispatch,
+        };
+    }
+
+    fn dispatch(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        key: tui.Key,
+        modifiers: tui.keys.KeyModifiers,
+        builtin_keybindings: []const extension_registry.BuiltinShortcutBinding,
+    ) !bool {
+        const self: *ShortcutTestSink = @ptrCast(@alignCast(context.?));
+        const raw_command = (try extension_ui_bridge.resolveShortcutCommand(
+            allocator,
+            &self.registry,
+            key,
+            modifiers,
+            builtin_keybindings,
+        )) orelse return false;
+        defer allocator.free(raw_command);
+
+        if (self.fail_matching_dispatch) return error.TestShortcutFailure;
+
+        const owned = try self.allocator.dupe(u8, raw_command);
+        if (self.last_raw_command) |previous| self.allocator.free(previous);
+        self.last_raw_command = owned;
+        self.invocation_count += 1;
+        return true;
+    }
+};
+
+test "registered extension shortcut dispatches command once and consumes editor input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var sink = ShortcutTestSink.init(allocator);
+    defer sink.deinit();
+    try sink.registry.registerCommand("run-shortcut", "Run shortcut", "/tmp/shortcut.ts");
+    try sink.registry.registerShortcut("Shift+Ctrl+X", "Run shortcut", "run-shortcut", "/tmp/shortcut.ts");
+    harness.live_resources.extension_shortcut_sink = sink.sink();
+
+    _ = try harness.editor.handlePaste("draft");
+    try harness.press(.{ .ctrl = 'x' }, .{ .shift = true });
+    try std.testing.expectEqual(@as(usize, 1), sink.invocation_count);
+    try std.testing.expectEqualStrings("/run-shortcut", sink.last_raw_command.?);
+    try std.testing.expectEqualStrings("draft", harness.editor.text());
+    try std.testing.expectEqualStrings("extension command dispatched", harness.state.status);
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("q") }, .{});
+    try std.testing.expectEqual(@as(usize, 1), sink.invocation_count);
+    try std.testing.expectEqualStrings("draftq", harness.editor.text());
+}
+
+test "extension shortcut conflicts preserve reserved built-ins and allow non-reserved overrides" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var sink = ShortcutTestSink.init(allocator);
+    defer sink.deinit();
+    try sink.registry.registerCommand("reserved", "Reserved", "/tmp/reserved.ts");
+    try sink.registry.registerCommand("paste-override", "Paste override", "/tmp/paste.ts");
+    try sink.registry.registerShortcut("ctrl+c", "Reserved conflict", "reserved", "/tmp/reserved.ts");
+    try sink.registry.registerShortcut("ctrl+v", "Allowed override", "paste-override", "/tmp/paste.ts");
+    harness.live_resources.extension_shortcut_sink = sink.sink();
+
+    _ = try harness.editor.handlePaste("draft");
+    try harness.press(.{ .ctrl = 'c' }, .{});
+    try std.testing.expectEqual(@as(usize, 0), sink.invocation_count);
+    try std.testing.expectEqualStrings("", harness.editor.text());
+
+    var input_buffer = std.ArrayList(u8).empty;
+    defer input_buffer.deinit(allocator);
+    var app_context = AppContext.init(cwd, std.testing.io);
+    try dispatchInputEvent(
+        allocator,
+        std.testing.io,
+        &harness.env_map,
+        .{ .event = .{ .key = .{ .ctrl = 'v' } }, .consumed = 0 },
+        &harness.session,
+        &harness.current_provider,
+        harness.options.session_dir,
+        harness.options,
+        &.{},
+        &harness.state,
+        &harness.editor,
+        &harness.overlay,
+        &harness.auth_flow,
+        &harness.prompt_worker,
+        &harness.prompt_worker_active,
+        harness.subscriber,
+        &harness.should_exit,
+        &input_buffer,
+        &app_context,
+        &harness.live_resources,
+    );
+    try std.testing.expectEqual(@as(usize, 1), sink.invocation_count);
+    try std.testing.expectEqualStrings("/paste-override", sink.last_raw_command.?);
+}
+
+test "extension shortcut duplicates invalid entries failures and reload isolation are bounded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var sink = ShortcutTestSink.init(allocator);
+    defer sink.deinit();
+    try sink.registry.registerCommand("invalid", "Invalid", "/tmp/invalid.ts");
+    try sink.registry.registerCommand("first", "First", "/tmp/first.ts");
+    try sink.registry.registerCommand("second", "Second", "/tmp/second.ts");
+    try sink.registry.registerCommand("reload", "Reload", "/tmp/reload.ts");
+    try sink.registry.registerCommand("failing", "Failing", "/tmp/failing.ts");
+    try sink.registry.registerShortcut("ctrl+nope", "Invalid", "invalid", "/tmp/invalid.ts");
+    try sink.registry.registerShortcut("ctrl+alt+x", "First", "first", "/tmp/first.ts");
+    try sink.registry.registerShortcut("Ctrl+Alt+X", "Second", "second", "/tmp/second.ts");
+    try sink.registry.registerShortcut("ctrl+alt+s", "Reload", "reload", "/tmp/reload.ts");
+    try sink.registry.registerShortcut("ctrl+alt+f", "Failing", "failing", "/tmp/failing.ts");
+    harness.live_resources.extension_shortcut_sink = sink.sink();
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("n") }, .{ .ctrl = true });
+    try std.testing.expectEqual(@as(usize, 0), sink.invocation_count);
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("x") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 1), sink.invocation_count);
+    try std.testing.expectEqualStrings("/second", sink.last_raw_command.?);
+
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("s") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 2), sink.invocation_count);
+    sink.registry.clearStaticRegistrationsForExtension("/tmp/reload.ts");
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("s") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 2), sink.invocation_count);
+
+    harness.editor.reset();
+    _ = try harness.editor.handlePaste("safe");
+    sink.fail_matching_dispatch = true;
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("f") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 2), sink.invocation_count);
+    try std.testing.expectEqualStrings("safe", harness.editor.text());
+    try std.testing.expectEqualStrings("extension shortcut failed: TestShortcutFailure", harness.state.status);
+
+    harness.live_resources.extension_shortcut_sink = null;
+    sink.fail_matching_dispatch = false;
+    try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("x") }, .{ .ctrl = true, .alt = true });
+    try std.testing.expectEqual(@as(usize, 2), sink.invocation_count);
+}
 
 test "configured editor keybindings drive movement and submit while old defaults stop" {
     const allocator = std.testing.allocator;
