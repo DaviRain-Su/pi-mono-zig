@@ -2119,7 +2119,7 @@ pub const ScreenComponent = struct {
         };
     }
 
-    pub fn renderInto(
+    fn renderInto(
         self: *const ScreenComponent,
         allocator: std.mem.Allocator,
         width: usize,
@@ -2368,6 +2368,47 @@ pub const ScreenComponent = struct {
         };
     }
 };
+
+pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenComponent, width: usize) !tui.LineList {
+    var vscreen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(@max(screen.height, 1)),
+        .cols = @intCast(@max(width, 1)),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer vscreen.deinit(allocator);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const window = tui.draw.rootWindow(&vscreen);
+    window.clear();
+    _ = try screen.draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+        .theme = screen.theme,
+    });
+
+    var lines = tui.LineList.empty;
+    for (0..screen.height) |row| {
+        var builder = std.ArrayList(u8).empty;
+        errdefer builder.deinit(allocator);
+        var col: usize = 0;
+        while (col < width) {
+            const cell = vscreen.readCell(@intCast(col), @intCast(row)) orelse break;
+            if (cell.char.grapheme.len > 0) {
+                try builder.appendSlice(allocator, cell.char.grapheme);
+                col += if (cell.char.width > 0) @as(usize, cell.char.width) else 1;
+            } else {
+                try builder.append(allocator, ' ');
+                col += 1;
+            }
+        }
+        const owned = try builder.toOwnedSlice(allocator);
+        try tui.component.appendOwnedLine(&lines, allocator, owned);
+    }
+    return lines;
+}
 
 fn styleForToken(theme: ?*const resources_mod.Theme, token: resources_mod.ThemeToken) tui.vaxis.Cell.Style {
     return if (theme) |active_theme| tui.styleFor(active_theme, token) else .{};

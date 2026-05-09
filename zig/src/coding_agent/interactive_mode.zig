@@ -1031,9 +1031,8 @@ test "screen renders welcome prompt footer and tool lines" {
         .height = 14,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 80, &lines);
 
     try std.testing.expect(lines.items.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
@@ -1481,9 +1480,8 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
         .height = 8,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 60);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 60, &lines);
 
     try std.testing.expect(lines.items.len >= 5);
     var saw_prompt_border = false;
@@ -1531,9 +1529,8 @@ test "screen renders themed output without persistent keybinding hints" {
         .theme = &theme,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 80, &lines);
 
     var saw_custom_hint = false;
     for (lines.items) |line| {
@@ -1586,9 +1583,8 @@ test "screen renders assistant markdown while keeping user messages plain" {
         .height = 20,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 80, &lines);
 
     var saw_prefix = false;
     var saw_user_literal = false;
@@ -1870,9 +1866,8 @@ test "screen renders queued messages and the dequeue hint" {
         .height = 12,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 80, &lines);
 
     try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued steer"));
     try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
@@ -5550,9 +5545,8 @@ test "interactive tool conversation renders tool lines and persists session entr
         .height = 24,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 240);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 240, &lines);
 
     var saw_user = false;
     var saw_tool_call = false;
@@ -5654,9 +5648,8 @@ test "interactive bash tool conversation preserves structured details" {
         .height = 24,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try rendering.renderScreenToLines(allocator, &screen, 240);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 240, &lines);
 
     var saw_bash_output = false;
     for (lines.items) |line| {
