@@ -359,6 +359,7 @@ pub const InputLoop = struct {
     allocator: std.mem.Allocator,
     vaxis_state: *vaxis.Vaxis,
     loop: vaxis.Loop(LoopEvent),
+    io: std.Io,
     paste_buffer: std.ArrayList(u8) = .empty,
     paste_active: bool = false,
     started: bool = false,
@@ -384,6 +385,7 @@ pub const InputLoop = struct {
             .allocator = allocator,
             .vaxis_state = vaxis_state,
             .loop = vaxis.Loop(LoopEvent).init(io, tty, vaxis_state),
+            .io = io,
         };
         errdefer result.paste_buffer.deinit(allocator);
 
@@ -444,16 +446,25 @@ pub const InputLoop = struct {
             return try processLoopEvent(self.allocator, &self.paste_buffer, &self.paste_active, first_event);
         }
 
-        // Accumulate text from consecutive key events that are immediately available
+        // For printable characters, wait briefly for more events to arrive.
+        // On Windows, pasted text arrives as a burst of key events, but the
+        // worker thread may not have posted them all to the queue yet.
+        const first_key = first_event.key_press;
+        const is_printable = first_key.text != null or
+            (first_key.codepoint >= 0x20 and first_key.codepoint < 0x7F and !first_key.mods.ctrl and !first_key.mods.alt);
+        if (is_printable) {
+            std.Io.sleep(self.io, .{ .nanoseconds = 15 * std.time.ns_per_ms }, .awake) catch {};
+        }
+
+        // Accumulate text from consecutive key events
         var implicit_buf: std.ArrayList(u8) = .empty;
         defer implicit_buf.deinit(self.allocator);
 
-        try appendPasteKeyText(self.allocator, &implicit_buf, first_event.key_press);
+        try appendPasteKeyText(self.allocator, &implicit_buf, first_key);
 
         // Drain any immediately-queued events (non-blocking)
         while (try self.loop.tryEvent()) |event| {
             if (event != .key_press) {
-                // Non-key event encountered — stash it for next call
                 const result = try processLoopEvent(
                     self.allocator, &self.paste_buffer, &self.paste_active, event,
                 );
@@ -478,7 +489,7 @@ pub const InputLoop = struct {
 
         // Single character — process as normal key event
         if (implicit_buf.items.len == 1) {
-            const parsed = keys.parsedInputFromVaxisKey(first_event.key_press, .press) orelse return null;
+            const parsed = keys.parsedInputFromVaxisKey(first_key, .press) orelse return null;
             return .{ .parsed = parsed };
         }
 
