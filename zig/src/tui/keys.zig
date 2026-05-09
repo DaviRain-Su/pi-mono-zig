@@ -96,12 +96,24 @@ pub const MouseClickInput = struct {
     col: i16,
 };
 
+pub const MouseDragInput = struct {
+    row: i16,
+    col: i16,
+};
+
+pub const MouseReleaseInput = struct {
+    row: i16,
+    col: i16,
+};
+
 pub const InputEvent = union(enum) {
     key: Key,
     paste: []const u8,
     protocol: ProtocolEvent,
     mouse_wheel: MouseWheelInput,
     mouse_click: MouseClickInput,
+    mouse_drag: MouseDragInput,
+    mouse_release: MouseReleaseInput,
 };
 
 pub const ParsedInput = struct {
@@ -140,6 +152,28 @@ pub fn parsedMouseClickInput(mouse: vaxis.Mouse) ?ParsedInput {
     if (mouse.button != .left) return null;
     return .{
         .event = .{ .mouse_click = .{
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedMouseDragInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .drag) return null;
+    return .{
+        .event = .{ .mouse_drag = .{
+            .row = mouse.row,
+            .col = mouse.col,
+        } },
+        .consumed = 0,
+    };
+}
+
+pub fn parsedMouseReleaseInput(mouse: vaxis.Mouse) ?ParsedInput {
+    if (mouse.type != .release) return null;
+    return .{
+        .event = .{ .mouse_release = .{
             .row = mouse.row,
             .col = mouse.col,
         } },

@@ -464,7 +464,9 @@ fn processLoopEvent(
         },
         .mouse => |mouse| {
             const parsed = keys.parsedMouseWheelInput(mouse) orelse
-                keys.parsedMouseClickInput(mouse) orelse return null;
+                keys.parsedMouseClickInput(mouse) orelse
+                keys.parsedMouseDragInput(mouse) orelse
+                keys.parsedMouseReleaseInput(mouse) orelse return null;
             return .{ .parsed = parsed };
         },
     }

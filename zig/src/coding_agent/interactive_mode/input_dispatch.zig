@@ -1205,6 +1205,16 @@ pub fn dispatchInputEvent(
                 context.app_state.handleMouseClick(click);
             }
         },
+        .mouse_drag => |drag| {
+            if (context.overlay.* == null and context.auth_flow.* == null) {
+                context.app_state.handleMouseDrag(drag);
+            }
+        },
+        .mouse_release => |release| {
+            if (context.overlay.* == null and context.auth_flow.* == null) {
+                context.app_state.handleMouseRelease(release);
+            }
+        },
     }
     consumeInputBytes(input_buffer, parsed.consumed);
 }
