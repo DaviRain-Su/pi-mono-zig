@@ -18,13 +18,6 @@ pub const TruncatedText = struct {
     ellipsis: []const u8 = "…",
     mode: TruncationMode = .end,
 
-    pub fn component(self: *const TruncatedText) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const TruncatedText) draw_mod.Component {
         return .{
             .ptr = self,
@@ -49,53 +42,6 @@ pub const TruncatedText = struct {
 
         const total_height = @min(window.height, @as(u16, @intCast(self.padding_y * 2 + 1)));
         return .{ .width = window.width, .height = total_height };
-    }
-
-    pub fn renderInto(
-        self: *const TruncatedText,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
-        const content_width = @max(effective_width, self.padding_x * 2 + 1) - self.padding_x * 2;
-
-        const blank_line = try allocator.alloc(u8, effective_width);
-        defer allocator.free(blank_line);
-        @memset(blank_line, ' ');
-
-        for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
-        }
-
-        const single_line = firstLine(self.text);
-        const display = try truncateCodepointsAlloc(allocator, single_line, content_width, self.ellipsis, self.mode);
-        defer allocator.free(display);
-
-        var builder = std.ArrayList(u8).empty;
-        defer builder.deinit(allocator);
-
-        try builder.appendNTimes(allocator, ' ', self.padding_x);
-        try builder.appendSlice(allocator, display);
-        try builder.appendNTimes(allocator, ' ', self.padding_x);
-
-        const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-        defer allocator.free(padded);
-        try component_mod.appendOwnedLine(lines, allocator, padded);
-
-        for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
-        }
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const TruncatedText = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(

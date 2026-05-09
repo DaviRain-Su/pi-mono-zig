@@ -118,13 +118,6 @@ pub const Editor = struct {
         self.* = undefined;
     }
 
-    pub fn component(self: *const Editor) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Editor) draw_mod.Component {
         return .{
             .ptr = self,
@@ -526,20 +519,6 @@ pub const Editor = struct {
         self.clearPastes();
     }
 
-    pub fn renderInto(
-        self: *const Editor,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        try self.renderTextInto(allocator, width, lines);
-
-        if (self.autocomplete_list) |list| {
-            const effective_width = @max(width, 1);
-            try list.renderInto(allocator, effective_width, lines);
-        }
-    }
-
     pub fn draw(
         self: *const Editor,
         window: vaxis.Window,
@@ -599,80 +578,6 @@ pub const Editor = struct {
             .width = window.width,
             .height = total_height,
         };
-    }
-
-    pub fn renderTextInto(
-        self: *const Editor,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
-
-        const blank_line = try allocator.alloc(u8, effective_width);
-        defer allocator.free(blank_line);
-        @memset(blank_line, ' ');
-
-        for (0..self.padding_y) |_| {
-            if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .editor, blank_line);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, blank_line);
-            }
-        }
-
-        if (self.buffer.items.len == 0) {
-            const rendered = try renderVisualLine(allocator, self.theme, "", 0, self.padding_x, effective_width);
-            defer allocator.free(rendered);
-            try component_mod.appendOwnedLine(lines, allocator, rendered);
-        } else {
-            var start: usize = 0;
-            while (true) {
-                const rel_end = std.mem.indexOfScalar(u8, self.buffer.items[start..], '\n');
-                const end = if (rel_end) |index| start + index else self.buffer.items.len;
-                const cursor_offset = if (self.cursor >= start and self.cursor <= end) self.cursor - start else null;
-                try appendWrappedLogicalLine(
-                    allocator,
-                    self.theme,
-                    self.buffer.items[start..end],
-                    cursor_offset,
-                    self.padding_x,
-                    effective_width,
-                    lines,
-                );
-
-                if (rel_end == null) break;
-
-                start = end + 1;
-                if (start == self.buffer.items.len) {
-                    const trailing_cursor = if (self.cursor == self.buffer.items.len) @as(?usize, 0) else null;
-                    try appendWrappedLogicalLine(allocator, self.theme, "", trailing_cursor, self.padding_x, effective_width, lines);
-                    break;
-                }
-            }
-        }
-
-        for (0..self.padding_y) |_| {
-            if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .editor, blank_line);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, blank_line);
-            }
-        }
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Editor = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(

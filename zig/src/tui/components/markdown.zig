@@ -51,61 +51,11 @@ pub const Markdown = struct {
     padding_y: usize = 0,
     theme: ?*const resources_mod.Theme = null,
 
-    pub fn component(self: *const Markdown) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Markdown) draw_mod.Component {
         return .{
             .ptr = self,
             .drawFn = drawOpaque,
         };
-    }
-
-    pub fn renderInto(
-        self: *const Markdown,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        if (std.mem.trim(u8, self.text, " \t\r\n").len == 0) return;
-
-        const effective_width = @max(width, 1);
-        const source_line_count = countSourceLines(self.text);
-        const max_height = @max(source_line_count + self.padding_y * 2 + 8, ansi.visibleWidth(self.text) + self.padding_y * 2 + 8);
-        var height_hint = @min(@max(source_line_count + self.padding_y * 2 + 4, 8), max_height);
-
-        while (true) {
-            var screen = try vaxis.Screen.init(allocator, .{
-                .rows = @intCast(@max(height_hint, 1)),
-                .cols = @intCast(effective_width),
-                .x_pixel = 0,
-                .y_pixel = 0,
-            });
-            defer screen.deinit(allocator);
-
-            const window = draw_mod.rootWindow(&screen);
-            window.clear();
-
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            defer arena.deinit();
-
-            const size = try self.draw(window, .{
-                .window = window,
-                .arena = arena.allocator(),
-                .theme = self.theme,
-            });
-
-            if (size.height < height_hint or height_hint >= max_height) {
-                try cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, effective_width, size.height, lines);
-                return;
-            }
-
-            height_hint = @min(max_height, height_hint * 2);
-        }
     }
 
     pub fn draw(
@@ -246,24 +196,11 @@ pub const Markdown = struct {
             );
         }
 
-        const total_height = @min(
-            @as(usize, window.height),
-            self.padding_y + current_row + self.padding_y,
-        );
+        const content_height = self.padding_y + current_row + self.padding_y;
         return .{
             .width = window.width,
-            .height = @intCast(total_height),
+            .height = @intCast(content_height),
         };
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Markdown = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(

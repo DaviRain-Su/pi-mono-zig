@@ -19,13 +19,6 @@ pub const Text = struct {
     theme: ?*const resources_mod.Theme = null,
     gradient: ?TextGradient = null,
 
-    pub fn component(self: *const Text) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Text) draw_mod.Component {
         return .{
             .ptr = self,
@@ -63,70 +56,6 @@ pub const Text = struct {
             @as(u16, @intCast(@min(@as(usize, std.math.maxInt(u16)), self.padding_y * 2 + rendered_height))),
         );
         return .{ .width = window.width, .height = total_height };
-    }
-
-    pub fn renderInto(
-        self: *const Text,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        if (std.mem.trim(u8, self.text, " \t\r\n").len == 0) return;
-
-        const effective_width = @max(width, 1);
-        const content_width = @max(effective_width, self.padding_x * 2 + 1) - self.padding_x * 2;
-
-        var wrapped = component_mod.LineList.empty;
-        defer component_mod.freeLines(allocator, &wrapped);
-        try ansi.wrapTextAlloc(allocator, self.text, content_width, &wrapped);
-
-        const blank_line = try allocator.alloc(u8, effective_width);
-        defer allocator.free(blank_line);
-        @memset(blank_line, ' ');
-
-        for (0..self.padding_y) |_| {
-            if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .text, blank_line);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, blank_line);
-            }
-        }
-
-        for (wrapped.items) |line| {
-            const rendered_line = try self.renderLineAlloc(allocator, line);
-            defer allocator.free(rendered_line);
-
-            var builder = std.ArrayList(u8).empty;
-            errdefer builder.deinit(allocator);
-
-            try builder.appendNTimes(allocator, ' ', self.padding_x);
-            try builder.appendSlice(allocator, rendered_line);
-
-            const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-            defer allocator.free(padded);
-            if (self.gradient != null) {
-                try component_mod.appendOwnedLine(lines, allocator, padded);
-            } else if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .text, padded);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, padded);
-            }
-            builder.deinit(allocator);
-        }
-
-        for (0..self.padding_y) |_| {
-            if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .text, blank_line);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, blank_line);
-            }
-        }
     }
 
     fn appendSegments(
@@ -177,21 +106,6 @@ pub const Text = struct {
             });
             index = cluster.end;
         }
-    }
-
-    fn renderLineAlloc(self: *const Text, allocator: std.mem.Allocator, line: []const u8) std.mem.Allocator.Error![]u8 {
-        _ = self;
-        return allocator.dupe(u8, line);
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Text = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(

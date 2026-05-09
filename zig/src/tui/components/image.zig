@@ -47,13 +47,6 @@ pub const Image = struct {
     padding_x: usize = 0,
     padding_y: usize = 0,
 
-    pub fn component(self: *const Image) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Image) draw_mod.Component {
         return .{
             .ptr = self,
@@ -144,16 +137,6 @@ pub const Image = struct {
         for (0..self.padding_y) |_| {
             try component_mod.appendOwnedLine(lines, allocator, blank_line);
         }
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Image = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(
@@ -537,15 +520,15 @@ test "image renders placeholder box within width and height constraints" {
         .max_height_cells = 4,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(image.drawComponent(), 30, 4);
+    defer screen.deinit(allocator);
 
-    try image.renderInto(allocator, 30, &lines);
-
-    try std.testing.expectEqual(@as(usize, 4), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 30), ansi.visibleWidth(lines.items[0]));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "Image") != null);
+    try std.testing.expectEqual(@as(u16, 4), screen.height);
+    try std.testing.expectEqual(@as(u16, 30), screen.width);
+    const rendered = try test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "╭") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Image") != null);
 }
 
 test "image renders provided ASCII art within constraints" {
@@ -559,14 +542,16 @@ test "image renders provided ASCII art within constraints" {
         .max_height_cells = 2,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(image.drawComponent(), 5, 2);
+    defer screen.deinit(allocator);
 
-    try image.renderInto(allocator, 5, &lines);
-
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("ABD  ", lines.items[0]);
-    try std.testing.expectEqualStrings("FGI  ", lines.items[1]);
+    try std.testing.expectEqual(@as(u16, 2), screen.height);
+    try test_helpers.expectCell(&screen, 0, 0, "A", .{});
+    try test_helpers.expectCell(&screen, 1, 0, "B", .{});
+    try test_helpers.expectCell(&screen, 2, 0, "D", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "F", .{});
+    try test_helpers.expectCell(&screen, 1, 1, "G", .{});
+    try test_helpers.expectCell(&screen, 2, 1, "I", .{});
 }
 
 test "image draw component renders fallback cells when kitty image is absent" {
@@ -653,14 +638,13 @@ test "image preserves aspect ratio when scaling ascii art" {
         .max_height_cells = 2,
     };
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(image.drawComponent(), 10, 1);
+    defer screen.deinit(allocator);
 
-    try image.renderInto(allocator, 10, &lines);
-
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 10), ansi.visibleWidth(lines.items[0]));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "ABCDEFGH") != null);
+    try std.testing.expectEqual(@as(u16, 1), screen.height);
+    const rendered = try test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "ABCDEFGH") != null);
 }
 
 test "image integrates with box component rendering" {

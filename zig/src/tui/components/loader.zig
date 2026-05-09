@@ -30,13 +30,6 @@ pub const Loader = struct {
     padding_x: usize = 0,
     padding_y: usize = 0,
 
-    pub fn component(self: *const Loader) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Loader) draw_mod.Component {
         return .{
             .ptr = self,
@@ -99,27 +92,6 @@ pub const Loader = struct {
         return .{ .width = window.width, .height = @intCast(rendered_height) };
     }
 
-    pub fn renderInto(
-        self: *const Loader,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const display = try self.displayText(allocator);
-        defer allocator.free(display);
-        try renderWrappedText(allocator, display, width, self.padding_x, self.padding_y, lines);
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Loader = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
-    }
-
     fn drawOpaque(
         ptr: *const anyopaque,
         window: vaxis.Window,
@@ -174,13 +146,6 @@ pub const CancellableLoader = struct {
     show_cancel_hint: bool = true,
     on_abort: ?AbortCallback = null,
     abort_signal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    pub fn component(self: *const CancellableLoader) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
 
     pub fn drawComponent(self: *const CancellableLoader) draw_mod.Component {
         return .{
@@ -239,27 +204,6 @@ pub const CancellableLoader = struct {
         });
         const hint_height = drawWrappedSegment(hint_window, self.cancel_hint, self.loader.padding_x, 0, 0, .{ .dim = true });
         return .{ .width = window.width, .height = @intCast(@min(@as(usize, window.height), loader_height + hint_height)) };
-    }
-
-    pub fn renderInto(
-        self: *const CancellableLoader,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        try self.loader.renderInto(allocator, width, lines);
-        if (!self.show_cancel_hint) return;
-        try renderWrappedText(allocator, self.cancel_hint, width, self.loader.padding_x, 0, lines);
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const CancellableLoader = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     fn drawOpaque(
