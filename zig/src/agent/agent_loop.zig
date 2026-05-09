@@ -1829,6 +1829,10 @@ test "streamAssistantResponse frees owned streaming deltas after consumption" {
     );
 
     try std.testing.expectEqualStrings("streamed response", assistant.content[0].text.text);
+    defer {
+        content_clone.deinitContentBlocks(std.testing.allocator, assistant.content);
+        std.testing.allocator.free(assistant.content);
+    }
 }
 
 test "route-a m1 streamAssistantResponse emits toolcall message updates" {
@@ -1883,6 +1887,14 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
         }
     }
     try std.testing.expectEqual(expected.len, next_expected);
+    defer {
+        content_clone.deinitContentBlocks(std.testing.allocator, assistant.content);
+        std.testing.allocator.free(assistant.content);
+        if (assistant.tool_calls) |tool_calls| {
+            for (tool_calls) |tc| content_clone.deinitToolCall(std.testing.allocator, tc);
+            std.testing.allocator.free(tool_calls);
+        }
+    }
 }
 
 test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content while tool JSON repairs" {
