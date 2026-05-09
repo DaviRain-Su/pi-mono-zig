@@ -97,6 +97,9 @@ pub const ExecuteOptions = struct {
     /// Test-only fault injection used to prove lifecycle state writes are
     /// transactional when the provenance lockfile cannot be replaced.
     fail_lockfile_write_for_testing: bool = false,
+    /// Test-only fault injection used to prove lifecycle state writes are
+    /// transactional when digest-bound policy cleanup cannot be persisted.
+    fail_policy_write_for_testing: bool = false,
 };
 
 pub const SelfUpdatePackageManager = enum { npm, pnpm, yarn, bun };
@@ -1521,6 +1524,22 @@ fn executeRemove(
     var lock_snapshot = try captureFileSnapshot(allocator, io, lockfile_path);
     defer lock_snapshot.deinit(allocator);
 
+    var policy_cleanup = try collectPolicyCleanupForLocalSource(
+        allocator,
+        io,
+        source,
+        matched_source,
+        command.local,
+        options,
+        scope,
+        lockfile_path,
+    );
+    defer policy_cleanup.deinit(allocator);
+    if (options.fail_policy_write_for_testing and hasMatchingExtensionPolicyEntry(settings_object, policy_cleanup)) {
+        return error.InjectedPolicyWriteFailure;
+    }
+    _ = try removeMatchingExtensionPolicyEntries(allocator, &settings_object, policy_cleanup);
+
     const removed = packages_value_ptr.?.array.orderedRemove(matched_index.?);
     common.deinitJsonValue(allocator, removed);
 
@@ -1544,6 +1563,144 @@ fn executeRemove(
     defer allocator.free(redacted_source);
     try stdout.print("Removed {s}\n  scope: {s}\n", .{ redacted_source, scope.jsonName() });
     return .{ .exit_code = 0 };
+}
+
+const PolicyCleanupPlan = struct {
+    exact_keys: std.ArrayList([]u8) = .empty,
+    native_prefixes: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *PolicyCleanupPlan, allocator: std.mem.Allocator) void {
+        freeOwnedStrings(allocator, &self.exact_keys);
+        freeOwnedStrings(allocator, &self.native_prefixes);
+        self.* = undefined;
+    }
+};
+
+fn collectPolicyCleanupForLocalSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input_source: []const u8,
+    matched_source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    scope: ProvenanceScope,
+    lockfile_path: []const u8,
+) !PolicyCleanupPlan {
+    var plan = PolicyCleanupPlan{};
+    errdefer plan.deinit(allocator);
+    try appendPolicyCleanupForSource(allocator, io, &plan, input_source, is_project, options, .input, scope, lockfile_path);
+    if (!std.mem.eql(u8, input_source, matched_source)) {
+        try appendPolicyCleanupForSource(allocator, io, &plan, matched_source, is_project, options, .settings, scope, lockfile_path);
+    }
+    return plan;
+}
+
+fn appendPolicyCleanupForSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    plan: *PolicyCleanupPlan,
+    source: []const u8,
+    is_project: bool,
+    options: ExecuteOptions,
+    mode: LocalPathMode,
+    scope: ProvenanceScope,
+    lockfile_path: []const u8,
+) !void {
+    var entry = try lockedLocalWasmEntryForSource(allocator, io, source, is_project, options, mode, scope, lockfile_path);
+    defer if (entry) |*locked| locked.deinit(allocator);
+    if (entry == null) return;
+    const exact_key = try policyLookupKeyFromLockEntry(allocator, entry.?);
+    errdefer allocator.free(exact_key);
+    try appendUniqueOwnedString(allocator, &plan.exact_keys, exact_key);
+    if (std.mem.eql(u8, entry.?.manifest_kind, "native-extension")) {
+        const prefix = try nativePolicyLookupPrefixFromLockEntry(allocator, entry.?);
+        errdefer allocator.free(prefix);
+        try appendUniqueOwnedString(allocator, &plan.native_prefixes, prefix);
+    }
+}
+
+fn appendUniqueOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]u8), owned: []u8) !void {
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, owned)) {
+            allocator.free(owned);
+            return;
+        }
+    }
+    try list.append(allocator, owned);
+}
+
+fn nativePolicyLookupPrefixFromLockEntry(
+    allocator: std.mem.Allocator,
+    entry: provenance_lockfile.LockEntry,
+) ![]u8 {
+    const schema_version = entry.manifest_schema_version orelse native_manifest.SCHEMA_VERSION;
+    const extension_id = entry.manifest_id orelse "";
+    const extension_version = entry.manifest_version orelse "";
+    return std.fmt.allocPrint(
+        allocator,
+        "native:locked:{s}:{s}:{s}:{s}:{s}:native:",
+        .{
+            entry.scope.jsonName(),
+            entry.source_identity,
+            schema_version,
+            extension_id,
+            extension_version,
+        },
+    );
+}
+
+fn policyKeyMatchesCleanup(key: []const u8, plan: PolicyCleanupPlan) bool {
+    for (plan.exact_keys.items) |exact| {
+        if (std.mem.eql(u8, key, exact)) return true;
+    }
+    for (plan.native_prefixes.items) |prefix| {
+        if (std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return false;
+}
+
+fn hasMatchingExtensionPolicyEntry(settings_object: std.json.ObjectMap, plan: PolicyCleanupPlan) bool {
+    const policies_value = settings_object.get("extensionPolicies") orelse return false;
+    if (policies_value != .object) return false;
+    var iterator = policies_value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (policyKeyMatchesCleanup(entry.key_ptr.*, plan)) return true;
+    }
+    return false;
+}
+
+fn removeMatchingExtensionPolicyEntries(
+    allocator: std.mem.Allocator,
+    settings_object: *std.json.ObjectMap,
+    plan: PolicyCleanupPlan,
+) !usize {
+    const policies_value = settings_object.getPtr("extensionPolicies") orelse return 0;
+    if (policies_value.* != .object) return 0;
+
+    var replacement = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const cleanup: std.json.Value = .{ .object = replacement };
+        common.deinitJsonValue(allocator, cleanup);
+    }
+
+    var removed_count: usize = 0;
+    var iterator = policies_value.object.iterator();
+    while (iterator.next()) |entry| {
+        if (policyKeyMatchesCleanup(entry.key_ptr.*, plan)) {
+            removed_count += 1;
+            continue;
+        }
+        try replacement.put(
+            allocator,
+            try allocator.dupe(u8, entry.key_ptr.*),
+            try common.cloneJsonValue(allocator, entry.value_ptr.*),
+        );
+    }
+
+    const old = policies_value.*;
+    policies_value.* = .{ .object = replacement };
+    common.deinitJsonValue(allocator, old);
+    return removed_count;
 }
 
 fn executeUpdate(
@@ -3970,6 +4127,109 @@ fn nativeTestLibrarySuffix() []const u8 {
     };
 }
 
+fn writeNativeDynamicPackageFixture(
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    package_relative_path: []const u8,
+    package_id: []const u8,
+    tool_name: []const u8,
+    artifact_bytes: []const u8,
+) ![]u8 {
+    const native_dir = try std.fs.path.join(allocator, &.{ package_relative_path, "native" });
+    defer allocator.free(native_dir);
+    try tmp.dir.createDirPath(std.testing.io, native_dir);
+    const artifact_rel = try std.fmt.allocPrint(allocator, "native/plugin{s}", .{nativeTestLibrarySuffix()});
+    errdefer allocator.free(artifact_rel);
+    const artifact_sub_path = try std.fs.path.join(allocator, &.{ package_relative_path, artifact_rel });
+    defer allocator.free(artifact_sub_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_sub_path, .data = artifact_bytes });
+
+    const manifest = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "{s}",
+        \\  "name": "Native Dynamic Fixture",
+        \\  "version": "0.1.0",
+        \\  "description": "Native dynamic package fixture.",
+        \\  "runtime": {{
+        \\    "kind": "native",
+        \\    "entrypoint": {{ "descriptor": "native://dynamic/{s}" }},
+        \\    "limits": {{ "timeoutMs": 1000, "outputBytes": 4096, "toolScopes": ["{s}"] }}
+        \\  }},
+        \\  "artifacts": [
+        \\    {{ "kind": "native-dynamic", "os": "{s}", "arch": "{s}", "path": "{s}" }}
+        \\  ],
+        \\  "tools": [
+        \\    {{ "name": "{s}", "description": "Native fixture tool.", "inputSchema": {{}}, "outputSchema": {{}} }}
+        \\  ],
+        \\  "capabilities": {{ "exports": [{{ "id": "{s}", "kind": "tool", "version": "0.1.0" }}], "imports": [] }},
+        \\  "permissions": [{{ "id": "file.read" }}]
+        \\}}
+    , .{ package_id, package_id, tool_name, nativeTestHostOs(), nativeTestHostArch(), artifact_rel, tool_name, tool_name });
+    defer allocator.free(manifest);
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_relative_path, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest });
+    return artifact_rel;
+}
+
+fn addPolicyToSettings(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    policy_key: []const u8,
+    approved_grant: []const u8,
+) !void {
+    var settings_object = try loadSettingsObject(allocator, std.testing.io, settings_path);
+    defer {
+        const cleanup: std.json.Value = .{ .object = settings_object };
+        common.deinitJsonValue(allocator, cleanup);
+    }
+
+    const policies_ptr = blk: {
+        if (settings_object.getPtr("extensionPolicies")) |existing| {
+            if (existing.* == .object) break :blk &existing.object;
+            const old = existing.*;
+            existing.* = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+            common.deinitJsonValue(allocator, old);
+            break :blk &existing.object;
+        }
+        try settings_object.put(
+            allocator,
+            try allocator.dupe(u8, "extensionPolicies"),
+            .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
+        );
+        break :blk &settings_object.getPtr("extensionPolicies").?.object;
+    };
+
+    var approved_grants = std.json.Array.init(allocator);
+    errdefer common.deinitJsonValue(allocator, .{ .array = approved_grants });
+    try approved_grants.append(.{ .string = try allocator.dupe(u8, approved_grant) });
+
+    var policy = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer common.deinitJsonValue(allocator, .{ .object = policy });
+    try policy.put(allocator, try allocator.dupe(u8, "approvedGrants"), .{ .array = approved_grants });
+    try policies_ptr.put(
+        allocator,
+        try allocator.dupe(u8, policy_key),
+        .{ .object = policy },
+    );
+
+    try writeSettingsObject(allocator, std.testing.io, settings_path, settings_object, .{ .cwd = "", .agent_dir = "" });
+}
+
+fn nativePolicyKeyForPackage(
+    allocator: std.mem.Allocator,
+    package_root: []const u8,
+    scope: provenance_lockfile.Scope,
+) ![]u8 {
+    var manifest_result = try native_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    var lock_entry = try provenance_lockfile.createNativeLockEntry(allocator, scope, manifest_result.valid.package_root, &manifest_result.valid);
+    defer lock_entry.deinit(allocator);
+    return provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, lock_entry);
+}
+
 test "native dynamic package install validates artifact schema and writes selected artifact provenance" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4088,6 +4348,304 @@ test "native dynamic package install rejects missing selected artifacts without 
     const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
     defer allocator.free(lockfile_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lockfile_path, .{}));
+}
+
+test "VAL-NATIVE-PKG-015-016 native update refreshes explicitly and failed update preserves lock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const artifact_rel = try writeNativeDynamicPackageFixture(
+        allocator,
+        &tmp,
+        "repo/fixtures/native-update",
+        "com.example.native-update",
+        "native.update",
+        "native-v1",
+    );
+    defer allocator.free(artifact_rel);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const package_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures/native-update" });
+    defer allocator.free(package_root);
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const initial_policy_key = try nativePolicyKeyForPackage(allocator, package_root, .user);
+    defer allocator.free(initial_policy_key);
+    try addPolicyToSettings(allocator, settings_path, initial_policy_key, "file.read");
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_result = try runCommand(allocator, &.{ "install", "./fixtures/native-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lock_before_drift = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before_drift);
+
+    const artifact_path = try std.fs.path.join(allocator, &.{ package_root, artifact_rel });
+    defer allocator.free(artifact_path);
+    try common.writeFileAbsolute(std.testing.io, artifact_path, "native-v2", true);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_drift = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_drift.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "runtime: native") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "trust: drifted") != null);
+    const lock_after_list = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_list);
+    try std.testing.expectEqualStrings(lock_before_drift, lock_after_list);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const reinstall_result = try runCommand(allocator, &.{ "install", "./fixtures/native-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), reinstall_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "pi update --extension") != null);
+    const lock_after_reinstall = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_reinstall);
+    try std.testing.expectEqualStrings(lock_before_drift, lock_after_reinstall);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "--extension", "./fixtures/native-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), update_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Updated ./fixtures/native-update") != null);
+    const lock_after_update = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_update);
+    try std.testing.expect(!std.mem.eql(u8, lock_before_drift, lock_after_update));
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_after_update = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_after_update.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "trust: locked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "policy: denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, initial_policy_key) == null);
+
+    try std.Io.Dir.deleteFileAbsolute(std.testing.io, artifact_path);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const failed_update = try runCommand(allocator, &.{ "update", "--extension", "./fixtures/native-update" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), failed_update.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "artifact file was not found") != null);
+    const lock_after_failed_update = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_update);
+    try std.testing.expectEqualStrings(lock_after_update, lock_after_failed_update);
+}
+
+test "VAL-NATIVE-PKG-017-018-033-034 native remove after drift clears scoped lock and stale policies" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const target_artifact_rel = try writeNativeDynamicPackageFixture(
+        allocator,
+        &tmp,
+        "repo/fixtures/native-remove",
+        "com.example.native-remove",
+        "native.remove",
+        "native-remove-v1",
+    );
+    defer allocator.free(target_artifact_rel);
+    const other_artifact_rel = try writeNativeDynamicPackageFixture(
+        allocator,
+        &tmp,
+        "repo/fixtures/native-other",
+        "com.example.native-other",
+        "native.other",
+        "native-other-v1",
+    );
+    defer allocator.free(other_artifact_rel);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const target_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures/native-remove" });
+    defer allocator.free(target_root);
+    const other_root = try std.fs.path.join(allocator, &.{ cwd, "fixtures/native-other" });
+    defer allocator.free(other_root);
+    const target_initial_policy = try nativePolicyKeyForPackage(allocator, target_root, .user);
+    defer allocator.free(target_initial_policy);
+    const other_policy = try nativePolicyKeyForPackage(allocator, other_root, .user);
+    defer allocator.free(other_policy);
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/native-remove" }, options, &stdout_buf, &stderr_buf);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    _ = try runCommand(allocator, &.{ "install", "./fixtures/native-other" }, options, &stdout_buf, &stderr_buf);
+    try addPolicyToSettings(allocator, settings_path, target_initial_policy, "file.read");
+    try addPolicyToSettings(allocator, settings_path, other_policy, "file.read");
+
+    const target_artifact_path = try std.fs.path.join(allocator, &.{ target_root, target_artifact_rel });
+    defer allocator.free(target_artifact_path);
+    try common.writeFileAbsolute(std.testing.io, target_artifact_path, "native-remove-v2", true);
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const update_result = try runCommand(allocator, &.{ "update", "--extension", "./fixtures/native-remove" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), update_result.exit_code);
+    const target_updated_policy = try nativePolicyKeyForPackage(allocator, target_root, .user);
+    defer allocator.free(target_updated_policy);
+    try std.testing.expect(!std.mem.eql(u8, target_initial_policy, target_updated_policy));
+
+    try common.writeFileAbsolute(std.testing.io, target_artifact_path, "native-remove-v3-drift", true);
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lock_before_remove = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before_remove);
+    try std.testing.expect(std.mem.indexOf(u8, lock_before_remove, "com.example.native-remove") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lock_before_remove, "com.example.native-other") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const remove_result = try runCommand(allocator, &.{ "remove", "./fixtures/native-remove" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), remove_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Removed ./fixtures/native-remove") != null);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+
+    const settings_after_remove = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, settings_after_remove, "native-remove") == null);
+    try std.testing.expect(std.mem.indexOf(u8, settings_after_remove, target_initial_policy) == null);
+    try std.testing.expect(std.mem.indexOf(u8, settings_after_remove, target_updated_policy) == null);
+    try std.testing.expect(std.mem.indexOf(u8, settings_after_remove, "native-other") != null);
+    try std.testing.expect(std.mem.indexOf(u8, settings_after_remove, other_policy) != null);
+
+    const lock_after_remove = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_remove);
+    try std.testing.expect(std.mem.indexOf(u8, lock_after_remove, "com.example.native-remove") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lock_after_remove, "com.example.native-other") != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const reinstall_result = try runCommand(allocator, &.{ "install", "./fixtures/native-remove" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), reinstall_result.exit_code);
+    const target_reinstall_policy = try nativePolicyKeyForPackage(allocator, target_root, .user);
+    defer allocator.free(target_reinstall_policy);
+    try std.testing.expect(!std.mem.eql(u8, target_updated_policy, target_reinstall_policy));
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_after_reinstall = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_after_reinstall.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "runtime: native") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "policy: denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, target_initial_policy) == null);
+}
+
+test "VAL-NATIVE-PKG-037 native lifecycle write failures preserve settings lock and policy atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const artifact_a = try writeNativeDynamicPackageFixture(
+        allocator,
+        &tmp,
+        "repo/fixtures/native-atomic-a",
+        "com.example.native-atomic-a",
+        "native.atomicA",
+        "native-atomic-a",
+    );
+    defer allocator.free(artifact_a);
+    const artifact_b = try writeNativeDynamicPackageFixture(
+        allocator,
+        &tmp,
+        "repo/fixtures/native-atomic-b",
+        "com.example.native-atomic-b",
+        "native.atomicB",
+        "native-atomic-b",
+    );
+    defer allocator.free(artifact_b);
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+    const install_a = try runCommand(allocator, &.{ "install", "./fixtures/native-atomic-a" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_a.exit_code);
+
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const package_root_a = try std.fs.path.join(allocator, &.{ cwd, "fixtures/native-atomic-a" });
+    defer allocator.free(package_root_a);
+    const policy_key_a = try nativePolicyKeyForPackage(allocator, package_root_a, .user);
+    defer allocator.free(policy_key_a);
+    try addPolicyToSettings(allocator, settings_path, policy_key_a, "file.read");
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+
+    const settings_before = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_before);
+    const lock_before = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_before);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    var fail_settings_options = options;
+    fail_settings_options.fail_settings_write_for_testing = true;
+    try std.testing.expectError(
+        error.InjectedSettingsWriteFailure,
+        runCommand(allocator, &.{ "install", "./fixtures/native-atomic-b" }, fail_settings_options, &stdout_buf, &stderr_buf),
+    );
+    const settings_after_failed_install = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_failed_install);
+    const lock_after_failed_install = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_install);
+    try std.testing.expectEqualStrings(settings_before, settings_after_failed_install);
+    try std.testing.expectEqualStrings(lock_before, lock_after_failed_install);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    var fail_lock_options = options;
+    fail_lock_options.fail_lockfile_write_for_testing = true;
+    const failed_lock_remove = try runCommand(allocator, &.{ "remove", "./fixtures/native-atomic-a" }, fail_lock_options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), failed_lock_remove.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "InjectedLockfileWriteFailure") != null);
+    const settings_after_failed_lock = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_failed_lock);
+    const lock_after_failed_lock = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_lock);
+    try std.testing.expectEqualStrings(settings_before, settings_after_failed_lock);
+    try std.testing.expectEqualStrings(lock_before, lock_after_failed_lock);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    var fail_policy_options = options;
+    fail_policy_options.fail_policy_write_for_testing = true;
+    try std.testing.expectError(
+        error.InjectedPolicyWriteFailure,
+        runCommand(allocator, &.{ "remove", "./fixtures/native-atomic-a" }, fail_policy_options, &stdout_buf, &stderr_buf),
+    );
+    const settings_after_failed_policy = try readSettings(allocator, settings_path);
+    defer allocator.free(settings_after_failed_policy);
+    const lock_after_failed_policy = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lock_after_failed_policy);
+    try std.testing.expectEqualStrings(settings_before, settings_after_failed_policy);
+    try std.testing.expectEqualStrings(lock_before, lock_after_failed_policy);
 }
 
 test "VAL-TRUST invalid wasm manifest diagnostics are redacted and leave no trust state" {
