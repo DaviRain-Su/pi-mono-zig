@@ -485,9 +485,6 @@ fn loadEnvOptional(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
     return try allocator.dupe(u8, std.mem.span(value));
 }
 
-// TODO(review-B7): This provider-specific SSE loop should migrate to
-// sse_loop.run() with a Handler struct. See openai_chat_sse.zig for the
-// reference implementation pattern.
 fn parseSseStreamLines(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,

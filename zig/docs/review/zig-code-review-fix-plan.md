@@ -54,9 +54,14 @@ Based on the systematic review in `zig-code-review.md`.
 - DONE - all production page_allocator usages fixed
 
 ## B7: Migrate parseSseStreamLines to sse_loop (P0-REVIEW-4)
-- [ ] Design Handler interface in sse_loop.zig
-- [ ] Migrate 10 providers one by one
-- High risk (core streaming logic)
+- [x] VERIFIED: All 10 providers already use sse_loop.run() or sse_loop.runFrames()
+- [x] azure_openai_responses, bedrock, google, google_vertex, google_gemini_cli,
+      kimi, mistral, openai_chat_sse, openai_codex_responses, openai_responses
+      all delegate SSE outer loop to shared sse_loop module
+- [x] anthropic uses sse_loop.runFrames() for frame-based SSE
+- [x] The remaining parseSseStreamLines wrappers handle provider-specific state
+      setup and finalization — this per-provider variation is legitimate
+- DONE - misleading TODO comment removed from azure_openai_responses.zig
 
 ## B8: Split agent_loop.zig (P1-REVIEW-5)
 - [x] Extracted json_schema.zig (~200 LOC of JSON schema validation)
