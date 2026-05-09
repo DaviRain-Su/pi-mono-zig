@@ -141,27 +141,78 @@ pub const PreparedExtensionCli = struct {
         if (saw_error) return false;
 
         for (apply_result.values) |entry| {
-            const name_owned = try self.allocator.dupe(u8, entry.name);
-            try self.parsed_flag_owned_names.append(self.allocator, name_owned);
-            switch (entry.value) {
-                .boolean => |b| {
-                    try self.parsed_cli_flag_values.append(self.allocator, .{
-                        .name = name_owned,
-                        .value = .{ .boolean = b },
-                    });
-                },
-                .string => |s| {
-                    const value_owned = try self.allocator.dupe(u8, s);
-                    try self.parsed_flag_owned_strings.append(self.allocator, value_owned);
-                    try self.parsed_cli_flag_values.append(self.allocator, .{
-                        .name = name_owned,
-                        .value = .{ .string = value_owned },
-                    });
-                },
-            }
+            try self.storeParsedCliFlagValue(entry);
         }
 
         return true;
+    }
+
+    /// Registry-dump mode is an explicit validation/debug surface. It
+    /// must preserve rejected sidecar diagnostics for the snapshot
+    /// instead of treating them as fatal stderr errors, while still
+    /// plumbing any successfully parsed extension flag values into the
+    /// live runtime registry.
+    pub fn applyUnknownFlagsForRegistryDump(
+        self: *PreparedExtensionCli,
+        unknown_flags: ?[]const cli.UnknownFlag,
+    ) !void {
+        const raw_unknown_flags = unknown_flags orelse &.{};
+
+        const parsed = try self.allocator.alloc(extension_flags.ParsedUnknownFlag, raw_unknown_flags.len);
+        defer self.allocator.free(parsed);
+        for (raw_unknown_flags, 0..) |raw, idx| {
+            parsed[idx] = .{
+                .name = raw.name,
+                .value = switch (raw.value) {
+                    .boolean => |b| .{ .boolean = b },
+                    .string => |s| .{ .string = s },
+                },
+            };
+        }
+
+        var apply_result = try extension_flags.applyUnknownFlags(
+            self.allocator,
+            &self.registry,
+            parsed,
+        );
+        defer apply_result.deinit(self.allocator);
+
+        for (apply_result.values) |entry| {
+            try self.storeParsedCliFlagValue(entry);
+        }
+    }
+
+    fn storeParsedCliFlagValue(
+        self: *PreparedExtensionCli,
+        entry: extension_flags.FlagValueEntry,
+    ) !void {
+        const name_owned = try self.allocator.dupe(u8, entry.name);
+        var name_stored = false;
+        errdefer if (!name_stored) self.allocator.free(name_owned);
+
+        switch (entry.value) {
+            .boolean => |b| {
+                try self.parsed_flag_owned_names.append(self.allocator, name_owned);
+                name_stored = true;
+                try self.parsed_cli_flag_values.append(self.allocator, .{
+                    .name = name_owned,
+                    .value = .{ .boolean = b },
+                });
+            },
+            .string => |s| {
+                const value_owned = try self.allocator.dupe(u8, s);
+                var value_stored = false;
+                errdefer if (!value_stored) self.allocator.free(value_owned);
+                try self.parsed_flag_owned_names.append(self.allocator, name_owned);
+                name_stored = true;
+                try self.parsed_flag_owned_strings.append(self.allocator, value_owned);
+                value_stored = true;
+                try self.parsed_cli_flag_values.append(self.allocator, .{
+                    .name = name_owned,
+                    .value = .{ .string = value_owned },
+                });
+            },
+        }
     }
 
     pub fn parsedCliFlagValues(self: *const PreparedExtensionCli) []const extension_registry.ParsedCliFlag {
@@ -294,23 +345,44 @@ fn snapshotWithRejectedFlagDiagnostics(
     defer parsed.deinit();
     if (parsed.value != .object) return try allocator.dupe(u8, snapshot);
 
-    var diagnostics_array = std.json.Array.init(allocator);
-    for (diagnostics) |diagnostic| {
-        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try entry.put(allocator, try allocator.dupe(u8, "severity"), .{ .string = try allocator.dupe(u8, switch (diagnostic.severity) {
+    const trimmed = std.mem.trim(u8, snapshot, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return try allocator.dupe(u8, snapshot);
+    const body = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
+    if (body.len > 0) try out.writer.writeAll(",");
+    try out.writer.writeAll("\"extensionFlagDiagnostics\":[");
+    for (diagnostics, 0..) |diagnostic, index| {
+        if (index > 0) try out.writer.writeAll(",");
+        try out.writer.writeAll("{\"severity\":");
+        try appendJsonString(allocator, &out.writer, switch (diagnostic.severity) {
             .warning => "warning",
             .@"error" => "error",
-        }) });
-        try entry.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, diagnostic.code) });
-        try entry.put(allocator, try allocator.dupe(u8, "owner"), .{ .string = try allocator.dupe(u8, diagnostic.owner) });
-        try entry.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, diagnostic.source) });
-        try entry.put(allocator, try allocator.dupe(u8, "flag"), .{ .string = try allocator.dupe(u8, diagnostic.flag_name) });
-        try entry.put(allocator, try allocator.dupe(u8, "reason"), .{ .string = try allocator.dupe(u8, diagnostic.reason) });
-        try entry.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, diagnostic.message) });
-        try diagnostics_array.append(.{ .object = entry });
+        });
+        try out.writer.writeAll(",\"code\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.code);
+        try out.writer.writeAll(",\"owner\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.owner);
+        try out.writer.writeAll(",\"source\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.source);
+        try out.writer.writeAll(",\"flag\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.flag_name);
+        try out.writer.writeAll(",\"reason\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.reason);
+        try out.writer.writeAll(",\"message\":");
+        try appendJsonString(allocator, &out.writer, diagnostic.message);
+        try out.writer.writeAll("}");
     }
-    try parsed.value.object.put(allocator, try allocator.dupe(u8, "extensionFlagDiagnostics"), .{ .array = diagnostics_array });
-    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    try out.writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
+    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
+    defer allocator.free(encoded);
+    try writer.writeAll(encoded);
 }
 
 fn isEnabledValue(value: []const u8) bool {

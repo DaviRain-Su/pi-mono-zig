@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
+const extension_manifest = @import("../extensions/extension_manifest.zig");
 const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const tui = @import("tui");
@@ -1148,6 +1149,7 @@ fn verifyLockedWasmPackageForResources(
     const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
     if (!pathExists(io, manifest_path)) return true;
+    if (!try manifestRequiresLegacyWasmLock(allocator, io, manifest_path)) return true;
 
     const provenance_scope: provenance_lockfile.Scope = if (scope == .project) .project else .user;
     const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
@@ -1200,6 +1202,7 @@ fn verifyLockedWasmPackageDetailed(
     const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
     if (!pathExists(io, manifest_path)) return null;
+    if (!try manifestRequiresLegacyWasmLock(allocator, io, manifest_path)) return null;
 
     const provenance_scope: provenance_lockfile.Scope = if (scope == .project) .project else .user;
     const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
@@ -1264,6 +1267,26 @@ fn verifyLockedWasmPackageDetailed(
         .manifest = cloned_manifest,
         .lock_entry = cloned_entry,
     };
+}
+
+fn manifestRequiresLegacyWasmLock(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    manifest_path: []const u8,
+) !bool {
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(manifest_text);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, manifest_text, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .object) return true;
+    const schema_value = parsed.value.object.get("schemaVersion") orelse return true;
+    if (schema_value != .string) return true;
+    if (std.mem.eql(u8, schema_value.string, extension_manifest.SCHEMA_VERSION)) return false;
+    return std.mem.eql(u8, schema_value.string, wasm_manifest.SCHEMA_VERSION);
 }
 
 fn appendWasmProvenanceMismatchDiagnostic(
@@ -1692,8 +1715,9 @@ fn collectPaths(
         return;
     };
     if (stat.kind == .file) {
-        if (kind != .extension or hasSupportedExtensionFile(path)) {
-            if (kind == .skill or kind == .prompt or kind == .theme or hasSupportedExtensionFile(path)) {
+        const package_extension_file = kind == .extension and seed.origin == .package;
+        if (kind != .extension or hasSupportedExtensionFile(path) or package_extension_file) {
+            if (kind == .skill or kind == .prompt or kind == .theme or hasSupportedExtensionFile(path) or package_extension_file) {
                 try appendResolvedResource(allocator, target, path, enabled, seed);
             }
         }
@@ -3034,6 +3058,69 @@ test "resolveConfiguredResources loads local, npm, and git resource sources" {
     try std.testing.expectEqual(@as(usize, 1), resolved.prompts.len);
     try std.testing.expect(std.mem.indexOf(u8, resolved.prompts[0].path, "summarize.md") != null);
     try std.testing.expectEqual(@as(usize, 2), resolved.themes.len);
+}
+
+test "resolveConfiguredResources loads unified extension package resources without wasm lock" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/unified-pkg/extensions");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/unified-pkg/package.json",
+        .data =
+        \\{
+        \\  "pi": { "extensions": ["extensions/extension.ts"] }
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/unified-pkg/pi-extension.json",
+        .data =
+        \\{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "com.example.unified",
+        \\  "name": "Unified Package",
+        \\  "version": "1.0.0",
+        \\  "runtime": {
+        \\    "kind": "process_jsonl",
+        \\    "entrypoint": { "argv": ["node", "extensions/extension.ts"] }
+        \\  },
+        \\  "tools": []
+        \\}
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/fixtures/unified-pkg/extensions/extension.ts",
+        .data = "export default {};\n",
+    });
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const fixture_root = try makeTmpPath(allocator, tmp, "repo/fixtures/unified-pkg");
+    defer allocator.free(fixture_root);
+
+    var package_config = PackageSourceConfig{ .source = try allocator.dupe(u8, fixture_root) };
+    defer package_config.deinit(allocator);
+
+    var resolved = try resolveConfiguredResources(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.extensions.len);
+    try std.testing.expectEqual(@as(usize, 0), resolved.diagnostics.len);
+    try std.testing.expect(std.mem.endsWith(u8, resolved.extensions[0].path, "extensions/extension.ts"));
+    try std.testing.expect(resolved.extensions[0].source_info.provenance == null);
 }
 
 test "resolveConfiguredResources discovers project .agents skills up to git root" {
