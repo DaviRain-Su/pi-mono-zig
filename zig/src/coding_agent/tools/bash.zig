@@ -13,6 +13,22 @@ pub const BashArgs = struct {
     timeout_seconds: ?u64 = null,
 };
 
+fn normalizeBackslashes(allocator: std.mem.Allocator, command: []const u8) ![]const u8 {
+    var has_backslash = false;
+    for (command) |c| {
+        if (c == '\\') {
+            has_backslash = true;
+            break;
+        }
+    }
+    if (!has_backslash) return command;
+    const buf = try allocator.alloc(u8, command.len);
+    for (command, 0..) |c, i| {
+        buf[i] = if (c == '\\') '/' else c;
+    }
+    return buf;
+}
+
 pub const BashDetails = struct {
     exit_code: ?u8 = null,
     timed_out: bool = false,
@@ -171,7 +187,9 @@ pub const BashTool = struct {
         if (builtin.os.tag == .windows) {
             argv_buf[0] = "bash";
             argv_buf[1] = "-c";
-            argv_buf[2] = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{args.command});
+            const normalized = try normalizeBackslashes(allocator, args.command);
+            defer allocator.free(normalized);
+            argv_buf[2] = try std.fmt.allocPrint(allocator, "exec 2>&1\n{s}", .{normalized});
             argv_len = 3;
         } else {
             argv_buf[0] = "/bin/sh";
