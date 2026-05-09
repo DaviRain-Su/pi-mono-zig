@@ -87,34 +87,20 @@ pub const Image = struct {
             };
         }
 
-        var lines = component_mod.LineList.empty;
-        try self.renderInto(ctx.arena, @as(usize, window.width), &lines);
-        drawLinesToWindow(window, lines.items);
-        return .{
-            .width = window.width,
-            .height = @intCast(@min(lines.items.len, @as(usize, window.height))),
-        };
-    }
-
-    fn renderInto(
-        self: *const Image,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
+        const allocator = ctx.arena;
+        const effective_width = @max(@as(usize, window.width), 1);
         const content_width = @max(effective_width, self.padding_x * 2 + 1) - self.padding_x * 2;
 
+        var lines = component_mod.LineList.empty;
+
         const blank_line = try allocator.alloc(u8, effective_width);
-        defer allocator.free(blank_line);
         @memset(blank_line, ' ');
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            try component_mod.appendOwnedLine(&lines, allocator, blank_line);
         }
 
         var rendered = component_mod.LineList.empty;
-        defer component_mod.freeLines(allocator, &rendered);
 
         switch (self.mode) {
             .placeholder => try self.renderPlaceholderInto(allocator, content_width, &rendered),
@@ -129,14 +115,19 @@ pub const Image = struct {
             try builder.appendSlice(allocator, line);
 
             const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-            defer allocator.free(padded);
-            try component_mod.appendOwnedLine(lines, allocator, padded);
+            try component_mod.appendOwnedLine(&lines, allocator, padded);
             builder.deinit(allocator);
         }
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
+            try component_mod.appendOwnedLine(&lines, allocator, blank_line);
         }
+
+        drawLinesToWindow(window, lines.items);
+        return .{
+            .width = window.width,
+            .height = @intCast(@min(lines.items.len, @as(usize, window.height))),
+        };
     }
 
     fn drawOpaque(
