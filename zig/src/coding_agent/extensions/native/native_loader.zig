@@ -21,12 +21,16 @@ pub const LoadedLibrary = struct {
     functions: native_abi_contract.FunctionTable,
     unloaded: bool = false,
 
+    pub fn shutdownAndClose(self: *LoadedLibrary) ?i32 {
+        if (self.unloaded) return null;
+        const shutdown_status = if (self.functions.shutdown) |shutdown| shutdown() else null;
+        self.library.close();
+        self.unloaded = true;
+        return shutdown_status;
+    }
+
     pub fn deinit(self: *LoadedLibrary, allocator: std.mem.Allocator) void {
-        if (!self.unloaded) {
-            if (self.functions.shutdown) |shutdown| _ = shutdown();
-            self.library.close();
-            self.unloaded = true;
-        }
+        _ = self.shutdownAndClose();
         allocator.free(self.artifact_path);
         self.* = undefined;
     }
@@ -128,7 +132,12 @@ pub fn loadVerifiedPackage(
     const contract = try native_abi_contract.validateAndInitialize(allocator, table, expectation, host_api);
     switch (contract) {
         .valid => {},
-        .invalid => |diagnostic| return .{ .invalid = contractDiagnostic(diagnostic, manifest.selected_artifact_absolute_path) },
+        .invalid => |diagnostic| {
+            if (std.mem.eql(u8, diagnostic.phase, "init")) {
+                if (table.shutdown) |shutdown| _ = shutdown();
+            }
+            return .{ .invalid = contractDiagnostic(diagnostic, manifest.selected_artifact_absolute_path) };
+        },
     }
 
     return .{ .loaded = .{
@@ -214,6 +223,10 @@ fn unsupportedPlatformReason() ?[]const u8 {
         .macos, .linux, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => null,
         else => "unsupported host OS for dynamic native runtime execution",
     };
+}
+
+pub fn unsupportedPlatformReasonForTesting() ?[]const u8 {
+    return unsupportedPlatformReason();
 }
 
 fn openPlatformLibrary(path: []const u8) !std.DynLib {

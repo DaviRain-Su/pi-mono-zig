@@ -12,6 +12,7 @@ const extension_host = @import("extension_host.zig");
 const extension_manifest = @import("extension_manifest.zig");
 const extension_registry = @import("extension_registry.zig");
 const workflow_execution = @import("workflow_execution.zig");
+const native_abi_contract = @import("native/native_abi_contract.zig");
 const native_loader = @import("native/native_loader.zig");
 const native_manifest = @import("native/native_manifest.zig");
 const native_runtime = @import("native_runtime.zig");
@@ -525,16 +526,37 @@ fn productionNativePackageLoad(
 pub const LockedNativeRuntimeEntry = struct {
     package_root: []u8,
     manifest_path: []u8,
+    extension_id: []u8,
+    extension_name: []u8,
+    extension_version: []u8,
     tool_name: []u8,
+    tool_description: []u8,
+    input_schema_json: []u8,
+    output_schema_json: []u8,
     policy_lookup_key: []u8,
+    artifact_path: []u8,
+    artifact_sha256: []u8,
+    package_root_sha256: []u8,
+    resource_limits: enforcement.ResourceLimits,
+    accounting: enforcement.Accounting = .{},
     loaded: native_loader.LoadedLibrary,
 
     fn deinit(self: *LockedNativeRuntimeEntry, allocator: std.mem.Allocator) void {
         self.loaded.deinit(allocator);
         allocator.free(self.package_root);
         allocator.free(self.manifest_path);
+        allocator.free(self.extension_id);
+        allocator.free(self.extension_name);
+        allocator.free(self.extension_version);
         allocator.free(self.tool_name);
+        allocator.free(self.tool_description);
+        allocator.free(self.input_schema_json);
+        allocator.free(self.output_schema_json);
         allocator.free(self.policy_lookup_key);
+        allocator.free(self.artifact_path);
+        allocator.free(self.artifact_sha256);
+        allocator.free(self.package_root_sha256);
+        deinitEnforcementResourceLimits(allocator, &self.resource_limits);
         self.* = undefined;
     }
 };
@@ -542,16 +564,299 @@ pub const LockedNativeRuntimeEntry = struct {
 pub const LockedNativeRuntimeSet = struct {
     allocator: std.mem.Allocator,
     entries: []LockedNativeRuntimeEntry,
+    retired_entries: []LockedNativeRuntimeEntry = &.{},
     diagnostics: []resources_mod.Diagnostic,
 
     pub fn deinit(self: *LockedNativeRuntimeSet) void {
         for (self.entries) |*entry| entry.deinit(self.allocator);
         self.allocator.free(self.entries);
+        for (self.retired_entries) |*entry| entry.deinit(self.allocator);
+        self.allocator.free(self.retired_entries);
         for (self.diagnostics) |*diagnostic| diagnostic.deinit(self.allocator);
         self.allocator.free(self.diagnostics);
         self.* = undefined;
     }
+
+    pub fn agentTool(self: *LockedNativeRuntimeSet, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
+        for (self.entries) |*entry| {
+            if (!std.mem.eql(u8, entry.tool_name, name)) continue;
+            var parsed_parameters = try std.json.parseFromSlice(std.json.Value, allocator, entry.input_schema_json, .{});
+            defer parsed_parameters.deinit();
+            const context = try allocator.create(LockedNativeToolContext);
+            errdefer allocator.destroy(context);
+            context.* = .{
+                .runtime_set = self,
+                .tool_name = try allocator.dupe(u8, entry.tool_name),
+            };
+            errdefer allocator.free(context.tool_name);
+            return .{
+                .name = entry.tool_name,
+                .description = entry.tool_description,
+                .label = entry.tool_name,
+                .parameters = try tools_common.cloneJsonValue(allocator, parsed_parameters.value),
+                .source = .extension,
+                .execute = lockedNativeAgentToolExecute,
+                .execute_context = context,
+                .deinit_execute_context = deinitLockedNativeToolContext,
+            };
+        }
+        return null;
+    }
+
+    pub fn unloadPackage(self: *LockedNativeRuntimeSet, package_root: []const u8) !bool {
+        var list = std.ArrayList(LockedNativeRuntimeEntry).fromOwnedSlice(self.entries);
+        self.entries = &.{};
+        var retired = std.ArrayList(LockedNativeRuntimeEntry).fromOwnedSlice(self.retired_entries);
+        self.retired_entries = &.{};
+        var removed = false;
+        var index: usize = 0;
+        while (index < list.items.len) {
+            if (!std.mem.eql(u8, list.items[index].package_root, package_root)) {
+                index += 1;
+                continue;
+            }
+            try retired.ensureUnusedCapacity(self.allocator, 1);
+            var entry = list.orderedRemove(index);
+            if (entry.loaded.shutdownAndClose()) |shutdown_status| {
+                if (shutdown_status != 0) {
+                    const message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "phase=shutdown; category=native_shutdown_failed; extension={s}; tool={s}; packageRoot={s}; artifactPath={s}; status={d}; native shutdown failed but unload cleanup completed",
+                        .{ entry.extension_id, entry.tool_name, entry.package_root, entry.artifact_path, shutdown_status },
+                    );
+                    defer self.allocator.free(message);
+                    try self.addDiagnostic("native_shutdown_failed", message, entry.manifest_path);
+                }
+            }
+            retired.appendAssumeCapacity(entry);
+            removed = true;
+        }
+        self.entries = try list.toOwnedSlice(self.allocator);
+        self.retired_entries = try retired.toOwnedSlice(self.allocator);
+        return removed;
+    }
+
+    pub fn addDiagnostic(
+        self: *LockedNativeRuntimeSet,
+        kind: []const u8,
+        message: []const u8,
+        path: []const u8,
+    ) !void {
+        const expanded = try self.allocator.alloc(resources_mod.Diagnostic, self.diagnostics.len + 1);
+        errdefer self.allocator.free(expanded);
+        @memcpy(expanded[0..self.diagnostics.len], self.diagnostics);
+        expanded[self.diagnostics.len] = try makeResourceDiagnostic(self.allocator, kind, message, path);
+        self.allocator.free(self.diagnostics);
+        self.diagnostics = expanded;
+    }
+
+    fn findActiveEntry(self: *LockedNativeRuntimeSet, name: []const u8) ?*LockedNativeRuntimeEntry {
+        for (self.entries) |*entry| {
+            if (std.mem.eql(u8, entry.tool_name, name)) return entry;
+        }
+        return null;
+    }
 };
+
+const LockedNativeToolContext = struct {
+    runtime_set: *LockedNativeRuntimeSet,
+    tool_name: []u8,
+
+    fn deinit(self: *LockedNativeToolContext, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        allocator.destroy(self);
+    }
+};
+
+fn deinitLockedNativeToolContext(allocator: std.mem.Allocator, tool_context: ?*anyopaque) void {
+    const context: *LockedNativeToolContext = @ptrCast(@alignCast(tool_context orelse return));
+    context.deinit(allocator);
+}
+
+fn lockedNativeAgentToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?agent.types.AgentToolUpdateCallback,
+) !agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = signal;
+    _ = on_update_context;
+    _ = on_update;
+    const context: *LockedNativeToolContext = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
+    const entry = context.runtime_set.findActiveEntry(context.tool_name) orelse return error.NativeToolNotRegistered;
+    if (entry.loaded.unloaded) return error.NativeToolNotRegistered;
+
+    const input_json = try std.json.Stringify.valueAlloc(allocator, params, .{});
+    defer allocator.free(input_json);
+    try enforceLockedNativeToolExecution(entry, .{ .turns = 1 });
+    if (input_json.len > native_sdk.MAX_EXECUTE_INPUT_BYTES) {
+        try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", "native_execute_input_too_large", "native execute input exceeded ABI maximum bytes");
+        return lockedNativeErrorResult(allocator, entry, "native_execute_input_too_large", "native execute input exceeded ABI maximum bytes");
+    }
+
+    const result_ptr = entry.loaded.functions.execute.?(input_json.ptr, input_json.len);
+    const result_len = entry.loaded.functions.execute_len.?();
+    const max_output_bytes = @min(
+        entry.resource_limits.output_bytes orelse native_sdk.MAX_EXECUTE_OUTPUT_BYTES,
+        native_sdk.MAX_EXECUTE_OUTPUT_BYTES,
+    );
+    const output_json = native_abi_contract.copyNativeBufferAndRelease(
+        allocator,
+        result_ptr,
+        result_len,
+        max_output_bytes,
+        entry.loaded.functions.free.?,
+    ) catch |err| {
+        const code = switch (err) {
+            error.NativeAbiOutputTooLarge => "native_execute_output_too_large",
+            error.NativeAbiNullBuffer => "native_execute_null_buffer",
+            else => return err,
+        };
+        try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", code, @errorName(err));
+        return lockedNativeErrorResult(allocator, entry, code, @errorName(err));
+    };
+    defer allocator.free(output_json);
+    try enforceLockedNativeToolExecution(entry, .{
+        .output_bytes = output_json.len,
+        .output_lines = countLogicalLines(output_json),
+    });
+
+    return lockedNativeAgentToolResultFromEnvelope(allocator, entry, output_json) catch |err| switch (err) {
+        error.NativeExecuteEnvelopeInvalid => {
+            try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", "native_execute_invalid_envelope", "native execute returned an invalid result envelope");
+            return lockedNativeErrorResult(allocator, entry, "native_execute_invalid_envelope", "native execute returned an invalid result envelope");
+        },
+        else => return err,
+    };
+}
+
+fn enforceLockedNativeToolExecution(entry: *LockedNativeRuntimeEntry, delta: enforcement.UsageDelta) !void {
+    const approved_tool_use = [_]wasm_manifest.Capability{.tool_use};
+    const decision = enforcement.decide(
+        .{
+            .runtime_kind = "native",
+            .extension_id = entry.extension_id,
+            .policy_lookup_key = entry.policy_lookup_key,
+            .package_root = entry.package_root,
+        },
+        .{
+            .approved_grants = approved_tool_use[0..],
+            .resource_limits = entry.resource_limits,
+        },
+        .tool_use,
+        .{ .id = entry.tool_name },
+        .call,
+        "native/dynamic-tool-execute",
+        delta,
+        &entry.accounting,
+    );
+    switch (decision) {
+        .allow => return,
+        .deny => return error.UnsupportedRuntimeCapability,
+    }
+}
+
+fn lockedNativeAgentToolResultFromEnvelope(
+    allocator: std.mem.Allocator,
+    entry: *const LockedNativeRuntimeEntry,
+    output_json: []const u8,
+) !agent.AgentToolResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output_json, .{}) catch return error.NativeExecuteEnvelopeInvalid;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NativeExecuteEnvelopeInvalid;
+    const ok_value = parsed.value.object.get("ok") orelse return error.NativeExecuteEnvelopeInvalid;
+    if (ok_value != .bool) return error.NativeExecuteEnvelopeInvalid;
+    const details = try lockedNativeRuntimeDetailsJson(allocator, entry);
+    errdefer if (details) |value| tools_common.deinitJsonValue(allocator, value);
+    if (ok_value.bool) {
+        const output_value = parsed.value.object.get("output") orelse return error.NativeExecuteEnvelopeInvalid;
+        const output_text = try std.json.Stringify.valueAlloc(allocator, output_value, .{});
+        defer allocator.free(output_text);
+        return .{
+            .content = try tools_common.makeTextContent(allocator, output_text),
+            .details = details,
+        };
+    }
+    return .{
+        .content = try tools_common.makeTextContent(allocator, output_json),
+        .details = details,
+        .is_error = true,
+    };
+}
+
+fn lockedNativeErrorResult(
+    allocator: std.mem.Allocator,
+    entry: *const LockedNativeRuntimeEntry,
+    code: []const u8,
+    message: []const u8,
+) !agent.AgentToolResult {
+    const details = try lockedNativeRuntimeDetailsJson(allocator, entry);
+    errdefer if (details) |value| tools_common.deinitJsonValue(allocator, value);
+    const text = try std.fmt.allocPrint(
+        allocator,
+        "{{\"ok\":false,\"error\":{{\"category\":\"{s}\",\"message\":\"{s}\"}}}}",
+        .{ code, message },
+    );
+    defer allocator.free(text);
+    return .{
+        .content = try tools_common.makeTextContent(allocator, text),
+        .details = details,
+        .is_error = true,
+    };
+}
+
+fn appendLockedNativeExecuteDiagnostic(
+    runtime_set: *LockedNativeRuntimeSet,
+    entry: *const LockedNativeRuntimeEntry,
+    phase: []const u8,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const diagnostic = try std.fmt.allocPrint(
+        runtime_set.allocator,
+        "phase={s}; category={s}; extension={s}; tool={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; requiredPolicy={s}; message={s}",
+        .{
+            phase,
+            code,
+            entry.extension_id,
+            entry.tool_name,
+            entry.package_root,
+            entry.manifest_path,
+            entry.artifact_path,
+            entry.package_root_sha256,
+            entry.artifact_sha256,
+            entry.policy_lookup_key,
+            message,
+        },
+    );
+    defer runtime_set.allocator.free(diagnostic);
+    try runtime_set.addDiagnostic(code, diagnostic, entry.manifest_path);
+}
+
+fn lockedNativeRuntimeDetailsJson(allocator: std.mem.Allocator, entry: *const LockedNativeRuntimeEntry) !?std.json.Value {
+    var runtime_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = runtime_object });
+    try putJsonString(allocator, &runtime_object, "runtimeKind", "native");
+    try putJsonString(allocator, &runtime_object, "extensionId", entry.extension_id);
+    try putJsonString(allocator, &runtime_object, "extensionName", entry.extension_name);
+    try putJsonString(allocator, &runtime_object, "extensionVersion", entry.extension_version);
+    try putJsonString(allocator, &runtime_object, "toolId", entry.tool_name);
+    try putJsonString(allocator, &runtime_object, "packageRoot", entry.package_root);
+    try putJsonString(allocator, &runtime_object, "manifestPath", entry.manifest_path);
+    try putJsonString(allocator, &runtime_object, "artifactPath", entry.artifact_path);
+    try putJsonString(allocator, &runtime_object, "artifactSha256", entry.artifact_sha256);
+    try putJsonString(allocator, &runtime_object, "packageRootSha256", entry.package_root_sha256);
+    try putJsonString(allocator, &runtime_object, "policyLookupKey", entry.policy_lookup_key);
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = root });
+    try root.put(allocator, try allocator.dupe(u8, "extensionRuntime"), .{ .object = runtime_object });
+    return .{ .object = root };
+}
 
 pub fn startLockedWasmPackageRuntimes(
     allocator: std.mem.Allocator,
@@ -783,6 +1088,8 @@ pub fn startLockedNativePackageRuntimesWithLoader(
         };
         const approved_capabilities = try approvedCapabilitiesFromExtensionPolicy(allocator, policy);
         defer allocator.free(approved_capabilities);
+        const allowed_capabilities_json = try nativeCapabilityListJson(allocator, approved_capabilities);
+        defer allocator.free(allowed_capabilities_json);
         if (wasm_manifest.denyFirstUnapprovedCapability(package.manifest.requested_capabilities, approved_capabilities, .initialize, "runtime/native-loader")) |denial| {
             const message = try std.fmt.allocPrint(
                 allocator,
@@ -821,7 +1128,7 @@ pub fn startLockedNativePackageRuntimesWithLoader(
             continue;
         }
 
-        var host_api = native_sdk.HostApiV0{ .abi_version = native_sdk.ABI_VERSION };
+        var host_api = native_sdk.HostApiV0.init(allowed_capabilities_json, null);
         const load_result = loader.load(loader.context, allocator, &package.manifest, &host_api) catch |err| {
             _ = seen_tools.remove(package.manifest.tool_name);
             const message = try std.fmt.allocPrint(
@@ -853,11 +1160,62 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                 continue;
             },
             .loaded => |loaded| {
+                var metadata = parseNativeLoadedToolMetadata(allocator, loaded.functions) catch |err| {
+                    _ = seen_tools.remove(package.manifest.tool_name);
+                    var loaded_for_cleanup = loaded;
+                    loaded_for_cleanup.deinit(allocator);
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "phase=metadata; category=native_metadata_invalid; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; reason={s}; native metadata failed closed before tool registration",
+                        .{
+                            package.manifest.id,
+                            package.manifest.tool_name,
+                            package.source_info.source,
+                            package.lock_entry.scope.jsonName(),
+                            package.manifest.package_root,
+                            package.manifest.manifest_path,
+                            package.manifest.selected_artifact_absolute_path,
+                            package.manifest.package_root_sha256,
+                            package.manifest.selected_artifact_sha256,
+                            @errorName(err),
+                        },
+                    );
+                    defer allocator.free(message);
+                    try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_metadata_invalid", message, package.manifest.manifest_path));
+                    continue;
+                };
+                defer metadata.deinit(allocator);
+                if (!std.mem.eql(u8, metadata.tool_name, package.manifest.tool_name)) {
+                    _ = seen_tools.remove(package.manifest.tool_name);
+                    var loaded_for_cleanup = loaded;
+                    loaded_for_cleanup.deinit(allocator);
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "phase=metadata; category=native_metadata_tool_mismatch; extension={s}; tool={s}; metadataTool={s}; packageRoot={s}; manifestPath={s}; native metadata tool identity changed after ABI validation",
+                        .{ package.manifest.id, package.manifest.tool_name, metadata.tool_name, package.manifest.package_root, package.manifest.manifest_path },
+                    );
+                    defer allocator.free(message);
+                    try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_metadata_tool_mismatch", message, package.manifest.manifest_path));
+                    continue;
+                }
+                var resource_limits = try nativeManifestResourceLimitsToEnforcement(allocator, package.manifest.resource_limits);
+                errdefer deinitEnforcementResourceLimits(allocator, &resource_limits);
+                narrowEnforcementResourceLimits(&resource_limits, enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits));
                 var entry = LockedNativeRuntimeEntry{
                     .package_root = try allocator.dupe(u8, package.manifest.package_root),
                     .manifest_path = try allocator.dupe(u8, package.manifest.manifest_path),
+                    .extension_id = try allocator.dupe(u8, package.manifest.id),
+                    .extension_name = try allocator.dupe(u8, package.manifest.name),
+                    .extension_version = try allocator.dupe(u8, package.manifest.version),
                     .tool_name = try allocator.dupe(u8, package.manifest.tool_name),
+                    .tool_description = try allocator.dupe(u8, metadata.tool_description),
+                    .input_schema_json = try allocator.dupe(u8, metadata.input_schema_json),
+                    .output_schema_json = try allocator.dupe(u8, metadata.output_schema_json),
                     .policy_lookup_key = try allocator.dupe(u8, policy_key),
+                    .artifact_path = try allocator.dupe(u8, package.manifest.selected_artifact_absolute_path),
+                    .artifact_sha256 = try allocator.dupe(u8, package.manifest.selected_artifact_sha256),
+                    .package_root_sha256 = try allocator.dupe(u8, package.manifest.package_root_sha256),
+                    .resource_limits = resource_limits,
                     .loaded = loaded,
                 };
                 errdefer entry.deinit(allocator);
@@ -869,6 +1227,7 @@ pub fn startLockedNativePackageRuntimesWithLoader(
     return .{
         .allocator = allocator,
         .entries = try entries.toOwnedSlice(allocator),
+        .retired_entries = &.{},
         .diagnostics = try diagnostics.toOwnedSlice(allocator),
     };
 }
@@ -905,6 +1264,96 @@ fn nativeLoaderDiagnosticMessage(
     if (diagnostic.actual) |actual| try out.writer.print("; actual={s}", .{actual});
     try out.writer.print("; message={s}", .{diagnostic.message});
     return out.toOwnedSlice();
+}
+
+const NativeLoadedToolMetadata = struct {
+    tool_name: []u8,
+    tool_description: []u8,
+    input_schema_json: []u8,
+    output_schema_json: []u8,
+
+    fn deinit(self: *NativeLoadedToolMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_name);
+        allocator.free(self.tool_description);
+        allocator.free(self.input_schema_json);
+        allocator.free(self.output_schema_json);
+        self.* = undefined;
+    }
+};
+
+fn parseNativeLoadedToolMetadata(
+    allocator: std.mem.Allocator,
+    functions: native_abi_contract.FunctionTable,
+) !NativeLoadedToolMetadata {
+    const metadata_ptr = functions.metadata_ptr orelse return error.NativeMetadataMissing;
+    const metadata_len = functions.metadata_len orelse return error.NativeMetadataMissing;
+    const metadata_json = metadata_ptr()[0..metadata_len()];
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, metadata_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.NativeMetadataInvalid;
+    const tool = parsed.value.object.get("tool") orelse return error.NativeMetadataInvalid;
+    if (tool != .object) return error.NativeMetadataInvalid;
+    const name = jsonString(tool.object, "name") orelse return error.NativeMetadataInvalid;
+    const description = jsonString(tool.object, "description") orelse return error.NativeMetadataInvalid;
+    const input_schema = tool.object.get("inputSchema") orelse return error.NativeMetadataInvalid;
+    if (input_schema != .object) return error.NativeMetadataInvalid;
+    const output_schema = tool.object.get("outputSchema") orelse return error.NativeMetadataInvalid;
+    if (output_schema != .object) return error.NativeMetadataInvalid;
+    const input_schema_json = try std.json.Stringify.valueAlloc(allocator, input_schema, .{});
+    errdefer allocator.free(input_schema_json);
+    const output_schema_json = try std.json.Stringify.valueAlloc(allocator, output_schema, .{});
+    errdefer allocator.free(output_schema_json);
+    return .{
+        .tool_name = try allocator.dupe(u8, name),
+        .tool_description = try allocator.dupe(u8, description),
+        .input_schema_json = input_schema_json,
+        .output_schema_json = output_schema_json,
+    };
+}
+
+fn nativeCapabilityListJson(allocator: std.mem.Allocator, capabilities: []const wasm_manifest.Capability) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("[");
+    for (capabilities, 0..) |capability, index| {
+        if (index > 0) try out.writer.writeAll(",");
+        try std.json.Stringify.value(capability.jsonName(), .{}, &out.writer);
+    }
+    try out.writer.writeAll("]");
+    return allocator.dupe(u8, out.written());
+}
+
+fn nativeManifestResourceLimitsToEnforcement(
+    allocator: std.mem.Allocator,
+    limits: native_manifest.ResourceLimits,
+) !enforcement.ResourceLimits {
+    const tool_scopes = try cloneStringListAsConst(allocator, limits.tool_scopes);
+    errdefer freeConstStringList(allocator, tool_scopes);
+    return .{
+        .timeout_ms = limits.timeout_ms,
+        .output_bytes = limits.output_bytes,
+        .output_lines = limits.output_lines,
+        .tool_scopes = tool_scopes,
+    };
+}
+
+fn cloneStringListAsConst(allocator: std.mem.Allocator, values: []const []u8) ![]const []const u8 {
+    const cloned = try allocator.alloc([]const u8, values.len);
+    errdefer allocator.free(cloned);
+    for (values, 0..) |value, index| {
+        cloned[index] = try allocator.dupe(u8, value);
+        errdefer allocator.free(cloned[index]);
+    }
+    return cloned;
+}
+
+fn narrowEnforcementResourceLimits(base: *enforcement.ResourceLimits, policy: enforcement.ResourceLimits) void {
+    base.max_children = narrowOptionalLimit(policy.max_children, base.max_children);
+    base.depth = narrowOptionalLimit(policy.depth, base.depth);
+    base.turns = narrowOptionalLimit(policy.turns, base.turns);
+    base.timeout_ms = narrowOptionalLimit(policy.timeout_ms, base.timeout_ms);
+    base.output_bytes = narrowOptionalLimit(policy.output_bytes, base.output_bytes);
+    base.output_lines = narrowOptionalLimit(policy.output_lines, base.output_lines);
 }
 
 fn findStaleLockedNativePolicyKey(
@@ -3100,6 +3549,13 @@ fn nativeDynamicHostArch() []const u8 {
     };
 }
 
+fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => 1,
+    };
+}
+
 const CountingNativeLoader = struct {
     calls: usize = 0,
     opened_path: ?[]u8 = null,
@@ -3164,6 +3620,117 @@ fn writeNativeDynamicRuntimePackage(
     defer allocator.free(manifest_json);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest_json });
     return absoluteTmpPath(allocator, &tmp.sub_path, package_dir);
+}
+
+fn writeExecutableNativeDynamicRuntimePackage(
+    allocator: std.mem.Allocator,
+    tmp: anytype,
+    package_dir: []const u8,
+    id: []const u8,
+    name: []const u8,
+    tool_name: []const u8,
+    permissions_json: []const u8,
+    output_bytes: u64,
+    shutdown_status: i32,
+) ![]u8 {
+    const src_dir = try std.fs.path.join(allocator, &.{ package_dir, "src" });
+    defer allocator.free(src_dir);
+    const native_dir = try std.fs.path.join(allocator, &.{ package_dir, "native" });
+    defer allocator.free(native_dir);
+    try tmp.dir.createDirPath(std.testing.io, src_dir);
+    try tmp.dir.createDirPath(std.testing.io, native_dir);
+    const source_sub_path = try std.fs.path.join(allocator, &.{ package_dir, "src", "plugin.zig" });
+    defer allocator.free(source_sub_path);
+    const metadata = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":\"pi-extension.v1\",\"runtime\":\"native\",\"abi\":{{\"name\":\"pi_native_extension_abi_v0\",\"minVersion\":0,\"maxVersion\":0}},\"id\":\"{s}\",\"name\":\"{s}\",\"version\":\"0.1.0\",\"description\":\"Native runtime executable fixture.\",\"tool\":{{\"name\":\"{s}\",\"description\":\"Native executable fixture.\",\"inputSchema\":{{\"type\":\"object\"}},\"outputSchema\":{{\"type\":\"object\"}}}},\"capabilities\":{{\"exports\":[{{\"id\":\"{s}\",\"kind\":\"tool\"}}],\"imports\":[]}}}}",
+        .{ id, name, tool_name, tool_name },
+    );
+    defer allocator.free(metadata);
+    const source = try std.fmt.allocPrint(
+        allocator,
+        \\const std = @import("std");
+        \\const HostApiV0 = extern struct {{
+        \\    abi_version: u32,
+        \\    table_bytes: usize,
+        \\    allowed_capabilities_ptr: ?[*]const u8,
+        \\    allowed_capabilities_len: usize,
+        \\    host_context: ?*anyopaque,
+        \\    reserved: ?*anyopaque,
+        \\}};
+        \\const abi_name = "pi_native_extension_abi_v0";
+        \\const metadata = "{f}";
+        \\const success = "{{\"ok\":true,\"output\":{{\"message\":\"native-ok\"}}}}";
+        \\const failure = "{{\"ok\":false,\"error\":{{\"category\":\"execute_failed\",\"message\":\"native requested failure\"}}}}";
+        \\var output: [512]u8 = undefined;
+        \\var output_len: usize = 0;
+        \\export fn pi_native_extension_abi_version() u32 {{ return 0; }}
+        \\export fn pi_native_extension_abi_name_ptr() [*]const u8 {{ return abi_name.ptr; }}
+        \\export fn pi_native_extension_abi_name_len() usize {{ return abi_name.len; }}
+        \\export fn pi_native_extension_metadata_ptr() [*]const u8 {{ return metadata.ptr; }}
+        \\export fn pi_native_extension_metadata_len() usize {{ return metadata.len; }}
+        \\export fn pi_native_extension_validate() i32 {{ return 0; }}
+        \\export fn pi_native_extension_init(host_api: *const HostApiV0) i32 {{
+        \\    if (host_api.abi_version != 0) return 1;
+        \\    if (host_api.table_bytes < @sizeOf(HostApiV0)) return 2;
+        \\    const ptr = host_api.allowed_capabilities_ptr orelse return 3;
+        \\    const caps = ptr[0..host_api.allowed_capabilities_len];
+        \\    if (std.mem.indexOf(u8, caps, "file.read") == null) return 4;
+        \\    return 0;
+        \\}}
+        \\export fn pi_native_extension_execute(input_ptr: [*]const u8, input_len: usize) [*]const u8 {{
+        \\    const input = input_ptr[0..input_len];
+        \\    const chosen = if (std.mem.indexOf(u8, input, "fail") != null) failure else success;
+        \\    @memcpy(output[0..chosen.len], chosen);
+        \\    output_len = chosen.len;
+        \\    return &output;
+        \\}}
+        \\export fn pi_native_extension_execute_len() usize {{ return output_len; }}
+        \\export fn pi_native_extension_free(_: [*]const u8, _: usize) void {{}}
+        \\export fn pi_native_extension_shutdown() i32 {{ return {d}; }}
+    , .{ std.zig.fmtString(metadata), shutdown_status });
+    defer allocator.free(source);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = source_sub_path, .data = source });
+
+    const package_root = try absoluteTmpPath(allocator, &tmp.sub_path, package_dir);
+    errdefer allocator.free(package_root);
+    const source_path = try std.fs.path.join(allocator, &.{ package_root, "src", "plugin.zig" });
+    defer allocator.free(source_path);
+    const artifact_rel = try std.fs.path.join(allocator, &.{ "native", nativeDynamicArtifactName() });
+    defer allocator.free(artifact_rel);
+    const artifact_path = try std.fs.path.join(allocator, &.{ package_root, artifact_rel });
+    defer allocator.free(artifact_path);
+    const emit_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{artifact_path});
+    defer allocator.free(emit_arg);
+    const build_result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "zig", "build-lib", "-dynamic", "-O", "ReleaseSafe", source_path, emit_arg },
+    });
+    defer allocator.free(build_result.stdout);
+    defer allocator.free(build_result.stderr);
+    if (exitCodeFromTerm(build_result.term) != 0) {
+        std.debug.print("native executable fixture build stdout:\n{s}\nstderr:\n{s}\n", .{ build_result.stdout, build_result.stderr });
+        return error.NativeExecutableFixtureBuildFailed;
+    }
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_dir, "pi-extension.json" });
+    defer allocator.free(manifest_path);
+    const manifest_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "{s}",
+        \\  "name": "{s}",
+        \\  "version": "0.1.0",
+        \\  "description": "Native runtime executable fixture.",
+        \\  "runtime": {{ "kind": "native", "entrypoint": {{ "descriptor": "native://dynamic/{s}" }}, "limits": {{ "timeoutMs": 1000, "outputBytes": {d}, "toolScopes": ["{s}"] }} }},
+        \\  "artifacts": [{{ "kind": "native-dynamic", "os": "{s}", "arch": "{s}", "path": "native/{s}" }}],
+        \\  "tools": [{{ "name": "{s}", "description": "Native executable fixture.", "inputSchema": {{}}, "outputSchema": {{}} }}],
+        \\  "capabilities": {{ "exports": [{{ "id": "{s}", "kind": "tool" }}], "imports": [] }},
+        \\  "permissions": [{s}]
+        \\}}
+    , .{ id, name, id, output_bytes, tool_name, nativeDynamicHostOs(), nativeDynamicHostArch(), nativeDynamicArtifactName(), tool_name, tool_name, permissions_json });
+    defer allocator.free(manifest_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest_json });
+    return package_root;
 }
 
 fn nativePolicyForLockedPackage(
@@ -3870,6 +4437,163 @@ test "native dynamic loader denies capabilities before opening library" {
     try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
     try std.testing.expectEqualStrings("denied_capability", set.diagnostics[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, "before library load") != null);
+}
+
+test "locked native runtime invokes through agent tool path and unload rejects stale handles" {
+    if (native_loader.unsupportedPlatformReasonForTesting()) |_| return;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/executable");
+
+    const package_root = try writeExecutableNativeDynamicRuntimePackage(
+        allocator,
+        tmp,
+        "project/executable",
+        "com.example.native.executable",
+        "Native Executable",
+        "native.executable",
+        "{\"id\":\"file.read\"}",
+        4096,
+        7,
+    );
+    defer allocator.free(package_root);
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    const policy_key = try nativePolicyForLockedPackage(allocator, package_root, .user, lock_path);
+    defer allocator.free(policy_key);
+    const settings_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"extensionPolicies\":{{\"{s}\":{{\"approvedGrants\":[\"file.read\"]}}}}}}",
+        .{policy_key},
+    );
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, package_root) };
+    defer package_config.deinit(allocator);
+    var set = try startLockedNativePackageRuntimes(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+    });
+    defer set.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), set.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), set.diagnostics.len);
+    var tool = (try set.agentTool(allocator, "native.executable")).?;
+    defer deinitAgentTool(allocator, &tool);
+    try std.testing.expectEqualStrings("native.executable", tool.name);
+    try std.testing.expectEqualStrings("Native executable fixture.", tool.description);
+    try std.testing.expectEqualStrings("object", tool.parameters.object.get("type").?.string);
+
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"hello\"}", .{});
+    defer params.deinit();
+    const result = try tool.execute.?(allocator, "native-executable-ok", params.value, tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, result.content);
+    defer if (result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, false), result.is_error);
+    try std.testing.expectEqualStrings("{\"message\":\"native-ok\"}", result.content[0].text.text);
+    try std.testing.expectEqualStrings("native", result.details.?.object.get("extensionRuntime").?.object.get("runtimeKind").?.string);
+    try std.testing.expectEqualStrings(policy_key, result.details.?.object.get("extensionRuntime").?.object.get("policyLookupKey").?.string);
+
+    var fail_params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"fail\"}", .{});
+    defer fail_params.deinit();
+    const failed = try tool.execute.?(allocator, "native-executable-fail", fail_params.value, tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, failed.content);
+    defer if (failed.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), failed.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, failed.content[0].text.text, "execute_failed") != null);
+
+    try std.testing.expect(try set.unloadPackage(package_root));
+    try std.testing.expectEqual(@as(usize, 0), set.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), set.retired_entries.len);
+    try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
+    try std.testing.expectEqualStrings("native_shutdown_failed", set.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, "cleanup completed") != null);
+    try std.testing.expectError(error.NativeToolNotRegistered, tool.execute.?(allocator, "native-stale", params.value, tool.execute_context, null, null, null));
+}
+
+test "locked native runtime enforces execute output byte limits deterministically" {
+    if (native_loader.unsupportedPlatformReasonForTesting()) |_| return;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/limited");
+
+    const package_root = try writeExecutableNativeDynamicRuntimePackage(
+        allocator,
+        tmp,
+        "project/limited",
+        "com.example.native.limited",
+        "Native Limited",
+        "native.limited",
+        "{\"id\":\"file.read\"}",
+        8,
+        0,
+    );
+    defer allocator.free(package_root);
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, project_dir, agent_dir);
+    defer allocator.free(lock_path);
+    const policy_key = try nativePolicyForLockedPackage(allocator, package_root, .user, lock_path);
+    defer allocator.free(policy_key);
+    const settings_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"extensionPolicies\":{{\"{s}\":{{\"approvedGrants\":[\"file.read\"]}}}}}}",
+        .{policy_key},
+    );
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("HOME", home_dir);
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime_config = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime_config.deinit();
+    defer ai.model_registry.resetForTesting();
+
+    var package_config = resources_mod.PackageSourceConfig{ .source = try allocator.dupe(u8, package_root) };
+    defer package_config.deinit(allocator);
+    var set = try startLockedNativePackageRuntimes(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{package_config} },
+    });
+    defer set.deinit();
+
+    var tool = (try set.agentTool(allocator, "native.limited")).?;
+    defer deinitAgentTool(allocator, &tool);
+    var params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"hello\"}", .{});
+    defer params.deinit();
+    const result = try tool.execute.?(allocator, "native-limited", params.value, tool.execute_context, null, null, null);
+    defer tools_common.deinitContentBlocks(allocator, result.content);
+    defer if (result.details) |details| tools_common.deinitJsonValue(allocator, details);
+    try std.testing.expectEqual(@as(?bool, true), result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "native_execute_output_too_large") != null);
+    try std.testing.expectEqual(@as(usize, 1), set.diagnostics.len);
+    try std.testing.expectEqualStrings("native_execute_output_too_large", set.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, set.diagnostics[0].message, "artifactSha256=") != null);
 }
 
 test "native descriptor template executes pure tool and recovers after invalid input" {

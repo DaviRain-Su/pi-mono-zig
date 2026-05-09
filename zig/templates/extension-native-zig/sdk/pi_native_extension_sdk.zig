@@ -15,7 +15,27 @@ pub const TRUSTED_CODE_SECURITY_LIMITATION =
 
 pub const HostApiV0 = extern struct {
     abi_version: u32,
+    table_bytes: usize = @sizeOf(HostApiV0),
+    allowed_capabilities_ptr: ?[*]const u8 = null,
+    allowed_capabilities_len: usize = 0,
+    host_context: ?*anyopaque = null,
     reserved: ?*anyopaque = null,
+
+    pub fn init(allowed_capabilities_json: []const u8, host_context: ?*anyopaque) HostApiV0 {
+        return .{
+            .abi_version = ABI_VERSION,
+            .table_bytes = @sizeOf(HostApiV0),
+            .allowed_capabilities_ptr = if (allowed_capabilities_json.len == 0) null else allowed_capabilities_json.ptr,
+            .allowed_capabilities_len = allowed_capabilities_json.len,
+            .host_context = host_context,
+            .reserved = null,
+        };
+    }
+
+    pub fn allowedCapabilities(self: *const HostApiV0) []const u8 {
+        const ptr_value = self.allowed_capabilities_ptr orelse return "";
+        return ptr_value[0..self.allowed_capabilities_len];
+    }
 };
 
 pub const Metadata = struct {

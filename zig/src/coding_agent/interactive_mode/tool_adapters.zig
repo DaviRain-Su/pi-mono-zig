@@ -26,6 +26,7 @@ pub const BuiltTools = struct {
     allocator: std.mem.Allocator,
     items: []agent.AgentTool,
     locked_wasm_runtimes: ?extension_runtime.LockedWasmRuntimeSet = null,
+    locked_native_runtimes: ?extension_runtime.LockedNativeRuntimeSet = null,
     extension_hosts: []extension_runtime.RuntimeAdapter = &.{},
     startup_diagnostics: []ExtensionStartupDiagnostic = &.{},
     startup_manifest_registry_snapshot: ?[]u8 = null,
@@ -40,6 +41,7 @@ pub const BuiltTools = struct {
         }
         self.allocator.free(self.items);
         if (self.locked_wasm_runtimes) |*runtime_set| runtime_set.deinit();
+        if (self.locked_native_runtimes) |*runtime_set| runtime_set.deinit();
         for (self.extension_hosts) |host| host.deinit();
         if (self.extension_hosts.len > 0) self.allocator.free(self.extension_hosts);
         for (self.startup_diagnostics) |*diagnostic| diagnostic.deinit(self.allocator);
@@ -53,6 +55,7 @@ pub const ToolBuildOptions = struct {
     selected_tools: tool_selection_mod.ToolSelection = .{},
     include_builtin_tools: bool = true,
     include_installed_wasm_tools: bool = true,
+    include_installed_native_tools: bool = true,
     runtime_config: ?*const config_mod.RuntimeConfig = null,
     resource_options: ?resources_mod.ResolveResourcesOptions = null,
     extension_options: ExtensionToolHostOptions = .{},
@@ -102,6 +105,7 @@ pub const ExtensionToolHostOptions = struct {
     start_without_tools: bool = false,
     include_builtin_tools: bool = true,
     include_installed_wasm_tools: bool = true,
+    include_installed_native_tools: bool = true,
     resource_options: ?resources_mod.ResolveResourcesOptions = null,
 };
 
@@ -124,6 +128,7 @@ pub fn buildAgentToolsWithOptions(
     extension_options.runtime_config = options.runtime_config;
     extension_options.include_builtin_tools = options.include_builtin_tools;
     extension_options.include_installed_wasm_tools = options.include_installed_wasm_tools;
+    extension_options.include_installed_native_tools = options.include_installed_native_tools;
     extension_options.resource_options = options.resource_options;
     return buildAgentToolsWithExtensionsSelection(allocator, app_context, options.selected_tools, extension_options);
 }
@@ -178,6 +183,8 @@ pub fn buildAgentToolsWithExtensionsSelection(
     errdefer if (startup_manifest_registry_snapshot) |snapshot| allocator.free(snapshot);
     var locked_wasm_runtimes: ?extension_runtime.LockedWasmRuntimeSet = null;
     errdefer if (locked_wasm_runtimes) |*runtime_set| runtime_set.deinit();
+    var locked_native_runtimes: ?extension_runtime.LockedNativeRuntimeSet = null;
+    errdefer if (locked_native_runtimes) |*runtime_set| runtime_set.deinit();
 
     if (extension_options.include_builtin_tools) {
         try appendToolIfEnabled(allocator, &items, app_context, selection, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
@@ -249,6 +256,20 @@ pub fn buildAgentToolsWithExtensionsSelection(
         }
     }
 
+    if (extension_options.include_installed_native_tools) {
+        if (extension_options.runtime_config) |runtime_config| {
+            if (extension_options.resource_options) |resource_options| {
+                locked_native_runtimes = try extension_runtime.startLockedNativePackageRuntimes(
+                    allocator,
+                    app_context.tool_runtime.io,
+                    runtime_config,
+                    resource_options,
+                );
+                try appendLockedNativeTools(allocator, &items, &locked_native_runtimes.?, selection);
+            }
+        }
+    }
+
     var resolved_extension_options = extension_options;
     if (resolved_extension_options.cwd.len == 0) resolved_extension_options.cwd = app_context.tool_runtime.cwd;
     if (resolved_extension_options.io == null) resolved_extension_options.io = app_context.tool_runtime.io;
@@ -280,6 +301,7 @@ pub fn buildAgentToolsWithExtensionsSelection(
         .allocator = allocator,
         .items = owned_items,
         .locked_wasm_runtimes = locked_wasm_runtimes,
+        .locked_native_runtimes = locked_native_runtimes,
         .extension_hosts = owned_extension_hosts,
         .startup_diagnostics = owned_startup_diagnostics,
         .startup_manifest_registry_snapshot = startup_manifest_registry_snapshot,
@@ -306,6 +328,30 @@ fn appendLockedWasmTools(
             continue;
         }
         var tool = (try runtime_set.agentTool(allocator, entry.tool_id)) orelse continue;
+        errdefer extension_runtime.deinitAgentTool(allocator, &tool);
+        try items.append(allocator, tool);
+    }
+}
+
+fn appendLockedNativeTools(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayList(agent.AgentTool),
+    runtime_set: *extension_runtime.LockedNativeRuntimeSet,
+    selection: tool_selection_mod.ToolSelection,
+) !void {
+    for (runtime_set.entries) |entry| {
+        if (!selection.allowsExtension(entry.tool_name)) continue;
+        if (hasToolName(items.items, entry.tool_name)) {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "phase=tool_construction; tool={s}; packageRoot={s}; installed native tool conflicts with existing provider tool",
+                .{ entry.tool_name, entry.package_root },
+            );
+            defer allocator.free(message);
+            try runtime_set.addDiagnostic("builtin_native_tool_conflict", message, entry.manifest_path);
+            continue;
+        }
+        var tool = (try runtime_set.agentTool(allocator, entry.tool_name)) orelse continue;
         errdefer extension_runtime.deinitAgentTool(allocator, &tool);
         try items.append(allocator, tool);
     }
