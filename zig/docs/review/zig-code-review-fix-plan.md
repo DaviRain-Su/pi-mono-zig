@@ -59,7 +59,10 @@ Based on the systematic review in `zig-code-review.md`.
 - High risk (core streaming logic)
 
 ## B8: Split agent_loop.zig (P1-REVIEW-5)
-- [ ] accumulator.zig, tool_execution.zig, streaming.zig
+- [x] Extracted json_schema.zig (~200 LOC of JSON schema validation)
+- [ ] Extract accumulator.zig (PartialAssistantAccumulator, PartialToolCallBlock, PartialContentBlock)
+- [ ] Extract tool_execution.zig (executeToolCalls, prepareToolCall, parallel execution)
+- [ ] Extract streaming.zig (streamAssistantResponse, streamSimpleForAgentLoop)
 - Depends on B2/B3
 
 ## B9: Split extension_runtime.zig (P2-REVIEW-1)
