@@ -257,13 +257,7 @@ pub fn buildRequestPayload(
         if (stream_options.metadata) |metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "metadata"), try provider_json.cloneValue(allocator, metadata));
         }
-        // B11 migration: read from provider union; fall back to flat field.
-        var mistral_opts: types.MistralStreamOptions = .{};
-        if (stream_options.provider == .mistral) {
-            mistral_opts = stream_options.provider.mistral;
-        } else {
-
-        }
+        const mistral_opts = stream_options.mistralOptions();
         if (mistral_opts.reasoning_effort) |effort| {
             try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, effort) });
         }

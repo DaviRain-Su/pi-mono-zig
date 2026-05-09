@@ -672,6 +672,70 @@ pub const StreamOptions = struct {
     /// union and the legacy flat fields above are populated. New code
     /// should read from this union; the flat fields will be removed.
     provider: ProviderStreamOptions = .none,
+
+    pub fn anthropicOptions(self: StreamOptions) AnthropicStreamOptions {
+        var opts: AnthropicStreamOptions = if (self.provider == .anthropic) self.provider.anthropic else .{};
+        if (opts.thinking_enabled == null) opts.thinking_enabled = self.anthropic_thinking_enabled;
+        if (opts.thinking_budget_tokens == null) opts.thinking_budget_tokens = self.anthropic_thinking_budget_tokens;
+        if (opts.thinking_display == null) opts.thinking_display = self.anthropic_thinking_display;
+        if (opts.effort == null) opts.effort = self.anthropic_effort;
+        if (opts.interleaved_thinking == null) opts.interleaved_thinking = self.anthropic_interleaved_thinking;
+        if (opts.tool_choice == null) opts.tool_choice = self.anthropic_tool_choice;
+        return opts;
+    }
+
+    pub fn azureOptions(self: StreamOptions) AzureStreamOptions {
+        var opts: AzureStreamOptions = if (self.provider == .azure) self.provider.azure else .{};
+        if (opts.api_version == null) opts.api_version = self.azure_api_version;
+        if (opts.resource_name == null) opts.resource_name = self.azure_resource_name;
+        if (opts.base_url == null) opts.base_url = self.azure_base_url;
+        if (opts.deployment_name == null) opts.deployment_name = self.azure_deployment_name;
+        return opts;
+    }
+
+    pub fn bedrockOptions(self: StreamOptions) BedrockStreamOptions {
+        var opts: BedrockStreamOptions = if (self.provider == .bedrock) self.provider.bedrock else .{};
+        if (opts.region == null) opts.region = self.bedrock_region;
+        if (opts.profile == null) opts.profile = self.bedrock_profile;
+        if (opts.bearer_token == null) opts.bearer_token = self.bedrock_bearer_token;
+        if (opts.tool_choice == null) opts.tool_choice = self.bedrock_tool_choice;
+        if (opts.reasoning == null) opts.reasoning = self.bedrock_reasoning;
+        if (opts.thinking_budgets == null) opts.thinking_budgets = self.bedrock_thinking_budgets;
+        if (opts.interleaved_thinking == null) opts.interleaved_thinking = self.bedrock_interleaved_thinking;
+        if (opts.thinking_display == null) opts.thinking_display = self.bedrock_thinking_display;
+        if (opts.request_metadata == null) opts.request_metadata = self.bedrock_request_metadata;
+        return opts;
+    }
+
+    pub fn googleOptions(self: StreamOptions) GoogleStreamOptions {
+        var opts: GoogleStreamOptions = if (self.provider == .google) self.provider.google else .{};
+        if (opts.tool_choice == null) opts.tool_choice = self.google_tool_choice;
+        if (opts.thinking == null) opts.thinking = self.google_thinking;
+        return opts;
+    }
+
+    pub fn mistralOptions(self: StreamOptions) MistralStreamOptions {
+        var opts: MistralStreamOptions = if (self.provider == .mistral) self.provider.mistral else .{};
+        if (opts.prompt_mode == null) opts.prompt_mode = self.mistral_prompt_mode;
+        if (opts.reasoning_effort == null) opts.reasoning_effort = self.mistral_reasoning_effort;
+        return opts;
+    }
+
+    pub fn openaiOptions(self: StreamOptions) OpenAIChatStreamOptions {
+        var opts: OpenAIChatStreamOptions = if (self.provider == .openai) self.provider.openai else .{};
+        if (opts.tool_choice == null) opts.tool_choice = self.openai_tool_choice;
+        if (opts.reasoning_effort == null) opts.reasoning_effort = self.openai_reasoning_effort;
+        return opts;
+    }
+
+    pub fn responsesOptions(self: StreamOptions) ResponsesStreamOptions {
+        var opts: ResponsesStreamOptions = if (self.provider == .responses) self.provider.responses else .{};
+        if (opts.reasoning_effort == null) opts.reasoning_effort = self.responses_reasoning_effort;
+        if (opts.reasoning_summary == null) opts.reasoning_summary = self.responses_reasoning_summary;
+        if (opts.service_tier == null) opts.service_tier = self.responses_service_tier;
+        if (opts.text_verbosity == null) opts.text_verbosity = self.responses_text_verbosity;
+        return opts;
+    }
 };
 
 pub const SimpleStreamOptions = struct {

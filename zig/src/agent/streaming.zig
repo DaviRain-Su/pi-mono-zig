@@ -191,6 +191,22 @@ fn emitPartialMessageUpdate(
     assistant_message_event: ai.AssistantMessageEvent,
     partial_accumulator: *accumulator.PartialAssistantAccumulator,
 ) !void {
+    if ((assistant_message_event.event_type == .toolcall_start or
+        assistant_message_event.event_type == .toolcall_delta or
+        assistant_message_event.event_type == .toolcall_end) and
+        partial_accumulator.hasOnlyLeadingToolCall())
+    {
+        var partial_message = template;
+        partial_message.content = &[_]ai.ContentBlock{};
+        partial_message.tool_calls = null;
+        try emit(emit_context, .{
+            .event_type = .message_update,
+            .message = .{ .assistant = partial_message },
+            .assistant_message_event = assistant_message_event,
+        });
+        return;
+    }
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
