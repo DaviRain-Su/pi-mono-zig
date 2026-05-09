@@ -95,6 +95,8 @@ test "zig extension template layout uses only public sdk boundary names" {
         try expectNotContains(bytes, "Review");
         try expectNotContains(bytes, "marketplace");
         try expectNotContains(bytes, "remoteWasm");
+        try expectNotContains(bytes, "webSimulator");
+        try expectNotContains(bytes, "native-dynamic");
     }
 
     const main_zig = try readRepoFile(allocator, TEMPLATE_ROOT ++ "/src/main.zig");
@@ -126,6 +128,7 @@ test "zig extension template builds standalone and validates reproducibly" {
     defer allocator.free(package_root);
 
     try runTemplateBuild(allocator, package_root);
+    try runTemplateTests(allocator, package_root);
     const first_manifest_bytes = try readAbsoluteFile(allocator, package_root, wasm_manifest.MANIFEST_FILE_NAME);
     defer allocator.free(first_manifest_bytes);
     var first_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, package_root);
@@ -168,6 +171,18 @@ test "zig sdk template validation rejects dynamic native and product surfaces" {
     );
     defer product_result.deinit(allocator);
     try expectInvalid(&product_result, "$.workflowPreset", "unsupported v0 trust/product surface");
+
+    var web_simulator_result = try wasm_manifest.validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example.web-simulator","name":"Web Simulator","version":"0.1.0","description":"Rejected","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"web.tool","description":"Rejected","inputSchema":{},"outputSchema":{}},"capabilities":[],"webSimulator":{"enabled":true}}
+    );
+    defer web_simulator_result.deinit(allocator);
+    try expectInvalid(&web_simulator_result, "$.webSimulator", "unsupported v0 trust/product surface");
+
+    var slash_commands_result = try wasm_manifest.validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example.slash-command","name":"Slash Command","version":"0.1.0","description":"Rejected","artifact":{"kind":"wasm-component","path":"wasm/plugin.wasm"},"tool":{"id":"slash.tool","description":"Rejected","inputSchema":{},"outputSchema":{"metadata":{"slashCommands":["/run"]}}},"capabilities":[]}
+    );
+    defer slash_commands_result.deinit(allocator);
+    try expectInvalid(&slash_commands_result, "$.tool.outputSchema.metadata.slashCommands", "unsupported v0 trust/product surface");
 }
 
 fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype) ![]u8 {
@@ -200,6 +215,19 @@ fn runTemplateBuild(allocator: std.mem.Allocator, package_root: []const u8) !voi
     if (exitCodeFromTerm(result.term) != 0) {
         std.debug.print("zig build stdout:\n{s}\nzig build stderr:\n{s}\n", .{ result.stdout, result.stderr });
         return error.TemplateBuildFailed;
+    }
+}
+
+fn runTemplateTests(allocator: std.mem.Allocator, package_root: []const u8) !void {
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "zig", "build", "-p", ".", "test" },
+        .cwd = .{ .path = package_root },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (exitCodeFromTerm(result.term) != 0) {
+        std.debug.print("zig build test stdout:\n{s}\nzig build test stderr:\n{s}\n", .{ result.stdout, result.stderr });
+        return error.TemplateTestsFailed;
     }
 }
 

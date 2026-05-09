@@ -452,10 +452,14 @@ const unsupported_trust_product_fields = [_][]const u8{
     "signature",
     "signing",
     "publisher",
+    "publisherIdentity",
     "marketplace",
+    "registry",
+    "registryUrl",
     "approvalUi",
     "approvalPolicy",
     "remoteUrl",
+    "remote",
     "remoteWasmUrl",
     "workflow",
     "workflowPreset",
@@ -465,6 +469,11 @@ const unsupported_trust_product_fields = [_][]const u8{
     "qaPreset",
     "review",
     "reviewPreset",
+    "webSimulator",
+    "webSimulatorPreset",
+    "web-simulator",
+    "productUi",
+    "productUI",
     "spawn",
     "spawnPolicy",
     "automaticSpawn",
@@ -473,6 +482,7 @@ const unsupported_trust_product_fields = [_][]const u8{
     "ui",
     "ux",
     "slashCommand",
+    "slashCommands",
 };
 
 fn unsupportedTrustProductSurfaceDiagnostic(
@@ -1687,6 +1697,52 @@ test "wasm manifest rejects zero multiple and non-tool declarations" {
     try expectInvalid(&nested_trust_surface, "$.tool.outputSchema.metadata.publisher", "unsupported v0 trust/product surface");
 }
 
+test "wasm manifest rejects product web simulator trust and remote surfaces" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const package_root = try makeValidPackage(allocator, tmp);
+    defer allocator.free(package_root);
+
+    const cases = [_]struct {
+        field: []const u8,
+        expected_path: []const u8,
+    }{
+        .{ .field = "webSimulator", .expected_path = "$.webSimulator" },
+        .{ .field = "webSimulatorPreset", .expected_path = "$.webSimulatorPreset" },
+        .{ .field = "web-simulator", .expected_path = "$.web-simulator" },
+        .{ .field = "productUi", .expected_path = "$.productUi" },
+        .{ .field = "marketplace", .expected_path = "$.marketplace" },
+        .{ .field = "signing", .expected_path = "$.signing" },
+        .{ .field = "publisherIdentity", .expected_path = "$.publisherIdentity" },
+        .{ .field = "registryUrl", .expected_path = "$.registryUrl" },
+        .{ .field = "remoteUrl", .expected_path = "$.remoteUrl" },
+        .{ .field = "remoteWasmUrl", .expected_path = "$.remoteWasmUrl" },
+        .{ .field = "workflow", .expected_path = "$.workflow" },
+        .{ .field = "wiki", .expected_path = "$.wiki" },
+        .{ .field = "qa", .expected_path = "$.qa" },
+        .{ .field = "review", .expected_path = "$.review" },
+        .{ .field = "slashCommands", .expected_path = "$.slashCommands" },
+    };
+
+    for (cases) |case| {
+        const manifest_text = try std.fmt.allocPrint(allocator,
+            \\{{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Rejected product surface","artifact":{{"kind":"wasm-component","path":"wasm/example-tool.wasm"}},"tool":{{"id":"example.tool","description":"Tool","inputSchema":{{}},"outputSchema":{{}}}},"capabilities":[],"{s}":{{}}}}
+        , .{case.field});
+        defer allocator.free(manifest_text);
+
+        var result = try validateManifestText(allocator, package_root, manifest_text);
+        defer result.deinit(allocator);
+        try expectInvalid(&result, case.expected_path, "unsupported v0 trust/product surface");
+    }
+
+    var nested_web_simulator = try validateManifestText(allocator, package_root,
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Nested product surface","artifact":{"kind":"wasm-component","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{"metadata":{"webSimulator":{}}},"outputSchema":{}},"capabilities":[]}
+    );
+    defer nested_web_simulator.deinit(allocator);
+    try expectInvalid(&nested_web_simulator, "$.tool.inputSchema.metadata.webSimulator", "unsupported v0 trust/product surface");
+}
+
 test "wasm manifest validates artifact kind and constrained paths before load success" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1695,10 +1751,10 @@ test "wasm manifest validates artifact kind and constrained paths before load su
     defer allocator.free(package_root);
 
     var wrong_kind = try validateManifestText(allocator, package_root,
-        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Wrong kind","artifact":{"kind":"native-library","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[]}
+        \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Wrong kind","artifact":{"kind":"native-dynamic","path":"wasm/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[]}
     );
     defer wrong_kind.deinit(allocator);
-    try expectInvalid(&wrong_kind, "$.artifact.kind", "unsupported artifact kind \"native-library\"; expected wasm-component");
+    try expectInvalid(&wrong_kind, "$.artifact.kind", "unsupported artifact kind \"native-dynamic\"; expected wasm-component");
 
     var absolute_path = try validateManifestText(allocator, package_root,
         \\{"schemaVersion":"pi-extension.v0","id":"com.example","name":"Example","version":"0.1.0","description":"Absolute path","artifact":{"kind":"wasm-component","path":"/tmp/example-tool.wasm"},"tool":{"id":"example.tool","description":"Tool","inputSchema":{},"outputSchema":{}},"capabilities":[]}
