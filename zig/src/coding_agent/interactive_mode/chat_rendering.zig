@@ -430,8 +430,8 @@ pub fn estimateItemRowsVisible(item: ChatItem, width: usize, all_expanded: bool)
 fn estimateItemRowsFull(item: ChatItem, width: usize, all_expanded: bool) usize {
     const item_text = displayText(item, all_expanded);
     return switch (item.kind) {
-        .assistant => 1 + estimateWrappedRows(item_text, width) + 8,
-        .markdown => estimateWrappedRows(item_text, width) + 8,
+        .assistant => 1 + estimateWrappedRows(item_text, width),
+        .markdown => estimateWrappedRows(item_text, width),
         .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item_text, width - 2)),
         else => estimateWrappedRows(item_text, width),
     };
