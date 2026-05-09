@@ -164,6 +164,11 @@ pub const NativeOptions = struct {
     resource_limits: ?NativeResourceLimits = null,
     policy_lookup_key: ?[]const u8 = null,
     host_effects: ?*NativeHostEffects = null,
+    /// Optional dynamic library handle kept open for descriptors loaded from
+    /// shared objects. NativeRuntime takes ownership only after successful
+    /// start; callers remain responsible for closing it when start returns an
+    /// error before ownership transfer.
+    dyn_lib: ?std.DynLib = null,
 };
 
 pub const NativeHostEffects = struct {
@@ -607,6 +612,8 @@ pub const NativeRuntime = struct {
     /// manifest (e.g. by native_extension_loader). Deinit frees this memory.
     owned_descriptor: ?*NativeDescriptor = null,
     owned_descriptor_allocator: ?std.mem.Allocator = null,
+    /// Dynamic library handle loaded by native_extension_loader. Closed on deinit.
+    dyn_lib: ?std.DynLib = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
@@ -631,6 +638,7 @@ pub const NativeRuntime = struct {
             .host_effects = options.host_effects,
             .tool_bindings = tool_bindings,
             .unloaded = false,
+            .dyn_lib = null,
         };
         for (runtime.tool_bindings, options.descriptor.tools) |*binding, *tool| {
             binding.* = .{
@@ -644,6 +652,7 @@ pub const NativeRuntime = struct {
         var api = NativeHostApi{ .runtime = runtime };
         try options.descriptor.start(&api);
         if (!runtime.state.ready_seen) return error.HostNotReady;
+        runtime.dyn_lib = options.dyn_lib;
         return runtime;
     }
 
@@ -803,6 +812,7 @@ pub const NativeRuntime = struct {
         self.cleanupForUnload();
         self.state.deinit();
         self.allocator.free(self.tool_bindings);
+        if (self.dyn_lib) |*dyn_lib| dyn_lib.close();
         if (owned) |desc| {
             if (owned_allocator) |alloc| {
                 freeOwnedNativeDescriptor(alloc, desc);

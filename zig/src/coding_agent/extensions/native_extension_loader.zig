@@ -2,6 +2,7 @@ const std = @import("std");
 const extension_manifest = @import("extension_manifest.zig");
 const extension_runtime = @import("extension_runtime.zig");
 const native_runtime = @import("native_runtime.zig");
+const native_loader = @import("native_loader.zig");
 const capability = @import("capability.zig");
 
 /// Load a native extension from a parsed manifest and return a RuntimeAdapter.
@@ -14,15 +15,28 @@ pub fn loadNativeFromManifest(
     approved_capabilities: []const capability.Capability,
     policy_lookup_key: ?[]const u8,
 ) !extension_runtime.RuntimeAdapter {
-    var descriptor = try buildNativeDescriptor(allocator, manifest);
-    errdefer freeOwnedDescriptor(allocator, &descriptor);
+    const build_result = try buildNativeDescriptor(allocator, manifest);
+    var descriptor_value = build_result.descriptor;
+    var descriptor_value_owned = true;
+    errdefer if (descriptor_value_owned) freeOwnedDescriptor(allocator, &descriptor_value);
+
+    const descriptor = try allocator.create(native_runtime.NativeDescriptor);
+    errdefer allocator.destroy(descriptor);
+    descriptor.* = descriptor_value;
+    descriptor_value_owned = false;
+    errdefer freeOwnedDescriptor(allocator, descriptor);
+
+    var dyn_lib = build_result.dyn_lib;
+    errdefer if (dyn_lib) |*lib| lib.close();
 
     const runtime = try native_runtime.NativeRuntime.start(allocator, io, .{
-        .descriptor = &descriptor,
+        .descriptor = descriptor,
         .approved_capabilities = approved_capabilities,
         .policy_lookup_key = policy_lookup_key,
+        .dyn_lib = dyn_lib,
     });
-    runtime.owned_descriptor = &descriptor;
+    dyn_lib = null;
+    runtime.owned_descriptor = descriptor;
     runtime.owned_descriptor_allocator = allocator;
 
     return .{
@@ -32,10 +46,15 @@ pub fn loadNativeFromManifest(
     };
 }
 
+const DescriptorBuildResult = struct {
+    descriptor: native_runtime.NativeDescriptor,
+    dyn_lib: ?std.DynLib,
+};
+
 fn buildNativeDescriptor(
     allocator: std.mem.Allocator,
     manifest: extension_manifest.NormalizedManifest,
-) !native_runtime.NativeDescriptor {
+) !DescriptorBuildResult {
     const id = try allocator.dupe(u8, manifest.id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, manifest.name);
@@ -64,6 +83,7 @@ fn buildNativeDescriptor(
 
     var dynamic_library_path: ?[]const u8 = null;
     var start_fn: native_runtime.NativeStartFn = native_runtime.defaultNativeStart;
+    var dyn_lib: ?std.DynLib = null;
     if (manifest.runtime_entrypoint == .object) {
         if (manifest.runtime_entrypoint.object.get("dynamic_library_path")) |dl| {
             if (dl == .string and dl.string.len > 0) {
@@ -71,28 +91,53 @@ fn buildNativeDescriptor(
                 errdefer allocator.free(abs_path);
                 dynamic_library_path = abs_path;
 
-                const handle = std.c.dlopen(try allocator.dupeZ(u8, abs_path), .{ .NOW = true });
-                if (handle) |h| {
-                    const sym = std.c.dlsym(h, "pi_extension_start");
-                    if (sym) |s| {
-                        start_fn = @ptrCast(@alignCast(s));
-                    }
+                var lib = native_loader.NativeLibrary.open(abs_path) catch {
+                    // Library not found or cannot be opened; leave dyn_lib null
+                    // and fall back to defaultNativeStart (which will fail at
+                    // runtime if tools need dynamic execution).
+                    return .{
+                        .descriptor = .{
+                            .id = id,
+                            .name = name,
+                            .version = version,
+                            .description = description,
+                            .tools = tools,
+                            .hooks = hooks,
+                            .requested_capabilities = caps,
+                            .resource_limits = limits,
+                            .dynamic_library_path = dynamic_library_path,
+                            .start = start_fn,
+                        },
+                        .dyn_lib = null,
+                    };
+                };
+                errdefer lib.close();
+
+                // Prefer the canonical pi_extension_descriptor symbol.
+                if (lib.lookupDescriptor()) |desc_ptr| {
+                    start_fn = desc_ptr.start;
+                } else if (lib.lookupStartFn()) |sf| {
+                    start_fn = sf;
                 }
+                dyn_lib = lib.dyn_lib;
             }
         }
     }
 
     return .{
-        .id = id,
-        .name = name,
-        .version = version,
-        .description = description,
-        .tools = tools,
-        .hooks = hooks,
-        .requested_capabilities = caps,
-        .resource_limits = limits,
-        .dynamic_library_path = dynamic_library_path,
-        .start = start_fn,
+        .descriptor = .{
+            .id = id,
+            .name = name,
+            .version = version,
+            .description = description,
+            .tools = tools,
+            .hooks = hooks,
+            .requested_capabilities = caps,
+            .resource_limits = limits,
+            .dynamic_library_path = dynamic_library_path,
+            .start = start_fn,
+        },
+        .dyn_lib = dyn_lib,
     };
 }
 
@@ -263,4 +308,23 @@ fn jsonU64(value: std.json.Value) ?u64 {
 fn jsonStringifyField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ?[]u8 {
     const value = obj.get(key) orelse return null;
     return std.json.Stringify.valueAlloc(allocator, value, .{}) catch null;
+}
+
+test "buildNativeDescriptor with missing dynamic_library_path falls back gracefully" {
+    const allocator = std.testing.allocator;
+    const manifest_text =
+        \\{"schemaVersion":"pi-extension.v1","id":"com.pi.native-dl","name":"Native DL","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"dynamic_library_path":"libnonexistent.dylib"}},"tools":[{"name":"native.dl.tool","description":"DL tool","inputSchema":{"type":"object"}}]}
+    ;
+    var result = try extension_manifest.parseManifestText(allocator, "/tmp/pkg", "/tmp/pkg/pi-extension.json", manifest_text);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .valid);
+
+    var build_result = try buildNativeDescriptor(allocator, result.valid);
+    defer freeOwnedDescriptor(allocator, &build_result.descriptor);
+    if (build_result.dyn_lib) |*lib| lib.close();
+
+    try std.testing.expectEqualStrings("com.pi.native-dl", build_result.descriptor.id);
+    try std.testing.expect(build_result.descriptor.dynamic_library_path != null);
+    try std.testing.expectEqualStrings("/tmp/pkg/libnonexistent.dylib", build_result.descriptor.dynamic_library_path.?);
+    try std.testing.expect(build_result.dyn_lib == null);
 }
