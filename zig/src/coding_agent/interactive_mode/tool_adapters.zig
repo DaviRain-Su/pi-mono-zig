@@ -15,6 +15,7 @@ const system_prompt_mod = @import("../resources/system_prompt.zig");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const shared = @import("shared.zig");
+const subagent = @import("../extensions/subagent.zig");
 const tool_selection_mod = @import("../tool_selection.zig");
 
 const AppContext = shared.AppContext;
@@ -184,6 +185,52 @@ pub fn buildAgentToolsWithExtensionsSelection(
         try appendToolIfEnabled(allocator, &items, app_context, selection, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
         try appendToolIfEnabled(allocator, &items, app_context, selection, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
         try appendToolIfEnabled(allocator, &items, app_context, selection, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
+
+        // Load built-in native extensions (subagent)
+        if (selection.hasAllowlist() and selection.allowsExtension(subagent.subagent_descriptor.tools[0].name)) {
+            const subagent_host = extension_runtime.startNative(allocator, app_context.tool_runtime.io, .{
+                .descriptor = &subagent.subagent_descriptor,
+                .approved_capabilities = &.{ .shell_run, .file_read, .env_read },
+            }) catch |err| blk: {
+                const message = try std.fmt.allocPrint(allocator, "built-in subagent extension startup failed: {s}", .{@errorName(err)});
+                defer allocator.free(message);
+                try startup_diagnostics.append(allocator, .{
+                    .severity = .warning,
+                    .phase = try allocator.dupe(u8, "startup"),
+                    .extension_id = try allocator.dupe(u8, subagent.subagent_descriptor.id),
+                    .extension_path = try allocator.dupe(u8, "native://subagent"),
+                    .source_path = try allocator.dupe(u8, "native://subagent"),
+                    .message = message,
+                });
+                break :blk null;
+            };
+            if (subagent_host) |host| {
+                var host_owned = true;
+                errdefer if (host_owned) host.deinit();
+
+                host.waitForReady(5000) catch |err| {
+                    const message = try std.fmt.allocPrint(allocator, "built-in subagent extension ready timeout: {s}", .{@errorName(err)});
+                    defer allocator.free(message);
+                    try startup_diagnostics.append(allocator, .{
+                        .severity = .warning,
+                        .phase = try allocator.dupe(u8, "startup"),
+                        .extension_id = try allocator.dupe(u8, subagent.subagent_descriptor.id),
+                        .extension_path = try allocator.dupe(u8, "native://subagent"),
+                        .source_path = try allocator.dupe(u8, "native://subagent"),
+                        .message = message,
+                    });
+                    host.deinit();
+                    host_owned = false;
+                };
+                if (host_owned) {
+                    if (try host.agentTool(allocator, subagent.subagent_descriptor.tools[0].name)) |tool| {
+                        try items.append(allocator, tool);
+                    }
+                    try extension_hosts.append(allocator, host);
+                    host_owned = false;
+                }
+            }
+        }
     }
 
     if (extension_options.include_installed_wasm_tools) {

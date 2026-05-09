@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai = @import("ai");
 const agent = @import("agent");
 const native_process = @import("native_process.zig");
 const capability = @import("capability.zig");
@@ -146,17 +147,9 @@ pub fn resultJson(allocator: std.mem.Allocator, value: std.json.Value) !agent.Ag
     return resultText(allocator, out.written());
 }
 
-fn makeTextContent(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
-    var array = try std.json.Array.init(allocator, 1);
-    errdefer array.deinit(allocator);
-    array.items[0] = .{
-        .object = blk: {
-            var obj = try std.json.ObjectMap.init(allocator, 1, 1);
-            errdefer obj.deinit(allocator);
-            try obj.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
-            try obj.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
-            break :blk obj;
-        },
-    };
-    return .{ .array = array };
+fn makeTextContent(allocator: std.mem.Allocator, text: []const u8) ![]const ai.ContentBlock {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    errdefer allocator.free(blocks);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return blocks;
 }
