@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent = @import("agent");
+const sandbox = ai.shared.sandbox;
 const string_utils = ai.shared.string_utils;
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
@@ -182,7 +183,7 @@ pub const NativeHostEffects = struct {
 
     fn ensureSandboxPath(self: NativeHostEffects, path: []const u8) !void {
         const root = self.sandbox_root orelse return;
-        if (isPathWithinSandbox(root, path)) return;
+        if (sandbox.isPathWithinSandbox(root, path)) return;
         return error.NativeHostSandboxDenied;
     }
 
@@ -211,28 +212,6 @@ pub const NativeHostEffects = struct {
             self.agent_delegations;
     }
 };
-
-fn isPathWithinSandbox(root: []const u8, path: []const u8) bool {
-    if (root.len == 0) return false;
-    if (std.mem.eql(u8, root, path)) return true;
-    if (!std.mem.startsWith(u8, path, root)) return false;
-    const suffix_start = if (root[root.len - 1] == std.fs.path.sep)
-        root.len
-    else blk: {
-        if (path.len <= root.len or path[root.len] != std.fs.path.sep) return false;
-        break :blk root.len + 1;
-    };
-    return isSafeRelativePathSuffix(path[suffix_start..]);
-}
-
-fn isSafeRelativePathSuffix(suffix: []const u8) bool {
-    var components = std.mem.splitScalar(u8, suffix, std.fs.path.sep);
-    while (components.next()) |component| {
-        if (component.len == 0) return false;
-        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
-}
 
 fn nativeResourceLimitsToEnforcement(limits: NativeResourceLimits) enforcement.ResourceLimits {
     return .{
@@ -1039,15 +1018,6 @@ fn makeNativeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relati
 }
 
 test "native sandbox boundary rejects lexical escapes and sibling prefixes" {
-    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox"));
-    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/read.txt"));
-    try std.testing.expect(isPathWithinSandbox("/tmp/native-sandbox/", "/tmp/native-sandbox/read.txt"));
-    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/../outside.txt"));
-    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/sub/../../outside.txt"));
-    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox/./inside.txt"));
-    try std.testing.expect(!isPathWithinSandbox("/tmp/native-sandbox", "/tmp/native-sandbox-sibling/read.txt"));
-    try std.testing.expect(!isPathWithinSandbox("", "/tmp/native-sandbox/read.txt"));
-
     var effects = NativeHostEffects{ .sandbox_root = "/tmp/native-sandbox" };
     try effects.recordFileRead("/tmp/native-sandbox/read.txt");
     try std.testing.expectError(error.NativeHostSandboxDenied, effects.recordFileRead("/tmp/native-sandbox/../outside.txt"));

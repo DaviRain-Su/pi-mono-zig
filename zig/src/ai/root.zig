@@ -23,6 +23,7 @@ pub const shared = struct {
     pub const provider_json = @import("shared/provider_json.zig");
     pub const provider_stream = @import("shared/provider_stream.zig");
     pub const responses_api = @import("shared/responses_api.zig");
+    pub const sandbox = @import("shared/sandbox.zig");
     pub const simple_options = @import("shared/simple_options.zig");
     pub const sse_loop = @import("shared/sse_loop.zig");
     pub const stop_reason = @import("shared/stop_reason.zig");

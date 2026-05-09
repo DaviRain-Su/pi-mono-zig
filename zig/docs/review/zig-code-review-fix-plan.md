@@ -34,9 +34,12 @@ Based on the systematic review in `zig-code-review.md`.
 - DONE - signatures unified, no more error unions for stop reason mapping
 
 ## B5: Extract isPathWithinSandbox to shared (P2-REVIEW-2)
-- [ ] Only in native_runtime.zig now (extension_protocol.zig no longer has it)
-- [ ] Move to shared/sandbox.zig or shared/path_utils.zig
-- Low risk
+- [x] Created `ai/shared/sandbox.zig` with `isPathWithinSandbox` and `isSafeRelativePathSuffix`
+- [x] Exported via `ai.shared.sandbox` in `ai/root.zig`
+- [x] Removed local functions and tests from `native_runtime.zig`
+- [x] Updated `ensureSandboxPath` to use `sandbox.isPathWithinSandbox`
+- [x] Tests moved to shared module with broader coverage
+- DONE
 
 ## B6: Fix page_allocator usage (P1-REVIEW-1, P1-REVIEW-2)
 - [x] agent.zig `promptTextWithImages`: changed from `page_allocator` to `self.allocator`
