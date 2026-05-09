@@ -908,6 +908,9 @@ fn validateUnifiedExtensionPackageForInstall(
             });
             accepted = false;
         }
+        if (record.manifest.runtime_kind == .native) {
+            if (try packageNativeLibraryMissing(allocator, io, record, stderr)) accepted = false;
+        }
         if (try packageHasDeniedPermissions(allocator, record, stderr)) accepted = false;
         if (try packageHasUnapprovedRequestedPermissions(allocator, record, effective_settings, is_project, stderr)) accepted = false;
     }
@@ -934,6 +937,27 @@ fn writeUnifiedInstallDiagnostic(stderr: *std.Io.Writer, diagnostic: extension_m
         diagnostic.path,
         diagnostic.message,
     });
+}
+
+fn packageNativeLibraryMissing(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record: extension_manifest.ManifestRecord,
+    stderr: *std.Io.Writer,
+) !bool {
+    const entrypoint = record.manifest.runtime_entrypoint;
+    if (entrypoint != .object) return false;
+    const dl = entrypoint.object.get("dynamic_library_path") orelse return false;
+    if (dl != .string or dl.string.len == 0) return false;
+    const lib_path = try std.fs.path.join(allocator, &.{ record.manifest.package_root, dl.string });
+    defer allocator.free(lib_path);
+    if (pathExists(io, lib_path)) return false;
+    try stderr.print("Error: {s}: install.native_library_missing: dynamic library \"{s}\" not found for package \"{s}\"\n", .{
+        record.manifest.manifest_path,
+        lib_path,
+        record.manifest.id,
+    });
+    return true;
 }
 
 fn packageHasDeniedPermissions(
