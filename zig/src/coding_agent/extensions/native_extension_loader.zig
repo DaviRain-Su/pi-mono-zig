@@ -48,7 +48,7 @@ pub fn loadNativeFromManifest(
 
 const DescriptorBuildResult = struct {
     descriptor: native_runtime.NativeDescriptor,
-    dyn_lib: ?std.DynLib,
+    dyn_lib: ?native_loader.NativeLibrary,
 };
 
 fn buildNativeDescriptor(
@@ -83,7 +83,7 @@ fn buildNativeDescriptor(
 
     var dynamic_library_path: ?[]const u8 = null;
     var start_fn: native_runtime.NativeStartFn = native_runtime.defaultNativeStart;
-    var dyn_lib: ?std.DynLib = null;
+    var dyn_lib: ?native_loader.NativeLibrary = null;
     if (manifest.runtime_entrypoint == .object) {
         if (manifest.runtime_entrypoint.object.get("dynamic_library_path")) |dl| {
             if (dl == .string and dl.string.len > 0) {
@@ -119,7 +119,7 @@ fn buildNativeDescriptor(
                 } else if (lib.lookupStartFn()) |sf| {
                     start_fn = sf;
                 }
-                dyn_lib = lib.dyn_lib;
+                dyn_lib = lib;
             }
         }
     }
