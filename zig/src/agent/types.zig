@@ -1,6 +1,13 @@
 const std = @import("std");
 const ai = @import("ai");
 
+pub const AgentLoopError = error{
+    MissingAssistantResult,
+    PartialContentOutOfOrder,
+    PartialContentIndexReused,
+    ToolCallAlreadyFinalized,
+};
+
 pub const AgentMessage = ai.Message;
 pub const AgentToolCall = ai.ToolCall;
 pub const ToolResultMessage = ai.types.ToolResultMessage;

@@ -4,6 +4,7 @@ const agent = @import("agent");
 const tools = @import("../tools/root.zig");
 const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
+const capability = @import("../extensions/capability.zig");
 const enforcement = @import("../extensions/enforcement.zig");
 const extension_manifest = @import("../extensions/extension_manifest.zig");
 const extension_registry = @import("../extensions/extension_registry.zig");
@@ -16,6 +17,7 @@ const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const shared = @import("shared.zig");
 const subagent = @import("../extensions/subagent.zig");
+const native_extension_loader = @import("../extensions/native_extension_loader.zig");
 const tool_selection_mod = @import("../tool_selection.zig");
 
 const AppContext = shared.AppContext;
@@ -497,6 +499,42 @@ fn appendExtensionTools(
     }
 }
 
+fn tryLoadNativeExtension(
+    allocator: std.mem.Allocator,
+    options: ExtensionToolHostOptions,
+    extension: resources_mod.LoadedExtension,
+    approved_capabilities: []const capability.Capability,
+    policy_lookup_key: ?[]const u8,
+) !?extension_runtime.RuntimeAdapter {
+    const manifest_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(extension.path) orelse ".", "pi-extension.json" });
+    defer allocator.free(manifest_path);
+
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), options.io.?, manifest_path, allocator, .limited(256 * 1024)) catch return null;
+    defer allocator.free(manifest_text);
+
+    const manifest_result = try extension_manifest.parseManifestText(allocator, std.fs.path.dirname(manifest_path) orelse ".", manifest_path, manifest_text);
+    if (manifest_result != .valid) {
+        var result = manifest_result;
+        result.deinit(allocator);
+        return null;
+    }
+    defer {
+        var result = manifest_result;
+        result.deinit(allocator);
+    }
+
+    if (manifest_result.valid.runtime_kind != .native) return null;
+
+    const host = try native_extension_loader.loadNativeFromManifest(
+        allocator,
+        options.io.?,
+        manifest_result.valid,
+        approved_capabilities,
+        policy_lookup_key,
+    );
+    return host;
+}
+
 fn appendSingleExtensionTools(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(agent.AgentTool),
@@ -521,6 +559,80 @@ fn appendSingleExtensionTools(
             policy.reason,
         );
         if (policy.required) required_startup_failed.* = true;
+        return;
+    }
+
+    // Try manifest-based native loading first
+    const maybe_native_host = tryLoadNativeExtension(allocator, options, extension, policy.approved_capabilities, policy.policy_key) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        // Native load failed for non-OOM reasons; fall through to process_jsonl.
+        break :blk null;
+    };
+    if (maybe_native_host) |host| {
+        var host_owned = true;
+        errdefer if (host_owned) host.deinit();
+
+        host.waitForReady(policy.startup_timeout_ms) catch |err| {
+            const message = try std.fmt.allocPrint(
+                allocator,
+                "native extension startup timed out or failed before ready after {d}ms: {s}",
+                .{ policy.startup_timeout_ms, @errorName(err) },
+            );
+            defer allocator.free(message);
+            try appendExtensionStartupDiagnostic(
+                allocator,
+                startup_diagnostics,
+                .@"error",
+                "startup",
+                extension,
+                policy.policy_key,
+                policy.required,
+                message,
+            );
+            host.deinit();
+            host_owned = false;
+            if (policy.required) required_startup_failed.* = true;
+            return;
+        };
+
+        drainExtensionRegistryFrames(host, options.env_map, options.io.?);
+        try appendHostDiagnostics(
+            allocator,
+            startup_diagnostics,
+            host,
+            extension,
+            policy.policy_key,
+            policy.required,
+        );
+
+        var names = ToolNameCollector{ .allocator = allocator };
+        defer names.deinit();
+        try host.withRegistry(&names, collectToolNames);
+
+        for (names.items.items) |name| {
+            if (!selection.allowsExtension(name)) continue;
+            if (hasActiveExtensionToolName(items.items, name)) {
+                const message = try std.fmt.allocPrint(allocator, "duplicate extension tool name skipped: {s}", .{name});
+                defer allocator.free(message);
+                try appendExtensionStartupDiagnostic(
+                    allocator,
+                    startup_diagnostics,
+                    .warning,
+                    "registry",
+                    extension,
+                    policy.policy_key,
+                    policy.required,
+                    message,
+                );
+                continue;
+            }
+            if (try host.agentTool(allocator, name)) |tool| {
+                try items.append(allocator, tool);
+            }
+        }
+
+        try extension_hosts.append(allocator, host);
+        host_owned = false;
         return;
     }
 

@@ -524,11 +524,6 @@ pub fn runInteractiveMode(
         }
         try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
 
-        // NOTE: screen/overlay resource pointers are rebound after input
-        // handling (see below), because auth/logout/settings flows can call
-        // live_resources.reload() during dispatchInputEvent(), which frees
-        // the previous ResourceBundle and its Theme instances.
-
         if (should_exit and !prompt_worker_active) break;
 
         const background_render_active = prompt_worker_active or app_state.user_bash_task.isActive();

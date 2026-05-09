@@ -1300,21 +1300,7 @@ fn exchangeAnthropicAuthorizationCode(
 
     const code = parsed.code orelse return error.MissingAuthorizationCode;
 
-    var payload = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    defer {
-        const cleanup_value: std.json.Value = .{ .object = payload };
-        common.deinitJsonValue(allocator, cleanup_value);
-    }
-
-    try payload.put(allocator, try allocator.dupe(u8, "grant_type"), .{ .string = try allocator.dupe(u8, "authorization_code") });
-    try payload.put(allocator, try allocator.dupe(u8, "client_id"), .{ .string = try allocator.dupe(u8, session.oauth_client.client_id) });
-    try payload.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, code) });
-    try payload.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, session.verifier) });
-    try payload.put(allocator, try allocator.dupe(u8, "redirect_uri"), .{ .string = try allocator.dupe(u8, ANTHROPIC_REDIRECT_URI) });
-    try payload.put(allocator, try allocator.dupe(u8, "code_verifier"), .{ .string = try allocator.dupe(u8, session.verifier) });
-
-    const payload_value: std.json.Value = .{ .object = payload };
-    const json_body = try std.json.Stringify.valueAlloc(allocator, payload_value, .{});
+    const json_body = try buildAnthropicTokenExchangeBody(allocator, session, code);
     defer allocator.free(json_body);
 
     const response_body = try postJson(allocator, io, ANTHROPIC_TOKEN_URL, json_body, null);
@@ -1333,6 +1319,38 @@ fn exchangeAnthropicAuthorizationCode(
         .refresh = try allocator.dupe(u8, refresh_token),
         .expires = computeExpiresAtMs(expires_in, io),
     };
+}
+
+fn writeJsonStringField(writer: *std.Io.Writer, first: *bool, comptime name: []const u8, value: []const u8) !void {
+    if (first.*) {
+        first.* = false;
+    } else {
+        try writer.writeByte(',');
+    }
+    try writer.print("\"{s}\":", .{name});
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn buildAnthropicTokenExchangeBody(
+    allocator: std.mem.Allocator,
+    session: *const BrowserLoginSession,
+    code: []const u8,
+) ![]u8 {
+    var body_writer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer body_writer.deinit();
+
+    const writer = &body_writer.writer;
+    try writer.writeByte('{');
+    var first = true;
+    try writeJsonStringField(writer, &first, "grant_type", "authorization_code");
+    try writeJsonStringField(writer, &first, "client_id", session.oauth_client.client_id);
+    try writeJsonStringField(writer, &first, "code", code);
+    try writeJsonStringField(writer, &first, "state", session.verifier);
+    try writeJsonStringField(writer, &first, "redirect_uri", ANTHROPIC_REDIRECT_URI);
+    try writeJsonStringField(writer, &first, "code_verifier", session.verifier);
+    try writer.writeByte('}');
+
+    return try body_writer.toOwnedSlice();
 }
 
 fn exchangeOpenAICodexAuthorizationCode(
@@ -2237,6 +2255,38 @@ test "loadOAuthClientCredentials falls back to public Anthropic client id for in
     defer credentials.deinit(allocator);
 
     try std.testing.expectEqualStrings(DEFAULT_ANTHROPIC_CLIENT_ID, credentials.client_id);
+}
+
+test "buildAnthropicTokenExchangeBody owns no intermediate JSON object allocations" {
+    const allocator = std.testing.allocator;
+
+    var session = BrowserLoginSession{
+        .kind = .anthropic,
+        .provider_id = "anthropic",
+        .provider_name = "Anthropic",
+        .oauth_client = .{
+            .client_id = try allocator.dupe(u8, "client-\"id"),
+            .client_secret = null,
+        },
+        .auth_url = try allocator.dupe(u8, "https://example.test/auth"),
+        .verifier = try allocator.dupe(u8, "verifier\\value"),
+        .state = try allocator.dupe(u8, "state"),
+    };
+    defer session.deinit(allocator);
+
+    const body = try buildAnthropicTokenExchangeBody(allocator, &session, "code\nvalue");
+    defer allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(.object, std.meta.activeTag(parsed.value));
+    try std.testing.expectEqualStrings("authorization_code", parsed.value.object.get("grant_type").?.string);
+    try std.testing.expectEqualStrings("client-\"id", parsed.value.object.get("client_id").?.string);
+    try std.testing.expectEqualStrings("code\nvalue", parsed.value.object.get("code").?.string);
+    try std.testing.expectEqualStrings("verifier\\value", parsed.value.object.get("state").?.string);
+    try std.testing.expectEqualStrings(ANTHROPIC_REDIRECT_URI, parsed.value.object.get("redirect_uri").?.string);
+    try std.testing.expectEqualStrings("verifier\\value", parsed.value.object.get("code_verifier").?.string);
 }
 
 test "parseAuthorizationInput accepts full callback URLs with fragments and quotes" {

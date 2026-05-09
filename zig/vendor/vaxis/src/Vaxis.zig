@@ -206,6 +206,7 @@ pub fn resize(
     // every cell
     self.screen_last.deinit(alloc);
     self.screen_last = try InternalScreen.init(alloc, winsize.cols, winsize.rows);
+    self.refresh = true;
     if (self.state.alt_screen)
         try tty.writeAll(ctlseqs.home)
     else {

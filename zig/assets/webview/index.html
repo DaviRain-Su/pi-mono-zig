@@ -165,7 +165,10 @@
         if (assistant.delta) {
           appendBlock("event", `${frame.sequence} ${frame.type}`, assistant.delta);
         } else if (frame.terminal) {
-          appendBlock("event", `${frame.sequence} terminal`, frame.terminalOutcome || "done");
+          const terminalText = frame.error
+            ? `${frame.terminalOutcome || "done"}: ${frame.error}`
+            : frame.terminalOutcome || "done";
+          appendBlock("event", `${frame.sequence} terminal`, terminalText);
         } else {
           appendBlock("event", `${frame.sequence} ${frame.type}`, event.type || "");
         }

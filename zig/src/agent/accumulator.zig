@@ -1,29 +1,29 @@
 const std = @import("std");
 const ai = @import("ai");
 const types = @import("types.zig");
-const agent = @import("agent.zig");
+const content_clone = @import("content_clone.zig");
 const agent_loop = @import("agent_loop.zig");
 
 /// Accumulates partial content blocks (text, thinking, tool_call) from a
 /// streaming assistant response. Deltas are applied in order; explicit
 /// content indices may be sparse but must not be reused after end.
-const PartialToolCallBlock = struct {
+pub const PartialToolCallBlock = struct {
     arguments: std.ArrayList(u8) = .empty,
     final_tool_call: ?ai.ToolCall = null,
 
-    fn deinit(self: *PartialToolCallBlock, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PartialToolCallBlock, allocator: std.mem.Allocator) void {
         self.arguments.deinit(allocator);
-        if (self.final_tool_call) |tool_call| agent.deinitToolCall(allocator, tool_call);
+        if (self.final_tool_call) |tool_call| content_clone.deinitToolCall(allocator, tool_call);
         self.* = undefined;
     }
 
-    fn appendDelta(self: *PartialToolCallBlock, allocator: std.mem.Allocator, delta: []const u8) !void {
+    pub fn appendDelta(self: *PartialToolCallBlock, allocator: std.mem.Allocator, delta: []const u8) !void {
         try self.arguments.appendSlice(allocator, delta);
     }
 
-    fn setFinal(self: *PartialToolCallBlock, allocator: std.mem.Allocator, tool_call: ai.ToolCall) !void {
-        const cloned = try agent.cloneToolCall(allocator, tool_call);
-        if (self.final_tool_call) |existing| agent.deinitToolCall(allocator, existing);
+    pub fn setFinal(self: *PartialToolCallBlock, allocator: std.mem.Allocator, tool_call: ai.ToolCall) !void {
+        const cloned = try content_clone.cloneToolCall(allocator, tool_call);
+        if (self.final_tool_call) |existing| content_clone.deinitToolCall(allocator, existing);
         self.final_tool_call = cloned;
     }
 };
@@ -69,11 +69,11 @@ pub const PartialAssistantAccumulator = struct {
             const requested: usize = @intCast(content_index);
             if (requested < self.index_map.items.len) {
                 if (self.index_map.items[requested]) |mapped| {
-                    if (self.isEnded(mapped)) return agent_loop.AgentLoopError.PartialContentIndexReused;
+                    if (self.isEnded(mapped)) return types.AgentLoopError.PartialContentIndexReused;
                     return mapped;
                 }
             }
-            if (!allow_new_explicit_index) return agent_loop.AgentLoopError.PartialContentOutOfOrder;
+            if (!allow_new_explicit_index) return types.AgentLoopError.PartialContentOutOfOrder;
             while (self.index_map.items.len <= requested) {
                 try self.index_map.append(self.allocator, null);
             }

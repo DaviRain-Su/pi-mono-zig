@@ -138,6 +138,10 @@ pub fn runWebViewMode(
     );
     try stderr.flush();
 
+    var smoke_faux_registration: ?ai.providers.faux.FauxProviderRegistration = null;
+    defer if (smoke_faux_registration) |registration| registration.unregister();
+    try configureFauxWebViewSmokeFixtures(allocator, env_map, options.provider, &smoke_faux_registration);
+
     var bridge = webview_bridge.BridgeHost.init(.{
         .cwd = options.cwd,
         .trusted_asset_root = asset.asset_root,
@@ -156,6 +160,15 @@ pub fn runWebViewMode(
 
     if (env_map.get("PI_WEBVIEW_SMOKE_PROMPT")) |prompt_text| {
         try runBridgeSmokePrompt(allocator, &bridge, prompt_text, stdout);
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_PROVIDER_ERROR_PROMPT")) |prompt_text| {
+        try runBridgeSmokeProviderError(allocator, &bridge, prompt_text, stdout);
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_ABORT_PROMPT")) |prompt_text| {
+        try runBridgeSmokeAbortFlow(allocator, &bridge, prompt_text, stdout);
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_CLOSE_PROMPT")) |prompt_text| {
+        try runBridgeSmokeCloseFlow(allocator, &bridge, prompt_text, stdout);
     }
 
     const exit_code = try runNativeWebView(allocator, env_map, asset.asset_path, &bridge, stderr);
@@ -327,6 +340,215 @@ fn runBridgeSmokePrompt(
     try writeBridgeSmokeResponse(allocator, bridge, "prompt", prompt_request.written(), stdout);
 
     try writeBridgeSmokeResponse(allocator, bridge, "messages_after", "{\"id\":\"smoke-messages-after\",\"command\":\"get_messages\"}", stdout);
+}
+
+fn runBridgeSmokeProviderError(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    prompt_text: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    try writeBridgeSmokeResponse(allocator, bridge, "state", "{\"id\":\"smoke-error-state\",\"command\":\"get_state\"}", stdout);
+    var prompt_request: std.Io.Writer.Allocating = .init(allocator);
+    defer prompt_request.deinit();
+    try prompt_request.writer.writeAll("{\"id\":\"smoke-error-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":");
+    try writeJsonString(allocator, &prompt_request.writer, prompt_text);
+    try prompt_request.writer.writeAll("}}");
+    try writeBridgeSmokeResponse(allocator, bridge, "provider_error", prompt_request.written(), stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "state_after_error", "{\"id\":\"smoke-error-state-after\",\"command\":\"get_state\"}", stdout);
+}
+
+fn runBridgeSmokeAbortFlow(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    prompt_text: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    var prompt_request: std.Io.Writer.Allocating = .init(allocator);
+    defer prompt_request.deinit();
+    try prompt_request.writer.writeAll("{\"id\":\"smoke-abort-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":");
+    try writeJsonString(allocator, &prompt_request.writer, prompt_text);
+    try prompt_request.writer.writeAll("}}");
+
+    var thread_result = BridgeSmokeThreadResult{};
+    const prompt_request_owned = try allocator.dupe(u8, prompt_request.written());
+    defer allocator.free(prompt_request_owned);
+    const prompt_thread = try std.Thread.spawn(.{}, runBridgeSmokePromptThread, .{ bridge, prompt_request_owned, &thread_result });
+    while (!bridge.active_generation.load(.seq_cst)) {
+        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(10), .awake) catch {};
+    }
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .awake) catch {};
+
+    try writeBridgeSmokeResponse(allocator, bridge, "abort", "{\"id\":\"smoke-abort\",\"command\":\"abort\"}", stdout);
+    prompt_thread.join();
+    if (thread_result.err) |err| return err;
+    const prompt_response = thread_result.response orelse return error.WebViewSmokePromptMissingResponse;
+    defer std.heap.c_allocator.free(prompt_response);
+    try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label=aborted_prompt response={s}\n", .{prompt_response});
+
+    try writeBridgeSmokeResponse(
+        allocator,
+        bridge,
+        "retry_after_abort",
+        "{\"id\":\"smoke-retry\",\"command\":\"prompt\",\"payload\":{\"text\":\"retry after abort\"}}",
+        stdout,
+    );
+    try writeBridgeSmokeResponse(allocator, bridge, "state_after_abort_retry", "{\"id\":\"smoke-abort-state-after\",\"command\":\"get_state\"}", stdout);
+}
+
+fn runBridgeSmokeCloseFlow(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    prompt_text: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    var prompt_request: std.Io.Writer.Allocating = .init(allocator);
+    defer prompt_request.deinit();
+    try prompt_request.writer.writeAll("{\"id\":\"smoke-close-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":");
+    try writeJsonString(allocator, &prompt_request.writer, prompt_text);
+    try prompt_request.writer.writeAll("}}");
+
+    var thread_result = BridgeSmokeThreadResult{};
+    const prompt_request_owned = try allocator.dupe(u8, prompt_request.written());
+    defer allocator.free(prompt_request_owned);
+    const prompt_thread = try std.Thread.spawn(.{}, runBridgeSmokePromptThread, .{ bridge, prompt_request_owned, &thread_result });
+    while (!bridge.active_generation.load(.seq_cst)) {
+        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(10), .awake) catch {};
+    }
+    std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .awake) catch {};
+    const aborted = bridge.closeAndAbortActiveWork();
+    try stdout.print(
+        "PI_WEBVIEW_CLOSE_DURING_ACTIVE aborted={s} active_before_join={s}\n",
+        .{ boolText(aborted), boolText(bridge.active_generation.load(.seq_cst)) },
+    );
+    prompt_thread.join();
+    if (thread_result.err) |err| return err;
+    const prompt_response = thread_result.response orelse return error.WebViewSmokePromptMissingResponse;
+    defer std.heap.c_allocator.free(prompt_response);
+    try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label=closed_prompt response={s}\n", .{prompt_response});
+    try stdout.print("PI_WEBVIEW_CLOSE_CLEANUP active_after_join={s}\n", .{boolText(bridge.active_generation.load(.seq_cst))});
+}
+
+const BridgeSmokeThreadResult = struct {
+    response: ?[]u8 = null,
+    err: ?anyerror = null,
+};
+
+fn runBridgeSmokePromptThread(
+    bridge: *webview_bridge.BridgeHost,
+    request_json: []const u8,
+    result: *BridgeSmokeThreadResult,
+) void {
+    result.response = bridge.handleRequestJson(
+        std.heap.c_allocator,
+        request_json,
+        webview_bridge.trusted_bundle_origin,
+    ) catch |err| {
+        result.err = err;
+        return;
+    };
+}
+
+fn configureFauxWebViewSmokeFixtures(
+    allocator: std.mem.Allocator,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    registration_out: *?ai.providers.faux.FauxProviderRegistration,
+) !void {
+    if (!std.mem.eql(u8, provider, "faux")) return;
+    if (env_map.get("PI_WEBVIEW_SMOKE_ABORT_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+            .tokens_per_second = 5,
+            .token_size = .{ .min = 1, .max = 1 },
+        });
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewSlowSmokeFactory },
+            .{ .factory = webViewRetrySmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_CLOSE_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+            .tokens_per_second = 5,
+            .token_size = .{ .min = 1, .max = 1 },
+        });
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewSlowSmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_PROVIDER_ERROR_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewProviderErrorSmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewSuccessSmokeFactory },
+        });
+        registration_out.* = registration;
+    }
+}
+
+fn webViewSuccessSmokeFactory(
+    allocator: std.mem.Allocator,
+    _: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("faux WebView smoke response");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn webViewSlowSmokeFactory(
+    allocator: std.mem.Allocator,
+    _: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn webViewRetrySmokeFactory(
+    allocator: std.mem.Allocator,
+    _: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("retry after abort succeeded");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn webViewProviderErrorSmokeFactory(
+    allocator: std.mem.Allocator,
+    _: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("partial before faux provider error");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{
+        .stop_reason = .error_reason,
+        .error_message = "faux provider error for WebView smoke",
+    });
 }
 
 fn writeBridgeSmokeResponse(

@@ -428,6 +428,7 @@ fn isBuiltinFlagName(name: []const u8) bool {
         "resume",
         "fork",
         "print",
+        "webview",
         "provider",
         "model",
         "models",
@@ -634,7 +635,8 @@ test "loadFromExtensionPaths diagnoses built-in and extension flag collisions" {
         .data =
         \\{ "flags": [
         \\  { "name": "plan", "type": "boolean" },
-        \\  { "name": "model", "type": "string" }
+        \\  { "name": "model", "type": "string" },
+        \\  { "name": "webview", "type": "boolean" }
         \\] }
         ,
     });
@@ -666,9 +668,11 @@ test "loadFromExtensionPaths diagnoses built-in and extension flag collisions" {
     var result = try applyUnknownFlags(allocator, &registry, &.{});
     defer result.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), result.values.len);
-    try std.testing.expectEqual(@as(usize, 2), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 3), result.diagnostics.len);
     try std.testing.expectEqualStrings("extension_flag.builtin_collision", result.diagnostics[0].code);
-    try std.testing.expectEqualStrings("extension_flag.owner_collision", result.diagnostics[1].code);
+    try std.testing.expectEqualStrings("extension_flag.builtin_collision", result.diagnostics[1].code);
+    try std.testing.expectEqualStrings("extension_flag.owner_collision", result.diagnostics[2].code);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "collides with a built-in option") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[1].message, "collides with another extension flag owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[1].message, "--webview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[2].message, "collides with another extension flag owner") != null);
 }

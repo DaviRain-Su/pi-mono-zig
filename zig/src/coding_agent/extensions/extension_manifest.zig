@@ -599,13 +599,25 @@ fn validateRuntimeEntrypoint(
             if (entrypoint != .object) {
                 return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.expected_object", "native entrypoint must be an object");
             }
-            const descriptor = entrypoint.object.get("descriptor") orelse
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.descriptor", "manifest.missing_required_field", "missing required field");
-            if (descriptor != .string or descriptor.string.len == 0) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.descriptor", "manifest.expected_string", "expected non-empty string");
+            const has_descriptor = entrypoint.object.get("descriptor") != null;
+            const has_dynamic_library = entrypoint.object.get("dynamic_library_path") != null;
+            if (!has_descriptor and !has_dynamic_library) {
+                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.missing_required_field", "native entrypoint must have either descriptor or dynamic_library_path");
             }
-            if (entrypoint.object.get("library_path") != null or entrypoint.object.get("dynamic_library_path") != null or entrypoint.object.get("remote_url") != null) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.forbidden_native_entrypoint_field", "native manifests must use an approved static descriptor entrypoint");
+            if (has_descriptor) {
+                const descriptor = entrypoint.object.get("descriptor").?;
+                if (descriptor != .string or descriptor.string.len == 0) {
+                    return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.descriptor", "manifest.expected_string", "expected non-empty string");
+                }
+            }
+            if (has_dynamic_library) {
+                const dynamic_library_path = entrypoint.object.get("dynamic_library_path").?;
+                if (dynamic_library_path != .string or dynamic_library_path.string.len == 0) {
+                    return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.dynamic_library_path", "manifest.expected_string", "expected non-empty string");
+                }
+            }
+            if (entrypoint.object.get("library_path") != null or entrypoint.object.get("remote_url") != null) {
+                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.forbidden_native_entrypoint_field", "native manifests must use an approved static descriptor or dynamic_library_path entrypoint");
             }
             return null;
         },
@@ -2609,7 +2621,7 @@ test "unified manifest validates runtime-specific entrypoint matrix" {
         .{ .text = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"ts\",\"name\":\"TS\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"typescript\",\"entrypoint\":\"src/index.txt\"}}", .path = "$.runtime.entrypoint" },
         .{ .text = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"proc\",\"name\":\"Proc\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"process_jsonl\",\"entrypoint\":{\"argv\":[]}}}", .path = "$.runtime.entrypoint.argv" },
         .{ .text = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"wasm\",\"name\":\"Wasm\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"wasm\",\"entrypoint\":{\"artifactPath\":\"/tmp/plugin.wasm\"}}}", .path = "$.runtime.entrypoint.artifactPath" },
-        .{ .text = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"native\",\"name\":\"Native\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"native\",\"entrypoint\":{\"library_path\":\"lib.so\"}}}", .path = "$.runtime.entrypoint.descriptor" },
+        .{ .text = "{\"schemaVersion\":\"pi-extension.v1\",\"id\":\"native\",\"name\":\"Native\",\"version\":\"1.0.0\",\"runtime\":{\"kind\":\"native\",\"entrypoint\":{\"library_path\":\"lib.so\"}}}", .path = "$.runtime.entrypoint" },
     };
     for (invalid_cases) |case| {
         var result = try parseManifestText(allocator, "/tmp/pkg", "/tmp/pkg/pi-extension.json", case.text);

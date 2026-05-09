@@ -136,7 +136,6 @@ pub const NativeDescriptor = struct {
 
     const forbidden_fields = &[_][]const u8{
         "library_path",
-        "dynamic_library_path",
         "executable_command",
         "process_command",
         "remote_url",
@@ -604,6 +603,10 @@ pub const NativeRuntime = struct {
     host_effects: ?*NativeHostEffects,
     tool_bindings: []NativeToolBinding,
     unloaded: bool,
+    /// If non-null, points to a heap-allocated descriptor that was built from a
+    /// manifest (e.g. by native_extension_loader). Deinit frees this memory.
+    owned_descriptor: ?*NativeDescriptor = null,
+    owned_descriptor_allocator: ?std.mem.Allocator = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);
@@ -795,9 +798,17 @@ pub const NativeRuntime = struct {
     }
 
     pub fn deinit(self: *NativeRuntime) void {
+        const owned = self.owned_descriptor;
+        const owned_allocator = self.owned_descriptor_allocator;
         self.cleanupForUnload();
         self.state.deinit();
         self.allocator.free(self.tool_bindings);
+        if (owned) |desc| {
+            if (owned_allocator) |alloc| {
+                freeOwnedNativeDescriptor(alloc, desc);
+                alloc.destroy(desc);
+            }
+        }
         self.allocator.destroy(self);
     }
 
@@ -813,7 +824,7 @@ pub const NativeRuntime = struct {
     }
 };
 
-fn defaultNativeStart(api: *NativeHostApi) !void {
+pub fn defaultNativeStart(api: *NativeHostApi) !void {
     try api.ready();
     for (api.runtime.descriptor.tools) |tool| {
         try api.registerTool(tool);
@@ -902,6 +913,31 @@ fn invalidNativeInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentT
         allocator,
         "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
     ) };
+}
+
+/// Free all memory owned by a heap-allocated NativeDescriptor that was built
+/// from a manifest (e.g. by native_extension_loader).
+pub fn freeOwnedNativeDescriptor(allocator: std.mem.Allocator, descriptor: *NativeDescriptor) void {
+    for (descriptor.tools) |*tool| {
+        allocator.free(tool.name);
+        allocator.free(tool.label);
+        allocator.free(tool.description);
+        allocator.free(tool.input_schema_json);
+        if (tool.output_schema_json) |s| allocator.free(s);
+        allocator.free(tool.extension_path);
+    }
+    allocator.free(descriptor.tools);
+    for (descriptor.hooks) |*hook| {
+        allocator.free(hook.event_name);
+        allocator.free(hook.extension_path);
+    }
+    allocator.free(descriptor.hooks);
+    allocator.free(descriptor.requested_capabilities);
+    allocator.free(descriptor.id);
+    allocator.free(descriptor.name);
+    allocator.free(descriptor.version);
+    allocator.free(descriptor.description);
+    if (descriptor.dynamic_library_path) |p| allocator.free(p);
 }
 
 // Host API vtable functions — bridge opaque context to NativeHostApi methods.

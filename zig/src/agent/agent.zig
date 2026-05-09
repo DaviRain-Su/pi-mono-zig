@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const agent_loop = @import("agent_loop.zig");
+const content_clone = @import("content_clone.zig");
 const provider_json = ai.provider_json;
 const types = @import("types.zig");
 
@@ -630,8 +631,8 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
         .user => |user| blk: {
             const role = try allocator.dupe(u8, user.role);
             errdefer allocator.free(role);
-            const content = try cloneContentBlocks(allocator, user.content);
-            errdefer deinitContentBlocks(allocator, content);
+            const content = try content_clone.cloneContentBlocks(allocator, user.content);
+            errdefer content_clone.deinitContentBlocks(allocator, content);
 
             break :blk .{ .user = .{
                 .role = role,
@@ -642,8 +643,8 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
         .assistant => |assistant| blk: {
             const role = try allocator.dupe(u8, assistant.role);
             errdefer allocator.free(role);
-            const content = try cloneContentBlocks(allocator, assistant.content);
-            errdefer deinitContentBlocks(allocator, content);
+            const content = try content_clone.cloneContentBlocks(allocator, assistant.content);
+            errdefer content_clone.deinitContentBlocks(allocator, content);
             const tool_calls = if (assistant.tool_calls) |calls| try cloneToolCalls(allocator, calls) else null;
             errdefer if (tool_calls) |calls| deinitToolCalls(allocator, calls);
             const api = try allocator.dupe(u8, assistant.api);
@@ -678,8 +679,8 @@ pub fn cloneMessage(allocator: std.mem.Allocator, message: types.AgentMessage) !
             errdefer allocator.free(tool_call_id);
             const tool_name = try allocator.dupe(u8, tool_result.tool_name);
             errdefer allocator.free(tool_name);
-            const content = try cloneContentBlocks(allocator, tool_result.content);
-            errdefer deinitContentBlocks(allocator, content);
+            const content = try content_clone.cloneContentBlocks(allocator, tool_result.content);
+            errdefer content_clone.deinitContentBlocks(allocator, content);
             const details = if (tool_result.details) |value| try provider_json.cloneValue(allocator, value) else null;
             errdefer if (details) |value| provider_json.freeValue(allocator, value);
 
@@ -700,11 +701,13 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage)
     switch (message.*) {
         .user => |*user| {
             allocator.free(user.role);
-            deinitContentBlocks(allocator, user.content);
+            content_clone.deinitContentBlocks(allocator, user.content);
+            allocator.free(user.content);
         },
         .assistant => |*assistant| {
             allocator.free(assistant.role);
-            deinitContentBlocks(allocator, assistant.content);
+            content_clone.deinitContentBlocks(allocator, assistant.content);
+            allocator.free(assistant.content);
             if (assistant.tool_calls) |tool_calls| deinitToolCalls(allocator, tool_calls);
             allocator.free(assistant.api);
             allocator.free(assistant.provider);
@@ -716,7 +719,8 @@ pub fn deinitMessage(allocator: std.mem.Allocator, message: *types.AgentMessage)
             allocator.free(tool_result.role);
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
-            deinitContentBlocks(allocator, tool_result.content);
+            content_clone.deinitContentBlocks(allocator, tool_result.content);
+            allocator.free(tool_result.content);
             if (tool_result.details) |details| provider_json.freeValue(allocator, details);
         },
     }
@@ -743,106 +747,6 @@ pub fn deinitMessageSlice(allocator: std.mem.Allocator, messages: []types.AgentM
     for (messages) |*message| deinitMessage(allocator, message);
 }
 
-fn cloneContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]const ai.ContentBlock {
-    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
-    errdefer allocator.free(cloned);
-
-    var initialized_len: usize = 0;
-    errdefer deinitContentBlocksPartial(allocator, cloned, initialized_len);
-
-    for (blocks, 0..) |block, index| {
-        cloned[index] = try cloneContentBlock(allocator, block);
-        initialized_len += 1;
-    }
-
-    return cloned;
-}
-
-fn cloneContentBlock(allocator: std.mem.Allocator, block: ai.ContentBlock) !ai.ContentBlock {
-    return switch (block) {
-        .text => |text| blk: {
-            const cloned_text = try allocator.dupe(u8, text.text);
-            errdefer allocator.free(cloned_text);
-            const text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
-            errdefer if (text_signature) |signature| allocator.free(signature);
-
-            break :blk ai.ContentBlock{ .text = .{
-                .text = cloned_text,
-                .text_signature = text_signature,
-            } };
-        },
-        .image => |image| blk: {
-            const data = try allocator.dupe(u8, image.data);
-            errdefer allocator.free(data);
-            const mime_type = try allocator.dupe(u8, image.mime_type);
-            errdefer allocator.free(mime_type);
-
-            break :blk ai.ContentBlock{ .image = .{
-                .data = data,
-                .mime_type = mime_type,
-            } };
-        },
-        .thinking => |thinking| blk: {
-            const cloned_thinking = try allocator.dupe(u8, thinking.thinking);
-            errdefer allocator.free(cloned_thinking);
-            const thinking_signature = if (thinking.thinking_signature) |signature| try allocator.dupe(u8, signature) else null;
-            errdefer if (thinking_signature) |signature| allocator.free(signature);
-            const signature = if (thinking.signature) |value| try allocator.dupe(u8, value) else null;
-            errdefer if (signature) |value| allocator.free(value);
-
-            break :blk ai.ContentBlock{ .thinking = .{
-                .thinking = cloned_thinking,
-                .thinking_signature = thinking_signature,
-                .signature = signature,
-                .redacted = thinking.redacted,
-            } };
-        },
-        .tool_call => |tool_call| ai.ContentBlock{ .tool_call = try cloneToolCall(allocator, tool_call) },
-    };
-}
-
-fn deinitContentBlocksPartial(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock, initialized_len: usize) void {
-    for (blocks[0..initialized_len]) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
-        }
-    }
-}
-
-fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) void {
-    for (blocks) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
-        }
-    }
-    allocator.free(blocks);
-}
 
 fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) ![]const ai.ToolCall {
     const cloned = try allocator.alloc(ai.ToolCall, tool_calls.len);
@@ -852,7 +756,7 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
     errdefer deinitToolCallsPartial(allocator, cloned, initialized_len);
 
     for (tool_calls, 0..) |tool_call, index| {
-        cloned[index] = try cloneToolCall(allocator, tool_call);
+        cloned[index] = try content_clone.cloneToolCall(allocator, tool_call);
         initialized_len += 1;
     }
 
@@ -861,41 +765,17 @@ fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall)
 
 fn deinitToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) void {
     for (tool_calls) |tool_call| {
-        deinitToolCall(allocator, tool_call);
+        content_clone.deinitToolCall(allocator, tool_call);
     }
     allocator.free(tool_calls);
 }
 
 fn deinitToolCallsPartial(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall, initialized_len: usize) void {
     for (tool_calls[0..initialized_len]) |tool_call| {
-        deinitToolCall(allocator, tool_call);
+        content_clone.deinitToolCall(allocator, tool_call);
     }
 }
 
-pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
-    const id = try allocator.dupe(u8, tool_call.id);
-    errdefer allocator.free(id);
-    const name = try allocator.dupe(u8, tool_call.name);
-    errdefer allocator.free(name);
-    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
-    errdefer provider_json.freeValue(allocator, arguments);
-    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
-    errdefer if (thought_signature) |signature| allocator.free(signature);
-
-    return .{
-        .id = id,
-        .name = name,
-        .arguments = arguments,
-        .thought_signature = thought_signature,
-    };
-}
-
-pub fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
 
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,

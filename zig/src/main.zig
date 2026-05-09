@@ -167,6 +167,10 @@ fn runCliWithInput(
         return 1;
     }
 
+    if (options.webview) {
+        if (try validateWebViewModeCombinations(&options, stderr)) |exit_code| return exit_code;
+    }
+
     if ((options.mode == .rpc or options.mode == .ts_rpc) and options.messages != null) {
         try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
@@ -177,7 +181,7 @@ fn runCliWithInput(
         return 1;
     }
 
-    const app_mode = bootstrap.resolveAppMode(options.mode, options.print, detected_stdin.is_tty);
+    const app_mode = bootstrap.resolveAppMode(options.mode, options.print, options.webview, detected_stdin.is_tty);
     const selected_tools = bootstrap.effectiveToolSelection(&options);
     const cwd = if (cwd_override) |override| blk: {
         break :blk try allocator.dupe(u8, override);
@@ -224,6 +228,17 @@ fn runCliWithInput(
         preflight_continue_confirmed = preflight_result.continue_confirmed;
     }
 
+    var webview_backend: ?coding_agent.webview_platform.AvailableBackend = null;
+    if (app_mode == .webview) {
+        switch (coding_agent.webview_platform.preflightHostBackend()) {
+            .available => |backend| webview_backend = backend,
+            .unavailable => |diagnostic| {
+                try writeWebViewBackendDiagnostic(stderr, diagnostic);
+                return 1;
+            },
+        }
+    }
+
     var prepared = try runtime_prep.prepareCliRuntime(allocator, io, &effective_env_map, cwd, &options, selected_tools);
     defer prepared.deinit(allocator);
     try output.writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
@@ -256,10 +271,46 @@ fn runCliWithInput(
             .app_mode = app_mode,
             .selected_tools = selected_tools,
             .preflight_continue_confirmed = preflight_continue_confirmed,
+            .webview_backend = webview_backend,
             .version = VERSION,
         },
         stdout,
         stderr,
+    );
+}
+
+fn validateWebViewModeCombinations(options: *const cli.Args, stderr: *std.Io.Writer) !?u8 {
+    if (options.print) {
+        try stderr.writeAll("Error: --webview cannot be combined with --print\n");
+        return 1;
+    }
+
+    switch (options.mode) {
+        .text => {},
+        .json => {
+            try stderr.writeAll("Error: --webview cannot be combined with --mode json\n");
+            return 1;
+        },
+        .rpc => {
+            try stderr.writeAll("Error: --webview cannot be combined with --mode json-rpc\n");
+            return 1;
+        },
+        .ts_rpc => {
+            try stderr.writeAll("Error: --webview cannot be combined with --mode rpc or --mode ts-rpc\n");
+            return 1;
+        },
+    }
+
+    return null;
+}
+
+fn writeWebViewBackendDiagnostic(
+    stderr: *std.Io.Writer,
+    diagnostic: coding_agent.webview_platform.BackendDiagnostic,
+) !void {
+    try stderr.print(
+        "Error: WebView mode unavailable on {s}: {s}. Requirements: {s}\n",
+        .{ @tagName(diagnostic.platform), diagnostic.message, diagnostic.requirements },
     );
 }
 
@@ -297,6 +348,7 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--webview") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode, -mode <mode>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "rpc, json-rpc") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools, -t <names>") != null);
@@ -1338,6 +1390,188 @@ test "runCli auto-switches to print mode for piped stdin" {
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("hello from stdin\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli webview captures prepared launch context without leaking secrets" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "project/notes.txt", .data = "file body" });
+
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    var stdin_input = CliStdin{
+        .is_tty = false,
+        .content = "stdin draft\n",
+    };
+
+    const exit_code = try runCliWithInput(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{
+            "--webview",
+            "--provider",
+            "faux",
+            "--model",
+            "faux-1",
+            "--api-key",
+            "sentinel-webview-secret",
+            "--no-session",
+            "--tools",
+            "read",
+            "@notes.txt",
+            "positional prompt",
+            "follow up",
+        },
+        project_dir,
+        &stdin_input,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    const out = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mode\":\"webview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"provider\":\"faux\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"model\":\"faux-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"noSession\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"toolAllowlist\":[\"read\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "stdin draft") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file body") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "positional prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"initialMessages\":[\"follow up\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"apiKeyPresent\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sentinel-webview-secret") == null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
+test "runCli rejects incompatible webview mode combinations before runtime dispatch" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    const cases = [_]struct {
+        args: []const []const u8,
+        expected: []const u8,
+    }{
+        .{ .args = &.{ "--webview", "--print", "hello" }, .expected = "--webview cannot be combined with --print" },
+        .{ .args = &.{ "--webview", "--mode", "json", "hello" }, .expected = "--webview cannot be combined with --mode json" },
+        .{ .args = &.{ "--webview", "--mode", "rpc" }, .expected = "--webview cannot be combined with --mode rpc" },
+        .{ .args = &.{ "--webview", "--mode", "json-rpc" }, .expected = "--webview cannot be combined with --mode json-rpc" },
+    };
+
+    for (cases) |case| {
+        var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stdout_capture.deinit();
+        var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr_capture.deinit();
+
+        const exit_code = try runCli(
+            allocator,
+            std.testing.io,
+            &env_map,
+            case.args,
+            "/tmp/project",
+            &stdout_capture.writer,
+            &stderr_capture.writer,
+        );
+
+        try std.testing.expectEqual(@as(u8, 1), exit_code);
+        try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+        try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), case.expected) != null);
+    }
+}
+
+test "runCli package and early-exit paths preempt webview startup" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+
+    const agent_dir = try cli_test.makeTmpPath(allocator, tmp, "agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    try env_map.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    const cases = [_]struct {
+        args: []const []const u8,
+        expected: []const u8,
+    }{
+        .{ .args = &.{ "--webview", "--help" }, .expected = "--webview" },
+        .{ .args = &.{ "--webview", "--version" }, .expected = "pi version" },
+        .{ .args = &.{ "install", "--help", "--webview" }, .expected = "Usage:\n  pi install <source> [-l]" },
+    };
+
+    for (cases) |case| {
+        var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stdout_capture.deinit();
+        var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr_capture.deinit();
+
+        const exit_code = try runCli(
+            allocator,
+            std.testing.io,
+            &env_map,
+            case.args,
+            project_dir,
+            &stdout_capture.writer,
+            &stderr_capture.writer,
+        );
+
+        try std.testing.expectEqual(@as(u8, 0), exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), case.expected) != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "\"mode\":\"webview\"") == null);
+        try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    }
+}
+
+test "runCli non-webview print ignores webview launch capture hook" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+    try env_map.put("PI_FAUX_RESPONSE", "plain print");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--provider", "faux", "--print", "hello" },
+        "/tmp/project",
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("plain print\n", stdout_capture.writer.buffered());
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
@@ -3334,6 +3568,93 @@ test "runCli missing-cwd preflight wins over runtime_prep failures (M10 ordering
 
     // The session file must remain byte-identical: a rejected non-interactive
     // resume must never mutate the persisted session.
+    const after_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after_bytes);
+    try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);
+}
+
+test "runCli webview missing-cwd preflight runs before provider and launch side effects" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "stored");
+    try tmp.dir.createDirPath(std.testing.io, "launch");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const stored_cwd = try cli_test.makeTmpPath(allocator, tmp, "stored");
+    defer allocator.free(stored_cwd);
+    const launch_cwd = try cli_test.makeTmpPath(allocator, tmp, "launch");
+    defer allocator.free(launch_cwd);
+    const session_dir = try cli_test.makeTmpPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    {
+        var seed_env = std.process.Environ.Map.init(allocator);
+        defer seed_env.deinit();
+        try seed_env.put("HOME", home_dir);
+        try seed_env.put("PI_FAUX_RESPONSE", "seed reply");
+
+        var seed_stdout: std.Io.Writer.Allocating = .init(allocator);
+        defer seed_stdout.deinit();
+        var seed_stderr: std.Io.Writer.Allocating = .init(allocator);
+        defer seed_stderr.deinit();
+        const seed_exit = try runCli(
+            allocator,
+            std.testing.io,
+            &seed_env,
+            &.{ "--provider", "faux", "--print", "--session-dir", session_dir, "seed prompt" },
+            stored_cwd,
+            &seed_stdout.writer,
+            &seed_stderr.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), seed_exit);
+    }
+
+    const session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(session_file);
+    const before_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before_bytes);
+    try tmp.dir.deleteTree(std.testing.io, "stored");
+
+    var run_env = std.process.Environ.Map.init(allocator);
+    defer run_env.deinit();
+    try run_env.put("HOME", home_dir);
+    try run_env.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &run_env,
+        &.{
+            "--webview",
+            "--provider",
+            "definitely-not-a-real-provider",
+            "--continue",
+            "--session-dir",
+            session_dir,
+        },
+        launch_cwd,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    try std.testing.expectEqualStrings("", stdout_capture.writer.buffered());
+    const stderr_text = stderr_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "Stored session working directory does not exist:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, stored_cwd) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_text, "definitely-not-a-real-provider") == null);
+
     const after_bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
     defer allocator.free(after_bytes);
     try std.testing.expectEqualSlices(u8, before_bytes, after_bytes);

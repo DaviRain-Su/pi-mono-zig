@@ -66,6 +66,7 @@ pub const Args = struct {
     list_models_search: ?[]const u8 = null,
     no_session: bool = false,
     print: bool = false,
+    webview: bool = false,
     mode: Mode = .text,
     tools: ?[]const []const u8 = null,
     no_tools: bool = false,
@@ -212,6 +213,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) ParseAr
                 i += 1;
                 try messages_builder.append(allocator, argv[i]);
             }
+        } else if (std.mem.eql(u8, arg, "--webview")) {
+            result.webview = true;
         } else if (std.mem.eql(u8, arg, "--mode") or std.mem.eql(u8, arg, "-mode")) {
             i += 1;
             if (i >= argv.len) return error.MissingOptionValue;
@@ -465,6 +468,7 @@ fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  --models <patterns>            Comma-separated model patterns for model selection
         \\  --list-models [search]         List available models and exit
         \\  --print, -p                    Non-interactive mode
+        \\  --webview                      Launch desktop WebView mode
         \\  --mode, -mode <mode>           Output mode: text, json, rpc, json-rpc (default: text; ts-rpc aliases rpc)
         \\  --tools, -t <names>            Comma-separated tool allowlist
         \\  --no-tools, -nt                Disable built-in tools by default
@@ -487,6 +491,7 @@ fn renderBaseHelp(allocator: std.mem.Allocator, version: []const u8) ![]u8 {
         \\  pi --models anthropic/*,*gpt-5*
         \\  pi --list-models sonnet
         \\  pi --print --mode json "Explain the latest session"
+        \\  pi --webview --provider faux --no-session
         \\  pi --tools read,grep,ls "Inspect the codebase"
         \\
     ,
@@ -575,6 +580,7 @@ test "parse args supports expected CLI flags" {
         "sonnet",
         "--no-session",
         "--print",
+        "--webview",
         "-mode",
         "json",
         "-t",
@@ -620,6 +626,7 @@ test "parse args supports expected CLI flags" {
     try std.testing.expectEqualStrings("sonnet", args.list_models_search.?);
     try std.testing.expect(args.no_session);
     try std.testing.expect(args.print);
+    try std.testing.expect(args.webview);
     try std.testing.expectEqual(Mode.json, args.mode);
     try std.testing.expect(args.no_tools);
     try std.testing.expect(args.no_builtin_tools);
@@ -792,6 +799,17 @@ test "parse args supports help and version" {
     try std.testing.expect(version_args.version);
 }
 
+test "parse args accepts webview as built-in flag" {
+    const allocator = std.testing.allocator;
+
+    var args = try parseArgs(allocator, &.{ "--webview", "--provider", "faux" });
+    defer args.deinit(allocator);
+
+    try std.testing.expect(args.webview);
+    try std.testing.expect(args.unknown_flags == null);
+    try std.testing.expectEqualStrings("faux", args.provider.?);
+}
+
 test "parse args frees previous tool list when --tools is repeated" {
     const allocator = std.testing.allocator;
 
@@ -898,6 +916,7 @@ test "help text mentions expected flags" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "--webview") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode, -mode <mode>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "rpc, json-rpc") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--append-system-prompt <text>") != null);

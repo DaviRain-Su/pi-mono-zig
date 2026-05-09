@@ -1,17 +1,17 @@
 const std = @import("std");
 
-const global_queue_allocator = std.heap.page_allocator;
-
 const QueueEntry = struct {
+    allocator: std.mem.Allocator,
     key: []u8,
     next_ticket: usize,
     serving_ticket: usize,
+    next: ?*QueueEntry = null,
 };
 
 const GlobalQueue = struct {
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    entries: std.ArrayListUnmanaged(QueueEntry) = .empty,
+    head: ?*QueueEntry = null,
 };
 
 var global_queue = GlobalQueue{};
@@ -36,23 +36,28 @@ pub fn acquire(io: std.Io, allocator: std.mem.Allocator, absolute_path: []const 
     defer global_queue.mutex.unlock(io);
 
     var ticket: usize = 0;
-    if (findEntryIndexLocked(lookup_key)) |index| {
-        const entry = &global_queue.entries.items[index];
+    if (findEntryLocked(lookup_key)) |entry| {
         ticket = entry.next_ticket;
         entry.next_ticket += 1;
     } else {
-        const queue_key = try global_queue_allocator.dupe(u8, lookup_key);
-        errdefer global_queue_allocator.free(queue_key);
-        try global_queue.entries.append(global_queue_allocator, .{
+        const entry = try allocator.create(QueueEntry);
+        errdefer allocator.destroy(entry);
+
+        const queue_key = try allocator.dupe(u8, lookup_key);
+        errdefer allocator.free(queue_key);
+
+        entry.* = .{
+            .allocator = allocator,
             .key = queue_key,
             .next_ticket = 1,
             .serving_ticket = 0,
-        });
+            .next = global_queue.head,
+        };
+        global_queue.head = entry;
     }
 
     while (true) {
-        const index = findEntryIndexLocked(lookup_key) orelse unreachable;
-        const entry = &global_queue.entries.items[index];
+        const entry = findEntryLocked(lookup_key) orelse unreachable;
         if (entry.serving_ticket == ticket) {
             allocator.free(lookup_key);
             return .{
@@ -68,26 +73,44 @@ fn releaseUnlocked(io: std.Io, key: []const u8) void {
     global_queue.mutex.lockUncancelable(io);
     defer global_queue.mutex.unlock(io);
 
-    const index = findEntryIndexLocked(key) orelse return;
-    const entry = &global_queue.entries.items[index];
+    const entry = findEntryLocked(key) orelse return;
     entry.serving_ticket += 1;
 
     if (entry.serving_ticket == entry.next_ticket) {
-        const removed = global_queue.entries.swapRemove(index);
-        global_queue_allocator.free(removed.key);
-        if (global_queue.entries.items.len == 0) {
-            global_queue.entries.clearAndFree(global_queue_allocator);
-        }
+        removeEntryLocked(entry);
     }
 
     global_queue.condition.broadcast(io);
 }
 
-fn findEntryIndexLocked(key: []const u8) ?usize {
-    for (global_queue.entries.items, 0..) |entry, index| {
-        if (std.mem.eql(u8, entry.key, key)) return index;
+fn findEntryLocked(key: []const u8) ?*QueueEntry {
+    var current = global_queue.head;
+    while (current) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return entry;
+        current = entry.next;
     }
     return null;
+}
+
+fn removeEntryLocked(target: *QueueEntry) void {
+    var previous: ?*QueueEntry = null;
+    var current = global_queue.head;
+    while (current) |entry| {
+        if (entry == target) {
+            if (previous) |previous_entry| {
+                previous_entry.next = entry.next;
+            } else {
+                global_queue.head = entry.next;
+            }
+            const allocator = entry.allocator;
+            allocator.free(entry.key);
+            allocator.destroy(entry);
+            return;
+        }
+        previous = entry;
+        current = entry.next;
+    }
+    unreachable;
 }
 
 fn canonicalizeKey(io: std.Io, allocator: std.mem.Allocator, absolute_path: []const u8) ![]u8 {

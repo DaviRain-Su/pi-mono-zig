@@ -218,13 +218,8 @@ pub const Terminal = struct {
                 self.current_size = try backend.getSize();
             },
             .native => |*native| {
-                // On Windows, SIGWINCH is unavailable, so always poll the size.
-                // On POSIX, only re-read when the signal fires.
-                const should_read = builtin.os.tag == .windows or
-                    native.resize_pending.swap(false, .seq_cst);
-                if (should_read) {
-                    self.current_size = native.readSize(self.current_size);
-                }
+                _ = native.resize_pending.swap(false, .seq_cst);
+                self.current_size = native.readSize(self.current_size);
             },
         }
         return self.current_size;
@@ -304,27 +299,27 @@ fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resou
 fn startupSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
     if (use_mouse_reporting) {
         if (use_kitty_keyboard_protocol) {
-            return Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE;
+            return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE;
         }
-        return Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.MOUSE_ENABLE;
+        return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.MOUSE_ENABLE;
     }
     if (use_kitty_keyboard_protocol) {
-        return Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE;
+        return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE;
     }
-    return Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR;
+    return Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR;
 }
 
 fn stopSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {
     if (use_mouse_reporting) {
         if (use_kitty_keyboard_protocol) {
-            return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE;
+            return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR;
         }
-        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE;
+        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.SHOW_CURSOR;
     }
     if (use_kitty_keyboard_protocol) {
-        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE;
+        return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR;
     }
-    return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE;
+    return Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR;
 }
 
 pub const testing = if (builtin.is_test) struct {
@@ -381,6 +376,8 @@ pub const InputLoop = struct {
 
         vaxis_state.* = try vaxis.init(io, allocator, @constCast(env_map), .{});
         errdefer vaxis_state.deinit(allocator, tty.writer());
+
+        try vaxis_state.enterAltScreen(tty.writer());
 
         result.* = .{
             .allocator = allocator,
@@ -820,22 +817,22 @@ test "terminal restores terminal modes when startup fails" {
 
 test "terminal startup and stop sequences include Kitty keyboard protocol by default without mouse reporting" {
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE,
         startupSequence(true, false),
     );
     try std.testing.expectEqualStrings(
-        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE,
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         stopSequence(true, false),
     );
 }
 
 test "terminal startup and stop sequences include requested mouse reporting" {
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR ++ Terminal.KITTY_KEYBOARD_QUERY ++ Terminal.KITTY_KEYBOARD_ENABLE ++ Terminal.MOUSE_ENABLE,
         startupSequence(true, true),
     );
     try std.testing.expectEqualStrings(
-        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE,
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.MOUSE_DISABLE ++ Terminal.KITTY_KEYBOARD_DISABLE ++ Terminal.SHOW_CURSOR,
         stopSequence(true, true),
     );
     try std.testing.expect(std.mem.indexOf(u8, startupSequence(true, true), Terminal.MOUSE_ENABLE) != null);
@@ -858,14 +855,14 @@ test "terminal mouse reporting is default-on and supports explicit opt-out" {
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {
     try std.testing.expectEqualStrings(
-        Terminal.ALT_SCREEN_ENABLE ++ Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR,
+        Terminal.BRACKETED_PASTE_ENABLE ++ Terminal.HIDE_CURSOR,
         startupSequence(false, false),
     );
     try std.testing.expect(std.mem.indexOf(u8, startupSequence(false, false), Terminal.KITTY_KEYBOARD_QUERY) == null);
     try std.testing.expect(std.mem.indexOf(u8, startupSequence(false, false), Terminal.KITTY_KEYBOARD_ENABLE) == null);
 
     try std.testing.expectEqualStrings(
-        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR ++ Terminal.ALT_SCREEN_DISABLE,
+        Terminal.BRACKETED_PASTE_DISABLE ++ Terminal.SHOW_CURSOR,
         stopSequence(false, false),
     );
     try std.testing.expect(std.mem.indexOf(u8, stopSequence(false, false), Terminal.KITTY_KEYBOARD_DISABLE) == null);
@@ -970,4 +967,37 @@ test "native terminal refreshes cached terminal size after libvaxis winsize call
     Terminal.handleNativeWinsize(&terminal);
 
     try std.testing.expectEqual(Size{ .width = 101, .height = 33 }, try terminal.refreshSize());
+}
+
+test "native terminal refresh polls current size without winsize callback" {
+    const allocator = std.testing.allocator;
+
+    const TestSizeReader = struct {
+        size: Size,
+
+        fn read(context: ?*anyopaque, tty: *vaxis.Tty) ?Size {
+            _ = tty;
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return self.size;
+        }
+    };
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var reader = TestSizeReader{
+        .size = .{ .width = 80, .height = 24 },
+    };
+    var terminal = Terminal.initNative(.{
+        .io = std.testing.io,
+        .env_map = &env_map,
+        .read_size_fn = TestSizeReader.read,
+        .read_size_context = &reader,
+    });
+    try terminal.start();
+    defer terminal.stop();
+
+    reader.size = .{ .width = 120, .height = 40 };
+
+    try std.testing.expectEqual(Size{ .width = 120, .height = 40 }, try terminal.refreshSize());
 }

@@ -81,6 +81,8 @@ pub const BridgeHost = struct {
     dispatch_counters: ?*DispatchCounters = null,
     injected_handler_error: ?anyerror = null,
     active_turn_id: ?[]const u8 = null,
+    active_generation: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    close_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     next_turn_index: usize = 0,
 
     pub fn init(context: BridgeContext) BridgeHost {
@@ -245,7 +247,7 @@ pub const BridgeHost = struct {
         try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
-        try writeBoolField(writer, "busy", self.active_turn_id != null or self.context.session.isStreaming(), true);
+        try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
         if (self.context.initial_prompt != null or self.context.initial_messages.len > 0 or self.context.initial_images_count > 0) {
             try writer.writeAll(",\"initialInput\":{");
             try writeOptionalStringField(allocator, writer, "prompt", self.context.initial_prompt, false);
@@ -279,7 +281,7 @@ pub const BridgeHost = struct {
         payload: std.json.Value,
     ) !void {
         const text = payload.object.get("text").?.string;
-        if (self.active_turn_id != null or self.context.session.isStreaming()) {
+        if (self.active_generation.load(.seq_cst)) {
             try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"queued\":false,\"message\":");
             try writeJsonString(allocator, writer, "Agent is already processing a WebView prompt");
             try writer.writeAll("}");
@@ -289,9 +291,12 @@ pub const BridgeHost = struct {
         const turn_id = try std.fmt.allocPrint(allocator, "webview-turn-{d}", .{self.next_turn_index});
         defer allocator.free(turn_id);
         self.next_turn_index += 1;
+        self.active_generation.store(true, .seq_cst);
         self.active_turn_id = turn_id;
         defer {
             self.active_turn_id = null;
+            self.active_generation.store(false, .seq_cst);
+            self.close_requested.store(false, .seq_cst);
         }
 
         var capture = PromptEventCapture.init(
@@ -324,13 +329,21 @@ pub const BridgeHost = struct {
             if (!capture.terminal_seen) {
                 try capture.appendSyntheticTerminal("success", "prompt completed without an agent_end event");
             }
-            try writer.writeAll("{\"status\":\"completed\",\"accepted\":");
+            try writer.writeAll("{\"status\":");
+            try writeJsonString(allocator, writer, statusForTerminalOutcome(capture.terminal_outcome));
+            try writer.writeAll(",\"accepted\":");
             try writer.writeAll(if (acceptance.accepted) "true" else "false");
             try writer.writeAll(",\"queued\":false,\"sessionId\":");
             try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
             try writer.writeAll(",\"turnId\":");
             try writeJsonString(allocator, writer, turn_id);
-            try writer.writeAll(",\"terminalOutcome\":\"success\",\"events\":[");
+            try writer.writeAll(",\"terminalOutcome\":");
+            try writeJsonString(allocator, writer, capture.terminal_outcome);
+            if (capture.terminal_error_message) |message| {
+                try writer.writeAll(",\"error\":");
+                try writeJsonString(allocator, writer, message);
+            }
+            try writer.writeAll(",\"events\":[");
             try capture.writeFrames(writer);
             try writer.writeAll("]}");
         } else |err| {
@@ -355,7 +368,7 @@ pub const BridgeHost = struct {
         self: *BridgeHost,
         writer: *std.Io.Writer,
     ) !void {
-        if (self.active_turn_id == null and !self.context.session.isStreaming()) {
+        if (!self.active_generation.load(.seq_cst)) {
             try writer.writeAll("{\"status\":\"not_running\",\"aborted\":false}");
             return;
         }
@@ -363,7 +376,24 @@ pub const BridgeHost = struct {
         self.context.session.agent.abort();
         try writer.writeAll("{\"status\":\"abort_requested\",\"aborted\":true}");
     }
+
+    pub fn closeAndAbortActiveWork(self: *BridgeHost) bool {
+        self.close_requested.store(true, .seq_cst);
+        if (!self.active_generation.load(.seq_cst)) return false;
+        self.context.session.abortRetry();
+        self.context.session.agent.abort();
+        return true;
+    }
 };
+
+fn statusForTerminalOutcome(outcome: []const u8) []const u8 {
+    if (std.mem.eql(u8, outcome, "success")) return "completed";
+    if (std.mem.eql(u8, outcome, "abort")) return "aborted";
+    if (std.mem.eql(u8, outcome, "provider_error")) return "failed";
+    if (std.mem.eql(u8, outcome, "setup_failure")) return "failed";
+    if (std.mem.eql(u8, outcome, "window_closed")) return "aborted";
+    return "failed";
+}
 
 pub const NavigationKind = enum {
     navigation,
@@ -703,6 +733,8 @@ const PromptEventCapture = struct {
     frames: std.ArrayList([]u8) = .empty,
     next_sequence: usize = 1,
     terminal_seen: bool = false,
+    terminal_outcome: []const u8 = "success",
+    terminal_error_message: ?[]u8 = null,
 
     fn init(allocator: std.mem.Allocator, session_id: []const u8, turn_id: []const u8) PromptEventCapture {
         return .{
@@ -715,12 +747,14 @@ const PromptEventCapture = struct {
     fn deinit(self: *PromptEventCapture) void {
         for (self.frames.items) |frame| self.allocator.free(frame);
         self.frames.deinit(self.allocator);
+        if (self.terminal_error_message) |message| self.allocator.free(message);
         self.* = undefined;
     }
 
     fn appendEvent(self: *PromptEventCapture, event: agent.AgentEvent) !void {
+        if (self.terminal_seen) return;
+        try self.observeTerminalOutcome(event);
         const terminal = event.event_type == .agent_end;
-        if (terminal and self.terminal_seen) return;
         if (terminal) self.terminal_seen = true;
 
         const event_json = try json_event_wire.stringifyAgentEventLine(self.allocator, event);
@@ -736,7 +770,14 @@ const PromptEventCapture = struct {
         try writeJsonString(self.allocator, &writer.writer, @tagName(event.event_type));
         try writer.writer.writeAll(",\"terminal\":");
         try writer.writer.writeAll(if (terminal) "true" else "false");
-        if (terminal) try writer.writer.writeAll(",\"terminalOutcome\":\"success\"");
+        if (terminal) {
+            try writer.writer.writeAll(",\"terminalOutcome\":");
+            try writeJsonString(self.allocator, &writer.writer, self.terminal_outcome);
+            if (self.terminal_error_message) |message| {
+                try writer.writer.writeAll(",\"error\":");
+                try writeJsonString(self.allocator, &writer.writer, message);
+            }
+        }
         try writer.writer.writeAll(",\"event\":");
         try writer.writer.writeAll(event_json);
         try writer.writer.writeAll("}");
@@ -747,6 +788,7 @@ const PromptEventCapture = struct {
     fn appendSyntheticTerminal(self: *PromptEventCapture, outcome: []const u8, message: []const u8) !void {
         if (self.terminal_seen) return;
         self.terminal_seen = true;
+        try self.setTerminalOutcome(outcome, message);
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer writer.deinit();
         try writer.writer.writeAll("{\"sessionId\":");
@@ -760,6 +802,28 @@ const PromptEventCapture = struct {
         try writer.writer.writeAll("}}");
         self.next_sequence += 1;
         try self.frames.append(self.allocator, try writer.toOwnedSlice());
+    }
+
+    fn observeTerminalOutcome(self: *PromptEventCapture, event: agent.AgentEvent) !void {
+        const message = event.message orelse return;
+        if (message != .assistant) return;
+        const assistant = message.assistant;
+        switch (assistant.stop_reason) {
+            .aborted => try self.setTerminalOutcome("abort", assistant.error_message orelse "Request was aborted"),
+            .error_reason => try self.setTerminalOutcome("provider_error", assistant.error_message orelse "Provider error"),
+            else => {},
+        }
+    }
+
+    fn setTerminalOutcome(self: *PromptEventCapture, outcome: []const u8, message: ?[]const u8) !void {
+        self.terminal_outcome = outcome;
+        if (self.terminal_error_message) |old| {
+            self.allocator.free(old);
+            self.terminal_error_message = null;
+        }
+        if (message) |text| {
+            self.terminal_error_message = try self.allocator.dupe(u8, text);
+        }
     }
 
     fn writeFrames(self: *const PromptEventCapture, writer: *std.Io.Writer) !void {
@@ -835,6 +899,7 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_messages\"}", trusted_bundle_origin);
     defer allocator.free(before);
     try std.testing.expect(std.mem.indexOf(u8, before, "\"messages\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, before, "\"messages\":[]") != null);
 
     const prompt = try bridge.handleRequestJson(
         allocator,
@@ -866,6 +931,7 @@ test "webview prompt denies concurrent active turn deterministically" {
     defer session.deinit();
     var bridge = testBridge(&session);
     bridge.active_turn_id = "active-turn";
+    bridge.active_generation.store(true, .seq_cst);
 
     const response = try bridge.handleRequestJson(
         allocator,
@@ -875,6 +941,148 @@ test "webview prompt denies concurrent active turn deterministically" {
     defer allocator.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"status\":\"busy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"accepted\":false") != null);
+}
+
+test "webview provider error is surfaced safely and bridge remains usable" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("partial before error")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{
+            .stop_reason = .error_reason,
+            .error_message = "faux provider failed safely",
+        }) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.model = registration.getModel();
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt-error\",\"command\":\"prompt\",\"payload\":{\"text\":\"trigger error\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"provider_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "faux provider failed safely") != null);
+
+    const state = try bridge.handleRequestJson(allocator, "{\"id\":\"after-error\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"id\":\"after-error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"busy\":false") != null);
+}
+
+test "webview abort without active generation is safe no-op" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+
+    const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(before);
+
+    const abort = try bridge.handleRequestJson(allocator, "{\"id\":\"abort-idle\",\"command\":\"abort\"}", trusted_bundle_origin);
+    defer allocator.free(abort);
+    try std.testing.expect(std.mem.indexOf(u8, abort, "\"status\":\"not_running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, abort, "\"aborted\":false") != null);
+
+    const after = try bridge.handleRequestJson(allocator, "{\"id\":\"after\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"messages\":[]") != null);
+}
+
+test "webview abort cancels active generation suppresses late events and supports retry" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .tokens_per_second = 5,
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+    const slow_blocks = [_]faux.FauxContentBlock{faux.fauxText(
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+    )};
+    const retry_blocks = [_]faux.FauxContentBlock{faux.fauxText("retry succeeded")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(slow_blocks[0..], .{}) },
+        .{ .message = faux.fauxAssistantMessage(retry_blocks[0..], .{}) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.model = registration.getModel();
+
+    const ThreadResult = struct {
+        response: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(host: *BridgeHost, result: *@This()) void {
+            result.response = host.handleRequestJson(
+                std.heap.c_allocator,
+                "{\"id\":\"abort-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"abort me\"}}",
+                trusted_bundle_origin,
+            ) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+
+    var thread_result = ThreadResult{};
+    const prompt_thread = try std.Thread.spawn(.{}, ThreadResult.run, .{ &bridge, &thread_result });
+    while (!bridge.active_generation.load(.seq_cst)) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    std.Io.sleep(std.testing.io, .fromMilliseconds(250), .awake) catch {};
+
+    const abort = try bridge.handleRequestJson(allocator, "{\"id\":\"abort-active\",\"command\":\"abort\"}", trusted_bundle_origin);
+    defer allocator.free(abort);
+    try std.testing.expect(std.mem.indexOf(u8, abort, "\"status\":\"abort_requested\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, abort, "\"aborted\":true") != null);
+
+    prompt_thread.join();
+    if (thread_result.err) |err| return err;
+    const aborted_prompt = thread_result.response.?;
+    defer std.heap.c_allocator.free(aborted_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"status\":\"aborted\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminalOutcome\":\"abort\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminal\":true") != null);
+    try std.testing.expect(!bridge.active_generation.load(.seq_cst));
+
+    var capture = PromptEventCapture.init(allocator, "session", "turn");
+    defer capture.deinit();
+    try capture.appendSyntheticTerminal("abort", "Request was aborted");
+    try capture.appendEvent(.{ .event_type = .message_update });
+    try std.testing.expectEqual(@as(usize, 1), capture.frames.items.len);
+
+    const retry = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"retry-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"try again\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(retry);
+    try std.testing.expect(std.mem.indexOf(u8, retry, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry, "retry succeeded") != null);
+}
+
+test "webview close aborts active generation cleanup path" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+
+    try std.testing.expect(!bridge.closeAndAbortActiveWork());
+    bridge.active_generation.store(true, .seq_cst);
+    try std.testing.expect(bridge.closeAndAbortActiveWork());
+    try std.testing.expect(bridge.close_requested.load(.seq_cst));
 }
 
 test "webview state surfaces prepared initial input without bridge metadata" {

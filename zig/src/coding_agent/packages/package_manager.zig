@@ -3,6 +3,7 @@ const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
 const extension_manifest = @import("../extensions/extension_manifest.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const policy_key_mod = @import("../extensions/policy_key.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
 const config_selector = @import("config_selector.zig");
@@ -1098,7 +1099,7 @@ fn readWasmPackagePolicyRequest(
     if (artifact != .object) return null;
     const artifact_path = jsonStringField(artifact.object, "path") orelse return null;
 
-    const policy_lookup_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_lookup_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = schema_version,
         .id = id,
         .version = version,
@@ -1131,7 +1132,7 @@ fn resolveFinalWasmExtensionPolicy(
     });
     defer manifest_result.deinit(allocator);
     if (manifest_result != .valid) return null;
-    const identity_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const identity_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(identity_key);
     return lookupExtensionPolicy(effective_settings, identity_key);
 }
@@ -1191,7 +1192,7 @@ fn wasmPolicyLookupKeyFromLockEntry(
         .input_schema_json = "{}",
         .output_schema_json = "{}",
     };
-    return extension_runtime.wasmPolicyLookupKey(allocator, handoff);
+    return policy_key_mod.wasmPolicyLookupKey(allocator, handoff);
 }
 
 fn writeWasmInstallDetails(
@@ -3728,7 +3729,7 @@ test "wasm package install honors pre-artifact manifest approved grants" {
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",
@@ -4013,7 +4014,7 @@ test "wasm package install honors final artifact approved grants" {
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -4056,7 +4057,7 @@ test "VAL-INSTALL-001 successful wasm install writes provenance lock before sett
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -4100,7 +4101,7 @@ test "VAL-INSTALL-009 remove deletes matching wasm provenance lock entry" {
         .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
     });
     defer manifest_result.deinit(allocator);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
@@ -4256,7 +4257,7 @@ test "wasm project install ignores unrelated malformed global policy" {
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const quoted_key = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = final_key }, .{});
     defer allocator.free(quoted_key);
@@ -4314,7 +4315,7 @@ test "wasm project install uses effective global pre-artifact approved grants" {
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",
@@ -4366,7 +4367,7 @@ test "wasm project install uses effective global final artifact approved grants"
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(user_settings_path);
@@ -4400,7 +4401,7 @@ test "wasm project install persists pre-artifact package despite unapproved poli
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",
@@ -4447,7 +4448,7 @@ test "wasm project install persists final package despite unapproved policy" {
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(user_settings_path);
@@ -4484,7 +4485,7 @@ test "wasm package install reports approval target without treating sibling gran
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",
@@ -4832,7 +4833,7 @@ test "wasm project install rejects approved grants from malformed resource limit
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const quoted_key = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = final_key }, .{});
     defer allocator.free(quoted_key);
@@ -4891,7 +4892,7 @@ test "wasm project policy override keeps pre-artifact grants default-denied when
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",
@@ -4938,7 +4939,7 @@ test "wasm project policy override keeps final artifact grants default-denied wh
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const final_key = try extension_runtime.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const final_key = try policy_key_mod.wasmPolicyLookupKey(allocator, extension_runtime.WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(final_key);
     const user_settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(user_settings_path);
@@ -4975,7 +4976,7 @@ test "wasm package install rejects sibling grants and resource limits as approva
     defer allocator.free(package_root);
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    const policy_key = try extension_runtime.wasmManifestPolicyLookupKey(allocator, .{
+    const policy_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = wasm_manifest.SCHEMA_VERSION,
         .id = "com.example.policy",
         .version = "0.1.0",

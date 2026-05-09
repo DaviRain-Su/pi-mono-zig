@@ -8,6 +8,7 @@ pub const AppMode = enum {
     json,
     rpc,
     ts_rpc,
+    webview,
 };
 
 pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) cli.ParseArgsError!cli.Args {
@@ -24,7 +25,8 @@ pub fn parseErrorMessage(err: cli.ParseArgsError) []const u8 {
     };
 }
 
-pub fn resolveAppMode(mode: cli.Mode, print_requested: bool, stdin_is_tty: bool) AppMode {
+pub fn resolveAppMode(mode: cli.Mode, print_requested: bool, webview_requested: bool, stdin_is_tty: bool) AppMode {
+    if (webview_requested) return .webview;
     return switch (mode) {
         .rpc => .rpc,
         .ts_rpc => .ts_rpc,
@@ -51,4 +53,12 @@ fn isTruthyEnvFlag(value: ?[]const u8) bool {
         std.ascii.eqlIgnoreCase(text, "true") or
         std.ascii.eqlIgnoreCase(text, "yes") or
         std.ascii.eqlIgnoreCase(text, "on");
+}
+
+test "resolveAppMode keeps TUI default and selects WebView explicitly" {
+    try std.testing.expectEqual(AppMode.interactive, resolveAppMode(.text, false, false, true));
+    try std.testing.expectEqual(AppMode.print, resolveAppMode(.text, false, false, false));
+    try std.testing.expectEqual(AppMode.print, resolveAppMode(.text, true, false, true));
+    try std.testing.expectEqual(AppMode.webview, resolveAppMode(.text, false, true, true));
+    try std.testing.expectEqual(AppMode.webview, resolveAppMode(.text, false, true, false));
 }

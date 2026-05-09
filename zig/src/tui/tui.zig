@@ -128,11 +128,19 @@ pub const Renderer = struct {
     }
 
     pub fn renderToVaxis(self: *Renderer, root: draw_mod.Component, vx: *vaxis.Vaxis, tty: *std.Io.Writer) !void {
-        if (!self.dirty) return;
+        const size = try self.terminal.refreshSize();
+        const size_changed = if (self.previous_size) |previous|
+            previous.width != size.width or previous.height != size.height
+        else
+            true;
+
+        if (!self.dirty and !size_changed) return;
         self.dirty = false;
 
-        const size = try self.terminal.refreshSize();
-        try ensureVaxisSize(self.allocator, vx, tty, size);
+        const resized = try ensureVaxisSize(self.allocator, vx, tty, size);
+        if (resized or size_changed) {
+            vx.queueRefresh();
+        }
 
         var frame_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer frame_arena.deinit();
@@ -208,16 +216,23 @@ const OverlayLayout = struct {
     col: usize,
 };
 
-fn ensureVaxisSize(allocator: std.mem.Allocator, vx: *vaxis.Vaxis, tty: *std.Io.Writer, size: terminal_mod.Size) !void {
+fn ensureVaxisSize(
+    allocator: std.mem.Allocator,
+    vx: *vaxis.Vaxis,
+    tty: *std.Io.Writer,
+    size: terminal_mod.Size,
+) !bool {
     const cols: u16 = @intCast(@min(size.width, @as(usize, std.math.maxInt(u16))));
     const rows: u16 = @intCast(@min(size.height, @as(usize, std.math.maxInt(u16))));
-    if (vx.screen.width == cols and vx.screen.height == rows) return;
+    if (vx.screen.width == cols and vx.screen.height == rows) return false;
+
     try vx.resize(allocator, tty, .{
         .rows = rows,
         .cols = cols,
         .x_pixel = 0,
         .y_pixel = 0,
     });
+    return true;
 }
 
 fn resolveOverlayWidth(options: OverlayOptions, terminal_width: usize) usize {
@@ -441,6 +456,42 @@ test "renderer can render a draw component through vaxis" {
     const window = vx.window();
     const drawn_cell = window.readCell(1, 1).?;
     try std.testing.expectEqualStrings("Z", drawn_cell.char.grapheme);
+}
+
+test "renderer redraws after terminal resize without explicit dirty mark" {
+    const allocator = std.testing.allocator;
+
+    var backend = TestMockBackend{ .size = .{ .width = 6, .height = 4 } };
+    defer backend.deinit(allocator);
+
+    var terminal = terminal_mod.Terminal.init(backend.backend());
+    try terminal.start();
+    defer terminal.stop();
+
+    var renderer = Renderer.init(allocator, &terminal);
+    defer renderer.deinit();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+
+    var vx = try vaxis.init(std.testing.io, allocator, &env_map, .{});
+    defer vx.deinit(allocator, &writer.writer);
+
+    try renderer.renderToVaxis(TestDrawComponent.component(), &vx, &writer.writer);
+    const first_render_bytes = writer.written().len;
+
+    try renderer.renderToVaxis(TestDrawComponent.component(), &vx, &writer.writer);
+    try std.testing.expectEqual(first_render_bytes, writer.written().len);
+
+    backend.size = .{ .width = 10, .height = 5 };
+    try renderer.renderToVaxis(TestDrawComponent.component(), &vx, &writer.writer);
+
+    try std.testing.expectEqual(@as(u16, 10), vx.screen.width);
+    try std.testing.expectEqual(@as(u16, 5), vx.screen.height);
+    try std.testing.expect(writer.written().len > first_render_bytes);
 }
 
 test "renderer composes draw overlays through child windows with animated offsets" {

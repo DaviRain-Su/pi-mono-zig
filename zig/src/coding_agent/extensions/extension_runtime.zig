@@ -19,6 +19,15 @@ const tools_common = @import("../tools/common.zig");
 const wasm_host = @import("wasm/wasm_host_spike.zig");
 const wasm_manifest = @import("wasm/wasm_manifest.zig");
 const lifecycle_support = @import("lifecycle_support.zig");
+const policy_key_mod = @import("policy_key.zig");
+
+pub const typeScriptPolicyLookupKey = policy_key_mod.typeScriptPolicyLookupKey;
+pub const wasmManifestPolicyLookupKey = policy_key_mod.wasmManifestPolicyLookupKey;
+pub const wasmPolicyLookupKey = policy_key_mod.wasmPolicyLookupKey;
+pub const nativePolicyLookupKey = policy_key_mod.nativePolicyLookupKey;
+pub const processJsonlPolicyLookupKey = policy_key_mod.processJsonlPolicyLookupKey;
+pub const TypeScriptPolicyLookupOptions = policy_key_mod.TypeScriptPolicyLookupOptions;
+pub const WasmManifestPolicyLookupOptions = policy_key_mod.WasmManifestPolicyLookupOptions;
 
 pub const DiagnosticCategory = extension_host.DiagnosticCategory;
 pub const ExtensionUiRequest = extension_host.ExtensionUiRequest;
@@ -55,152 +64,6 @@ pub const LifecycleSupportRuntime = lifecycle_support.LifecycleSupportRuntime;
 pub const LifecycleSupportEntry = lifecycle_support.LifecycleSupportEntry;
 pub const lifecycleSupportMatrix = lifecycle_support.lifecycleSupportMatrix;
 
-pub const TypeScriptPolicyLookupOptions = struct {
-    configured_path: []const u8,
-    resolved_path: []const u8,
-    source_info: resources_mod.SourceInfo,
-};
-
-pub fn typeScriptPolicyLookupKey(allocator: std.mem.Allocator, options: TypeScriptPolicyLookupOptions) ![]u8 {
-    const configured_path = try toPolicyPathAlloc(allocator, options.configured_path);
-    defer allocator.free(configured_path);
-    const resolved_path = try toPolicyPathAlloc(allocator, options.resolved_path);
-    defer allocator.free(resolved_path);
-
-    if (configured_path.len >= 2 and configured_path[0] == '<' and configured_path[configured_path.len - 1] == '>') {
-        const source = if (options.source_info.source.len > 0) options.source_info.source else "temporary";
-        return std.fmt.allocPrint(allocator, "typescript:inline:{s}:{s}", .{ source, configured_path });
-    }
-
-    const scope = sourceScopeName(options.source_info.scope);
-    if (options.source_info.origin == .package) {
-        const entry_path = try relativePolicyPathAlloc(allocator, options.source_info.base_dir, resolved_path) orelse
-            try allocator.dupe(u8, resolved_path);
-        defer allocator.free(entry_path);
-        return std.fmt.allocPrint(
-            allocator,
-            "typescript:package:{s}:{s}:{s}:{s}",
-            .{ scope, options.source_info.source, entry_path, resolved_path },
-        );
-    }
-
-    return std.fmt.allocPrint(allocator, "typescript:local:{s}:{s}", .{ scope, resolved_path });
-}
-
-pub const WasmManifestPolicyLookupOptions = struct {
-    schema_version: []const u8,
-    id: []const u8,
-    version: []const u8,
-    package_root: []const u8,
-    manifest_path: []const u8,
-    artifact_path: []const u8,
-};
-
-pub fn wasmManifestPolicyLookupKey(allocator: std.mem.Allocator, options: WasmManifestPolicyLookupOptions) ![]u8 {
-    const package_root = try toPolicyPathAlloc(allocator, options.package_root);
-    defer allocator.free(package_root);
-    const manifest_path = try toPolicyPathAlloc(allocator, options.manifest_path);
-    defer allocator.free(manifest_path);
-    const artifact_path = try toPolicyPathAlloc(allocator, options.artifact_path);
-    defer allocator.free(artifact_path);
-    return std.fmt.allocPrint(
-        allocator,
-        "wasm:manifest:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{ options.schema_version, options.id, options.version, package_root, manifest_path, artifact_path },
-    );
-}
-
-pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: WasmManifestHandoff) ![]u8 {
-    const manifest_path = try toPolicyPathAlloc(allocator, manifest.manifest_path orelse "");
-    defer allocator.free(manifest_path);
-    const artifact_absolute_path = try toPolicyPathAlloc(allocator, manifest.artifact_absolute_path);
-    defer allocator.free(artifact_absolute_path);
-    return std.fmt.allocPrint(
-        allocator,
-        "wasm:locked:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{
-            manifest.policy_scope,
-            manifest.schema_version,
-            manifest.id,
-            manifest.version,
-            manifest.package_root_sha256 orelse "",
-            manifest.artifact_sha256 orelse "",
-            manifest_path,
-            artifact_absolute_path,
-        },
-    );
-}
-
-pub fn nativePolicyLookupKey(allocator: std.mem.Allocator, descriptor: NativeDescriptor) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "native:{s}:{s}:{s}",
-        .{ descriptor.id, descriptor.version, descriptor.name },
-    );
-}
-
-pub fn processJsonlPolicyLookupKey(allocator: std.mem.Allocator, options: ProcessJsonlOptions) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    try out.writer.writeAll("process_jsonl:{\"argv\":[");
-    for (options.argv, 0..) |arg, index| {
-        if (index > 0) try out.writer.writeAll(",");
-        const normalized = try toPolicyPathAlloc(allocator, arg);
-        defer allocator.free(normalized);
-        try writeJsonString(&out.writer, normalized);
-    }
-    try out.writer.writeAll("]");
-    if (options.extension_path) |extension_path| {
-        const normalized = try toPolicyPathAlloc(allocator, extension_path);
-        defer allocator.free(normalized);
-        try out.writer.writeAll(",\"extensionPath\":");
-        try writeJsonString(&out.writer, normalized);
-    }
-    if (options.cwd) |cwd| {
-        const resolved = try std.fs.path.resolve(allocator, &.{cwd});
-        defer allocator.free(resolved);
-        const normalized = try toPolicyPathAlloc(allocator, resolved);
-        defer allocator.free(normalized);
-        try out.writer.writeAll(",\"cwd\":");
-        try writeJsonString(&out.writer, normalized);
-    }
-    try out.writer.writeAll("}");
-    return out.toOwnedSlice();
-}
-
-fn toPolicyPathAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    const normalized = try allocator.dupe(u8, value);
-    for (normalized) |*char| {
-        if (char.* == '\\') char.* = '/';
-    }
-    return normalized;
-}
-
-fn sourceScopeName(scope: resources_mod.SourceScope) []const u8 {
-    return switch (scope) {
-        .temporary => "temporary",
-        .project => "project",
-        .user => "user",
-    };
-}
-
-fn relativePolicyPathAlloc(allocator: std.mem.Allocator, base_dir: ?[]const u8, file_path: []const u8) !?[]u8 {
-    const raw_base = base_dir orelse return null;
-    const base = try toPolicyPathAlloc(allocator, raw_base);
-    defer allocator.free(base);
-    var base_len = base.len;
-    while (base_len > 0 and base[base_len - 1] == '/') base_len -= 1;
-    const trimmed_base = base[0..base_len];
-    if (trimmed_base.len == 0) return null;
-    if (std.mem.eql(u8, trimmed_base, file_path)) return null;
-    if (!std.mem.startsWith(u8, file_path, trimmed_base)) return null;
-    if (file_path.len <= trimmed_base.len or file_path[trimmed_base.len] != '/') return null;
-    return try allocator.dupe(u8, file_path[trimmed_base.len + 1 ..]);
-}
-
-fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
-    try std.json.Stringify.value(value, .{}, writer);
-}
 
 pub const UnsupportedRuntimeOptions = struct {
     label: ?[]const u8 = null,
@@ -658,11 +521,11 @@ pub fn startLockedWasmPackageRuntimes(
     for (resolved.packages) |package| {
         var handoff = WasmManifestHandoff.fromManifest(&package.manifest);
         handoff.policy_scope = package.lock_entry.scope.jsonName();
-        const policy_key = try wasmPolicyLookupKey(allocator, handoff);
-        defer allocator.free(policy_key);
-        handoff.policy_lookup_key = policy_key;
+        const policy_lookup_key = try policy_key_mod.wasmPolicyLookupKey(allocator, handoff);
+        defer allocator.free(policy_lookup_key);
+        handoff.policy_lookup_key = policy_lookup_key;
 
-        const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
+        const policy = runtime_config.getExtensionPolicy(policy_lookup_key) orelse {
             if (try findStaleLockedWasmPolicyKey(allocator, runtime_config, handoff)) |attempted_policy| {
                 defer allocator.free(attempted_policy);
                 const message = try std.fmt.allocPrint(
@@ -676,7 +539,7 @@ pub fn startLockedWasmPackageRuntimes(
                         package.manifest.package_root_sha256,
                         package.manifest.artifact_sha256,
                         attempted_policy,
-                        policy_key,
+                        policy_lookup_key,
                     },
                 );
                 defer allocator.free(message);
@@ -692,7 +555,7 @@ pub fn startLockedWasmPackageRuntimes(
                         package.manifest.package_root,
                         package.manifest.package_root_sha256,
                         package.manifest.artifact_sha256,
-                        policy_key,
+                        policy_lookup_key,
                     },
                 );
                 defer allocator.free(message);
@@ -723,8 +586,8 @@ pub fn startLockedWasmPackageRuntimes(
                     package.manifest.artifact_absolute_path,
                     package.manifest.package_root_sha256,
                     package.manifest.artifact_sha256,
-                    policy_key,
-                    policy_key,
+                    policy_lookup_key,
+                    policy_lookup_key,
                 },
             );
             defer allocator.free(message);
@@ -773,7 +636,7 @@ pub fn startLockedWasmPackageRuntimes(
                 .package_root = try allocator.dupe(u8, package.manifest.package_root),
                 .manifest_path = try allocator.dupe(u8, package.manifest.manifest_path),
                 .tool_id = try allocator.dupe(u8, package.manifest.tool_id),
-                .policy_lookup_key = try allocator.dupe(u8, policy_key),
+                .policy_lookup_key = try allocator.dupe(u8, policy_lookup_key),
                 .adapter = adapter,
             };
             errdefer entry.deinit(allocator);
@@ -2901,7 +2764,7 @@ fn nativeDeinit(ptr: *anyopaque) void {
     nativeRuntime(ptr).deinit();
 }
 
-const native_vtable: RuntimeAdapter.VTable = .{
+pub const native_vtable: RuntimeAdapter.VTable = .{
     .wait_for_ready = nativeWaitForReady,
     .pending_count = nativePendingCount,
     .diagnostic_count = nativeDiagnosticCount,
@@ -3127,7 +2990,7 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
         .origin = .top_level,
         .base_dir = @constCast("/workspace/project/.pi"),
     };
-    const local_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+    const local_ts_key = try policy_key_mod.typeScriptPolicyLookupKey(allocator, .{
         .configured_path = "/workspace/project/.pi/extensions/local.ts",
         .resolved_path = "/workspace/project/.pi/extensions/local.ts",
         .source_info = local_source_info,
@@ -3142,7 +3005,7 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
         .origin = .package,
         .base_dir = @constCast("/workspace/pkg"),
     };
-    const package_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+    const package_ts_key = try policy_key_mod.typeScriptPolicyLookupKey(allocator, .{
         .configured_path = "/workspace/pkg/extensions/entry.ts",
         .resolved_path = "/workspace/pkg/extensions/entry.ts",
         .source_info = package_source_info,
@@ -3156,7 +3019,7 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
         .scope = .temporary,
         .origin = .top_level,
     };
-    const inline_ts_key = try typeScriptPolicyLookupKey(allocator, .{
+    const inline_ts_key = try policy_key_mod.typeScriptPolicyLookupKey(allocator, .{
         .configured_path = "<inline:1>",
         .resolved_path = "<inline:1>",
         .source_info = inline_source_info,
@@ -3169,7 +3032,7 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
     try std.testing.expect(manifest_result == .valid);
 
     const wasm_handoff = WasmManifestHandoff.fromManifest(&manifest_result.valid);
-    const wasm_key = try wasmPolicyLookupKey(allocator, wasm_handoff);
+    const wasm_key = try policy_key_mod.wasmPolicyLookupKey(allocator, wasm_handoff);
     defer allocator.free(wasm_key);
     const expected_wasm_key = try std.fmt.allocPrint(
         allocator,
@@ -3179,7 +3042,7 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
     defer allocator.free(expected_wasm_key);
     try std.testing.expectEqualStrings(expected_wasm_key, wasm_key);
 
-    const wasm_manifest_key = try wasmManifestPolicyLookupKey(allocator, .{
+    const wasm_manifest_key = try policy_key_mod.wasmManifestPolicyLookupKey(allocator, .{
         .schema_version = manifest_result.valid.schema_version,
         .id = manifest_result.valid.id,
         .version = manifest_result.valid.version,
@@ -3196,18 +3059,18 @@ test "extension runtime policy lookup keys are canonical per runtime source" {
     defer allocator.free(expected_wasm_manifest_key);
     try std.testing.expectEqualStrings(expected_wasm_manifest_key, wasm_manifest_key);
 
-    const native_key = try nativePolicyLookupKey(allocator, native_static_descriptor);
+    const native_key = try policy_key_mod.nativePolicyLookupKey(allocator, native_static_descriptor);
     defer allocator.free(native_key);
     try std.testing.expectEqualStrings("native:com.pi.native-static-fixture:0.1.0:Native Static Fixture", native_key);
 
-    const process_a = try processJsonlPolicyLookupKey(allocator, .{
+    const process_a = try policy_key_mod.processJsonlPolicyLookupKey(allocator, .{
         .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-a" },
         .cwd = "/workspace",
         .extension_path = "/workspace/ext-a",
         .initialize = .{ .marker = "marker", .cwd = "/workspace", .fixture = "same-protocol" },
     });
     defer allocator.free(process_a);
-    const process_b = try processJsonlPolicyLookupKey(allocator, .{
+    const process_b = try policy_key_mod.processJsonlPolicyLookupKey(allocator, .{
         .argv = &.{ "/bin/pi-extension-host", "--runtime", "process_jsonl", "/workspace/ext-b" },
         .cwd = "/workspace",
         .extension_path = "/workspace/ext-b",
@@ -3666,7 +3529,7 @@ test "persisted native extension policy resource limits drive enforcement diagno
     defer allocator.free(home_dir);
     const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
     defer allocator.free(project_dir);
-    const native_key = try nativePolicyLookupKey(allocator, native_persisted_policy_limit_descriptor);
+    const native_key = try policy_key_mod.nativePolicyLookupKey(allocator, native_persisted_policy_limit_descriptor);
     defer allocator.free(native_key);
     const settings_json = try std.fmt.allocPrint(allocator,
         \\{{"extensionPolicies":{{"{s}":{{"approvedGrants":["agent.spawn"],"resourceLimits":{{"maxChildren":1}}}}}}}}
@@ -3734,11 +3597,10 @@ test "native runtime preserves ready boundary duplicate readiness and determinis
     try std.testing.expect(std.mem.indexOf(u8, snapshot_one, "native.fixture.preready") == null);
 }
 
-test "native descriptor rejects dynamic runtime and product policy fields" {
+test "native descriptor rejects unsupported runtime and product policy fields" {
     const allocator = std.testing.allocator;
     const forbidden_descriptors = [_]NativeDescriptor{
         .{ .id = "com.pi.native-library", .name = "Library", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .library_path = "/tmp/libnative.dylib" },
-        .{ .id = "com.pi.native-dynamic-library", .name = "Dynamic Library", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .dynamic_library_path = "/tmp/libnative.dylib" },
         .{ .id = "com.pi.native-process", .name = "Process", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .executable_command = "node extension.js" },
         .{ .id = "com.pi.native-process-command", .name = "Process Command", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .process_command = "bun extension.ts" },
         .{ .id = "com.pi.native-remote", .name = "Remote", .version = "0.1.0", .description = "forbidden", .tools = &.{native_static_tool}, .remote_url = "https://example.invalid/plugin.wasm" },
@@ -4080,7 +3942,7 @@ test "persisted wasm extension policy resource limits reach tool enforcement dia
     var manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, "test/fixtures/wasm/pure-truncate-head-v0");
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);
-    const wasm_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    const wasm_key = try policy_key_mod.wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
     defer allocator.free(wasm_key);
     const settings_json = try std.fmt.allocPrint(allocator,
         \\{{"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["policy.allowed.tool"]}}}}}}}}
@@ -4155,11 +4017,11 @@ test "locked wasm packages resolve to policy gated runtime set and unload cleanl
     defer allocator.free(lock_path);
     try @import("../packages/provenance_lockfile.zig").writeEntry(allocator, std.testing.io, .user, lock_path, lock_entry);
 
-    const policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
-    defer allocator.free(policy_key);
+    const policy_lookup_key = try policy_key_mod.wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&manifest_result.valid));
+    defer allocator.free(policy_lookup_key);
     const settings_json = try std.fmt.allocPrint(allocator,
         \\{{"packages":["{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["builtin.truncateHead"]}}}}}}}}
-    , .{ package_root, policy_key });
+    , .{ package_root, policy_lookup_key });
     defer allocator.free(settings_json);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/settings.json", .data = settings_json });
 
@@ -4283,9 +4145,9 @@ test "locked wasm runtime set omits missing policy, capability-denied, and abi i
     defer invalid_abi_lock.deinit(allocator);
     try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, invalid_abi_lock);
 
-    const capability_policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&capability_denied_result.valid));
+    const capability_policy_key = try policy_key_mod.wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&capability_denied_result.valid));
     defer allocator.free(capability_policy_key);
-    const invalid_policy_key = try wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&invalid_abi_result.valid));
+    const invalid_policy_key = try policy_key_mod.wasmPolicyLookupKey(allocator, WasmManifestHandoff.fromManifest(&invalid_abi_result.valid));
     defer allocator.free(invalid_policy_key);
     const settings_json = try std.fmt.allocPrint(allocator,
         \\{{"packages":["{s}","{s}","{s}"],"extensionPolicies":{{"{s}":{{"resourceLimits":{{"toolScopes":["example.capabilityDenied"]}}}},"{s}":{{"resourceLimits":{{"toolScopes":["example.invalidAbi"]}}}}}}}}

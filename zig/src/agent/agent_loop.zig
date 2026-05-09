@@ -7,105 +7,12 @@ const provider_json = ai.provider_json;
 const types = @import("types.zig");
 const json_schema = @import("json_schema.zig");
 const accumulator = @import("accumulator.zig");
+const content_clone = @import("content_clone.zig");
+const tool_execution = @import("tool_execution.zig");
+const streaming = @import("streaming.zig");
 
-pub const AgentLoopError = error{
-    MissingAssistantResult,
-    PartialContentOutOfOrder,
-    PartialContentIndexReused,
-    ToolCallAlreadyFinalized,
-};
+pub const AgentLoopError = types.AgentLoopError;
 
-const PreparedToolCall = struct {
-    tool_call: ai.ToolCall,
-    tool: types.AgentTool,
-    args: std.json.Value,
-    finalized: bool = false,
-
-    fn deinit(self: *PreparedToolCall, allocator: std.mem.Allocator) void {
-        provider_json.freeValue(allocator, self.args);
-    }
-};
-
-const ImmediateToolCallOutcome = struct {
-    result: types.AgentToolResult,
-    is_error: bool,
-};
-
-const ExecutedToolCallOutcome = struct {
-    result: types.AgentToolResult,
-    is_error: bool,
-};
-
-const FinalizedToolCallOutcome = struct {
-    result: types.AgentToolResult,
-    is_error: bool,
-};
-
-/// Partial tool-call UX policy:
-/// - Every toolcall_start/toolcall_delta/toolcall_end still emits a
-///   message_update so RPC/streaming clients can observe argument
-///   accumulation and finalization order.
-/// - Partial arguments are exposed in the callback-scoped partial assistant
-///   message only when another assistant block anchors the transcript row.
-///   A standalone leading tool call is hidden from message.content until the
-
-const UpdateEmitterContext = struct {
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    tool_call: ai.ToolCall,
-};
-
-const ParallelToolEmitter = struct {
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-
-    fn emitUpdate(self: *ParallelToolEmitter, event: types.AgentEvent) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        try self.emit(self.emit_context, event);
-    }
-};
-
-const ParallelToolTask = struct {
-    arena: std.heap.ArenaAllocator,
-    prepared: PreparedToolCall,
-    source_index: usize,
-    completion_counter: *std.atomic.Value(usize),
-    completion_order: usize = std.math.maxInt(usize),
-    signal: ?*const std.atomic.Value(bool),
-    emitter: *ParallelToolEmitter,
-    result: ?types.AgentToolResult = null,
-    is_error: bool = false,
-
-    fn init(
-        parent_allocator: std.mem.Allocator,
-        prepared: PreparedToolCall,
-        source_index: usize,
-        completion_counter: *std.atomic.Value(usize),
-        signal: ?*const std.atomic.Value(bool),
-        emitter: *ParallelToolEmitter,
-    ) ParallelToolTask {
-        return .{
-            .arena = std.heap.ArenaAllocator.init(parent_allocator),
-            .prepared = prepared,
-            .source_index = source_index,
-            .completion_counter = completion_counter,
-            .signal = signal,
-            .emitter = emitter,
-        };
-    }
-
-    fn deinit(self: *ParallelToolTask) void {
-        self.arena.deinit();
-    }
-};
-
-const PreparedToolCallEntry = struct {
-    prepared: PreparedToolCall,
-    source_index: usize,
-};
 
 pub fn runAgentLoop(
     allocator: std.mem.Allocator,
@@ -213,7 +120,7 @@ fn runLoop(
                 .extension_hook_context = config.extension_hook_context,
             };
 
-            const assistant = try streamAssistantResponse(
+            const assistant = try streaming.streamAssistantResponse(
                 allocator,
                 io,
                 current_context,
@@ -248,7 +155,7 @@ fn runLoop(
             has_more_tool_calls = tool_calls.len > 0;
 
             if (has_more_tool_calls) {
-                const executed_tool_results = try executeToolCalls(
+                const executed_tool_results = try tool_execution.executeToolCalls(
                     allocator,
                     io,
                     current_context,
@@ -309,180 +216,6 @@ fn runLoop(
     });
 }
 
-fn mapThinkingLevel(level: types.ThinkingLevel) ?ai.types.ThinkingLevel {
-    return switch (level) {
-        .off => null,
-        .minimal => .minimal,
-        .low => .low,
-        .medium => .medium,
-        .high => .high,
-        .xhigh => .xhigh,
-    };
-}
-
-fn streamSimpleForAgentLoop(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    context: ai.Context,
-    options: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    return try ai.streamSimple(allocator, io, model, context, options);
-}
-
-fn streamAssistantResponse(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    context: types.AgentContext,
-    config: types.AgentLoopConfig,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-    stream_fn: ?types.StreamFn,
-) !ai.AssistantMessage {
-    const transformed_messages = if (config.transform_context) |transform|
-        try transform(allocator, context.messages, signal, config.transform_context_context)
-    else
-        context.messages;
-
-    const llm_messages = try config.convert_to_llm(allocator, transformed_messages, config.convert_to_llm_context);
-
-    const llm_tools = if (context.tools.len > 0)
-        try convertToolsToLlm(allocator, context.tools)
-    else
-        null;
-
-    const llm_context = ai.Context{
-        .system_prompt = if (context.system_prompt.len > 0) context.system_prompt else null,
-        .messages = llm_messages,
-        .tools = llm_tools,
-    };
-    const options = ai.types.SimpleStreamOptions{
-        .api_key = config.api_key,
-        .session_id = config.session_id,
-        .signal = signal,
-        .reasoning = if (config.reasoning) |reasoning| mapThinkingLevel(reasoning) else null,
-    };
-
-    const active_stream_fn = stream_fn orelse streamSimpleForAgentLoop;
-    var stream = try active_stream_fn(allocator, io, config.model, llm_context, options, config.stream_context);
-    defer stream.deinit();
-
-    var partial_template: ?ai.AssistantMessage = null;
-    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(allocator);
-    defer partial_accumulator.deinit();
-    var saw_message_start = false;
-
-    while (stream.next()) |event| {
-        defer event.deinitTransient(allocator);
-        switch (event.event_type) {
-            .start => {
-                if (event.message) |message| {
-                    partial_template = message;
-                    saw_message_start = true;
-                    try emit(emit_context, .{
-                        .event_type = .message_start,
-                        .message = .{ .assistant = message },
-                    });
-                }
-            },
-            .text_start => {
-                if (partial_template) |template| {
-                    try partial_accumulator.applyEvent(event);
-                    try emitPartialMessageUpdate(
-                        allocator,
-                        emit_context,
-                        emit,
-                        template,
-                        event,
-                        &partial_accumulator,
-                    );
-                }
-            },
-            .text_delta => {
-                if (partial_template) |template| {
-                    try partial_accumulator.applyEvent(event);
-                    try emitPartialMessageUpdate(
-                        allocator,
-                        emit_context,
-                        emit,
-                        template,
-                        event,
-                        &partial_accumulator,
-                    );
-                }
-            },
-            .text_end => {
-                if (partial_template) |template| {
-                    try partial_accumulator.applyEvent(event);
-                    try emitPartialMessageUpdate(
-                        allocator,
-                        emit_context,
-                        emit,
-                        template,
-                        event,
-                        &partial_accumulator,
-                    );
-                }
-            },
-            .thinking_start,
-            .thinking_delta,
-            .thinking_end,
-            .toolcall_start,
-            .toolcall_delta,
-            .toolcall_end,
-            => {
-                const template = if (partial_template) |value| value else ai.AssistantMessage{
-                    .content = &[_]ai.ContentBlock{},
-                    .api = config.model.api,
-                    .provider = config.model.provider,
-                    .model = config.model.id,
-                    .usage = ai.Usage.init(),
-                    .stop_reason = .stop,
-                    .timestamp = types.nowMilliseconds(),
-                };
-                try partial_accumulator.applyEvent(event);
-                try emitPartialMessageUpdate(
-                    allocator,
-                    emit_context,
-                    emit,
-                    template,
-                    event,
-                    &partial_accumulator,
-                );
-            },
-            .done, .error_event => {
-                const final_message = event.message orelse stream.result() orelse return AgentLoopError.MissingAssistantResult;
-                if (!saw_message_start) {
-                    try emit(emit_context, .{
-                        .event_type = .message_start,
-                        .message = .{ .assistant = final_message },
-                    });
-                }
-                try emit(emit_context, .{
-                    .event_type = .message_end,
-                    .message = .{ .assistant = final_message },
-                });
-                return final_message;
-            },
-        }
-    }
-
-    const final_message = stream.result() orelse return AgentLoopError.MissingAssistantResult;
-    if (!saw_message_start) {
-        try emit(emit_context, .{
-            .event_type = .message_start,
-            .message = .{ .assistant = final_message },
-        });
-    }
-    try emit(emit_context, .{
-        .event_type = .message_end,
-        .message = .{ .assistant = final_message },
-    });
-    return final_message;
-}
-
 fn getPendingMessages(
     allocator: std.mem.Allocator,
     callback: ?types.PendingMessagesFn,
@@ -498,868 +231,7 @@ fn isAbortRequested(signal: ?*const std.atomic.Value(bool)) bool {
     return if (signal) |abort_signal| abort_signal.load(.seq_cst) else false;
 }
 
-fn executeToolCalls(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    current_context: types.AgentContext,
-    assistant_message: ai.AssistantMessage,
-    tool_calls: []const ai.ToolCall,
-    config: types.AgentLoopConfig,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-) ![]const types.ToolResultMessage {
-    var has_sequential_tool = false;
-    for (tool_calls) |tool_call| {
-        if (findTool(current_context.tools, tool_call.name)) |tool| {
-            if (tool.execution_mode == .sequential) {
-                has_sequential_tool = true;
-                break;
-            }
-        }
-    }
 
-    if (config.tool_execution == .sequential or has_sequential_tool) {
-        return executeToolCallsSequential(
-            allocator,
-            io,
-            current_context,
-            assistant_message,
-            tool_calls,
-            config,
-            emit_context,
-            emit,
-            signal,
-        );
-    }
-
-    return executeToolCallsParallel(
-        allocator,
-        io,
-        current_context,
-        assistant_message,
-        tool_calls,
-        config,
-        emit_context,
-        emit,
-        signal,
-    );
-}
-
-fn executeToolCallsSequential(
-    allocator: std.mem.Allocator,
-    _: std.Io,
-    current_context: types.AgentContext,
-    assistant_message: ai.AssistantMessage,
-    tool_calls: []const ai.ToolCall,
-    config: types.AgentLoopConfig,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-) ![]const types.ToolResultMessage {
-    var results = std.ArrayList(types.ToolResultMessage).empty;
-    errdefer results.deinit(allocator);
-
-    for (tool_calls) |tool_call| {
-        try emit(emit_context, .{
-            .event_type = .tool_execution_start,
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .args = tool_call.arguments,
-        });
-
-        const prepared = try prepareToolCall(
-            allocator,
-            current_context,
-            assistant_message,
-            tool_call,
-            config,
-            signal,
-        );
-
-        const tool_result = switch (prepared) {
-            .prepared => |prepared_tool| blk: {
-                var owned_prepared_tool = prepared_tool;
-                defer owned_prepared_tool.deinit(allocator);
-                const executed = try executePreparedToolCallSequential(
-                    allocator,
-                    owned_prepared_tool,
-                    emit_context,
-                    emit,
-                    signal,
-                );
-                const finalized = try finalizeExecutedToolCall(
-                    allocator,
-                    current_context,
-                    assistant_message,
-                    &owned_prepared_tool,
-                    executed,
-                    false,
-                    config,
-                    emit_context,
-                    emit,
-                    signal,
-                );
-                break :blk try emitToolResultMessageForToolCall(
-                    owned_prepared_tool.tool_call,
-                    finalized.result,
-                    finalized.is_error,
-                    emit_context,
-                    emit,
-                );
-            },
-            .immediate => |immediate| try emitToolCallOutcome(
-                allocator,
-                tool_call,
-                immediate.result,
-                immediate.is_error,
-                emit_context,
-                emit,
-            ),
-        };
-
-        try results.append(allocator, tool_result);
-    }
-
-    return try results.toOwnedSlice(allocator);
-}
-
-fn executeToolCallsParallel(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    current_context: types.AgentContext,
-    assistant_message: ai.AssistantMessage,
-    tool_calls: []const ai.ToolCall,
-    config: types.AgentLoopConfig,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-) ![]const types.ToolResultMessage {
-    const result_slots = try allocator.alloc(?types.ToolResultMessage, tool_calls.len);
-    @memset(result_slots, null);
-    defer allocator.free(result_slots);
-
-    var prepared_calls = std.ArrayList(PreparedToolCallEntry).empty;
-    defer {
-        for (prepared_calls.items) |*entry| {
-            entry.prepared.deinit(allocator);
-        }
-        prepared_calls.deinit(allocator);
-    }
-
-    for (tool_calls, 0..) |tool_call, source_index| {
-        try emit(emit_context, .{
-            .event_type = .tool_execution_start,
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .args = tool_call.arguments,
-        });
-
-        const prepared = try prepareToolCall(
-            allocator,
-            current_context,
-            assistant_message,
-            tool_call,
-            config,
-            signal,
-        );
-
-        switch (prepared) {
-            .prepared => |prepared_tool| try prepared_calls.append(allocator, .{
-                .prepared = prepared_tool,
-                .source_index = source_index,
-            }),
-            .immediate => |immediate| {
-                const tool_result = try finalizeImmediateToolCall(
-                    tool_call,
-                    immediate.result,
-                    immediate.is_error,
-                    emit_context,
-                    emit,
-                );
-                result_slots[source_index] = tool_result;
-            },
-        }
-    }
-
-    if (prepared_calls.items.len == 0) {
-        try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
-        return try collectParallelToolResultsInSourceOrder(allocator, result_slots);
-    }
-
-    const task_count = prepared_calls.items.len;
-    const tasks = try allocator.alloc(ParallelToolTask, task_count);
-    defer allocator.free(tasks);
-    const threads = try allocator.alloc(std.Thread, task_count);
-    defer allocator.free(threads);
-
-    var parallel_emitter = ParallelToolEmitter{
-        .io = io,
-        .emit_context = emit_context,
-        .emit = emit,
-    };
-    var completion_counter = std.atomic.Value(usize).init(0);
-
-    for (prepared_calls.items, 0..) |entry, index| {
-        tasks[index] = ParallelToolTask.init(
-            allocator,
-            entry.prepared,
-            entry.source_index,
-            &completion_counter,
-            signal,
-            &parallel_emitter,
-        );
-        threads[index] = try std.Thread.spawn(.{}, runParallelToolTask, .{&tasks[index]});
-    }
-
-    for (threads) |thread| {
-        thread.join();
-    }
-    defer {
-        for (tasks) |*task| task.deinit();
-    }
-
-    const completion_order = try allocator.alloc(usize, task_count);
-    defer allocator.free(completion_order);
-    fillTaskCompletionOrder(completion_order, tasks);
-
-    for (completion_order) |task_index| {
-        const task = &tasks[task_index];
-        const executed = ExecutedToolCallOutcome{
-            .result = if (task.result) |result|
-                try cloneToolResult(result, allocator)
-            else
-                try createErrorToolResult(allocator, "Parallel tool execution failed"),
-            .is_error = task.is_error,
-        };
-        const finalized = try finalizeExecutedToolCall(
-            allocator,
-            current_context,
-            assistant_message,
-            &task.prepared,
-            executed,
-            true,
-            config,
-            emit_context,
-            emit,
-            signal,
-        );
-        result_slots[task.source_index] = createToolResultMessage(
-            task.prepared.tool_call,
-            finalized.result,
-            finalized.is_error,
-        );
-    }
-
-    try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
-    return try collectParallelToolResultsInSourceOrder(allocator, result_slots);
-}
-
-const PreparedToolCallOrImmediate = union(enum) {
-    prepared: PreparedToolCall,
-    immediate: ImmediateToolCallOutcome,
-};
-
-fn prepareToolCall(
-    allocator: std.mem.Allocator,
-    current_context: types.AgentContext,
-    assistant_message: ai.AssistantMessage,
-    tool_call: ai.ToolCall,
-    config: types.AgentLoopConfig,
-    signal: ?*const std.atomic.Value(bool),
-) !PreparedToolCallOrImmediate {
-    const tool = findTool(current_context.tools, tool_call.name) orelse {
-        return .{ .immediate = .{
-            .result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "Tool {s} not found", .{tool_call.name})),
-            .is_error = true,
-        } };
-    };
-
-    var args = prepareToolCallArguments(allocator, tool, tool_call.arguments) catch |err| {
-        return .{ .immediate = .{
-            .result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)})),
-            .is_error = true,
-        } };
-    };
-    if (try json_schema.validateToolArguments(allocator, tool.parameters, args)) |failure| {
-        defer failure.deinit(allocator);
-        const result = if (tool.invalid_arguments_result) |invalid_arguments_result|
-            try invalid_arguments_result(
-                allocator,
-                tool_call.id,
-                args,
-                tool.execute_context,
-                .{
-                    .code = failure.code,
-                    .message = failure.message,
-                    .path = failure.path,
-                },
-            )
-        else
-            try createErrorToolResult(allocator, "InvalidToolArguments");
-        provider_json.freeValue(allocator, args);
-        return .{ .immediate = .{
-            .result = result,
-            .is_error = true,
-        } };
-    }
-
-    if (config.before_tool_call) |before_tool_call| {
-        const before_result = before_tool_call(allocator, .{
-            .assistant_message = assistant_message,
-            .tool_call = tool_call,
-            .args = &args,
-            .context = current_context,
-        }, signal) catch |err| {
-            provider_json.freeValue(allocator, args);
-            return .{ .immediate = .{
-                .result = try createErrorToolResult(allocator, @errorName(err)),
-                .is_error = true,
-            } };
-        };
-
-        if (before_result) |result| {
-            if (result.block) {
-                provider_json.freeValue(allocator, args);
-                return .{ .immediate = .{
-                    .result = try createErrorToolResult(
-                        allocator,
-                        result.reason orelse "Tool execution was blocked",
-                    ),
-                    .is_error = true,
-                } };
-            }
-        }
-    }
-
-    return .{ .prepared = .{
-        .tool_call = tool_call,
-        .tool = tool,
-        .args = args,
-    } };
-}
-
-fn prepareToolCallArguments(
-    allocator: std.mem.Allocator,
-    tool: types.AgentTool,
-    args: std.json.Value,
-) !std.json.Value {
-    if (tool.prepare_arguments) |prepare_arguments| {
-        return try prepare_arguments(allocator, args);
-    }
-    return try provider_json.cloneValue(allocator, args);
-}
-
-fn findTool(tools: []const types.AgentTool, name: []const u8) ?types.AgentTool {
-    for (tools) |tool| {
-        if (std.mem.eql(u8, tool.name, name)) return tool;
-    }
-    return null;
-}
-
-fn executePreparedToolCallSequential(
-    allocator: std.mem.Allocator,
-    prepared: PreparedToolCall,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-) !ExecutedToolCallOutcome {
-    var update_context = UpdateEmitterContext{
-        .emit_context = emit_context,
-        .emit = emit,
-        .tool_call = prepared.tool_call,
-    };
-    return try executePreparedToolCallInternal(
-        allocator,
-        prepared,
-        signal,
-        &update_context,
-        emitToolExecutionUpdate,
-    );
-}
-
-fn executePreparedToolCallInternal(
-    allocator: std.mem.Allocator,
-    prepared: PreparedToolCall,
-    signal: ?*const std.atomic.Value(bool),
-    on_update_context: ?*anyopaque,
-    on_update: ?types.AgentToolUpdateCallback,
-) !ExecutedToolCallOutcome {
-    const execute_tool = prepared.tool.execute orelse {
-        return .{
-            .result = try createErrorToolResult(allocator, "Tool has no execute function"),
-            .is_error = true,
-        };
-    };
-
-    const result = execute_tool(
-        allocator,
-        prepared.tool_call.id,
-        prepared.args,
-        prepared.tool.execute_context,
-        signal,
-        on_update_context,
-        on_update,
-    ) catch |err| {
-        return .{
-            .result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)})),
-            .is_error = true,
-        };
-    };
-
-    return .{
-        .result = result,
-        .is_error = result.is_error,
-    };
-}
-
-fn emitToolExecutionUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
-    const update_context: *UpdateEmitterContext = @ptrCast(@alignCast(context.?));
-    try update_context.emit(update_context.emit_context, .{
-        .event_type = .tool_execution_update,
-        .tool_call_id = update_context.tool_call.id,
-        .tool_name = update_context.tool_call.name,
-        .args = update_context.tool_call.arguments,
-        .partial_result = partial_result,
-    });
-}
-
-fn runParallelToolTask(task: *ParallelToolTask) void {
-    const outcome = executePreparedToolCallInternal(
-        task.arena.allocator(),
-        task.prepared,
-        task.signal,
-        task,
-        emitParallelToolUpdate,
-    ) catch {
-        task.result = createErrorToolResult(task.arena.allocator(), "Parallel tool execution failed") catch unreachable;
-        task.is_error = true;
-        task.completion_order = task.completion_counter.fetchAdd(1, .seq_cst);
-        return;
-    };
-
-    task.result = outcome.result;
-    task.is_error = outcome.is_error;
-    task.completion_order = task.completion_counter.fetchAdd(1, .seq_cst);
-}
-
-fn emitParallelToolUpdate(context: ?*anyopaque, partial_result: types.AgentToolResult) !void {
-    const task: *ParallelToolTask = @ptrCast(@alignCast(context.?));
-    try task.emitter.emitUpdate(.{
-        .event_type = .tool_execution_update,
-        .tool_call_id = task.prepared.tool_call.id,
-        .tool_name = task.prepared.tool_call.name,
-        .args = task.prepared.tool_call.arguments,
-        .partial_result = partial_result,
-    });
-}
-
-fn finalizeExecutedToolCall(
-    allocator: std.mem.Allocator,
-    current_context: types.AgentContext,
-    assistant_message: ai.AssistantMessage,
-    prepared: *PreparedToolCall,
-    executed: ExecutedToolCallOutcome,
-    owns_result_content: bool,
-    config: types.AgentLoopConfig,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    signal: ?*const std.atomic.Value(bool),
-) !FinalizedToolCallOutcome {
-    if (prepared.finalized) return AgentLoopError.ToolCallAlreadyFinalized;
-    prepared.finalized = true;
-
-    var result = executed.result;
-    var is_error = executed.is_error;
-    var result_content_owned = owns_result_content;
-
-    if (config.after_tool_call) |after_tool_call| {
-        const after_result = after_tool_call(allocator, .{
-            .assistant_message = assistant_message,
-            .tool_call = prepared.tool_call,
-            .args = prepared.args,
-            .result = result,
-            .is_error = is_error,
-            .context = current_context,
-        }, signal) catch |err| {
-            if (result_content_owned) deinitContentBlocks(allocator, result.content);
-            result = try createErrorToolResult(allocator, try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}));
-            is_error = true;
-            try emitToolExecutionEnd(
-                prepared.tool_call,
-                result,
-                is_error,
-                emit_context,
-                emit,
-            );
-            return .{ .result = result, .is_error = is_error };
-        };
-
-        if (after_result) |override| {
-            if (override.content) |content| {
-                const replaced_content = !sameContentBlocks(result.content, content);
-                if (result_content_owned and replaced_content) {
-                    deinitContentBlocks(allocator, result.content);
-                }
-                result.content = content;
-                if (replaced_content) result_content_owned = false;
-            }
-            if (override.details) |details| result.details = details;
-            if (override.is_error) |next_is_error| is_error = next_is_error;
-        }
-    }
-
-    result.is_error = is_error;
-    try emitToolExecutionEnd(
-        prepared.tool_call,
-        result,
-        is_error,
-        emit_context,
-        emit,
-    );
-    return .{ .result = result, .is_error = is_error };
-}
-
-fn createErrorToolResult(allocator: std.mem.Allocator, message: []const u8) !types.AgentToolResult {
-    const content = try allocator.alloc(ai.ContentBlock, 1);
-    content[0] = .{
-        .text = .{
-            .text = try allocator.dupe(u8, message),
-        },
-    };
-    return .{
-        .content = content,
-        .details = null,
-        .is_error = true,
-    };
-}
-
-fn emitToolCallOutcome(
-    allocator: std.mem.Allocator,
-    tool_call: ai.ToolCall,
-    result: types.AgentToolResult,
-    is_error: bool,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !types.ToolResultMessage {
-    _ = allocator;
-    const tool_result = try finalizeImmediateToolCall(
-        tool_call,
-        result,
-        is_error,
-        emit_context,
-        emit,
-    );
-    try emitToolResultMessage(tool_result, emit_context, emit);
-    return tool_result;
-}
-
-fn finalizeImmediateToolCall(
-    tool_call: ai.ToolCall,
-    result: types.AgentToolResult,
-    is_error: bool,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !types.ToolResultMessage {
-    try emitToolExecutionEnd(tool_call, result, is_error, emit_context, emit);
-    return createToolResultMessage(tool_call, result, is_error);
-}
-
-fn emitToolExecutionEnd(
-    tool_call: ai.ToolCall,
-    result: types.AgentToolResult,
-    is_error: bool,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !void {
-    var emitted_result = result;
-    emitted_result.is_error = is_error;
-    try emit(emit_context, .{
-        .event_type = .tool_execution_end,
-        .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
-        .args = tool_call.arguments,
-        .result = emitted_result,
-        .is_error = is_error,
-    });
-}
-
-fn createToolResultMessage(
-    tool_call: ai.ToolCall,
-    result: types.AgentToolResult,
-    is_error: bool,
-) types.ToolResultMessage {
-    var emitted_result = result;
-    emitted_result.is_error = is_error;
-    return .{
-        .tool_call_id = tool_call.id,
-        .tool_name = tool_call.name,
-        .content = emitted_result.content,
-        .details = emitted_result.details,
-        .is_error = is_error,
-        .timestamp = types.nowMilliseconds(),
-    };
-}
-
-fn emitToolResultMessage(
-    tool_result: types.ToolResultMessage,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !void {
-    try emit(emit_context, .{
-        .event_type = .message_start,
-        .message = .{ .tool_result = tool_result },
-    });
-    try emit(emit_context, .{
-        .event_type = .message_end,
-        .message = .{ .tool_result = tool_result },
-    });
-}
-
-fn emitToolResultMessageForToolCall(
-    tool_call: ai.ToolCall,
-    result: types.AgentToolResult,
-    is_error: bool,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !types.ToolResultMessage {
-    const tool_result = createToolResultMessage(tool_call, result, is_error);
-    try emitToolResultMessage(tool_result, emit_context, emit);
-    return tool_result;
-}
-
-fn collectParallelToolResultsInSourceOrder(
-    allocator: std.mem.Allocator,
-    result_slots: []const ?types.ToolResultMessage,
-) ![]const types.ToolResultMessage {
-    var results = try std.ArrayList(types.ToolResultMessage).initCapacity(allocator, result_slots.len);
-    errdefer results.deinit(allocator);
-
-    for (result_slots) |slot| {
-        const tool_result = slot orelse return error.MissingToolResult;
-        try results.append(allocator, tool_result);
-    }
-
-    return try results.toOwnedSlice(allocator);
-}
-
-fn emitParallelToolResultMessagesInSourceOrder(
-    result_slots: []const ?types.ToolResultMessage,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-) !void {
-    for (result_slots) |slot| {
-        const tool_result = slot orelse return error.MissingToolResult;
-        try emitToolResultMessage(tool_result, emit_context, emit);
-    }
-}
-
-fn fillTaskCompletionOrder(order: []usize, tasks: []const ParallelToolTask) void {
-    for (order, 0..) |*slot, index| slot.* = index;
-
-    var index: usize = 1;
-    while (index < order.len) : (index += 1) {
-        const task_index = order[index];
-        const task_completion = tasks[task_index].completion_order;
-        var cursor = index;
-        while (cursor > 0 and tasks[order[cursor - 1]].completion_order > task_completion) : (cursor -= 1) {
-            order[cursor] = order[cursor - 1];
-        }
-        order[cursor] = task_index;
-    }
-}
-
-fn emitPartialMessageUpdate(
-    allocator: std.mem.Allocator,
-    emit_context: ?*anyopaque,
-    emit: types.AgentEventCallback,
-    template: ai.AssistantMessage,
-    assistant_message_event: ai.AssistantMessageEvent,
-    partial_accumulator: *accumulator.PartialAssistantAccumulator,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    // `partial_accumulator` owns long-lived partial bytes with the parent
-    // allocator, while this arena owns the callback-scoped message shape
-    // (`content` slices and temporary parsed JSON). Every pointer in the
-    // emitted update is borrowed for this callback only; subscribers that keep
-    // any update data must clone it before returning.
-    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
-    try emit(emit_context, .{
-        .event_type = .message_update,
-        .message = .{ .assistant = partial_message },
-        .assistant_message_event = assistant_message_event,
-    });
-}
-
-fn cloneToolResult(
-    result: types.AgentToolResult,
-    allocator: std.mem.Allocator,
-) !types.AgentToolResult {
-    return .{
-        .content = try cloneContentBlocks(allocator, result.content),
-        .details = if (result.details) |details| try provider_json.cloneValue(allocator, details) else null,
-        .is_error = result.is_error,
-    };
-}
-
-fn cloneContentBlocks(
-    allocator: std.mem.Allocator,
-    blocks: []const ai.ContentBlock,
-) ![]const ai.ContentBlock {
-    const cloned = try allocator.alloc(ai.ContentBlock, blocks.len);
-    var initialized_len: usize = 0;
-    errdefer {
-        deinitContentBlocks(allocator, cloned[0..initialized_len]);
-        allocator.free(cloned);
-    }
-
-    for (blocks, 0..) |block, index| {
-        cloned[index] = try cloneContentBlock(allocator, block);
-        initialized_len += 1;
-    }
-
-    return cloned;
-}
-
-fn cloneContentBlock(
-    allocator: std.mem.Allocator,
-    block: ai.ContentBlock,
-) !ai.ContentBlock {
-    return switch (block) {
-        .text => |text| blk: {
-            const owned_text = try allocator.dupe(u8, text.text);
-            errdefer allocator.free(owned_text);
-
-            const text_signature = if (text.text_signature) |signature| try allocator.dupe(u8, signature) else null;
-            errdefer if (text_signature) |signature| allocator.free(signature);
-
-            break :blk .{
-                .text = .{
-                    .text = owned_text,
-                    .text_signature = text_signature,
-                },
-            };
-        },
-        .image => |image| blk: {
-            const data = try allocator.dupe(u8, image.data);
-            errdefer allocator.free(data);
-
-            const mime_type = try allocator.dupe(u8, image.mime_type);
-            errdefer allocator.free(mime_type);
-
-            break :blk .{
-                .image = .{
-                    .data = data,
-                    .mime_type = mime_type,
-                },
-            };
-        },
-        .thinking => |thinking| blk: {
-            const thinking_text = try allocator.dupe(u8, thinking.thinking);
-            errdefer allocator.free(thinking_text);
-
-            const source_signature = ai.thinkingSignature(thinking);
-            const thinking_signature = if (source_signature) |signature| try allocator.dupe(u8, signature) else null;
-            errdefer if (thinking_signature) |signature| allocator.free(signature);
-
-            const signature = if (source_signature) |source| try allocator.dupe(u8, source) else null;
-            errdefer if (signature) |owned_signature| allocator.free(owned_signature);
-
-            break :blk .{
-                .thinking = .{
-                    .thinking = thinking_text,
-                    .thinking_signature = thinking_signature,
-                    .signature = signature,
-                    .redacted = thinking.redacted,
-                },
-            };
-        },
-        .tool_call => |tool_call| .{ .tool_call = try cloneToolCall(allocator, tool_call) },
-    };
-}
-
-fn deinitContentBlocks(
-    allocator: std.mem.Allocator,
-    blocks: []const ai.ContentBlock,
-) void {
-    for (blocks) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .tool_call => |tool_call| deinitToolCall(allocator, tool_call),
-        }
-    }
-}
-
-/// Tool-call clone ownership audit:
-/// - `accumulator.PartialToolCallBlock.setFinal` retains at most one cloned final tool call
-///   and releases the previous clone only after the replacement clone succeeds.
-/// - `cloneContentBlock` retains cloned inline tool calls inside a cloned
-///   content slice; `cloneContentBlocks` unwinds initialized blocks on error,
-///   and `deinitContentBlocks` releases those clones.
-/// Keep all future `cloneToolCall` retainers paired with `deinitToolCall`.
-fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
-    const id = try allocator.dupe(u8, tool_call.id);
-    errdefer allocator.free(id);
-
-    const name = try allocator.dupe(u8, tool_call.name);
-    errdefer allocator.free(name);
-
-    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
-    errdefer provider_json.freeValue(allocator, arguments);
-
-    const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
-    errdefer if (thought_signature) |signature| allocator.free(signature);
-
-    return .{
-        .id = id,
-        .name = name,
-        .arguments = arguments,
-        .thought_signature = thought_signature,
-    };
-}
-
-fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
-
-fn sameContentBlocks(
-    lhs: []const ai.ContentBlock,
-    rhs: []const ai.ContentBlock,
-) bool {
-    return lhs.len == rhs.len and lhs.ptr == rhs.ptr;
-}
-
-fn convertToolsToLlm(
-    allocator: std.mem.Allocator,
-    tools: []const types.AgentTool,
-) ![]ai.Tool {
-    const converted = try allocator.alloc(ai.Tool, tools.len);
-    for (tools, converted) |tool, *slot| {
-        slot.* = .{
-            .name = tool.name,
-            .description = tool.description,
-            .parameters = tool.parameters,
-        };
-    }
-    return converted;
-}
 
 const TestCapture = struct {
     allocator: std.mem.Allocator,
@@ -2327,7 +1199,7 @@ fn recordAfterToolCallOrder(
     context: types.AfterToolCallContext,
     _: ?*const std.atomic.Value(bool),
 ) !?types.AfterToolCallResult {
-    const tool = findTool(context.context.tools, context.tool_call.name) orelse return error.MissingParallelHookOrderingTool;
+    const tool = tool_execution.findTool(context.context.tools, context.tool_call.name) orelse return error.MissingParallelHookOrderingTool;
     const capture: *ParallelHookOrderingCapture = @ptrCast(@alignCast(tool.execute_context orelse return error.MissingParallelHookOrderingCapture));
     try capture.after_hook_order.append(capture.allocator, context.tool_call.id);
     return null;
@@ -2938,7 +1810,7 @@ test "streamAssistantResponse frees owned streaming deltas after consumption" {
         .max_tokens = 256,
     };
 
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -2974,7 +1846,7 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
     var capture = ToolExecutionCapture.init(std.testing.allocator);
     defer capture.deinit();
 
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -3026,7 +1898,7 @@ test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content 
     };
 
     var capture = PartialUpdateCrossCapture{};
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -3070,7 +1942,7 @@ test "VAL-REVIEW-M8-001 streaming message_update snapshots cover partial tool-ca
     var capture = StreamingUpdateSnapshotCapture.init(std.testing.allocator);
     defer capture.deinit();
 
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -3124,7 +1996,7 @@ test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty obj
     };
 
     var capture = MalformedPartialArgsCapture{};
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -3162,7 +2034,7 @@ test "ISS-401 aborted stream cleans partial accumulator tool state" {
 
     var aborted = std.atomic.Value(bool).init(false);
     var capture = MessageUpdateCountCapture{};
-    const assistant = try streamAssistantResponse(
+    const assistant = try streaming.streamAssistantResponse(
         std.testing.allocator,
         std.Io.failing,
         .{
@@ -3297,9 +2169,9 @@ test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
         .thought_signature = "content signature",
     } }};
 
-    const cloned = try cloneContentBlocks(allocator, source[0..]);
+    const cloned = try content_clone.cloneContentBlocks(allocator, source[0..]);
     defer {
-        deinitContentBlocks(allocator, cloned);
+        content_clone.deinitContentBlocks(allocator, cloned);
         allocator.free(cloned);
     }
 
@@ -3316,14 +2188,14 @@ test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
 }
 
 fn checkCloneToolCallAllocation(allocator: std.mem.Allocator, source: ai.ToolCall) !void {
-    const cloned = try cloneToolCall(allocator, source);
-    defer deinitToolCall(allocator, cloned);
+    const cloned = try content_clone.cloneToolCall(allocator, source);
+    defer content_clone.deinitToolCall(allocator, cloned);
 }
 
 fn checkCloneContentBlocksAllocation(allocator: std.mem.Allocator, source: []const ai.ContentBlock) !void {
-    const cloned = try cloneContentBlocks(allocator, source);
+    const cloned = try content_clone.cloneContentBlocks(allocator, source);
     defer {
-        deinitContentBlocks(allocator, cloned);
+        content_clone.deinitContentBlocks(allocator, cloned);
         allocator.free(cloned);
     }
 }
@@ -3531,7 +2403,7 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
 
 test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
     const args = try jsonStringObject(std.testing.allocator, "value", "once");
-    var prepared = PreparedToolCall{
+    var prepared = tool_execution.PreparedToolCall{
         .tool_call = .{
             .id = "tool-double-finalize",
             .name = "echo",
@@ -3549,7 +2421,7 @@ test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
 
     const content = try std.testing.allocator.alloc(ai.ContentBlock, 1);
     content[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, "already executed") } };
-    const executed = ExecutedToolCallOutcome{
+    const executed = tool_execution.ExecutedToolCallOutcome{
         .result = .{
             .content = content,
             .details = null,
@@ -3592,7 +2464,7 @@ test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
         .convert_to_llm = defaultConvertToLlmForTest,
     };
 
-    const finalized = try finalizeExecutedToolCall(
+    const finalized = try tool_execution.finalizeExecutedToolCall(
         std.testing.allocator,
         context,
         assistant_message,
@@ -3610,7 +2482,7 @@ test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
 
     try std.testing.expectError(
         AgentLoopError.ToolCallAlreadyFinalized,
-        finalizeExecutedToolCall(
+        tool_execution.finalizeExecutedToolCall(
             std.testing.allocator,
             context,
             assistant_message,
@@ -3670,9 +2542,9 @@ test "ISS-401 ISS-407 message_update payload is callback-scoped and retained con
     try std.testing.expect(content_ptr < temp_end);
 
     const borrowed_text_ptr = partial_message.content[0].text.text.ptr;
-    const retained_content = try cloneContentBlocks(std.testing.allocator, partial_message.content);
+    const retained_content = try content_clone.cloneContentBlocks(std.testing.allocator, partial_message.content);
     defer {
-        deinitContentBlocks(std.testing.allocator, retained_content);
+        content_clone.deinitContentBlocks(std.testing.allocator, retained_content);
         std.testing.allocator.free(retained_content);
     }
 
@@ -3988,7 +2860,7 @@ test "ISS-404 parallel after_tool_call finalizes in completion order and emits m
         .execute = hookOrderingToolExecute,
     };
 
-    const results = try executeToolCallsParallel(
+    const results = try tool_execution.executeToolCallsParallel(
         std.testing.allocator,
         std.testing.io,
         .{
@@ -4027,7 +2899,7 @@ test "ISS-404 parallel after_tool_call finalizes in completion order and emits m
     );
     defer {
         for (results) |result| {
-            deinitContentBlocks(std.testing.allocator, result.content);
+            content_clone.deinitContentBlocks(std.testing.allocator, result.content);
             std.testing.allocator.free(result.content);
         }
         std.testing.allocator.free(results);
@@ -4072,7 +2944,7 @@ test "ISS-401 executeToolCallsParallel returns tool result content that survives
         .execute = capturingEchoToolExecute,
     };
 
-    const results = try executeToolCallsParallel(
+    const results = try tool_execution.executeToolCallsParallel(
         std.testing.allocator,
         std.testing.io,
         .{
@@ -4110,7 +2982,7 @@ test "ISS-401 executeToolCallsParallel returns tool result content that survives
     );
     defer {
         for (results) |result| {
-            deinitContentBlocks(std.testing.allocator, result.content);
+            content_clone.deinitContentBlocks(std.testing.allocator, result.content);
             std.testing.allocator.free(result.content);
         }
         std.testing.allocator.free(results);
@@ -4156,7 +3028,7 @@ test "route-a m1 parallel tool updates emit before join and only updates leave m
         .execute = streamingParallelToolExecute,
     };
 
-    const results = try executeToolCallsParallel(
+    const results = try tool_execution.executeToolCallsParallel(
         std.testing.allocator,
         std.testing.io,
         .{
@@ -4194,7 +3066,7 @@ test "route-a m1 parallel tool updates emit before join and only updates leave m
     );
     defer {
         for (results) |result| {
-            deinitContentBlocks(std.testing.allocator, result.content);
+            content_clone.deinitContentBlocks(std.testing.allocator, result.content);
             std.testing.allocator.free(result.content);
         }
         std.testing.allocator.free(results);
@@ -4229,7 +3101,7 @@ test "route-a m1 parallel emitter serializes concurrent update callbacks" {
         .execute = stressStreamingParallelToolExecute,
     };
 
-    const results = try executeToolCallsParallel(
+    const results = try tool_execution.executeToolCallsParallel(
         std.testing.allocator,
         std.testing.io,
         .{
@@ -4267,7 +3139,7 @@ test "route-a m1 parallel emitter serializes concurrent update callbacks" {
     );
     defer {
         for (results) |result| {
-            deinitContentBlocks(std.testing.allocator, result.content);
+            content_clone.deinitContentBlocks(std.testing.allocator, result.content);
             std.testing.allocator.free(result.content);
         }
         std.testing.allocator.free(results);

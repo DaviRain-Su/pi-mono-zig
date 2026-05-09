@@ -13,6 +13,7 @@ pub const DispatchRunModeOptions = struct {
     app_mode: bootstrap.AppMode,
     selected_tools: tool_selection.ToolSelection,
     preflight_continue_confirmed: bool = false,
+    webview_backend: ?coding_agent.webview_platform.AvailableBackend = null,
     version: []const u8,
 };
 
@@ -53,6 +54,17 @@ pub fn dispatchRunMode(
         return 1;
     }
 
+    var resolved_webview_backend = dispatch_options.webview_backend;
+    if (app_mode == .webview and resolved_webview_backend == null) {
+        switch (coding_agent.webview_platform.preflightHostBackend()) {
+            .available => |backend| resolved_webview_backend = backend,
+            .unavailable => |diagnostic| {
+                try writeWebViewBackendDiagnostic(stderr, diagnostic);
+                return 1;
+            },
+        }
+    }
+
     if (app_mode != .interactive) {
         // Preflight stored-session cwd BEFORE provider/auth resolution and
         // tool construction so missing-cwd diagnostics always preempt
@@ -81,6 +93,22 @@ pub fn dispatchRunMode(
         return 1;
     };
     defer provider_runtime.deinit(allocator);
+
+    if (app_mode == .webview) {
+        return try dispatchWebViewMode(
+            allocator,
+            io,
+            options,
+            env_map,
+            prepared,
+            initial_input,
+            dispatch_options,
+            resolved_webview_backend.?,
+            &provider_runtime,
+            stdout,
+            stderr,
+        );
+    }
 
     if (app_mode != .interactive) {
         return try dispatchNonInteractiveMode(
@@ -145,6 +173,134 @@ pub fn dispatchRunMode(
             .missing_cwd_mode = if (dispatch_options.preflight_continue_confirmed) .use_fallback else .fail,
             .missing_cwd_already_confirmed = dispatch_options.preflight_continue_confirmed,
         },
+        stderr,
+    );
+}
+
+fn dispatchWebViewMode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: *const cli.Args,
+    env_map: *const std.process.Environ.Map,
+    prepared: *runtime_prep.PreparedCliRuntime,
+    initial_input: *const input_prep.PreparedInitialInput,
+    dispatch_options: DispatchRunModeOptions,
+    webview_backend: coding_agent.webview_platform.AvailableBackend,
+    provider_runtime: *coding_agent.ResolvedProviderConfig,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) !u8 {
+    const cwd = dispatch_options.cwd;
+    const construction_selected_tools = constructionToolSelection(options, dispatch_options.selected_tools);
+    var app_context = coding_agent.interactive_mode.AppContext.init(cwd, io);
+    var built_tools = try coding_agent.interactive_mode.buildAgentToolsWithExtensionsSelection(allocator, &app_context, construction_selected_tools, .{
+        .extensions = prepared.resource_bundle.extensions,
+        .env_map = env_map,
+        .cwd = cwd,
+        .io = io,
+        .runtime_config = &prepared.runtime_config,
+        .include_builtin_tools = includeBuiltinTools(options),
+        .include_installed_wasm_tools = includeInstalledWasmTools(options),
+        .resource_options = .{
+            .cwd = cwd,
+            .agent_dir = prepared.runtime_config.agent_dir,
+            .global = coding_agent.interactive_mode.settingsResources(prepared.runtime_config.global_settings),
+            .project = coding_agent.interactive_mode.settingsResources(prepared.runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        },
+    });
+    defer built_tools.deinit();
+    if (built_tools.locked_wasm_runtimes) |*runtime_set| {
+        try output.writeResourceDiagnostics(stderr, runtime_set.diagnostics);
+    }
+    try coding_agent.interactive_mode.writeStartupDiagnostics(stderr, built_tools.startup_diagnostics);
+    if (built_tools.required_startup_failed) {
+        try stderr.flush();
+        return 1;
+    }
+
+    try runtime_prep.refreshSystemPromptWithActiveTools(
+        allocator,
+        prepared,
+        cwd,
+        options,
+        dispatch_options.selected_tools,
+        built_tools.items,
+    );
+
+    var missing_cwd_issue: ?coding_agent.interactive_mode.OwnedMissingSessionCwdIssue = null;
+    defer if (missing_cwd_issue) |*captured| captured.deinit(allocator);
+    var session = coding_agent.interactive_mode.openInitialSessionWithMissingCwd(
+        allocator,
+        io,
+        prepared.session_dir,
+        .{
+            .cwd = cwd,
+            .system_prompt = prepared.system_prompt,
+            .session_dir = prepared.session_dir,
+            .provider = prepared.provider_name,
+            .model = prepared.model_name,
+            .api_key = options.api_key,
+            .thinking = prepared.thinking_level,
+            .session = options.session,
+            .@"continue" = options.@"continue",
+            .@"resume" = options.@"resume",
+            .fork = options.fork,
+            .no_session = options.no_session,
+            .model_patterns = options.models,
+            .selected_tools = construction_selected_tools,
+            .include_builtin_tools = includeBuiltinTools(options),
+            .include_installed_wasm_tools = includeInstalledWasmTools(options),
+            .initial_prompt = null,
+            .initial_messages = &.{},
+            .initial_images = &.{},
+            .prompt_templates = prepared.resource_bundle.prompt_templates,
+            .extensions = prepared.resource_bundle.extensions,
+            .keybindings = &prepared.runtime_config.keybindings,
+            .theme = prepared.resource_bundle.selectedTheme(),
+            .runtime_config = &prepared.runtime_config,
+            .missing_cwd_mode = .fail,
+            .missing_cwd_already_confirmed = dispatch_options.preflight_continue_confirmed,
+        },
+        provider_runtime.model,
+        provider_runtime.api_key,
+        built_tools.items,
+        &missing_cwd_issue,
+    ) catch |err| switch (err) {
+        error.MissingSessionCwd => {
+            if (missing_cwd_issue) |captured| {
+                try cli_preflight.writeMissingSessionCwdError(allocator, captured.issue(), stderr);
+            } else {
+                try cli_preflight.writeMissingSessionCwdFallbackError(stderr);
+            }
+            try stderr.flush();
+            return 1;
+        },
+        else => return err,
+    };
+    defer session.deinit();
+
+    return try coding_agent.runWebViewMode(
+        allocator,
+        env_map,
+        &session,
+        .{
+            .cwd = cwd,
+            .provider = prepared.provider_name,
+            .model = provider_runtime.model,
+            .backend = webview_backend,
+            .no_session = options.no_session,
+            .api_key_present = options.api_key != null or provider_runtime.api_key != null,
+            .selected_tools = construction_selected_tools,
+            .active_tool_count = built_tools.items.len,
+            .initial_prompt = initial_input.prompt,
+            .initial_messages = initial_input.messages,
+            .initial_images_count = initial_input.images.len,
+        },
+        stdout,
         stderr,
     );
 }
@@ -299,6 +455,16 @@ fn dispatchNonInteractiveMode(
         },
         stdout,
         stderr,
+    );
+}
+
+fn writeWebViewBackendDiagnostic(
+    stderr: *std.Io.Writer,
+    diagnostic: coding_agent.webview_platform.BackendDiagnostic,
+) !void {
+    try stderr.print(
+        "Error: WebView mode unavailable on {s}: {s}. Requirements: {s}\n",
+        .{ @tagName(diagnostic.platform), diagnostic.message, diagnostic.requirements },
     );
 }
 
