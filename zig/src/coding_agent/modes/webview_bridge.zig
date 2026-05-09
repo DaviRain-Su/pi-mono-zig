@@ -3,6 +3,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const json_event_wire = @import("json_event_wire.zig");
 const session_mod = @import("../sessions/session.zig");
+const session_manager_mod = @import("../sessions/session_manager.zig");
 const tool_selection = @import("../tool_selection.zig");
 
 pub const trusted_bundle_origin = "pi-webview://bundle";
@@ -21,10 +22,26 @@ pub const Command = enum {
     get_messages,
     prompt,
     abort,
+    new_session,
+    resume_session,
+    switch_session,
 };
 
 pub const Permission = enum {
     skeleton_chat,
+    session_mutation,
+};
+
+pub const BridgePermissions = struct {
+    skeleton_chat: bool = true,
+    session_mutation: bool = false,
+
+    fn allows(self: BridgePermissions, permission: Permission) bool {
+        return switch (permission) {
+            .skeleton_chat => self.skeleton_chat,
+            .session_mutation => self.session_mutation,
+        };
+    }
 };
 
 pub const CommandSpec = struct {
@@ -38,6 +55,9 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "get_messages", .command = .get_messages, .permission = .skeleton_chat },
     .{ .name = "prompt", .command = .prompt, .permission = .skeleton_chat },
     .{ .name = "abort", .command = .abort, .permission = .skeleton_chat },
+    .{ .name = "new_session", .command = .new_session, .permission = .session_mutation },
+    .{ .name = "resume_session", .command = .resume_session, .permission = .session_mutation },
+    .{ .name = "switch_session", .command = .switch_session, .permission = .session_mutation },
 };
 
 pub const BridgeContext = struct {
@@ -50,6 +70,7 @@ pub const BridgeContext = struct {
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     session: *session_mod.AgentSession,
+    permissions: BridgePermissions = .{},
     initial_prompt: ?[]const u8 = null,
     initial_messages: []const []const u8 = &.{},
     initial_images_count: usize = 0,
@@ -60,6 +81,9 @@ pub const DispatchCounters = struct {
     get_messages: usize = 0,
     prompt: usize = 0,
     abort: usize = 0,
+    new_session: usize = 0,
+    resume_session: usize = 0,
+    switch_session: usize = 0,
 
     fn increment(self: *DispatchCounters, command: Command) void {
         switch (command) {
@@ -67,11 +91,20 @@ pub const DispatchCounters = struct {
             .get_messages => self.get_messages += 1,
             .prompt => self.prompt += 1,
             .abort => self.abort += 1,
+            .new_session => self.new_session += 1,
+            .resume_session => self.resume_session += 1,
+            .switch_session => self.switch_session += 1,
         }
     }
 
     fn total(self: DispatchCounters) usize {
-        return self.get_state + self.get_messages + self.prompt + self.abort;
+        return self.get_state +
+            self.get_messages +
+            self.prompt +
+            self.abort +
+            self.new_session +
+            self.resume_session +
+            self.switch_session;
     }
 };
 
@@ -192,6 +225,23 @@ pub const BridgeHost = struct {
                 "Bridge command payload exceeds the configured command limit",
             ),
         };
+        self.validateCommandPayloadSemantics(spec.command, payload) catch |err| switch (err) {
+            error.InvalidSessionTarget => return writeErrorResponseAlloc(
+                allocator,
+                request_id,
+                "invalid_payload",
+                "Bridge session target is invalid or missing",
+            ),
+        };
+
+        if (!self.context.permissions.allows(spec.permission)) {
+            return writeErrorResponseAlloc(
+                allocator,
+                request_id,
+                "permission_denied",
+                "WebView session mutation requires explicit session mutation permission",
+            );
+        }
 
         if (self.dispatch_counters) |counters| counters.increment(spec.command);
         return self.dispatch(allocator, request_id, spec.command, payload) catch |err| switch (err) {
@@ -228,6 +278,7 @@ pub const BridgeHost = struct {
             .get_messages => try self.writeMessagesResult(allocator, &writer.writer),
             .prompt => try self.writePromptResult(allocator, &writer.writer, payload.?),
             .abort => try self.writeAbortResult(&writer.writer),
+            .new_session, .resume_session, .switch_session => try self.writeSessionMutationGatedResult(allocator, &writer.writer, command),
         }
 
         try writer.writer.writeAll("}");
@@ -377,6 +428,50 @@ pub const BridgeHost = struct {
         try writer.writeAll("{\"status\":\"abort_requested\",\"aborted\":true}");
     }
 
+    fn writeSessionMutationGatedResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        command: Command,
+    ) !void {
+        _ = self;
+        try writer.writeAll("{\"status\":\"gated\",\"accepted\":false,\"command\":");
+        try writeJsonString(allocator, writer, @tagName(command));
+        try writer.writeAll(",\"message\":");
+        try writeJsonString(allocator, writer, "WebView session mutation commands are permissioned but not implemented in this milestone");
+        try writer.writeAll("}");
+    }
+
+    fn validateCommandPayloadSemantics(
+        self: *BridgeHost,
+        command: Command,
+        payload: ?std.json.Value,
+    ) error{InvalidSessionTarget}!void {
+        switch (command) {
+            .new_session => {
+                if (payload) |value| {
+                    if (value == .object) {
+                        if (value.object.get("parentSession")) |parent_session| {
+                            if (parent_session != .string or !isValidSessionPath(parent_session.string)) return error.InvalidSessionTarget;
+                        }
+                    }
+                }
+            },
+            .resume_session, .switch_session => {
+                const value = payload orelse return error.InvalidSessionTarget;
+                const session_path_value = value.object.get("sessionPath") orelse return error.InvalidSessionTarget;
+                if (session_path_value != .string or !isValidSessionPath(session_path_value.string)) return error.InvalidSessionTarget;
+                var header = session_manager_mod.readSessionHeader(
+                    self.context.session.allocator,
+                    self.context.session.io,
+                    session_path_value.string,
+                ) catch return error.InvalidSessionTarget;
+                session_manager_mod.freeSessionHeader(self.context.session.allocator, &header);
+            },
+            .get_state, .get_messages, .prompt, .abort => {},
+        }
+    }
+
     pub fn closeAndAbortActiveWork(self: *BridgeHost) bool {
         self.close_requested.store(true, .seq_cst);
         if (!self.active_generation.load(.seq_cst)) return false;
@@ -460,6 +555,8 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     return switch (command) {
         .get_state, .get_messages, .abort => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
+        .new_session => true,
+        .resume_session, .switch_session => value.object.get("sessionPath") != null and value.object.get("sessionPath").? == .string,
     };
 }
 
@@ -472,6 +569,12 @@ fn validateCommandPayloadBounds(
     const value = payload orelse return;
     const text = value.object.get("text").?.string;
     if (text.len > limits.max_prompt_bytes) return error.PromptTooLarge;
+}
+
+fn isValidSessionPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    return std.mem.endsWith(u8, path, ".jsonl");
 }
 
 fn validateValueBounds(value: std.json.Value, limits: Limits, depth: usize) error{ PayloadTooDeep, StringTooLong }!void {
@@ -851,12 +954,25 @@ fn handleWebViewPromptEvent(context: ?*anyopaque, event: agent.AgentEvent) !void
     try capture.appendEvent(event);
 }
 
-test "bridge command table exposes only approved skeleton commands" {
-    try std.testing.expectEqual(@as(usize, 4), command_table.len);
+test "bridge command table exposes approved skeleton commands first" {
+    try std.testing.expect(command_table.len >= 4);
     try std.testing.expectEqualStrings("get_state", command_table[0].name);
     try std.testing.expectEqualStrings("get_messages", command_table[1].name);
     try std.testing.expectEqualStrings("prompt", command_table[2].name);
     try std.testing.expectEqualStrings("abort", command_table[3].name);
+}
+
+test "bridge command table explicitly gates future session mutation commands" {
+    try std.testing.expectEqual(@as(usize, 7), command_table.len);
+    try std.testing.expectEqualStrings("new_session", command_table[4].name);
+    try std.testing.expectEqual(Command.new_session, command_table[4].command);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[4].permission);
+    try std.testing.expectEqualStrings("resume_session", command_table[5].name);
+    try std.testing.expectEqual(Command.resume_session, command_table[5].command);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[5].permission);
+    try std.testing.expectEqualStrings("switch_session", command_table[6].name);
+    try std.testing.expectEqual(Command.switch_session, command_table[6].command);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -969,6 +1085,78 @@ test "webview get_state mirrors existing session without mutating persisted stat
     try std.testing.expect(std.mem.indexOf(u8, first, "\"noSession\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, session_id) != null);
     try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "webview session mutation commands deny without permission and preserve session file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    const session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(session_id);
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before);
+
+    var request: std.Io.Writer.Allocating = .init(allocator);
+    defer request.deinit();
+    try request.writer.writeAll("{\"id\":\"switch-denied\",\"command\":\"switch_session\",\"payload\":{\"sessionPath\":");
+    try writeJsonString(allocator, &request.writer, session_file);
+    try request.writer.writeAll("}}");
+
+    const response = try bridge.handleRequestJson(allocator, request.written(), trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"switch-denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"permission_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "session mutation") != null);
+
+    const after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(@as(usize, 0), counters.total());
+}
+
+test "webview session mutation commands validate targets before permission gate" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(before);
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"bad-switch\",\"command\":\"switch_session\",\"payload\":{\"sessionPath\":\"\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"bad-switch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"invalid_payload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "session target") != null);
+
+    const after = try bridge.handleRequestJson(allocator, "{\"id\":\"after\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"busy\":false") != null);
+    try std.testing.expectEqual(@as(usize, 2), counters.get_state);
+    try std.testing.expectEqual(@as(usize, 0), counters.get_messages);
+    try std.testing.expectEqual(@as(usize, 0), counters.prompt);
+    try std.testing.expectEqual(@as(usize, 0), counters.abort);
 }
 
 test "webview no-session prompt remains in memory without session file persistence" {
