@@ -9,6 +9,7 @@ const enforcement = @import("enforcement.zig");
 const tools_common = @import("../tools/common.zig");
 const capability = @import("capability.zig");
 const sdk = @import("sdk.zig");
+const native_loader = @import("native_loader.zig");
 const native_process = @import("native_process.zig");
 
 pub const Registry = extension_registry.Registry;
@@ -168,7 +169,7 @@ pub const NativeOptions = struct {
     /// shared objects. NativeRuntime takes ownership only after successful
     /// start; callers remain responsible for closing it when start returns an
     /// error before ownership transfer.
-    dyn_lib: ?std.DynLib = null,
+    dyn_lib: ?native_loader.NativeLibrary = null,
 };
 
 pub const NativeHostEffects = struct {
@@ -613,7 +614,7 @@ pub const NativeRuntime = struct {
     owned_descriptor: ?*NativeDescriptor = null,
     owned_descriptor_allocator: ?std.mem.Allocator = null,
     /// Dynamic library handle loaded by native_extension_loader. Closed on deinit.
-    dyn_lib: ?std.DynLib = null,
+    dyn_lib: ?native_loader.NativeLibrary = null,
 
     pub fn start(allocator: std.mem.Allocator, io: std.Io, options: NativeOptions) !*NativeRuntime {
         try options.descriptor.validate(allocator);

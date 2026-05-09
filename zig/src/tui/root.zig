@@ -13,6 +13,7 @@ pub const test_helpers = @import("test_helpers.zig");
 pub const theme = @import("theme.zig");
 pub const tui = @import("tui.zig");
 pub const visual_parity = @import("visual_parity.zig");
+pub const constraints = @import("constraints.zig");
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -26,6 +27,7 @@ pub const components = struct {
     pub const spacer = @import("components/spacer.zig");
     pub const truncated_text = @import("components/truncated_text.zig");
     pub const viewport = @import("components/viewport.zig");
+    pub const table = @import("components/table.zig");
 };
 
 pub const Component = component.Component;
@@ -39,6 +41,8 @@ pub const JustifyContent = layout.JustifyContent;
 pub const AlignItems = layout.AlignItems;
 pub const Insets = layout.Insets;
 pub const ViewportAnchor = layout.ViewportAnchor;
+pub const Constraint = constraints.Constraint;
+pub const splitHorizontal = constraints.splitHorizontal;
 pub const Terminal = terminal.Terminal;
 pub const Backend = terminal.Backend;
 pub const Size = terminal.Size;
@@ -77,6 +81,10 @@ pub const Spacer = components.spacer.Spacer;
 pub const TruncatedText = components.truncated_text.TruncatedText;
 pub const TruncationMode = components.truncated_text.TruncationMode;
 pub const Viewport = components.viewport.Viewport;
+pub const Table = components.table.Table;
+pub const TableState = components.table.TableState;
+pub const TableCell = components.table.Cell;
+pub const TableRow = components.table.Row;
 
 test {
     _ = @import("ansi.zig");
@@ -103,6 +111,8 @@ test {
     _ = @import("components/spacer.zig");
     _ = @import("components/truncated_text.zig");
     _ = @import("components/viewport.zig");
+    _ = @import("constraints.zig");
+    _ = @import("components/table.zig");
 }
 
 test "components export autocomplete module" {

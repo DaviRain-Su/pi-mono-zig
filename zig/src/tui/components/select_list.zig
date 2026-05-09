@@ -1,7 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
-const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
 const style_mod = @import("../style.zig");
@@ -32,13 +31,6 @@ pub const SelectList = struct {
     padding_x: usize = 0,
     padding_y: usize = 0,
     theme: ?*const resources_mod.Theme = null,
-
-    pub fn component(self: *const SelectList) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
 
     pub fn drawComponent(self: *const SelectList) draw_mod.Component {
         return .{
@@ -137,54 +129,6 @@ pub const SelectList = struct {
         return .{ .width = window.width, .height = row };
     }
 
-    pub fn renderInto(
-        self: *const SelectList,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
-        const blank_line = try allocator.alloc(u8, effective_width);
-        defer allocator.free(blank_line);
-        @memset(blank_line, ' ');
-
-        for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
-        }
-
-        if (self.items.len == 0) {
-            const empty = try ansi.padRightVisibleAlloc(allocator, "No items", effective_width);
-            defer allocator.free(empty);
-            if (self.theme) |theme| {
-                const themed = try theme.applyAlloc(allocator, .select_empty, empty);
-                defer allocator.free(themed);
-                try component_mod.appendOwnedLine(lines, allocator, themed);
-            } else {
-                try component_mod.appendOwnedLine(lines, allocator, empty);
-            }
-        } else {
-            const start_index = self.visibleStartIndex();
-            const end_index = @min(start_index + @max(self.max_visible, 1), self.items.len);
-            for (start_index..end_index) |index| {
-                const rendered = try self.renderItem(allocator, self.items[index], index == self.selectedIndex(), effective_width);
-                defer allocator.free(rendered);
-                try component_mod.appendOwnedLine(lines, allocator, rendered);
-            }
-
-            if (self.items.len > @max(self.max_visible, 1)) {
-                const info = try std.fmt.allocPrint(allocator, "  ({d}/{d})", .{ self.selectedIndex() + 1, self.items.len });
-                defer allocator.free(info);
-                const styled = try renderPaddedLine(allocator, self.theme, info, effective_width, false);
-                defer allocator.free(styled);
-                try component_mod.appendOwnedLine(lines, allocator, styled);
-            }
-        }
-
-        for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(lines, allocator, blank_line);
-        }
-    }
-
     fn drawItemRow(
         _: *const SelectList,
         allocator: std.mem.Allocator,
@@ -249,16 +193,6 @@ pub const SelectList = struct {
         _ = row_window.print(segments.items, .{ .wrap = .none });
     }
 
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const SelectList = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
-    }
-
     fn drawOpaque(
         ptr: *const anyopaque,
         window: vaxis.Window,
@@ -277,53 +211,6 @@ pub const SelectList = struct {
         return @min(centered, max_start);
     }
 
-    fn renderItem(
-        self: *const SelectList,
-        allocator: std.mem.Allocator,
-        item: SelectItem,
-        is_selected: bool,
-        width: usize,
-    ) std.mem.Allocator.Error![]u8 {
-        const prefix = if (is_selected) "→ " else "  ";
-        const prefix_width = ansi.visibleWidth(prefix);
-        const content_width = width - @min(width, prefix_width);
-
-        var line = std.ArrayList(u8).empty;
-        errdefer line.deinit(allocator);
-
-        try line.appendSlice(allocator, prefix);
-
-        const display = item.display();
-        if (item.description) |description| {
-            if (content_width > 16) {
-                const primary_width = @max(1, content_width / 2);
-                const truncated_label = try truncatePlainAlloc(allocator, display, primary_width);
-                defer allocator.free(truncated_label);
-
-                const truncated_description = try truncatePlainAlloc(allocator, normalizeSingleLine(description), content_width - @min(content_width, primary_width));
-                defer allocator.free(truncated_description);
-
-                try line.appendSlice(allocator, truncated_label);
-
-                const used_width = ansi.visibleWidth(prefix) + ansi.visibleWidth(truncated_label);
-                const gap = @max(@as(usize, 1), primary_width + prefix_width - used_width);
-                try line.appendNTimes(allocator, ' ', gap);
-                try line.appendSlice(allocator, truncated_description);
-            } else {
-                const truncated = try truncatePlainAlloc(allocator, display, content_width);
-                defer allocator.free(truncated);
-                try line.appendSlice(allocator, truncated);
-            }
-        } else {
-            const truncated = try truncatePlainAlloc(allocator, display, content_width);
-            defer allocator.free(truncated);
-            try line.appendSlice(allocator, truncated);
-        }
-
-        const padded = try renderPaddedLine(allocator, self.theme, line.items, width, is_selected);
-        line.deinit(allocator);
-        return padded;
-    }
 };
 
 fn renderPaddedLine(

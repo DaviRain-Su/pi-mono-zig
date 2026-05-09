@@ -8661,3 +8661,61 @@ test "config selector simulate esc flow does not persist changes" {
     defer allocator.free(after);
     try std.testing.expectEqualStrings(before, after);
 }
+
+test "native extension install rejects missing dynamic_library_path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const manifest_text =
+        \\{ "schemaVersion": "pi-extension.v1", "id": "com.example.native-missing", "name": "Native Missing", "version": "1.0.0", "description": "Missing lib.", "runtime": { "kind": "native", "entrypoint": { "dynamic_library_path": "libmissing.dylib" } }, "tools": [{ "name": "missing.tool", "description": "T", "inputSchema": { "type": "object" } }], "permissions": [] }
+    ;
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/native-missing");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native-missing/pi-extension.json", .data = manifest_text });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/native-missing" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "native_library_missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "libmissing.dylib") != null);
+}
+
+test "native extension install succeeds when dynamic_library_path exists" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+
+    const manifest_text =
+        \\{ "schemaVersion": "pi-extension.v1", "id": "com.example.native-present", "name": "Native Present", "version": "1.0.0", "description": "Present lib.", "runtime": { "kind": "native", "entrypoint": { "dynamic_library_path": "libpresent.dylib" } }, "tools": [{ "name": "present.tool", "description": "T", "inputSchema": { "type": "object" } }], "permissions": [] }
+    ;
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/native-present");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native-present/pi-extension.json", .data = manifest_text });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native-present/libpresent.dylib", .data = "native" });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/native-present" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed") != null);
+}

@@ -1,17 +1,14 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
-const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const layout = @import("../layout.zig");
 const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
-const cell_rows = @import("../cell_rows.zig");
 
 pub const Viewport = struct {
-    child: component_mod.Component,
-    draw_child: ?draw_mod.Component = null,
+    child: draw_mod.Component,
     height: usize,
     scroll_offset: usize = 0,
     anchor: layout.ViewportAnchor = .top,
@@ -20,89 +17,11 @@ pub const Viewport = struct {
     indicator_token: resources_mod.ThemeToken = .status,
     theme: ?*const resources_mod.Theme = null,
 
-    pub fn component(self: *const Viewport) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Viewport) draw_mod.Component {
         return .{
             .ptr = self,
             .drawFn = drawOpaque,
         };
-    }
-
-    pub fn renderInto(
-        self: *const Viewport,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
-        const inner_width = if (effective_width > self.padding.horizontal())
-            effective_width - self.padding.horizontal()
-        else
-            1;
-        const inner_height = if (self.height > self.padding.vertical())
-            self.height - self.padding.vertical()
-        else
-            0;
-
-        var child_lines = component_mod.LineList.empty;
-        defer component_mod.freeLines(allocator, &child_lines);
-        try self.child.renderInto(allocator, inner_width, &child_lines);
-
-        const slice = resolveVisibleSlice(child_lines.items.len, inner_height, self.scroll_offset, self.anchor);
-        const overflow_above = slice.start > 0;
-        const overflow_below = slice.end < child_lines.items.len;
-
-        try layout.appendBlankLines(allocator, lines, self.padding.top, effective_width);
-
-        for (0..inner_height) |visible_index| {
-            const rendered_line = if (visible_index < slice.end - slice.start)
-                child_lines.items[slice.start + visible_index]
-            else
-                "";
-
-            var line_text = rendered_line;
-            var owned_indicator: ?[]u8 = null;
-            defer if (owned_indicator) |indicator| allocator.free(indicator);
-
-            if (self.show_indicators and inner_height > 0) {
-                if (visible_index == 0 and overflow_above) {
-                    owned_indicator = try indicatorLine(allocator, self.theme, self.indicator_token, inner_width, "↑ more");
-                    line_text = owned_indicator.?;
-                } else if (visible_index + 1 == inner_height and overflow_below) {
-                    owned_indicator = try indicatorLine(allocator, self.theme, self.indicator_token, inner_width, "↓ more");
-                    line_text = owned_indicator.?;
-                }
-            }
-
-            const fitted = try layout.wrapInsetLineAlloc(
-                allocator,
-                line_text,
-                inner_width,
-                effective_width,
-                self.padding,
-                .stretch,
-            );
-            defer allocator.free(fitted);
-            try component_mod.appendOwnedLine(lines, allocator, fitted);
-        }
-
-        try layout.appendBlankLines(allocator, lines, self.padding.bottom, effective_width);
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Viewport = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     pub fn draw(
@@ -128,7 +47,6 @@ pub const Viewport = struct {
         const rendered = try renderChildToScreen(
             ctx.arena,
             self.child,
-            self.draw_child,
             @max(@as(usize, inner_window.width), 1),
             @max(measurement_height, 1),
             ctx.theme,
@@ -221,20 +139,6 @@ fn indicatorLine(
 
 fn renderChildToScreen(
     allocator: std.mem.Allocator,
-    child: component_mod.Component,
-    draw_child: ?draw_mod.Component,
-    width: usize,
-    min_height: usize,
-    theme: ?*const resources_mod.Theme,
-) std.mem.Allocator.Error!RenderedChild {
-    if (draw_child) |draw_component| {
-        return renderDrawChildToScreen(allocator, draw_component, width, min_height, theme);
-    }
-    return renderLegacyChildToScreen(allocator, child, width, min_height);
-}
-
-fn renderDrawChildToScreen(
-    allocator: std.mem.Allocator,
     child: draw_mod.Component,
     width: usize,
     min_height: usize,
@@ -262,35 +166,6 @@ fn renderDrawChildToScreen(
     return .{
         .screen = try cloneScreen(allocator, &screen, width, @max(min_height, @as(usize, size.height))),
         .line_count = @max(@as(usize, size.height), 1),
-    };
-}
-
-fn renderLegacyChildToScreen(
-    allocator: std.mem.Allocator,
-    child: component_mod.Component,
-    width: usize,
-    min_height: usize,
-) std.mem.Allocator.Error!RenderedChild {
-    var child_lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &child_lines);
-    try child.renderInto(allocator, @max(width, 1), &child_lines);
-
-    const screen_height = @max(child_lines.items.len, @max(min_height, 1));
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = @intCast(screen_height),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-    try cell_rows.renderLineListToWindow(window, child_lines.items, allocator);
-
-    return .{
-        .screen = try cloneScreen(allocator, &screen, width, screen_height),
-        .line_count = child_lines.items.len,
     };
 }
 
@@ -376,103 +251,40 @@ fn drawIndicator(
     _ = window.printSegment(.{ .text = text, .style = style }, .{ .wrap = .none });
 }
 
-const StaticLinesComponent = struct {
+const StaticLinesDrawComponent = struct {
     lines: []const []const u8,
 
-    fn component(self: *const StaticLinesComponent) component_mod.Component {
+    fn drawComponent(self: *const StaticLinesDrawComponent) draw_mod.Component {
         return .{
             .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
+            .drawFn = draw,
         };
     }
 
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const StaticLinesComponent = @ptrCast(@alignCast(ptr));
-        for (self.lines) |line| {
-            const fitted = try ansi.padRightVisibleAlloc(allocator, line, width);
-            defer allocator.free(fitted);
-            try component_mod.appendOwnedLine(lines, allocator, fitted);
+    fn draw(ptr: *const anyopaque, window: vaxis.Window, _: draw_mod.DrawContext) std.mem.Allocator.Error!draw_mod.Size {
+        const self: *const StaticLinesDrawComponent = @ptrCast(@alignCast(ptr));
+        window.clear();
+        for (self.lines, 0..) |line, row_index| {
+            if (row_index >= @as(usize, window.height)) break;
+            const row_window = window.child(.{
+                .y_off = @intCast(row_index),
+                .height = 1,
+            });
+            _ = row_window.printSegment(.{ .text = line }, .{ .wrap = .none });
         }
+        return .{
+            .width = window.width,
+            .height = @intCast(@min(self.lines.len, @as(usize, window.height))),
+        };
     }
 };
 
 test "viewport clips top anchored content to fixed height" {
-    const allocator = std.testing.allocator;
-
-    const child = StaticLinesComponent{
+    const child = StaticLinesDrawComponent{
         .lines = &[_][]const u8{ "one", "two", "three", "four" },
     };
     const viewport = Viewport{
-        .child = child.component(),
-        .height = 2,
-    };
-
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try viewport.renderInto(allocator, 8, &lines);
-
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "two") != null);
-}
-
-test "viewport bottom anchor keeps latest lines visible" {
-    const allocator = std.testing.allocator;
-
-    const child = StaticLinesComponent{
-        .lines = &[_][]const u8{ "one", "two", "three", "four" },
-    };
-    const viewport = Viewport{
-        .child = child.component(),
-        .height = 2,
-        .anchor = .bottom,
-    };
-
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try viewport.renderInto(allocator, 8, &lines);
-
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "three") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "four") != null);
-}
-
-test "viewport adds indicators when clipping overflow" {
-    const allocator = std.testing.allocator;
-
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
-
-    const child = StaticLinesComponent{
-        .lines = &[_][]const u8{ "one", "two", "three", "four" },
-    };
-    const viewport = Viewport{
-        .child = child.component(),
-        .height = 2,
-        .scroll_offset = 1,
-        .show_indicators = true,
-        .theme = &theme,
-    };
-
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try viewport.renderInto(allocator, 10, &lines);
-
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "↑ more") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "↓ more") != null);
-}
-
-test "viewport draw shows top anchored rows from off-screen screen" {
-    const child = StaticLinesComponent{
-        .lines = &[_][]const u8{ "one", "two", "three", "four" },
-    };
-    const viewport = Viewport{
-        .child = child.component(),
+        .child = child.drawComponent(),
         .height = 2,
     };
 
@@ -483,12 +295,51 @@ test "viewport draw shows top anchored rows from off-screen screen" {
     try test_helpers.expectCell(&screen, 0, 1, "t", .{});
 }
 
+test "viewport bottom anchor keeps latest lines visible" {
+    const child = StaticLinesDrawComponent{
+        .lines = &[_][]const u8{ "one", "two", "three", "four" },
+    };
+    const viewport = Viewport{
+        .child = child.drawComponent(),
+        .height = 2,
+        .anchor = .bottom,
+    };
+
+    var screen = try test_helpers.renderToScreen(viewport.drawComponent(), 8, 2);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "t", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "f", .{});
+}
+
+test "viewport adds indicators when clipping overflow" {
+    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
+    defer theme.deinit(std.testing.allocator);
+
+    const child = StaticLinesDrawComponent{
+        .lines = &[_][]const u8{ "one", "two", "three", "four" },
+    };
+    const viewport = Viewport{
+        .child = child.drawComponent(),
+        .height = 2,
+        .scroll_offset = 1,
+        .show_indicators = true,
+        .theme = &theme,
+    };
+
+    var screen = try test_helpers.renderToScreen(viewport.drawComponent(), 10, 2);
+    defer screen.deinit(std.testing.allocator);
+
+    const indicator_style = style_mod.styleFor(&theme, .select_scroll);
+    try test_helpers.expectCell(&screen, 0, 0, "↑", indicator_style);
+    try test_helpers.expectCell(&screen, 0, 1, "↓", indicator_style);
+}
+
 test "viewport draw scrolls a borrowed cell window" {
     const selected_style = vaxis.Cell.Style{ .reverse = true };
     const row_one = [_]vaxis.Cell{.{ .char = .{ .grapheme = "1", .width = 1 } }};
     const row_two = [_]vaxis.Cell{.{ .char = .{ .grapheme = "2", .width = 1 }, .style = selected_style }};
     const row_three = [_]vaxis.Cell{.{ .char = .{ .grapheme = "3", .width = 1 } }};
-    const blank = StaticLinesComponent{ .lines = &[_][]const u8{""} };
 
     const BorrowedRows = struct {
         const Row = struct { cells: []const vaxis.Cell };
@@ -526,8 +377,7 @@ test "viewport draw scrolls a borrowed cell window" {
         },
     };
     const viewport = Viewport{
-        .child = blank.component(),
-        .draw_child = borrowed.drawComponent(),
+        .child = borrowed.drawComponent(),
         .height = 2,
         .scroll_offset = 1,
     };

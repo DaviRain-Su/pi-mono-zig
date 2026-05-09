@@ -22,6 +22,7 @@ pub const Command = enum {
     get_messages,
     prompt,
     abort,
+    model_select,
     new_session,
     resume_session,
     switch_session,
@@ -29,16 +30,19 @@ pub const Command = enum {
 
 pub const Permission = enum {
     skeleton_chat,
+    model_selection,
     session_mutation,
 };
 
 pub const BridgePermissions = struct {
     skeleton_chat: bool = true,
+    model_selection: bool = false,
     session_mutation: bool = false,
 
     fn allows(self: BridgePermissions, permission: Permission) bool {
         return switch (permission) {
             .skeleton_chat => self.skeleton_chat,
+            .model_selection => self.model_selection,
             .session_mutation => self.session_mutation,
         };
     }
@@ -55,6 +59,7 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "get_messages", .command = .get_messages, .permission = .skeleton_chat },
     .{ .name = "prompt", .command = .prompt, .permission = .skeleton_chat },
     .{ .name = "abort", .command = .abort, .permission = .skeleton_chat },
+    .{ .name = "model_select", .command = .model_select, .permission = .model_selection },
     .{ .name = "new_session", .command = .new_session, .permission = .session_mutation },
     .{ .name = "resume_session", .command = .resume_session, .permission = .session_mutation },
     .{ .name = "switch_session", .command = .switch_session, .permission = .session_mutation },
@@ -81,6 +86,7 @@ pub const DispatchCounters = struct {
     get_messages: usize = 0,
     prompt: usize = 0,
     abort: usize = 0,
+    model_select: usize = 0,
     new_session: usize = 0,
     resume_session: usize = 0,
     switch_session: usize = 0,
@@ -91,6 +97,7 @@ pub const DispatchCounters = struct {
             .get_messages => self.get_messages += 1,
             .prompt => self.prompt += 1,
             .abort => self.abort += 1,
+            .model_select => self.model_select += 1,
             .new_session => self.new_session += 1,
             .resume_session => self.resume_session += 1,
             .switch_session => self.switch_session += 1,
@@ -102,6 +109,7 @@ pub const DispatchCounters = struct {
             self.get_messages +
             self.prompt +
             self.abort +
+            self.model_select +
             self.new_session +
             self.resume_session +
             self.switch_session;
@@ -232,6 +240,12 @@ pub const BridgeHost = struct {
                 "invalid_payload",
                 "Bridge session target is invalid or missing",
             ),
+            error.InvalidModelSelection => return writeErrorResponseAlloc(
+                allocator,
+                request_id,
+                "invalid_payload",
+                "Bridge provider/model selection is invalid or unsupported",
+            ),
         };
 
         if (!self.context.permissions.allows(spec.permission)) {
@@ -239,7 +253,7 @@ pub const BridgeHost = struct {
                 allocator,
                 request_id,
                 "permission_denied",
-                "WebView session mutation requires explicit session mutation permission",
+                permissionDeniedMessage(spec.permission),
             );
         }
 
@@ -278,6 +292,7 @@ pub const BridgeHost = struct {
             .get_messages => try self.writeMessagesResult(allocator, &writer.writer),
             .prompt => try self.writePromptResult(allocator, &writer.writer, payload.?),
             .abort => try self.writeAbortResult(&writer.writer),
+            .model_select => try self.writeModelSelectResult(allocator, &writer.writer, payload.?),
             .new_session, .resume_session, .switch_session => try self.writeSessionMutationGatedResult(allocator, &writer.writer, command),
         }
 
@@ -293,6 +308,10 @@ pub const BridgeHost = struct {
         try writer.writeAll("{");
         try writeStringField(allocator, writer, "provider", self.context.provider, false);
         try writeStringField(allocator, writer, "model", self.context.model.id, true);
+        try writeStringField(allocator, writer, "modelProvider", self.context.model.provider, true);
+        try writeStringField(allocator, writer, "modelName", self.context.model.name, true);
+        try writeStringField(allocator, writer, "modelApi", self.context.model.api, true);
+        try writer.writeAll(",\"modelSelection\":{\"status\":\"gated\",\"permissionRequired\":true}");
         try writeStringField(allocator, writer, "sessionId", self.context.session.session_manager.getSessionId(), true);
         try writeBoolField(writer, "noSession", self.context.no_session, true);
         try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
@@ -306,6 +325,34 @@ pub const BridgeHost = struct {
             try writeUsizeField(writer, "imagesCount", self.context.initial_images_count, true);
             try writer.writeAll("}");
         }
+        try writer.writeAll("}");
+    }
+
+    fn writeModelSelectResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const provider = payload.object.get("provider").?.string;
+        const model = payload.object.get("model").?.string;
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"provider\":");
+            try writeJsonString(allocator, writer, self.context.provider);
+            try writer.writeAll(",\"model\":");
+            try writeJsonString(allocator, writer, self.context.model.id);
+            try writer.writeAll(",\"message\":");
+            try writeJsonString(allocator, writer, "WebView model selection is blocked while a prompt is active");
+            try writer.writeAll("}");
+            return;
+        }
+
+        try writer.writeAll("{\"status\":\"gated\",\"accepted\":false,\"provider\":");
+        try writeJsonString(allocator, writer, provider);
+        try writer.writeAll(",\"model\":");
+        try writeJsonString(allocator, writer, model);
+        try writer.writeAll(",\"message\":");
+        try writeJsonString(allocator, writer, "WebView model selection is permissioned but not implemented in this milestone");
         try writer.writeAll("}");
     }
 
@@ -446,8 +493,15 @@ pub const BridgeHost = struct {
         self: *BridgeHost,
         command: Command,
         payload: ?std.json.Value,
-    ) error{InvalidSessionTarget}!void {
+    ) error{ InvalidSessionTarget, InvalidModelSelection }!void {
         switch (command) {
+            .model_select => {
+                const value = payload orelse return error.InvalidModelSelection;
+                const provider_value = value.object.get("provider") orelse return error.InvalidModelSelection;
+                const model_value = value.object.get("model") orelse return error.InvalidModelSelection;
+                if (provider_value != .string or model_value != .string) return error.InvalidModelSelection;
+                if (!isValidModelSelection(self.context.model, provider_value.string, model_value.string)) return error.InvalidModelSelection;
+            },
             .new_session => {
                 if (payload) |value| {
                     if (value == .object) {
@@ -480,6 +534,14 @@ pub const BridgeHost = struct {
         return true;
     }
 };
+
+fn permissionDeniedMessage(permission: Permission) []const u8 {
+    return switch (permission) {
+        .skeleton_chat => "WebView bridge command is disabled by policy",
+        .model_selection => "WebView model selection requires explicit model selection permission",
+        .session_mutation => "WebView session mutation requires explicit session mutation permission",
+    };
+}
 
 fn statusForTerminalOutcome(outcome: []const u8) []const u8 {
     if (std.mem.eql(u8, outcome, "success")) return "completed";
@@ -555,6 +617,10 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     return switch (command) {
         .get_state, .get_messages, .abort => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
+        .model_select => value.object.get("provider") != null and
+            value.object.get("provider").? == .string and
+            value.object.get("model") != null and
+            value.object.get("model").? == .string,
         .new_session => true,
         .resume_session, .switch_session => value.object.get("sessionPath") != null and value.object.get("sessionPath").? == .string,
     };
@@ -575,6 +641,13 @@ fn isValidSessionPath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
     return std.mem.endsWith(u8, path, ".jsonl");
+}
+
+fn isValidModelSelection(current_model: ai.Model, provider: []const u8, model_id: []const u8) bool {
+    if (provider.len == 0 or model_id.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, provider, 0) != null or std.mem.indexOfScalar(u8, model_id, 0) != null) return false;
+    if (std.mem.eql(u8, current_model.provider, provider) and std.mem.eql(u8, current_model.id, model_id)) return true;
+    return ai.model_registry.find(provider, model_id) != null;
 }
 
 fn validateValueBounds(value: std.json.Value, limits: Limits, depth: usize) error{ PayloadTooDeep, StringTooLong }!void {
@@ -963,16 +1036,22 @@ test "bridge command table exposes approved skeleton commands first" {
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 7), command_table.len);
-    try std.testing.expectEqualStrings("new_session", command_table[4].name);
-    try std.testing.expectEqual(Command.new_session, command_table[4].command);
-    try std.testing.expectEqual(Permission.session_mutation, command_table[4].permission);
-    try std.testing.expectEqualStrings("resume_session", command_table[5].name);
-    try std.testing.expectEqual(Command.resume_session, command_table[5].command);
+    try std.testing.expectEqual(@as(usize, 8), command_table.len);
+    try std.testing.expectEqualStrings("new_session", command_table[5].name);
+    try std.testing.expectEqual(Command.new_session, command_table[5].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[5].permission);
-    try std.testing.expectEqualStrings("switch_session", command_table[6].name);
-    try std.testing.expectEqual(Command.switch_session, command_table[6].command);
+    try std.testing.expectEqualStrings("resume_session", command_table[6].name);
+    try std.testing.expectEqual(Command.resume_session, command_table[6].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
+    try std.testing.expectEqualStrings("switch_session", command_table[7].name);
+    try std.testing.expectEqual(Command.switch_session, command_table[7].command);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[7].permission);
+}
+
+test "bridge command table explicitly gates future model selection command" {
+    try std.testing.expectEqualStrings("model_select", command_table[4].name);
+    try std.testing.expectEqual(Command.model_select, command_table[4].command);
+    try std.testing.expectEqual(Permission.model_selection, command_table[4].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -1085,6 +1164,123 @@ test "webview get_state mirrors existing session without mutating persisted stat
     try std.testing.expect(std.mem.indexOf(u8, first, "\"noSession\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, session_id) != null);
     try std.testing.expectEqualSlices(u8, before, after);
+}
+
+test "webview get_state exposes resolver model metadata without secrets" {
+    const allocator = std.testing.allocator;
+    var secret_model = testModel();
+    secret_model.id = "sentinel-model";
+    secret_model.name = "Sentinel Display";
+    secret_model.api = "openai-responses";
+    secret_model.provider = "sentinel-provider";
+    secret_model.base_url = "https://example.invalid/sk-webview-secret";
+
+    var session = try testSessionWithModel(allocator, secret_model);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.provider = "sentinel-provider";
+    bridge.context.model = secret_model;
+    bridge.context.api_key_present = true;
+
+    const response = try bridge.handleRequestJson(allocator, "{\"id\":\"state-model\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"provider\":\"sentinel-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"model\":\"sentinel-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"modelProvider\":\"sentinel-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"modelName\":\"Sentinel Display\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"modelApi\":\"openai-responses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"apiKeyPresent\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "base_url") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "baseUrl") == null);
+}
+
+test "webview model selection command is permission gated and preserves state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+    const session_id = try allocator.dupe(u8, session.session_manager.getSessionId());
+    defer allocator.free(session_id);
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const before_file = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before_file);
+
+    const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(before);
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"select-denied\",\"command\":\"model_select\",\"payload\":{\"provider\":\"faux\",\"model\":\"faux-model\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"select-denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"permission_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "model selection") != null);
+
+    const after = try bridge.handleRequestJson(allocator, "{\"id\":\"after\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(after);
+    const after_file = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after_file);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"provider\":\"faux\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "\"model\":\"faux-model\"") != null);
+    try std.testing.expectEqualStrings(session_id, session.session_manager.getSessionId());
+    try std.testing.expectEqualSlices(u8, before_file, after_file);
+    try std.testing.expectEqual(@as(usize, 2), counters.get_state);
+    try std.testing.expectEqual(@as(usize, 0), counters.model_select);
+}
+
+test "webview model selection validates provider model pairs before dispatch" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"bad-model\",\"command\":\"model_select\",\"payload\":{\"provider\":\"faux\",\"model\":\"missing-model\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"bad-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"invalid_payload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "provider/model") != null);
+    try std.testing.expectEqual(@as(usize, 0), counters.total());
+}
+
+test "webview model selection during active generation is blocked without changing model" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.permissions.model_selection = true;
+    bridge.active_generation.store(true, .seq_cst);
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"select-active\",\"command\":\"model_select\",\"payload\":{\"provider\":\"faux\",\"model\":\"faux-model\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"select-active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"status\":\"busy\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"accepted\":false") != null);
+    try std.testing.expectEqualStrings("faux-model", bridge.context.model.id);
 }
 
 test "webview session mutation commands deny without permission and preserve session file" {

@@ -1,9 +1,27 @@
 const std = @import("std");
 const native_runtime = @import("native_runtime.zig");
+const builtin = @import("builtin");
 
 /// Cross-platform dynamic library wrapper for native extension loading.
 /// Uses std.DynLib (POSIX dlopen / Windows LoadLibrary) under the hood.
-pub const NativeLibrary = struct {
+/// On Windows, std.DynLib is not supported in Zig 0.16, so we provide a stub.
+pub const NativeLibrary = if (builtin.os.tag == .windows) struct {
+    pub const Error = error{ UnsupportedPlatform, FileNotFound };
+
+    pub fn open(_: []const u8) Error!NativeLibrary {
+        return error.UnsupportedPlatform;
+    }
+
+    pub fn close(_: *NativeLibrary) void {}
+
+    pub fn lookupDescriptor(_: *NativeLibrary) ?*const native_runtime.NativeDescriptor {
+        return null;
+    }
+
+    pub fn lookupStartFn(_: *NativeLibrary) ?native_runtime.NativeStartFn {
+        return null;
+    }
+} else struct {
     dyn_lib: std.DynLib,
 
     pub const Error = std.DynLib.Error;
@@ -32,5 +50,9 @@ pub const NativeLibrary = struct {
 };
 
 test "NativeLibrary open nonexistent returns error" {
-    try std.testing.expectError(error.FileNotFound, NativeLibrary.open("/nonexistent/library.so"));
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectError(error.UnsupportedPlatform, NativeLibrary.open("/nonexistent/library.so"));
+    } else {
+        try std.testing.expectError(error.FileNotFound, NativeLibrary.open("/nonexistent/library.so"));
+    }
 }
