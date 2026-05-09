@@ -97,7 +97,7 @@ pub fn drawViewport(
         if (selection) |sel| {
             try extractSelectedTextFromItems(
                 allocator, keybindings, theme,
-                items, layout, src_start, visible_height, width,
+                items, layout, width,
                 now_ms, all_expanded, sel, text_out,
             );
         }
@@ -525,74 +525,81 @@ fn extractSelectedTextFromItems(
     theme: ?*const resources_mod.Theme,
     items: []const ChatItem,
     layout: Layout,
-    src_start: usize,
-    visible_height: usize,
     width: usize,
     now_ms: i64,
     all_expanded: bool,
     selection: SelectionRange,
     output: *std.ArrayList(u8),
 ) !void {
-    // Find items overlapping the visible area.
+    // Find all items that overlap the selection range (not just the visible viewport).
     var item_row: usize = 0;
-    var item_index: usize = 0;
-    while (item_index < layout.entries.items.len) : (item_index += 1) {
-        const entry_rows = layout.entries.items[item_index].rows;
+    for (items, 0..) |item, item_index| {
+        const entry_rows = if (item_index < layout.entries.items.len) layout.entries.items[item_index].rows else estimateItemRowsVisible(item, width, all_expanded);
         const item_end = item_row + entry_rows;
-        if (item_end > src_start) break;
-        item_row = item_end;
-    }
 
-    // Re-render visible items into a full scratch screen for text extraction.
-    var scratch = try tui.vaxis.Screen.init(allocator, .{
-        .rows = @intCast(@min(visible_height, @as(usize, std.math.maxInt(u16)))),
-        .cols = @intCast(@min(width, @as(usize, std.math.maxInt(u16)))),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer scratch.deinit(allocator);
+        // Skip items entirely above or below the selection.
+        if (item_end <= selection.start_row) {
+            item_row = item_end;
+            continue;
+        }
+        if (item_row > selection.end_row) break;
 
-    const scratch_window = tui.draw.rootWindow(&scratch);
-    scratch_window.clear();
+        // Use a generous scratch screen size for text extraction.
+        // estimateItemRowsFull underestimates markdown content (code blocks, headings, etc.),
+        // so the scratch screen needs extra room to avoid truncation.
+        const item_text = displayText(item, all_expanded);
+        const source_lines = countNewlines(item_text) + 1;
+        const generous_rows = @max(entry_rows, source_lines * 2 + 8);
+        var item_scratch = try tui.vaxis.Screen.init(allocator, .{
+            .rows = @intCast(@min(generous_rows, @as(usize, std.math.maxInt(u16)))),
+            .cols = @intCast(@min(width, @as(usize, std.math.maxInt(u16)))),
+            .x_pixel = 0,
+            .y_pixel = 0,
+        });
+        defer item_scratch.deinit(allocator);
 
-    var dst_row: usize = 0;
-    while (item_index < items.len and dst_row < visible_height) : (item_index += 1) {
-        const entry_rows = if (item_index < layout.entries.items.len) layout.entries.items[item_index].rows else estimateItemRowsVisible(items[item_index], width, all_expanded);
-        const draw_start = if (item_row < src_start) src_start - item_row else 0;
-        const available = visible_height - dst_row;
+        const item_window = tui.draw.rootWindow(&item_scratch);
+        item_window.clear();
+        _ = try drawItem(item_window, allocator, keybindings, theme, item, 0, now_ms, all_expanded);
 
-        if (draw_start < entry_rows and available > 0) {
-            const slice_height = @min(entry_rows - draw_start, available);
-            // Render item into its own small scratch screen.
-            const item_scratch_rows = @max(@as(usize, 1), @min(entry_rows, draw_start + slice_height + 1));
-            var item_scratch = try tui.vaxis.Screen.init(allocator, .{
-                .rows = @intCast(@min(item_scratch_rows, @as(usize, std.math.maxInt(u16)))),
-                .cols = @intCast(width),
-                .x_pixel = 0,
-                .y_pixel = 0,
-            });
-            defer item_scratch.deinit(allocator);
-
-            const item_window = tui.draw.rootWindow(&item_scratch);
-            item_window.clear();
-            _ = try drawItem(item_window, allocator, keybindings, theme, items[item_index], 0, now_ms, all_expanded);
-
-            // Blit the item's rendered rows into the scratch screen at the correct position.
-            const actual_src = @min(draw_start, @as(usize, item_scratch.height) -| 1);
-            const rows_to_copy = @min(slice_height, visible_height - dst_row);
-            const cols = @min(@as(usize, item_scratch.width), @as(usize, scratch.width));
-            for (0..rows_to_copy) |r| {
-                for (0..cols) |c| {
-                    const cell = item_scratch.readCell(@intCast(c), @intCast(actual_src + r)) orelse continue;
-                    scratch_window.writeCell(@intCast(c), @intCast(dst_row + r), normalizeCellForBlit(cell));
+        // Extract selected rows from this item's scratch screen.
+        const sel_start_in_item = if (selection.start_row > item_row) selection.start_row - item_row else 0;
+        const sel_end_in_item = if (selection.end_row < item_end) selection.end_row - item_row + 1 else entry_rows;
+        const cols = @min(@as(usize, item_scratch.width), @as(usize, width));
+        var trailing_space: usize = 0;
+        var skip_next: bool = false;
+        for (sel_start_in_item..sel_end_in_item) |local_row| {
+            if (local_row >= @as(usize, item_scratch.height)) break;
+            const abs_row = item_row + local_row;
+            const col_start: usize = if (abs_row == selection.start_row) selection.start_col else 0;
+            const col_end: usize = if (abs_row == selection.end_row) @min(selection.end_col, cols) else cols;
+            for (col_start..col_end) |col| {
+                const cell = item_scratch.readCell(@intCast(col), @intCast(local_row)) orelse continue;
+                if (skip_next) {
+                    skip_next = false;
+                    continue;
+                }
+                const grapheme = cell.char.grapheme;
+                if (cell.char.width > 1) {
+                    for (0..trailing_space) |_| try output.append(allocator, ' ');
+                    trailing_space = 0;
+                    try output.appendSlice(allocator, grapheme);
+                    skip_next = true;
+                } else if (grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ')) {
+                    trailing_space += 1;
+                } else {
+                    for (0..trailing_space) |_| try output.append(allocator, ' ');
+                    trailing_space = 0;
+                    try output.appendSlice(allocator, grapheme);
                 }
             }
-            dst_row += slice_height;
+            if (abs_row < selection.end_row) {
+                try output.append(allocator, '\n');
+                trailing_space = 0;
+            }
         }
-        item_row += entry_rows;
+        item_row = item_end;
     }
-
-    try extractSelectedText(allocator, &scratch, 0, visible_height, selection, output);
 }
 
 fn isCellSelected(row: usize, col: usize, sel: SelectionRange) bool {
@@ -619,10 +626,20 @@ fn extractSelectedText(
         const col_start: usize = if (abs_row == selection.start_row) selection.start_col else 0;
         const col_end: usize = if (abs_row == selection.end_row) @min(selection.end_col, @as(usize, cols)) else @as(usize, cols);
         var trailing_space: usize = 0;
+        var skip_next: bool = false;
         for (col_start..col_end) |col| {
             const cell = source.readCell(@intCast(col), @intCast(abs_row)) orelse continue;
+            if (skip_next) {
+                skip_next = false;
+                continue;
+            }
             const grapheme = cell.char.grapheme;
-            if (grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ')) {
+            if (cell.char.width > 1) {
+                for (0..trailing_space) |_| try output.append(allocator, ' ');
+                trailing_space = 0;
+                try output.appendSlice(allocator, grapheme);
+                skip_next = true;
+            } else if (grapheme.len == 0 or (grapheme.len == 1 and grapheme[0] == ' ')) {
                 trailing_space += 1;
             } else {
                 for (0..trailing_space) |_| try output.append(allocator, ' ');
@@ -658,7 +675,15 @@ fn renderedPrintHeight(result: tui.vaxis.Window.PrintResult, had_text: bool, max
     return @min(@max(height, 1), @as(usize, max_height));
 }
 
-pub fn estimateWrappedRows(text: []const u8, width: usize) usize {
+pub fn countNewlines(text: []const u8) usize {
+    var count: usize = 0;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
+}
+
+fn estimateWrappedRows(text: []const u8, width: usize) usize {
     const effective_width = @max(width, 1);
     if (text.len == 0) return 1;
     var rows: usize = 0;
