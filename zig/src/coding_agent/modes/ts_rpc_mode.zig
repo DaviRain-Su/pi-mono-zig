@@ -2821,6 +2821,20 @@ fn waitForAbsoluteFile(path: []const u8, timeout_ms: u64) !void {
     _ = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{});
 }
 
+fn waitForAbsoluteFileContains(allocator: std.mem.Allocator, path: []const u8, needle: []const u8, timeout_ms: u64) !void {
+    var elapsed: u64 = 0;
+    while (elapsed <= timeout_ms) : (elapsed += 5) {
+        if (std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .unlimited)) |bytes| {
+            defer allocator.free(bytes);
+            if (std.mem.indexOf(u8, bytes, needle) != null) return;
+        } else |_| {}
+        std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, allocator, .unlimited);
+    defer allocator.free(bytes);
+    try expectContains(bytes, needle);
+}
+
 fn waitForNoActiveBashTask(server: *TsRpcServer, timeout_ms: u64) !void {
     var elapsed: u64 = 0;
     while (elapsed <= timeout_ms) : (elapsed += 5) {
@@ -5531,6 +5545,7 @@ test "M7 TS RPC lists extension commands and dispatches slash command without ag
     try expectContains(snapshot, "\"shortcuts\":[{\"shortcut\":\"ctrl+e\",\"description\":\"Run M7 echo\",\"command\":\"m7.echo\"");
     try expectContains(snapshot, "\"messageRenderers\":[{\"customType\":\"m7.message\",\"extensionPath\":\"fixture/m7.ts\"}]");
 
+    try waitForAbsoluteFileContains(allocator, capture_path, "{\"type\":\"extension_event\",\"eventId\":\"", 1000);
     try server.finish();
     const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
     defer allocator.free(capture);

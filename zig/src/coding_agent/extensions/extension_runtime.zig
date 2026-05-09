@@ -580,27 +580,45 @@ pub const LockedNativeRuntimeSet = struct {
     pub fn agentTool(self: *LockedNativeRuntimeSet, allocator: std.mem.Allocator, name: []const u8) !?agent.AgentTool {
         for (self.entries) |*entry| {
             if (!std.mem.eql(u8, entry.tool_name, name)) continue;
-            var parsed_parameters = try std.json.parseFromSlice(std.json.Value, allocator, entry.input_schema_json, .{});
-            defer parsed_parameters.deinit();
-            const context = try allocator.create(LockedNativeToolContext);
-            errdefer allocator.destroy(context);
-            context.* = .{
-                .runtime_set = self,
-                .tool_name = try allocator.dupe(u8, entry.tool_name),
-            };
-            errdefer allocator.free(context.tool_name);
-            return .{
-                .name = entry.tool_name,
-                .description = entry.tool_description,
-                .label = entry.tool_name,
-                .parameters = try tools_common.cloneJsonValue(allocator, parsed_parameters.value),
-                .source = .extension,
-                .execute = lockedNativeAgentToolExecute,
-                .execute_context = context,
-                .deinit_execute_context = deinitLockedNativeToolContext,
-            };
+            return try lockedNativeAgentToolForEntry(allocator, entry, self);
         }
         return null;
+    }
+
+    pub fn detachedAgentToolForEntry(
+        self: *LockedNativeRuntimeSet,
+        allocator: std.mem.Allocator,
+        entry: *LockedNativeRuntimeEntry,
+    ) !agent.AgentTool {
+        _ = self;
+        return lockedNativeAgentToolForEntry(allocator, entry, null);
+    }
+
+    fn lockedNativeAgentToolForEntry(
+        allocator: std.mem.Allocator,
+        entry: *LockedNativeRuntimeEntry,
+        runtime_set: ?*LockedNativeRuntimeSet,
+    ) !agent.AgentTool {
+        var parsed_parameters = try std.json.parseFromSlice(std.json.Value, allocator, entry.input_schema_json, .{});
+        defer parsed_parameters.deinit();
+        const context = try allocator.create(LockedNativeToolContext);
+        errdefer allocator.destroy(context);
+        context.* = .{
+            .runtime_set = runtime_set,
+            .entry = entry,
+            .tool_name = try allocator.dupe(u8, entry.tool_name),
+        };
+        errdefer allocator.free(context.tool_name);
+        return .{
+            .name = entry.tool_name,
+            .description = entry.tool_description,
+            .label = entry.tool_name,
+            .parameters = try tools_common.cloneJsonValue(allocator, parsed_parameters.value),
+            .source = .extension,
+            .execute = lockedNativeAgentToolExecute,
+            .execute_context = context,
+            .deinit_execute_context = deinitLockedNativeToolContext,
+        };
     }
 
     pub fn unloadPackage(self: *LockedNativeRuntimeSet, package_root: []const u8) !bool {
@@ -659,7 +677,8 @@ pub const LockedNativeRuntimeSet = struct {
 };
 
 const LockedNativeToolContext = struct {
-    runtime_set: *LockedNativeRuntimeSet,
+    runtime_set: ?*LockedNativeRuntimeSet,
+    entry: *LockedNativeRuntimeEntry,
     tool_name: []u8,
 
     fn deinit(self: *LockedNativeToolContext, allocator: std.mem.Allocator) void {
@@ -687,14 +706,19 @@ fn lockedNativeAgentToolExecute(
     _ = on_update_context;
     _ = on_update;
     const context: *LockedNativeToolContext = @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
-    const entry = context.runtime_set.findActiveEntry(context.tool_name) orelse return error.NativeToolNotRegistered;
+    const entry = if (context.runtime_set) |runtime_set|
+        runtime_set.findActiveEntry(context.tool_name) orelse return error.NativeToolNotRegistered
+    else
+        context.entry;
     if (entry.loaded.unloaded) return error.NativeToolNotRegistered;
 
     const input_json = try std.json.Stringify.valueAlloc(allocator, params, .{});
     defer allocator.free(input_json);
     try enforceLockedNativeToolExecution(entry, .{ .turns = 1 });
     if (input_json.len > native_sdk.MAX_EXECUTE_INPUT_BYTES) {
-        try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", "native_execute_input_too_large", "native execute input exceeded ABI maximum bytes");
+        if (context.runtime_set) |runtime_set| {
+            try appendLockedNativeExecuteDiagnostic(runtime_set, entry, "execute", "native_execute_input_too_large", "native execute input exceeded ABI maximum bytes");
+        }
         return lockedNativeErrorResult(allocator, entry, "native_execute_input_too_large", "native execute input exceeded ABI maximum bytes");
     }
 
@@ -716,7 +740,9 @@ fn lockedNativeAgentToolExecute(
             error.NativeAbiNullBuffer => "native_execute_null_buffer",
             else => return err,
         };
-        try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", code, @errorName(err));
+        if (context.runtime_set) |runtime_set| {
+            try appendLockedNativeExecuteDiagnostic(runtime_set, entry, "execute", code, @errorName(err));
+        }
         return lockedNativeErrorResult(allocator, entry, code, @errorName(err));
     };
     defer allocator.free(output_json);
@@ -727,7 +753,9 @@ fn lockedNativeAgentToolExecute(
 
     return lockedNativeAgentToolResultFromEnvelope(allocator, entry, output_json) catch |err| switch (err) {
         error.NativeExecuteEnvelopeInvalid => {
-            try appendLockedNativeExecuteDiagnostic(context.runtime_set, entry, "execute", "native_execute_invalid_envelope", "native execute returned an invalid result envelope");
+            if (context.runtime_set) |runtime_set| {
+                try appendLockedNativeExecuteDiagnostic(runtime_set, entry, "execute", "native_execute_invalid_envelope", "native execute returned an invalid result envelope");
+            }
             return lockedNativeErrorResult(allocator, entry, "native_execute_invalid_envelope", "native execute returned an invalid result envelope");
         },
         else => return err,
@@ -3647,8 +3675,7 @@ fn writeExecutableNativeDynamicRuntimePackage(
         .{ id, name, tool_name, tool_name },
     );
     defer allocator.free(metadata);
-    const source = try std.fmt.allocPrint(
-        allocator,
+    const source = try std.fmt.allocPrint(allocator,
         \\const std = @import("std");
         \\const HostApiV0 = extern struct {{
         \\    abi_version: u32,

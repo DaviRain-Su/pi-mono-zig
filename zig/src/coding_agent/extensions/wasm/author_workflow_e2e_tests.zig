@@ -1,8 +1,11 @@
 const std = @import("std");
+const agent = @import("agent");
 const ai = @import("ai");
 const config_mod = @import("../../config/config.zig");
 const extension_runtime = @import("../extension_runtime.zig");
 const interactive_mode = @import("../../interactive_mode.zig");
+const native_loader = @import("../native/native_loader.zig");
+const native_manifest = @import("../native/native_manifest.zig");
 const package_manager = @import("../../packages/package_manager.zig");
 const print_mode = @import("../../modes/print_mode.zig");
 const resources_mod = @import("../../resources/resources.zig");
@@ -20,6 +23,15 @@ const TEMPLATE_FILES = [_][]const u8{
     "src/main.zig",
     "test/main.zig",
     "wasm/.gitkeep",
+};
+const NATIVE_TEMPLATE_ROOT = "templates/extension-native-zig";
+const NATIVE_TEMPLATE_FILES = [_][]const u8{
+    "build.zig",
+    "pi-extension.json",
+    "sdk/pi_native_extension_sdk.zig",
+    "src/main.zig",
+    "test/main.zig",
+    "native/.gitkeep",
 };
 
 test "VAL-CROSS final Zig author workflow copy install execute drift update remove" {
@@ -279,6 +291,269 @@ test "VAL-CROSS final Zig author workflow copy install execute drift update remo
     try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "post-remove construction", .{
         .include_installed_wasm_tools = true,
     }, .text, "post-remove construction ok\n");
+}
+
+test "VAL-CROSS aggregate mixed runtime author workflow and CI boundary gate" {
+    if (native_loader.unsupportedPlatformReasonForTesting()) |_| return;
+    if (@import("builtin").os.tag != .macos) return;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer ai.model_registry.resetForTesting();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project/sessions");
+    const home_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home");
+    defer allocator.free(home_dir);
+    const agent_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const project_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project");
+    defer allocator.free(project_dir);
+    const session_dir = try absoluteTmpPath(allocator, &tmp.sub_path, "project/sessions");
+    defer allocator.free(session_dir);
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const lock_path = try std.fs.path.join(allocator, &.{ agent_dir, "extensions.lock.json" });
+    defer allocator.free(lock_path);
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, settings_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lock_path, .{}));
+
+    const wasm_root = try copyTemplateToTmp(allocator, &tmp, "project/aggregate-wasm-author-plugin");
+    defer allocator.free(wasm_root);
+    const native_root = try copyNativeTemplateToTmp(allocator, &tmp, "project/aggregate-native-author-plugin");
+    defer allocator.free(native_root);
+    try runTemplateBuild(allocator, wasm_root);
+    try runNativeTemplateBuild(allocator, native_root);
+    try runNativeTemplateValidate(allocator, native_root);
+
+    try expectPackageTreeExcludesProductSurfaces(allocator, wasm_root);
+    try expectPackageTreeExcludesProductSurfaces(allocator, native_root);
+
+    var wasm_manifest_result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, wasm_root);
+    defer wasm_manifest_result.deinit(allocator);
+    try std.testing.expect(wasm_manifest_result == .valid);
+    var native_manifest_result = try native_manifest.validateManifestFile(allocator, std.testing.io, native_root);
+    defer native_manifest_result.deinit(allocator);
+    try std.testing.expect(native_manifest_result == .valid);
+    try std.testing.expectEqualStrings("template.echo", wasm_manifest_result.valid.tool_id);
+    try std.testing.expectEqualStrings("native.echo", native_manifest_result.valid.tool_name);
+
+    var wasm_install = try runPackageCommand(allocator, &.{ "install", wasm_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer wasm_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), wasm_install.exit_code);
+    try expectContains(wasm_install.stdout, "runtime: wasm");
+    try expectContains(wasm_install.stdout, "approval target: wasm:locked:user:");
+    const wasm_policy_key = try extractApprovalTarget(allocator, wasm_install.stdout);
+    defer allocator.free(wasm_policy_key);
+
+    var native_install = try runPackageCommand(allocator, &.{ "install", native_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer native_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), native_install.exit_code);
+    try expectContains(native_install.stdout, "runtime: native");
+    try expectContains(native_install.stdout, "approval target: native:locked:user:");
+    const native_policy_key = try extractApprovalTarget(allocator, native_install.stdout);
+    defer allocator.free(native_policy_key);
+
+    var initial_list = try runPackageCommand(allocator, &.{"list"}, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer initial_list.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), initial_list.exit_code);
+    try expectContains(initial_list.stdout, "runtime: wasm");
+    try expectContains(initial_list.stdout, "runtime: native");
+    try expectContains(initial_list.stdout, "policy: denied");
+    try expectNotContains(initial_list.stdout, "Web Simulator");
+    try expectNotContains(initial_list.stdout, "marketplace");
+
+    try expectMixedRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{
+        "tool=template.echo",
+        wasm_manifest_result.valid.package_root_sha256,
+        wasm_manifest_result.valid.artifact_sha256,
+    }, "missing_policy", &.{
+        "tool=native.echo",
+        "scope=user",
+        native_manifest_result.valid.package_root_sha256,
+        native_manifest_result.valid.selected_artifact_sha256,
+    });
+
+    try writeAggregateAuthorSettings(allocator, settings_path, &.{
+        .{ .source = wasm_root, .policy_key = wasm_policy_key, .tool_scope = "template.echo" },
+        .{ .source = native_root, .policy_key = native_policy_key, .tool_scope = "native.echo" },
+    });
+
+    const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+        .{ .factory = normalConstructionFactory },
+        .{ .factory = forcedWasmSuccessToolCallFactory },
+        .{ .factory = verifyWasmSuccessResultFactory },
+        .{ .factory = forcedNativeSuccessToolCallFactory },
+        .{ .factory = verifyNativeSuccessResultFactory },
+        .{ .factory = forcedWasmSuccessToolCallFactory },
+        .{ .factory = verifyWasmSuccessResultFactory },
+        .{ .factory = forcedNativeSuccessToolCallFactory },
+        .{ .factory = verifyNativeSuccessResultFactory },
+        .{ .factory = aggregatePostRemoveConstructionFactory },
+    });
+
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "mixed construction", .{
+        .include_installed_wasm_tools = true,
+        .include_installed_native_tools = true,
+    }, .text, "mixed construction ok\n");
+    try runNormalTemplateInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), wasm_manifest_result.valid.artifact_sha256);
+    try runNormalNativeInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), native_manifest_result.valid.selected_artifact_sha256);
+
+    var project_wasm_install = try runPackageCommand(allocator, &.{ "install", wasm_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_wasm_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_wasm_install.exit_code);
+    try expectContains(project_wasm_install.stdout, "scope: project");
+    var project_native_install = try runPackageCommand(allocator, &.{ "install", native_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_native_install.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_native_install.exit_code);
+    try expectContains(project_native_install.stdout, "scope: project");
+    try expectMixedRuntimeProjectDenied(allocator, home_dir, agent_dir, project_dir);
+    var project_wasm_remove = try runPackageCommand(allocator, &.{ "remove", wasm_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_wasm_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_wasm_remove.exit_code);
+    var project_native_remove = try runPackageCommand(allocator, &.{ "remove", native_root, "-l" }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer project_native_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), project_native_remove.exit_code);
+
+    const lock_before_drift = try readFile(allocator, lock_path);
+    defer allocator.free(lock_before_drift);
+    try writePackageRootDriftFile(allocator, wasm_root, "aggregate-wasm-drift.txt", "wasm root drift");
+    try writePackageRootDriftFile(allocator, native_root, "aggregate-native-drift.txt", "native root drift");
+    try expectMixedRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "package_root_digest_mismatch", &.{
+        wasm_manifest_result.valid.package_root_sha256,
+        "actual=",
+    }, "package_root_digest_mismatch", &.{
+        native_manifest_result.valid.package_root_sha256,
+        "actual=",
+    });
+    const lock_after_drift = try readFile(allocator, lock_path);
+    defer allocator.free(lock_after_drift);
+    try std.testing.expectEqualStrings(lock_before_drift, lock_after_drift);
+
+    var wasm_update = try runPackageCommand(allocator, &.{ "update", wasm_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+        .self_update_command_override = &.{"/usr/bin/true"},
+    });
+    defer wasm_update.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), wasm_update.exit_code);
+    var native_update = try runPackageCommand(allocator, &.{ "update", "--extension", native_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer native_update.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), native_update.exit_code);
+
+    var updated_wasm_manifest = try wasm_manifest.validateManifestFile(allocator, std.testing.io, wasm_root);
+    defer updated_wasm_manifest.deinit(allocator);
+    try std.testing.expect(updated_wasm_manifest == .valid);
+    var updated_native_manifest = try native_manifest.validateManifestFile(allocator, std.testing.io, native_root);
+    defer updated_native_manifest.deinit(allocator);
+    try std.testing.expect(updated_native_manifest == .valid);
+    try std.testing.expect(!std.mem.eql(u8, wasm_manifest_result.valid.package_root_sha256, updated_wasm_manifest.valid.package_root_sha256));
+    try std.testing.expect(!std.mem.eql(u8, native_manifest_result.valid.package_root_sha256, updated_native_manifest.valid.package_root_sha256));
+
+    try expectMixedRuntimeDeniedWithFields(allocator, home_dir, agent_dir, project_dir, "policy_digest_mismatch", &.{
+        wasm_manifest_result.valid.package_root_sha256,
+        updated_wasm_manifest.valid.package_root_sha256,
+        "attemptedPolicy=",
+        "requiredPolicy=",
+    }, "policy_digest_mismatch", &.{
+        native_manifest_result.valid.package_root_sha256,
+        updated_native_manifest.valid.package_root_sha256,
+        "attemptedPolicy=",
+        "requiredPolicy=",
+    });
+
+    var updated_list = try runPackageCommand(allocator, &.{"list"}, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer updated_list.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), updated_list.exit_code);
+    const updated_wasm_policy_key = try extractApprovalTargetWithPrefix(allocator, updated_list.stdout, "wasm:locked:user:");
+    defer allocator.free(updated_wasm_policy_key);
+    const updated_native_policy_key = try extractApprovalTargetWithPrefix(allocator, updated_list.stdout, "native:locked:user:");
+    defer allocator.free(updated_native_policy_key);
+    try expectContains(updated_wasm_policy_key, updated_wasm_manifest.valid.package_root_sha256);
+    try expectContains(updated_native_policy_key, updated_native_manifest.valid.package_root_sha256);
+    try writeAggregateAuthorSettings(allocator, settings_path, &.{
+        .{ .source = wasm_root, .policy_key = updated_wasm_policy_key, .tool_scope = "template.echo" },
+        .{ .source = native_root, .policy_key = updated_native_policy_key, .tool_scope = "native.echo" },
+    });
+
+    try runNormalTemplateInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), updated_wasm_manifest.valid.artifact_sha256);
+    try runNormalNativeInvocation(allocator, home_dir, agent_dir, project_dir, session_dir, registration.getModel(), updated_native_manifest.valid.selected_artifact_sha256);
+
+    var wasm_remove = try runPackageCommand(allocator, &.{ "remove", wasm_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer wasm_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), wasm_remove.exit_code);
+    var native_remove = try runPackageCommand(allocator, &.{ "remove", native_root }, .{
+        .cwd = project_dir,
+        .agent_dir = agent_dir,
+    });
+    defer native_remove.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), native_remove.exit_code);
+
+    var removed_tools = try buildAggregateAuthorTools(allocator, home_dir, agent_dir, project_dir, .{});
+    defer removed_tools.deinit();
+    try std.testing.expectEqual(@as(usize, 0), removed_tools.locked_wasm_runtimes.?.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), removed_tools.locked_native_runtimes.?.entries.len);
+    try expectBuiltToolAbsent(removed_tools.items, "template.echo");
+    try expectBuiltToolAbsent(removed_tools.items, "native.echo");
+    try runNormalConstructionCase(allocator, home_dir, agent_dir, project_dir, registration.getModel(), "aggregate post-remove construction", .{
+        .include_installed_wasm_tools = true,
+        .include_installed_native_tools = true,
+    }, .text, "aggregate post-remove construction ok\n");
+}
+
+test "VAL-CROSS-030 CI matrix keeps aggregate native runtime boundaries explicit" {
+    const allocator = std.testing.allocator;
+    const zig_ci = try readFile(allocator, "../.github/workflows/zig-ci.yml");
+    defer allocator.free(zig_ci);
+    const node_ci = try readFile(allocator, "../.github/workflows/ci.yml");
+    defer allocator.free(node_ci);
+
+    try expectContains(zig_ci, "os: [ubuntu-latest, macos-latest, windows-latest]");
+    try expectContains(zig_ci, "ZIG_VERSION=0.16.0");
+    try expectContains(zig_ci, "Linux Zig smoke");
+    try expectContains(zig_ci, "zig build check-external-tools --summary all");
+    try expectContains(zig_ci, "Skipping Linux zig build/test because Zig 0.16.0 SIGSEGVs");
+    try expectContains(zig_ci, "if: runner.os != 'Linux'");
+    try expectContains(zig_ci, "if: runner.os == 'macOS'");
+    try expectContains(zig_ci, "zig build test");
+    try expectContains(node_ci, "npm run check");
+    try expectNotContains(zig_ci, "Web Simulator");
+    try expectNotContains(zig_ci, "marketplace");
+    try expectNotContains(zig_ci, "signing");
 }
 
 test "VAL-RUNTIME normal agent construction includes installed wasm tools with filters" {
@@ -722,7 +997,7 @@ fn normalConstructionFactory(
     const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
     const tools = context.tools orelse &.{};
     const response_text = responseTextForNormalConstructionPrompt(prompt) orelse return error.UnexpectedNormalConstructionPrompt;
-    if (std.mem.eql(u8, prompt, "default construction") or std.mem.eql(u8, prompt, "json construction")) {
+    if (std.mem.eql(u8, prompt, "default construction") or std.mem.eql(u8, prompt, "json construction") or std.mem.eql(u8, prompt, "mixed construction")) {
         try expectProviderToolPresent(tools, "read");
         try expectProviderToolPresent(tools, "bash");
         try expectProviderToolPresent(tools, "write");
@@ -731,6 +1006,9 @@ fn normalConstructionFactory(
         try expectProviderToolPresent(tools, "find");
         try expectProviderToolPresent(tools, "ls");
         try expectProviderToolPresent(tools, "template.echo");
+        if (std.mem.eql(u8, prompt, "mixed construction")) {
+            try expectProviderToolPresent(tools, "native.echo");
+        }
     } else if (std.mem.eql(u8, prompt, "selected builtins")) {
         try expectProviderToolNamesExactly(tools, &.{ "read", "grep" });
     } else if (std.mem.eql(u8, prompt, "selected wasm")) {
@@ -758,6 +1036,7 @@ fn responseTextForNormalConstructionPrompt(prompt: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, prompt, "no builtins")) return "no builtins ok";
     if (std.mem.eql(u8, prompt, "no tools explicit wasm")) return "no tools explicit wasm ok";
     if (std.mem.eql(u8, prompt, "json construction")) return "json construction ok";
+    if (std.mem.eql(u8, prompt, "mixed construction")) return "mixed construction ok";
     return null;
 }
 
@@ -797,6 +1076,46 @@ fn verifyWasmSuccessResultFactory(
 
     const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
     blocks[0] = ai.providers.faux.fauxText("installed wasm success observed");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
+fn forcedNativeSuccessToolCallFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try std.testing.expect(context.messages.len >= 1);
+    const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
+    try std.testing.expectEqualStrings("call installed native", prompt);
+
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"message\":\"normal native path\"}", .{});
+    defer args.deinit();
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = try ai.providers.faux.fauxToolCall(allocator, "native.echo", args.value, .{ .id = "native-normal-success" });
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use });
+}
+
+fn verifyNativeSuccessResultFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try expectLatestToolResult(context.messages, .{
+        .tool_call_id = "native-normal-success",
+        .tool_name = "native.echo",
+        .is_error = false,
+        .content_contains = "\"message\":\"normal native path\"",
+        .expected_runtime_kind = "native",
+        .expected_extension_id = "com.pi.native.template.echo",
+        .expected_artifact_sha256 = null,
+    });
+
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("installed native success observed");
     return ai.providers.faux.fauxAssistantMessage(blocks, .{});
 }
 
@@ -892,11 +1211,33 @@ fn postRemoveConstructionFactory(
     return ai.providers.faux.fauxAssistantMessage(blocks, .{});
 }
 
+fn aggregatePostRemoveConstructionFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    try std.testing.expect(context.messages.len >= 1);
+    const prompt = context.messages[context.messages.len - 1].user.content[0].text.text;
+    try std.testing.expectEqualStrings("aggregate post-remove construction", prompt);
+    const tools = context.tools orelse &.{};
+    try expectProviderToolPresent(tools, "read");
+    try expectProviderToolPresent(tools, "bash");
+    try expectProviderToolAbsent(tools, "template.echo");
+    try expectProviderToolAbsent(tools, "native.echo");
+
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 1);
+    blocks[0] = ai.providers.faux.fauxText("aggregate post-remove construction ok");
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{});
+}
+
 const ExpectedToolResult = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     is_error: bool,
     content_contains: []const u8,
+    expected_runtime_kind: []const u8 = "wasm",
     expected_extension_id: []const u8,
     expected_artifact_sha256: ?[]const u8,
 };
@@ -913,7 +1254,7 @@ fn expectLatestToolResult(messages: []const ai.Message, expected: ExpectedToolRe
                 try std.testing.expect(std.mem.indexOf(u8, tool_result.content[0].text.text, expected.content_contains) != null);
                 const details = tool_result.details orelse return error.ExpectedWasmRuntimeDetails;
                 const runtime = details.object.get("extensionRuntime") orelse return error.ExpectedWasmRuntimeDetails;
-                try std.testing.expectEqualStrings("wasm", runtime.object.get("runtimeKind").?.string);
+                try std.testing.expectEqualStrings(expected.expected_runtime_kind, runtime.object.get("runtimeKind").?.string);
                 try std.testing.expectEqualStrings(expected.expected_extension_id, runtime.object.get("extensionId").?.string);
                 try std.testing.expectEqualStrings(expected.tool_name, runtime.object.get("toolId").?.string);
                 if (expected.expected_artifact_sha256) |artifact_sha256| {
@@ -986,6 +1327,81 @@ fn runNormalUpdatedTemplateInvocation(
         .content_contains = "\"echo\":\"edited runtime output\"",
         .expected_artifact_sha256 = expected_artifact_sha256,
     });
+}
+
+fn runNormalNativeInvocation(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    session_dir: []const u8,
+    model: ai.Model,
+    expected_artifact_sha256: []const u8,
+) !void {
+    var runtime_config = try loadAuthorRuntimeConfig(allocator, home_dir, agent_dir, project_dir);
+    defer runtime_config.deinit();
+
+    var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
+    var built_tools = try interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
+        .selected_tools = tool_selection_mod.ToolSelection.fromAllowlist(&.{"native.echo"}),
+        .include_installed_wasm_tools = true,
+        .include_installed_native_tools = true,
+        .runtime_config = &runtime_config,
+        .resource_options = .{
+            .cwd = project_dir,
+            .agent_dir = runtime_config.agent_dir,
+            .global = interactive_mode.settingsResources(runtime_config.global_settings),
+            .project = interactive_mode.settingsResources(runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        },
+    });
+    defer built_tools.deinit();
+    try std.testing.expect(built_tools.locked_native_runtimes != null);
+    try std.testing.expectEqual(@as(usize, 1), built_tools.locked_native_runtimes.?.entries.len);
+    try expectBuiltToolPresent(built_tools.items, "native.echo");
+    try expectBuiltToolAbsent(built_tools.items, "template.echo");
+
+    var session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
+        .cwd = project_dir,
+        .system_prompt = "sys",
+        .model = model,
+        .session_dir = session_dir,
+        .tools = built_tools.items,
+    });
+    defer session.deinit();
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+    const exit_code = try print_mode.runPrintMode(
+        allocator,
+        std.testing.io,
+        &session,
+        "call installed native",
+        .{ .mode = .text, .install_signal_handlers = false },
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+    if (exit_code != 0) {
+        std.debug.print("native invocation stdout:\n{s}\nnative invocation stderr:\n{s}\n", .{ stdout_capture.writer.buffered(), stderr_capture.writer.buffered() });
+    }
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("installed native success observed\n", stdout_capture.writer.buffered());
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    try expectLatestToolResult(session.agent.getMessages(), .{
+        .tool_call_id = "native-normal-success",
+        .tool_name = "native.echo",
+        .is_error = false,
+        .content_contains = "\"message\":\"normal native path\"",
+        .expected_runtime_kind = "native",
+        .expected_extension_id = "com.pi.native.template.echo",
+        .expected_artifact_sha256 = expected_artifact_sha256,
+    });
+    try std.testing.expect(!built_tools.locked_native_runtimes.?.entries[0].loaded.unloaded);
 }
 
 const NormalInvocationExpected = struct {
@@ -1170,6 +1586,19 @@ fn expectProviderToolNamesExactly(tools: []const ai.types.Tool, expected: []cons
     }
 }
 
+fn expectBuiltToolPresent(tools: []const agent.AgentTool, name: []const u8) !void {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return;
+    }
+    return error.ExpectedBuiltToolMissing;
+}
+
+fn expectBuiltToolAbsent(tools: []const agent.AgentTool, name: []const u8) !void {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return error.ExpectedBuiltToolAbsent;
+    }
+}
+
 fn runPackageCommand(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -1235,6 +1664,55 @@ fn loadAuthorRuntimeConfig(
         project_dir,
         .{ .discover_models = false },
     );
+}
+
+fn startNativeAuthorRuntimeSet(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+) !extension_runtime.LockedNativeRuntimeSet {
+    var runtime_config = try loadAuthorRuntimeConfig(allocator, home_dir, agent_dir, project_dir);
+    defer runtime_config.deinit();
+
+    return extension_runtime.startLockedNativePackageRuntimes(allocator, std.testing.io, &runtime_config, .{
+        .cwd = project_dir,
+        .agent_dir = runtime_config.agent_dir,
+        .global = resources_mod.SettingsResources{ .packages = runtime_config.global_settings.packages },
+        .project = resources_mod.SettingsResources{ .packages = runtime_config.project_settings.packages },
+        .include_default_extensions = false,
+        .include_default_skills = false,
+        .include_default_prompts = false,
+        .include_default_themes = false,
+    });
+}
+
+fn buildAggregateAuthorTools(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    selection: tool_selection_mod.ToolSelection,
+) !interactive_mode.BuiltTools {
+    var runtime_config = try loadAuthorRuntimeConfig(allocator, home_dir, agent_dir, project_dir);
+    defer runtime_config.deinit();
+    var app_context = interactive_mode.AppContext.init(project_dir, std.testing.io);
+    return interactive_mode.buildAgentToolsWithOptions(allocator, &app_context, .{
+        .selected_tools = selection,
+        .include_installed_wasm_tools = true,
+        .include_installed_native_tools = true,
+        .runtime_config = &runtime_config,
+        .resource_options = .{
+            .cwd = project_dir,
+            .agent_dir = runtime_config.agent_dir,
+            .global = interactive_mode.settingsResources(runtime_config.global_settings),
+            .project = interactive_mode.settingsResources(runtime_config.project_settings),
+            .include_default_extensions = false,
+            .include_default_skills = false,
+            .include_default_prompts = false,
+            .include_default_themes = false,
+        },
+    });
 }
 
 fn executeAuthorTool(
@@ -1322,6 +1800,54 @@ fn expectRuntimeDiagnosticWithFields(
     return error.ExpectedRuntimeDiagnosticMissing;
 }
 
+fn expectMixedRuntimeDeniedWithFields(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+    wasm_kind: []const u8,
+    wasm_fields: []const []const u8,
+    native_kind: []const u8,
+    native_fields: []const []const u8,
+) !void {
+    try expectRuntimeDiagnosticWithFields(allocator, home_dir, agent_dir, project_dir, wasm_kind, wasm_fields, 0);
+    var native_set = try startNativeAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+    defer native_set.deinit();
+    try std.testing.expectEqual(@as(usize, 0), native_set.entries.len);
+    try expectDiagnosticFields(native_set.diagnostics, native_kind, native_fields);
+}
+
+fn expectMixedRuntimeProjectDenied(
+    allocator: std.mem.Allocator,
+    home_dir: []const u8,
+    agent_dir: []const u8,
+    project_dir: []const u8,
+) !void {
+    try expectRuntimeDiagnosticWithFields(allocator, home_dir, agent_dir, project_dir, "missing_policy", &.{"scope=project"}, 1);
+    var native_set = try startNativeAuthorRuntimeSet(allocator, home_dir, agent_dir, project_dir);
+    defer native_set.deinit();
+    try std.testing.expectEqual(@as(usize, 1), native_set.entries.len);
+    try expectDiagnosticFields(native_set.diagnostics, "missing_policy", &.{"scope=project"});
+}
+
+fn expectDiagnosticFields(
+    diagnostics: []const resources_mod.Diagnostic,
+    expected_kind: []const u8,
+    expected_fields: []const []const u8,
+) !void {
+    for (diagnostics) |diagnostic| {
+        if (!std.mem.eql(u8, diagnostic.kind, expected_kind)) continue;
+        for (expected_fields) |field| {
+            if (diagnostic.path) |path| {
+                if (std.mem.indexOf(u8, path, field) != null) continue;
+            }
+            try expectContains(diagnostic.message, field);
+        }
+        return;
+    }
+    return error.ExpectedRuntimeDiagnosticMissing;
+}
+
 fn writeAuthorSettings(
     allocator: std.mem.Allocator,
     settings_path: []const u8,
@@ -1367,6 +1893,47 @@ fn writeAuthorSettingsWithPolicies(
     const settings = try std.fmt.allocPrint(allocator,
         \\{{"packages":[{{"source":{s}}}],"extensionPolicies":{{{s}}}}}
     , .{ source_json, policies.written() });
+    defer allocator.free(settings);
+    try tools_common.writeFileAbsolute(std.testing.io, settings_path, settings, true);
+}
+
+const AggregatePolicyEntry = struct {
+    source: []const u8,
+    policy_key: []const u8,
+    tool_scope: []const u8,
+};
+
+fn writeAggregateAuthorSettings(
+    allocator: std.mem.Allocator,
+    settings_path: []const u8,
+    entries: []const AggregatePolicyEntry,
+) !void {
+    var packages: std.Io.Writer.Allocating = .init(allocator);
+    defer packages.deinit();
+    var policies: std.Io.Writer.Allocating = .init(allocator);
+    defer policies.deinit();
+
+    for (entries, 0..) |entry, index| {
+        if (index > 0) {
+            try packages.writer.writeAll(",");
+            try policies.writer.writeAll(",");
+        }
+        const source_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = entry.source }, .{});
+        defer allocator.free(source_json);
+        const policy_key_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = entry.policy_key }, .{});
+        defer allocator.free(policy_key_json);
+        const tool_scope_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = entry.tool_scope }, .{});
+        defer allocator.free(tool_scope_json);
+
+        try packages.writer.print("{{\"source\":{s}}}", .{source_json});
+        try policies.writer.print(
+            \\{s}:{{"approvedGrants":[],"resourceLimits":{{"toolScopes":[{s}],"outputBytes":65536}}}}
+        , .{ policy_key_json, tool_scope_json });
+    }
+
+    const settings = try std.fmt.allocPrint(allocator,
+        \\{{"packages":[{s}],"extensionPolicies":{{{s}}}}}
+    , .{ packages.written(), policies.written() });
     defer allocator.free(settings);
     try tools_common.writeFileAbsolute(std.testing.io, settings_path, settings, true);
 }
@@ -1432,6 +1999,19 @@ fn extractApprovalTarget(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return allocator.dupe(u8, std.mem.trim(u8, after_marker[0..newline_index], " \t\r\n"));
 }
 
+fn extractApprovalTargetWithPrefix(allocator: std.mem.Allocator, text: []const u8, prefix: []const u8) ![]u8 {
+    const marker = "approval target:";
+    var remainder = text;
+    while (std.mem.indexOf(u8, remainder, marker)) |marker_index| {
+        const after_marker = std.mem.trim(u8, remainder[marker_index + marker.len ..], " \t");
+        const newline_index = std.mem.indexOfScalar(u8, after_marker, '\n') orelse after_marker.len;
+        const candidate = std.mem.trim(u8, after_marker[0..newline_index], " \t\r\n");
+        if (std.mem.startsWith(u8, candidate, prefix)) return allocator.dupe(u8, candidate);
+        remainder = after_marker[newline_index..];
+    }
+    return error.ExpectedApprovalTarget;
+}
+
 fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype, package_relative_path: []const u8) ![]u8 {
     try tmp.dir.createDirPath(std.testing.io, package_relative_path);
     for (TEMPLATE_FILES) |relative_path| {
@@ -1441,6 +2021,25 @@ fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype, package_relativ
             try tmp.dir.createDirPath(std.testing.io, target_dir);
         }
         const source_path = try std.fs.path.join(allocator, &.{ TEMPLATE_ROOT, relative_path });
+        defer allocator.free(source_path);
+        const bytes = try readFile(allocator, source_path);
+        defer allocator.free(bytes);
+        const target_path = try std.fs.path.join(allocator, &.{ package_relative_path, relative_path });
+        defer allocator.free(target_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = target_path, .data = bytes });
+    }
+    return absoluteTmpPath(allocator, &tmp.sub_path, package_relative_path);
+}
+
+fn copyNativeTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype, package_relative_path: []const u8) ![]u8 {
+    try tmp.dir.createDirPath(std.testing.io, package_relative_path);
+    for (NATIVE_TEMPLATE_FILES) |relative_path| {
+        if (std.fs.path.dirname(relative_path)) |dirname| {
+            const target_dir = try std.fs.path.join(allocator, &.{ package_relative_path, dirname });
+            defer allocator.free(target_dir);
+            try tmp.dir.createDirPath(std.testing.io, target_dir);
+        }
+        const source_path = try std.fs.path.join(allocator, &.{ NATIVE_TEMPLATE_ROOT, relative_path });
         defer allocator.free(source_path);
         const bytes = try readFile(allocator, source_path);
         defer allocator.free(bytes);
@@ -1500,6 +2099,36 @@ fn runTemplateBuild(allocator: std.mem.Allocator, package_root: []const u8) !voi
     if (exitCodeFromTerm(result.term) != 0) {
         std.debug.print("zig build stdout:\n{s}\nzig build stderr:\n{s}\n", .{ result.stdout, result.stderr });
         return error.TemplateBuildFailed;
+    }
+}
+
+fn runNativeTemplateBuild(allocator: std.mem.Allocator, package_root: []const u8) !void {
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "zig", "build", "-p", "." },
+        .cwd = .{ .path = package_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (exitCodeFromTerm(result.term) != 0) {
+        std.debug.print("native zig build stdout:\n{s}\nnative zig build stderr:\n{s}\n", .{ result.stdout, result.stderr });
+        return error.NativeTemplateBuildFailed;
+    }
+}
+
+fn runNativeTemplateValidate(allocator: std.mem.Allocator, package_root: []const u8) !void {
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "zig", "build", "-p", ".", "validate" },
+        .cwd = .{ .path = package_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (exitCodeFromTerm(result.term) != 0) {
+        std.debug.print("native zig build validate stdout:\n{s}\nnative zig build validate stderr:\n{s}\n", .{ result.stdout, result.stderr });
+        return error.NativeTemplateValidationFailed;
     }
 }
 
@@ -1639,6 +2268,60 @@ fn writeRootOnlyAuthorManifest(allocator: std.mem.Allocator, package_root: []con
         \\}
         \\
     , true);
+}
+
+fn writePackageRootDriftFile(
+    allocator: std.mem.Allocator,
+    package_root: []const u8,
+    relative_path: []const u8,
+    contents: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ package_root, relative_path });
+    defer allocator.free(path);
+    try tools_common.writeFileAbsolute(std.testing.io, path, contents, true);
+}
+
+fn expectPackageTreeExcludesProductSurfaces(allocator: std.mem.Allocator, package_root: []const u8) !void {
+    var dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, package_root, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    try expectDirectoryTreeExcludesProductSurfaces(allocator, package_root, &dir);
+}
+
+fn expectDirectoryTreeExcludesProductSurfaces(
+    allocator: std.mem.Allocator,
+    root_path: []const u8,
+    dir: *std.Io.Dir,
+) !void {
+    var iterator = dir.iterate();
+    while (try iterator.next(std.testing.io)) |entry| {
+        const child_path = try std.fs.path.join(allocator, &.{ root_path, entry.name });
+        defer allocator.free(child_path);
+        switch (entry.kind) {
+            .directory => {
+                if (std.mem.eql(u8, entry.name, ".zig-cache") or std.mem.eql(u8, entry.name, "zig-out")) continue;
+                var child_dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, child_path, .{ .iterate = true });
+                defer child_dir.close(std.testing.io);
+                try expectDirectoryTreeExcludesProductSurfaces(allocator, child_path, &child_dir);
+            },
+            .file => {
+                if (std.mem.indexOf(u8, child_path, std.fs.path.sep_str ++ "sdk" ++ std.fs.path.sep_str) != null) continue;
+                const ext = std.fs.path.extension(child_path);
+                if (std.mem.eql(u8, ext, ".wasm") or std.mem.eql(u8, ext, ".dylib") or std.mem.eql(u8, ext, ".so") or std.mem.eql(u8, ext, ".dll")) continue;
+                const bytes = try readFile(allocator, child_path);
+                defer allocator.free(bytes);
+                try expectNotContains(bytes, "Web Simulator");
+                try expectNotContains(bytes, "Workflow");
+                try expectNotContains(bytes, "Wiki");
+                try expectNotContains(bytes, "QA");
+                try expectNotContains(bytes, "Review");
+                try expectNotContains(bytes, "marketplace");
+                try expectNotContains(bytes, "signing");
+                try expectNotContains(bytes, "Remote WASM");
+                try expectNotContains(bytes, "remote WASM");
+            },
+            else => {},
+        }
+    }
 }
 
 fn appendFile(allocator: std.mem.Allocator, path: []const u8, suffix: []const u8) !void {

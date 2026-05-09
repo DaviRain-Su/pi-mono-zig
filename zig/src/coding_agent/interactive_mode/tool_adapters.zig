@@ -315,7 +315,7 @@ fn appendLockedWasmTools(
     runtime_set: *extension_runtime.LockedWasmRuntimeSet,
     selection: tool_selection_mod.ToolSelection,
 ) !void {
-    for (runtime_set.entries) |entry| {
+    for (runtime_set.entries) |*entry| {
         if (!selection.allowsExtension(entry.tool_id)) continue;
         if (hasToolName(items.items, entry.tool_id)) {
             const message = try std.fmt.allocPrint(
@@ -339,7 +339,7 @@ fn appendLockedNativeTools(
     runtime_set: *extension_runtime.LockedNativeRuntimeSet,
     selection: tool_selection_mod.ToolSelection,
 ) !void {
-    for (runtime_set.entries) |entry| {
+    for (runtime_set.entries) |*entry| {
         if (!selection.allowsExtension(entry.tool_name)) continue;
         if (hasToolName(items.items, entry.tool_name)) {
             const message = try std.fmt.allocPrint(
@@ -351,7 +351,7 @@ fn appendLockedNativeTools(
             try runtime_set.addDiagnostic("builtin_native_tool_conflict", message, entry.manifest_path);
             continue;
         }
-        var tool = (try runtime_set.agentTool(allocator, entry.tool_name)) orelse continue;
+        var tool = try runtime_set.detachedAgentToolForEntry(allocator, entry);
         errdefer extension_runtime.deinitAgentTool(allocator, &tool);
         try items.append(allocator, tool);
     }
