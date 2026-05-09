@@ -15,6 +15,14 @@ pub const ViewportMetrics = struct {
     visible_height: usize,
 };
 
+const ItemLayout = struct {
+    item_index: usize,
+    rows: usize,
+};
+
+/// Renders chat items into `window`, applying scroll offset without allocating
+/// a full-size scratch screen. Only items that overlap the visible area are
+/// rendered, avoiding expensive off-screen markdown processing.
 pub fn drawViewport(
     allocator: std.mem.Allocator,
     keybindings: ?*const keybindings_mod.Keybindings,
@@ -31,19 +39,12 @@ pub fn drawViewport(
 
     const visible_height = @min(height, @as(usize, window.height) - start_row);
     const width = @max(@as(usize, window.width), 1);
-    const scratch_height = @max(visible_height, estimateRows(items, width, all_expanded));
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = @intCast(@min(scratch_height, @as(usize, std.math.maxInt(u16)))),
-        .cols = window.width,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
 
-    const scratch_window = tui.draw.rootWindow(&screen);
-    scratch_window.clear();
-    const rendered = try drawItems(scratch_window, allocator, keybindings, theme, items, now_ms, all_expanded);
-    const rendered_height = @min(@as(usize, rendered.height), @as(usize, screen.height));
+    // Compute total rendered height and per-item layout without rendering.
+    var layout = try computeLayout(allocator, items, width, all_expanded);
+    defer layout.deinit(allocator);
+
+    const rendered_height = layout.total_rows;
     const max_offset = rendered_height -| visible_height;
     const offset = @min(chat_scroll_offset, max_offset);
     const src_start = max_offset -| offset;
@@ -51,9 +52,97 @@ pub fn drawViewport(
         .y_off = @intCast(start_row),
         .height = @intCast(visible_height),
     });
-    blitScreenRows(&screen, dst, src_start, visible_height);
+
+    // Find the first item that overlaps the visible area.
+    var item_row: usize = 0;
+    var item_index: usize = 0;
+    while (item_index < layout.entries.items.len) : (item_index += 1) {
+        const entry_rows = layout.entries.items[item_index].rows;
+        const item_end = item_row + entry_rows;
+        if (item_end > src_start) break;
+        item_row = item_end;
+    }
+
+    // Render visible items directly into the destination window.
+    var dst_row: usize = 0;
+    while (item_index < items.len and dst_row < visible_height) : (item_index += 1) {
+        const entry_rows = if (item_index < layout.entries.items.len) layout.entries.items[item_index].rows else estimateItemRowsVisible(items[item_index], width, all_expanded);
+        const draw_start = if (item_row < src_start) src_start - item_row else 0;
+        const available = visible_height - dst_row;
+
+        if (draw_start < entry_rows and available > 0) {
+            const slice_height = @min(entry_rows - draw_start, available);
+            try renderItemSlice(
+                dst, allocator, keybindings, theme,
+                items[item_index], dst_row, slice_height,
+                draw_start, now_ms, all_expanded, width,
+            );
+            dst_row += slice_height;
+        }
+        item_row += entry_rows;
+    }
+
     drawScrollIndicators(dst, theme, src_start, rendered_height, visible_height);
     return .{ .rendered_height = rendered_height, .visible_height = visible_height };
+}
+
+/// Pre-computed layout: total row count and per-item row counts.
+/// Cached across render calls by the caller (AppState) to avoid re-computation
+/// when content has not changed.
+const Layout = struct {
+    total_rows: usize,
+    entries: std.ArrayList(ItemLayout),
+
+    fn deinit(self: *Layout, allocator: std.mem.Allocator) void {
+        self.entries.deinit(allocator);
+    }
+};
+
+fn computeLayout(allocator: std.mem.Allocator, items: []const ChatItem, width: usize, all_expanded: bool) !Layout {
+    var entries = try std.ArrayList(ItemLayout).initCapacity(allocator, items.len);
+    var total: usize = 0;
+    for (items, 0..) |item, i| {
+        const rows = estimateItemRowsVisible(item, width, all_expanded);
+        entries.appendAssumeCapacity(.{ .item_index = i, .rows = rows });
+        total += rows;
+    }
+    return .{ .total_rows = total, .entries = entries };
+}
+
+fn renderItemSlice(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    dst_row: usize,
+    slice_height: usize,
+    src_skip: usize,
+    now_ms: i64,
+    all_expanded: bool,
+    width: usize,
+) !void {
+    // Allocate a small scratch screen just for this item.
+    const full_height = estimateItemRowsFull(item, width, true);
+    const scratch_rows = @max(@as(usize, 1), @min(full_height, src_skip + slice_height + 1));
+    var scratch = try tui.vaxis.Screen.init(allocator, .{
+        .rows = @intCast(@min(scratch_rows, @as(usize, std.math.maxInt(u16)))),
+        .cols = @intCast(width),
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer scratch.deinit(allocator);
+
+    const scratch_window = tui.draw.rootWindow(&scratch);
+    scratch_window.clear();
+    _ = try drawItem(scratch_window, allocator, keybindings, theme, item, 0, now_ms, all_expanded);
+
+    const child = window.child(.{
+        .y_off = @intCast(dst_row),
+        .height = @intCast(slice_height),
+    });
+    const actual_src = @min(src_skip, @as(usize, scratch.height) -| 1);
+    blitScreenRows(&scratch, child, actual_src, slice_height);
 }
 
 fn drawScrollIndicators(
@@ -395,7 +484,7 @@ fn renderedPrintHeight(result: tui.vaxis.Window.PrintResult, had_text: bool, max
     return @min(@max(height, 1), @as(usize, max_height));
 }
 
-fn estimateWrappedRows(text: []const u8, width: usize) usize {
+pub fn estimateWrappedRows(text: []const u8, width: usize) usize {
     const effective_width = @max(width, 1);
     if (text.len == 0) return 1;
     var rows: usize = 0;
