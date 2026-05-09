@@ -393,3 +393,27 @@ pub const subagent_descriptor: native_runtime.NativeDescriptor = .{
     .tools = &.{subagent_tool_definition},
     .requested_capabilities = &.{ .shell_run, .file_read, .env_read },
 };
+
+test "subagent descriptor validates without errors" {
+    const allocator = std.testing.allocator;
+    try subagent_descriptor.validate(allocator);
+}
+
+test "subagent parseAgentMarkdown extracts frontmatter and body" {
+    const allocator = std.testing.allocator;
+    const content =
+        \\---
+        \\name: test-agent
+        \\description: A test agent
+        \\model: gpt-4
+        \\---
+        \\System prompt line 1
+        \\System prompt line 2
+    ;
+    const parsed = try parseAgentMarkdown(allocator, content);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("test-agent", parsed.name);
+    try std.testing.expectEqualStrings("A test agent", parsed.description);
+    try std.testing.expectEqualStrings("gpt-4", parsed.model.?);
+    try std.testing.expect(std.mem.containsAtLeast(u8, parsed.body, 1, "System prompt line 1"));
+}
