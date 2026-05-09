@@ -474,13 +474,28 @@ pub const AgentSession = struct {
     }
 
     pub fn setThinkingLevel(self: *AgentSession, thinking_level: agent.ThinkingLevel) !void {
-        self.agent.setThinkingLevel(thinking_level);
-        _ = try self.session_manager.appendThinkingLevelChange(thinking_level);
+        try self.setThinkingLevelWithSource(thinking_level, "agent_session");
+    }
+
+    pub fn setThinkingLevelWithSource(self: *AgentSession, thinking_level: agent.ThinkingLevel, source: []const u8) !void {
+        const previous_level = self.agent.getThinkingLevel();
+        const effective_level = clampAgentThinkingLevel(self.agent.getModel(), thinking_level);
+        if (effective_level == previous_level) return;
+        self.agent.setThinkingLevel(effective_level);
+        _ = try self.session_manager.appendThinkingLevelChange(effective_level);
+        try self.emitThinkingLevelSelect(effective_level, previous_level, source);
     }
 
     pub fn setModel(self: *AgentSession, model: ai.Model) !void {
+        try self.setModelWithSource(model, "agent_session");
+    }
+
+    pub fn setModelWithSource(self: *AgentSession, model: ai.Model, source: []const u8) !void {
+        const previous_model = self.agent.getModel();
+        if (modelsEqual(previous_model, model)) return;
         self.agent.setModel(model);
         _ = try self.session_manager.appendModelChange(model.provider, model.id);
+        try self.emitModelSelect(model, previous_model, source);
     }
 
     pub fn setApiKey(self: *AgentSession, api_key: ?[]const u8) void {
@@ -932,6 +947,30 @@ pub const AgentSession = struct {
         try putString(self.allocator, &event.object, "reason", reason);
         try context.invokeObservational(self.allocator, "session_shutdown", event);
     }
+
+    fn emitModelSelect(self: *AgentSession, model: ai.Model, previous_model: ai.Model, source: []const u8) !void {
+        const context = self.extension_hook_context orelse return;
+        if (!context.hasHook("model_select")) return;
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "model_select");
+        try putModelSummary(self.allocator, &event.object, "model", model);
+        try putModelSummary(self.allocator, &event.object, "previousModel", previous_model);
+        try putString(self.allocator, &event.object, "source", source);
+        try context.invokeObservational(self.allocator, "model_select", event);
+    }
+
+    fn emitThinkingLevelSelect(self: *AgentSession, level: agent.ThinkingLevel, previous_level: agent.ThinkingLevel, source: []const u8) !void {
+        const context = self.extension_hook_context orelse return;
+        if (!context.hasHook("thinking_level_select")) return;
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "thinking_level_select");
+        try putString(self.allocator, &event.object, "level", @tagName(level));
+        try putString(self.allocator, &event.object, "previousLevel", @tagName(previous_level));
+        try putString(self.allocator, &event.object, "source", source);
+        try context.invokeObservational(self.allocator, "thinking_level_select", event);
+    }
 };
 
 const ExtensionHookContext = struct {
@@ -1342,6 +1381,18 @@ fn putInt(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []cons
 
 fn putValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
     try object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn putModelSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, model: ai.Model) !void {
+    var summary = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = summary });
+    try putString(allocator, &summary, "id", model.id);
+    try putString(allocator, &summary, "name", model.name);
+    try putString(allocator, &summary, "api", model.api);
+    try putString(allocator, &summary, "provider", model.provider);
+    try putString(allocator, &summary, "baseUrl", model.base_url);
+    try putBool(allocator, &summary, "reasoning", model.reasoning);
+    try putValue(allocator, object, key, .{ .object = summary });
 }
 
 fn jsonObjectWithString(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {
@@ -1782,6 +1833,34 @@ fn resolveModel(explicit_model: ?ai.Model, restored: ?session_manager.SessionMod
         return model;
     }
     return agent.DEFAULT_MODEL;
+}
+
+fn modelsEqual(lhs: ai.Model, rhs: ai.Model) bool {
+    return std.mem.eql(u8, lhs.provider, rhs.provider) and
+        std.mem.eql(u8, lhs.id, rhs.id) and
+        std.mem.eql(u8, lhs.api, rhs.api);
+}
+
+fn clampAgentThinkingLevel(model: ai.Model, requested: agent.ThinkingLevel) agent.ThinkingLevel {
+    return switch (ai.model_registry.clampThinkingLevel(model, agentThinkingLevelToModel(requested))) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+}
+
+fn agentThinkingLevelToModel(level: agent.ThinkingLevel) ai.ModelThinkingLevel {
+    return switch (level) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
 }
 
 fn treeNavigationLeaf(entry: *const session_manager.SessionEntry) ?[]const u8 {
@@ -2739,6 +2818,8 @@ const TestHookHost = struct {
     tool_execution_end: bool = false,
     tool_call: bool = false,
     tool_result: bool = false,
+    model_select: bool = false,
+    thinking_level_select: bool = false,
     label: []const u8 = "",
     order_log: ?*std.ArrayList([]const u8) = null,
     order_allocator: ?std.mem.Allocator = null,
@@ -2760,6 +2841,10 @@ const TestHookHost = struct {
     tool_execution_end_calls: usize = 0,
     tool_call_calls: usize = 0,
     tool_result_calls: usize = 0,
+    model_select_calls: usize = 0,
+    thinking_level_select_calls: usize = 0,
+    saw_model_select_payload: bool = false,
+    saw_thinking_level_select_payload: bool = false,
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
@@ -2828,6 +2913,8 @@ fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     if (std.mem.eql(u8, event_name, "tool_execution_end")) return host.tool_execution_end;
     if (std.mem.eql(u8, event_name, "tool_call")) return host.tool_call;
     if (std.mem.eql(u8, event_name, "tool_result")) return host.tool_result;
+    if (std.mem.eql(u8, event_name, "model_select")) return host.model_select;
+    if (std.mem.eql(u8, event_name, "thinking_level_select")) return host.thinking_level_select;
     return false;
 }
 fn testHookSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
@@ -3011,6 +3098,7 @@ fn testHookInvoke(
         try putBool(allocator, &result.object, "isError", false);
         return result;
     }
+    if (try testHookHandleSelectionEvent(host, event_name, event)) return result;
     return result;
 }
 
@@ -3063,6 +3151,28 @@ fn testHookExpectToolExecutionEnd(host: *TestHookHost, event: std.json.Value) !v
     host.saw_tool_execution_result = true;
 }
 
+fn testHookHandleSelectionEvent(host: *TestHookHost, event_name: []const u8, event: std.json.Value) !bool {
+    if (std.mem.eql(u8, event_name, "model_select")) {
+        host.model_select_calls += 1;
+        try std.testing.expectEqualStrings("model_select", event.object.get("type").?.string);
+        try std.testing.expectEqualStrings("set", event.object.get("source").?.string);
+        try std.testing.expectEqualStrings("faux-next", event.object.get("model").?.object.get("id").?.string);
+        try std.testing.expectEqualStrings("faux-session", event.object.get("previousModel").?.object.get("id").?.string);
+        host.saw_model_select_payload = true;
+        return true;
+    }
+    if (std.mem.eql(u8, event_name, "thinking_level_select")) {
+        host.thinking_level_select_calls += 1;
+        try std.testing.expectEqualStrings("thinking_level_select", event.object.get("type").?.string);
+        try std.testing.expectEqualStrings("set", event.object.get("source").?.string);
+        try std.testing.expectEqualStrings("high", event.object.get("level").?.string);
+        try std.testing.expectEqualStrings("off", event.object.get("previousLevel").?.string);
+        host.saw_thinking_level_select_payload = true;
+        return true;
+    }
+    return false;
+}
+
 fn testHookShutdown(ptr: *anyopaque) !void {
     _ = ptr;
 }
@@ -3090,6 +3200,66 @@ const test_hook_vtable: extension_runtime.RuntimeAdapter.VTable = .{
     .shutdown = testHookShutdown,
     .deinit = testHookDeinit,
 };
+
+test "extension selection hooks emit only effective model and clamped thinking changes" {
+    const allocator = std.testing.allocator;
+    const text_inputs = [_][]const u8{"text"};
+    const base_model = ai.Model{
+        .id = "faux-session",
+        .name = "Faux Session",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .reasoning = true,
+        .input_types = text_inputs[0..],
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const next_model = ai.Model{
+        .id = "faux-next",
+        .name = "Faux Next",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .reasoning = true,
+        .thinking_level_map = .{
+            .off = .unsupported,
+            .minimal = .unsupported,
+            .low = .unsupported,
+            .medium = .unsupported,
+            .high = .{ .mapped = "high" },
+            .xhigh = .unsupported,
+        },
+        .input_types = text_inputs[0..],
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var fixture = TestHookHost{
+        .model_select = true,
+        .thinking_level_select = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(allocator, std.testing.io, .{
+        .cwd = "/tmp/selection-events",
+        .system_prompt = "system",
+        .model = base_model,
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.setModelWithSource(next_model, "set");
+    try session.setModelWithSource(next_model, "set");
+    try session.setThinkingLevelWithSource(.low, "set");
+    try session.setThinkingLevelWithSource(.xhigh, "set");
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.model_select_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.thinking_level_select_calls);
+    try std.testing.expect(fixture.saw_model_select_payload);
+    try std.testing.expect(fixture.saw_thinking_level_select_payload);
+    try std.testing.expectEqualStrings("faux-next", session.agent.getModel().id);
+    try std.testing.expectEqual(agent.ThinkingLevel.high, session.agent.getThinkingLevel());
+}
 
 test "mixed runtime adapter helper covers tool hook workflow shutdown contracts" {
     const allocator = std.testing.allocator;
