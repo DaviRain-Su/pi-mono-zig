@@ -65,16 +65,16 @@ Based on the systematic review in `zig-code-review.md`.
 
 ## B8: Split agent_loop.zig (P1-REVIEW-5)
 - [x] Extracted json_schema.zig (~200 LOC of JSON schema validation)
-- [ ] Extract accumulator.zig (PartialAssistantAccumulator, PartialToolCallBlock, PartialContentBlock)
+- [x] Extracted accumulator.zig (~240 LOC: PartialAssistantAccumulator, PartialContentBlock, PartialToolCallBlock, buildPartialToolCallBlock, emptyJsonObject)
 - [ ] Extract tool_execution.zig (executeToolCalls, prepareToolCall, parallel execution)
 - [ ] Extract streaming.zig (streamAssistantResponse, streamSimpleForAgentLoop)
 - DONE for Phase 1 - remaining extractions are lower priority
 
 ## B9: Split extension_runtime.zig (P2-REVIEW-1)
 - [x] Extracted lifecycle_support.zig (~130 LOC of lifecycle matrix definitions)
-- [ ] Extract policy_key.zig (policy lookup helpers)
+- [ ] Extract policy_key.zig (policy lookup helpers) — blocked by WasmManifestHandoff circular dependency
 - [ ] Extract extension_loader.zig, extension_lifecycle.zig, extension_event_bridge.zig
-- DONE for Phase 1 - remaining extractions are lower priority
+- DONE for Phase 1 - remaining extractions require deeper dependency untangling
 
 ## B10: Mark NativeHostApi stubs (P1-REVIEW-3)
 - [x] Added "Permission-gated counter stub" doc comments to all 12 NativeHostApi methods
