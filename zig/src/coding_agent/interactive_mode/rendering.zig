@@ -2119,51 +2119,6 @@ pub const ScreenComponent = struct {
         };
     }
 
-    fn renderInto(
-        self: *const ScreenComponent,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *tui.LineList,
-    ) std.mem.Allocator.Error!void {
-        var screen = try tui.vaxis.Screen.init(allocator, .{
-            .rows = @intCast(@max(self.height, 1)),
-            .cols = @intCast(@max(width, 1)),
-            .x_pixel = 0,
-            .y_pixel = 0,
-        });
-        defer screen.deinit(allocator);
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        const window = tui.draw.rootWindow(&screen);
-        window.clear();
-        _ = try self.draw(window, .{
-            .window = window,
-            .arena = arena.allocator(),
-            .theme = self.theme,
-        });
-
-        for (0..self.height) |row| {
-            var builder = std.ArrayList(u8).empty;
-            errdefer builder.deinit(allocator);
-            var col: usize = 0;
-            while (col < width) {
-                const cell = screen.readCell(@intCast(col), @intCast(row)) orelse break;
-                if (cell.char.grapheme.len > 0) {
-                    try builder.appendSlice(allocator, cell.char.grapheme);
-                    col += if (cell.char.width > 0) @as(usize, cell.char.width) else 1;
-                } else {
-                    try builder.append(allocator, ' ');
-                    col += 1;
-                }
-            }
-            const owned = try builder.toOwnedSlice(allocator);
-            defer allocator.free(owned);
-            try tui.component.appendOwnedLine(lines, allocator, owned);
-        }
-    }
-
     pub fn drawOpaque(
         ptr: *const anyopaque,
         window: tui.vaxis.Window,
@@ -4684,16 +4639,14 @@ test "tool expansion rerenders existing bash details immediately" {
         .height = 12,
     };
 
-    var collapsed_lines = tui.LineList.empty;
+    var collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
     defer freeLinesSafe(allocator, &collapsed_lines);
-    try screen_component.renderInto(allocator, 80, &collapsed_lines);
     try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "Details:"));
     try std.testing.expect(renderedLinesContain(collapsed_lines.items, "to expand"));
 
     state.toggleAllExpanded();
-    var expanded_lines = tui.LineList.empty;
+    var expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
     defer freeLinesSafe(allocator, &expanded_lines);
-    try screen_component.renderInto(allocator, 80, &expanded_lines);
     try std.testing.expect(renderedLinesContain(expanded_lines.items, "Details:"));
     try std.testing.expect(renderedLinesContain(expanded_lines.items, "\"exit_code\":0"));
 }
@@ -4728,16 +4681,14 @@ test "tool expansion rerenders existing user bash tail preview immediately" {
         .height = 16,
     };
 
-    var collapsed_lines = tui.LineList.empty;
+    var collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
     defer freeLinesSafe(allocator, &collapsed_lines);
-    try screen_component.renderInto(allocator, 80, &collapsed_lines);
     try std.testing.expect(renderedLinesContain(collapsed_lines.items, "line 25"));
     try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "line 5"));
 
     state.toggleAllExpanded();
-    var expanded_lines = tui.LineList.empty;
+    var expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
     defer freeLinesSafe(allocator, &expanded_lines);
-    try screen_component.renderInto(allocator, 80, &expanded_lines);
     try std.testing.expect(renderedLinesContain(expanded_lines.items, "line 1"));
 }
 
@@ -4777,9 +4728,8 @@ test "extension UI hooks render widgets editor footer and status lifecycle" {
         .height = 14,
     };
 
-    var lines = tui.LineList.empty;
+    var lines = try renderScreenToLines(allocator, &screen, 100);
     defer freeLinesSafe(allocator, &lines);
-    try screen.renderInto(allocator, 100, &lines);
     try std.testing.expect(renderedLinesContain(lines.items, "ext header"));
     try std.testing.expect(renderedLinesContain(lines.items, "above one"));
     try std.testing.expect(renderedLinesContain(lines.items, "Extension editor: VimEditor"));
@@ -4930,25 +4880,22 @@ test "active operation indicator animates agent wait and clears on agent end" {
         .now_ms = 1_000,
     };
 
-    var first = tui.LineList.empty;
+    var first = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &first);
-    try screen.renderInto(allocator, 140, &first);
     try std.testing.expect(renderedLinesContain(first.items, "Working... 0s elapsed"));
     try std.testing.expect(renderedLinesContain(first.items, "Esc to interrupt"));
     try std.testing.expect(renderedLinesContain(first.items, "⠋ Working"));
 
     const item_count = state.items.items.len;
     screen.now_ms = 1_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
-    var second = tui.LineList.empty;
+    var second = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &second);
-    try screen.renderInto(allocator, 140, &second);
     try std.testing.expectEqual(item_count, state.items.items.len);
     try std.testing.expect(renderedLinesContain(second.items, "⠙ Working"));
 
     try state.handleAgentEvent(.{ .event_type = .agent_end });
-    var completed = tui.LineList.empty;
+    var completed = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &completed);
-    try screen.renderInto(allocator, 140, &completed);
     try std.testing.expect(!renderedLinesContain(completed.items, "Working..."));
     try std.testing.expect(renderedLinesContain(completed.items, "Status: idle"));
 }
@@ -4977,17 +4924,15 @@ test "active operation indicator identifies running tool without appending anima
         .now_ms = 5_000,
     };
 
-    var first = tui.LineList.empty;
+    var first = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &first);
-    try screen.renderInto(allocator, 140, &first);
     try std.testing.expect(renderedLinesContain(first.items, "Running read 0s elapsed"));
     try std.testing.expect(renderedLinesContain(first.items, "⠋ Running read"));
 
     const item_count = state.items.items.len;
     screen.now_ms = 5_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
-    var second = tui.LineList.empty;
+    var second = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &second);
-    try screen.renderInto(allocator, 140, &second);
     try std.testing.expectEqual(item_count, state.items.items.len);
     try std.testing.expect(renderedLinesContain(second.items, "⠙ Running read"));
 }
@@ -5016,16 +4961,14 @@ test "active operation retry countdown and compaction elapsed render dynamically
         .error_message = "rate limit",
     } });
 
-    var retry_first = tui.LineList.empty;
+    var retry_first = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &retry_first);
-    try screen.renderInto(allocator, 140, &retry_first);
     try std.testing.expect(renderedLinesContain(retry_first.items, "Retrying (2/4) in 3s..."));
     try std.testing.expect(renderedLinesContain(retry_first.items, "Esc to cancel"));
 
     screen.now_ms = 11_100;
-    var retry_second = tui.LineList.empty;
+    var retry_second = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &retry_second);
-    try screen.renderInto(allocator, 140, &retry_second);
     try std.testing.expect(renderedLinesContain(retry_second.items, "Retrying (2/4) in 2s..."));
 
     try state.handleRetryLifecycleEvent(.{ .end = .{
@@ -5033,24 +4976,21 @@ test "active operation retry countdown and compaction elapsed render dynamically
         .attempt = 2,
         .final_error = null,
     } });
-    var retry_end = tui.LineList.empty;
+    var retry_end = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &retry_end);
-    try screen.renderInto(allocator, 140, &retry_end);
     try std.testing.expect(!renderedLinesContain(retry_end.items, "Retrying (2/4)"));
 
     clock.now_ms = 20_000;
     try state.handleCompactionLifecycleEvent(.{ .start = .{ .reason = .threshold } });
     screen.now_ms = 20_000;
-    var compact_first = tui.LineList.empty;
+    var compact_first = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &compact_first);
-    try screen.renderInto(allocator, 140, &compact_first);
     try std.testing.expect(renderedLinesContain(compact_first.items, "Auto-compacting... 0s elapsed"));
     try std.testing.expect(renderedLinesContain(compact_first.items, "Esc to cancel"));
 
     screen.now_ms = 21_000;
-    var compact_second = tui.LineList.empty;
+    var compact_second = try renderScreenToLines(allocator, &screen, 140);
     defer freeLinesSafe(allocator, &compact_second);
-    try screen.renderInto(allocator, 140, &compact_second);
     try std.testing.expect(renderedLinesContain(compact_second.items, "Auto-compacting... 1s elapsed"));
 }
 
@@ -5344,8 +5284,9 @@ test "screen rendering releases app state lock before expensive rendering work" 
         render_error: ?std.mem.Allocator.Error = null,
 
         fn run(self: *@This()) void {
-            self.screen.renderInto(self.allocator, 120, &self.lines) catch |err| {
+            self.lines = renderScreenToLines(self.allocator, self.screen, 120) catch |err| {
                 self.render_error = err;
+                return;
             };
         }
     };
