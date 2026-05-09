@@ -714,14 +714,14 @@ test "processLoopEvent forwards owned libvaxis paste events" {
     }, result.parsed);
 }
 
-test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
+test "LoopEvent exposes mouse events and processLoopEvent forwards mouse inputs" {
     comptime try std.testing.expect(@hasField(LoopEvent, "mouse"));
 
     var paste_buffer = std.ArrayList(u8).empty;
     defer paste_buffer.deinit(std.testing.allocator);
     var paste_active = false;
 
-    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+    const click = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
         .mouse = .{
             .col = 4,
             .row = 5,
@@ -729,17 +729,16 @@ test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
             .mods = .{},
             .type = .press,
         },
-    })) == null);
+    })).?;
+    defer click.deinit(std.testing.allocator);
 
-    try std.testing.expect((try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
-        .mouse = .{
-            .col = 4,
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_click = .{
             .row = 5,
-            .button = .wheel_up,
-            .mods = .{},
-            .type = .release,
-        },
-    })) == null);
+            .col = 4,
+        } },
+        .consumed = 0,
+    }, click.parsed);
 
     const result = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
         .mouse = .{
@@ -760,6 +759,44 @@ test "LoopEvent exposes mouse events and processLoopEvent forwards wheel only" {
         } },
         .consumed = 0,
     }, result.parsed);
+
+    const drag = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 10,
+            .row = 11,
+            .button = .left,
+            .mods = .{},
+            .type = .drag,
+        },
+    })).?;
+    defer drag.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_drag = .{
+            .row = 11,
+            .col = 10,
+        } },
+        .consumed = 0,
+    }, drag.parsed);
+
+    const release = (try processLoopEvent(std.testing.allocator, &paste_buffer, &paste_active, .{
+        .mouse = .{
+            .col = 12,
+            .row = 13,
+            .button = .left,
+            .mods = .{},
+            .type = .release,
+        },
+    })).?;
+    defer release.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualDeep(keys.ParsedInput{
+        .event = .{ .mouse_release = .{
+            .row = 13,
+            .col = 12,
+        } },
+        .consumed = 0,
+    }, release.parsed);
 }
 
 test "terminal enters raw mode on startup and restores on exit" {
@@ -843,9 +880,9 @@ test "terminal startup and stop sequences include requested mouse reporting" {
     try std.testing.expect(std.mem.indexOf(u8, stopSequence(true, true), Terminal.MOUSE_DISABLE) != null);
 }
 
-test "terminal mouse reporting is opt-in and supports explicit opt-out" {
-    try std.testing.expect(!shouldUseMouseReportingForEnv(null));
-    try std.testing.expect(!shouldUseMouseReportingForEnv(""));
+test "terminal mouse reporting is default-on and supports explicit opt-out" {
+    try std.testing.expect(shouldUseMouseReportingForEnv(null));
+    try std.testing.expect(shouldUseMouseReportingForEnv(""));
     try std.testing.expect(shouldUseMouseReportingForEnv("1"));
     try std.testing.expect(shouldUseMouseReportingForEnv("true"));
     try std.testing.expect(shouldUseMouseReportingForEnv("yes"));
@@ -854,7 +891,7 @@ test "terminal mouse reporting is opt-in and supports explicit opt-out" {
     try std.testing.expect(!shouldUseMouseReportingForEnv("false"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("no"));
     try std.testing.expect(!shouldUseMouseReportingForEnv("off"));
-    try std.testing.expect(!shouldUseMouseReportingForEnv("unexpected"));
+    try std.testing.expect(shouldUseMouseReportingForEnv("unexpected"));
 }
 
 test "terminal startup and stop sequences omit Kitty keyboard protocol for Ghostty" {

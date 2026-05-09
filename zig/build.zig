@@ -232,6 +232,7 @@ pub fn build(b: *std.Build) void {
     main_test_mod.addImport("ai", ai_mod);
     main_test_mod.addImport("agent", agent_mod);
     main_test_mod.addImport("tui", tui_mod);
+    main_test_mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,

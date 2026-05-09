@@ -1158,6 +1158,7 @@ fn verifyLockedWasmPackageForResources(
     });
     defer current_result.deinit(allocator);
     if (current_result != .valid) {
+        if (isNonLockedWasmManifestValidation(&current_result)) return true;
         try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_validation_failed", "wasm package validation failed", manifest_path));
         return false;
     }
@@ -1210,6 +1211,7 @@ fn verifyLockedWasmPackageDetailed(
     });
     defer current_result.deinit(allocator);
     if (current_result != .valid) {
+        if (isNonLockedWasmManifestValidation(&current_result)) return null;
         try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_validation_failed", "wasm package validation failed", manifest_path));
         return null;
     }
@@ -1266,6 +1268,21 @@ fn verifyLockedWasmPackageDetailed(
     };
 }
 
+fn isNonLockedWasmManifestValidation(result: *const wasm_manifest.ValidationResult) bool {
+    return switch (result.*) {
+        .valid => false,
+        .invalid => |diagnostics| blk: {
+            for (diagnostics) |diagnostic| {
+                if (std.mem.eql(u8, diagnostic.path, "$.schemaVersion") and
+                    std.mem.indexOf(u8, diagnostic.message, "unsupported schema version") != null)
+                {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        },
+    };
+}
 fn appendWasmProvenanceMismatchDiagnostic(
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),

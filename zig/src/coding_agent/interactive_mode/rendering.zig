@@ -2519,7 +2519,8 @@ fn drawTaskPanel(
     snapshot: *const RenderStateSnapshot,
     now_ms: i64,
 ) !tui.DrawSize {
-    const requested_height = taskPanelHeightForWidth(@as(usize, window.width));
+    const outer_width = @as(usize, window.width);
+    const requested_height = taskPanelHeightForWidth(outer_width);
     const panel_height = @min(requested_height, @as(usize, window.height));
     if (panel_height == 0) return .{ .width = window.width, .height = 0 };
     const border_style = styleForToken(theme, .task_header_separator);
@@ -2549,7 +2550,7 @@ fn drawTaskPanel(
             keybindings,
             snapshot,
             content_width,
-            layoutMode(@as(usize, window.width)),
+            layoutMode(outer_width),
             now_ms,
         );
         _ = panel_inner.printSegment(.{
