@@ -742,16 +742,40 @@ inline fn parseMouse(input: []const u8, full_input: []const u8) Result {
     var px: i16 = undefined;
     var py: i16 = undefined;
     var xterm: bool = undefined;
-    if (input.len == 3 and (input[2] == 'M') and full_input.len >= 6) {
+    if (input.len == 3 and input[2] == 'M') {
+        // Legacy X10/normal mouse reports are 6 bytes total:
+        // ESC [ M Cb Cx Cy
+        // If a read split leaves us with only the prefix so far, do not
+        // consume ESC [ M yet or the remaining payload bytes will leak as
+        // text.
+        if (full_input.len < 6) {
+            return .{
+                .event = null,
+                .n = 0,
+            };
+        }
+
         xterm = true;
         button_mask = full_input[3] - 32;
         px = full_input[4] - 32;
         py = full_input[5] - 32;
     } else if (input.len >= 4 and input[2] == '<') {
         xterm = false;
-        const delim1 = std.mem.indexOfScalarPos(u8, input, 3, ';') orelse return null_event;
+
+        // SGR mouse reports are variable length:
+        // ESC [ < Cb ; Cx ; Cy (M|m)
+        // If the numeric payload is incomplete, do not consume the prefix
+        // or the remaining bytes will leak as printable text on a later read.
+        const delim1 = std.mem.indexOfScalarPos(u8, input, 3, ';') orelse return .{
+            .event = null,
+            .n = 0,
+        };
+        const delim2 = std.mem.indexOfScalarPos(u8, input, delim1 + 1, ';') orelse return .{
+            .event = null,
+            .n = 0,
+        };
+
         button_mask = parseParam(u16, input[3..delim1], null) orelse return null_event;
-        const delim2 = std.mem.indexOfScalarPos(u8, input, delim1 + 1, ';') orelse return null_event;
         px = parseParam(i16, input[delim1 + 1 .. delim2], 1) orelse return null_event;
         py = parseParam(i16, input[delim2 + 1 .. input.len - 1], 1) orelse return null_event;
     } else {
