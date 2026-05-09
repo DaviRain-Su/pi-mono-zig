@@ -192,6 +192,7 @@ pub const AgentSession = struct {
             options.extension_hosts,
             options.extension_hook_timeout_ms,
             manager,
+            "startup",
         );
         if (options.model) |model| {
             _ = try instance.session_manager.appendModelChange(model.provider, model.id);
@@ -227,6 +228,7 @@ pub const AgentSession = struct {
             options.extension_hosts,
             options.extension_hook_timeout_ms,
             manager,
+            "resume",
         );
     }
 
@@ -252,10 +254,12 @@ pub const AgentSession = struct {
             options.extension_hosts,
             options.extension_hook_timeout_ms,
             manager,
+            "startup",
         );
     }
 
     pub fn deinit(self: *AgentSession) void {
+        self.emitSessionShutdown("quit") catch {};
         if (self.subscribed) {
             _ = self.agent.unsubscribe(self.subscriber);
             self.subscribed = false;
@@ -678,6 +682,7 @@ pub const AgentSession = struct {
         extension_hosts: []const extension_runtime.RuntimeAdapter,
         extension_hook_timeout_ms: u64,
         manager: *session_manager.SessionManager,
+        lifecycle_reason: []const u8,
     ) !AgentSession {
         var session_context = try manager.buildSessionContext(allocator);
         defer session_context.deinit(allocator);
@@ -756,6 +761,9 @@ pub const AgentSession = struct {
             try instance.agent.subscribe(instance.extension_event_subscriber);
             instance.extension_event_subscribed = true;
         }
+        errdefer instance.deinit();
+        try instance.emitSessionStart(lifecycle_reason);
+        try instance.emitResourcesDiscover(lifecycle_reason);
         return instance;
     }
 
@@ -886,6 +894,37 @@ pub const AgentSession = struct {
             _ = try self.session_manager.appendMessage(message);
         }
     }
+
+    fn emitSessionStart(self: *AgentSession, reason: []const u8) !void {
+        const context = self.extension_hook_context orelse return;
+        if (!context.hasHook("session_start")) return;
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "session_start");
+        try putString(self.allocator, &event.object, "reason", reason);
+        try context.invokeObservational(self.allocator, "session_start", event);
+    }
+
+    fn emitResourcesDiscover(self: *AgentSession, reason: []const u8) !void {
+        const context = self.extension_hook_context orelse return;
+        if (!context.hasHook("resources_discover")) return;
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "resources_discover");
+        try putString(self.allocator, &event.object, "cwd", self.cwd);
+        try putString(self.allocator, &event.object, "reason", reason);
+        try context.invokeObservational(self.allocator, "resources_discover", event);
+    }
+
+    fn emitSessionShutdown(self: *AgentSession, reason: []const u8) !void {
+        const context = self.extension_hook_context orelse return;
+        if (!context.hasHook("session_shutdown")) return;
+        var event = try makeObject(self.allocator);
+        defer tools_common.deinitJsonValue(self.allocator, event);
+        try putString(self.allocator, &event.object, "type", "session_shutdown");
+        try putString(self.allocator, &event.object, "reason", reason);
+        try context.invokeObservational(self.allocator, "session_shutdown", event);
+    }
 };
 
 const ExtensionHookContext = struct {
@@ -964,8 +1003,55 @@ const ExtensionHookContext = struct {
         };
     }
 
+    fn invokeObservational(self: *ExtensionHookContext, allocator: std.mem.Allocator, event_name: []const u8, event: std.json.Value) !void {
+        var dispatch_entries = std.ArrayList(HookDispatchEntry).empty;
+        defer dispatch_entries.deinit(allocator);
+        for (self.hosts, 0..) |host, host_index| {
+            if (!host.hasRegisteredHook(event_name)) continue;
+            try dispatch_entries.append(allocator, hookDispatchEntryForHost(host, event_name, host_index));
+        }
+        std.mem.sort(HookDispatchEntry, dispatch_entries.items, {}, hookDispatchEntryLessThan);
+
+        for (dispatch_entries.items) |entry| {
+            const result = entry.host.invokeExtensionEvent(allocator, event_name, event, self.timeout_ms) catch |err| {
+                try self.recordInvocationDiagnostic(allocator, entry.host, event_name, err);
+                continue;
+            };
+            if (result) |value| tools_common.deinitJsonValue(allocator, value);
+        }
+    }
+
+    fn recordInvocationDiagnostic(
+        self: *ExtensionHookContext,
+        allocator: std.mem.Allocator,
+        host: extension_runtime.RuntimeAdapter,
+        event_name: []const u8,
+        err: anyerror,
+    ) !void {
+        const extension_id = describeHookSource(allocator, host, event_name) catch |source_err| {
+            const fallback = try std.fmt.allocPrint(
+                allocator,
+                "Extension event invocation failed extensionId={s} event={s}: {s}",
+                .{ host.kind.jsonName(), event_name, @errorName(source_err) },
+            );
+            defer allocator.free(fallback);
+            try self.recordDiagnostic(fallback);
+            return;
+        };
+        defer allocator.free(extension_id);
+        const diagnostic = try std.fmt.allocPrint(
+            allocator,
+            "Extension event invocation failed extensionId={s} event={s}: {s}",
+            .{ extension_id, event_name, @errorName(err) },
+        );
+        defer allocator.free(diagnostic);
+        try self.recordDiagnostic(diagnostic);
+    }
+
     fn invokeLifecycle(self: *ExtensionHookContext, allocator: std.mem.Allocator, event: agent.AgentEvent) !void {
         const event_name = switch (event.event_type) {
+            .agent_start => "agent_start",
+            .agent_end => "agent_end",
             .turn_start => "turn_start",
             .message_end => "message_end",
             .turn_end => "turn_end",
@@ -980,8 +1066,7 @@ const ExtensionHookContext = struct {
 
         const payload = try makeLifecycleEventObject(allocator, event_name, event, self.active_turn_index orelse 0);
         defer tools_common.deinitJsonValue(allocator, payload);
-        const result = try self.invoke(allocator, event_name, payload);
-        if (result) |value| tools_common.deinitJsonValue(allocator, value);
+        try self.invokeObservational(allocator, event_name, payload);
     }
 };
 
@@ -2108,6 +2193,7 @@ test "agent session navigation switches visible branch transcript" {
         &.{},
         1000,
         manager,
+        "startup",
     );
     manager_transferred = true;
     defer session.deinit();
@@ -2172,6 +2258,7 @@ test "agent session tree navigation matches user parentage and summary attachmen
         &.{},
         1000,
         manager,
+        "startup",
     );
     manager_transferred = true;
     defer session.deinit();
@@ -2239,6 +2326,7 @@ test "VAL-CROSS-006 session reload keeps errored partial assistant inert" {
         &.{},
         1000,
         manager,
+        "startup",
     );
     manager_transferred = true;
     defer session.deinit();
@@ -2536,6 +2624,11 @@ const TestHookHost = struct {
     input: bool = false,
     before_agent_start: bool = false,
     context: bool = false,
+    session_start: bool = false,
+    resources_discover: bool = false,
+    agent_start: bool = false,
+    agent_end: bool = false,
+    session_shutdown: bool = false,
     turn_start: bool = false,
     message_end: bool = false,
     turn_end: bool = false,
@@ -2547,6 +2640,11 @@ const TestHookHost = struct {
     input_calls: usize = 0,
     before_calls: usize = 0,
     context_calls: usize = 0,
+    session_start_calls: usize = 0,
+    resources_discover_calls: usize = 0,
+    agent_start_calls: usize = 0,
+    agent_end_calls: usize = 0,
+    session_shutdown_calls: usize = 0,
     turn_start_calls: usize = 0,
     message_end_calls: usize = 0,
     turn_end_calls: usize = 0,
@@ -2555,6 +2653,7 @@ const TestHookHost = struct {
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
+    fail_event_name: ?[]const u8 = null,
 
     fn adapter(self: *TestHookHost) extension_runtime.RuntimeAdapter {
         return .{
@@ -2596,6 +2695,11 @@ fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     if (std.mem.eql(u8, event_name, "input")) return host.input;
     if (std.mem.eql(u8, event_name, "before_agent_start")) return host.before_agent_start;
     if (std.mem.eql(u8, event_name, "context")) return host.context;
+    if (std.mem.eql(u8, event_name, "session_start")) return host.session_start;
+    if (std.mem.eql(u8, event_name, "resources_discover")) return host.resources_discover;
+    if (std.mem.eql(u8, event_name, "agent_start")) return host.agent_start;
+    if (std.mem.eql(u8, event_name, "agent_end")) return host.agent_end;
+    if (std.mem.eql(u8, event_name, "session_shutdown")) return host.session_shutdown;
     if (std.mem.eql(u8, event_name, "turn_start")) return host.turn_start;
     if (std.mem.eql(u8, event_name, "message_end")) return host.message_end;
     if (std.mem.eql(u8, event_name, "turn_end")) return host.turn_end;
@@ -2642,12 +2746,14 @@ fn testHookInvoke(
     event: std.json.Value,
     timeout_ms: u64,
 ) !?std.json.Value {
-    _ = event;
     _ = timeout_ms;
     const host = testHookHost(ptr);
     if (host.order_log) |log| {
         const name = if (host.label.len > 0) host.label else event_name;
         try log.append(host.order_allocator orelse allocator, name);
+    }
+    if (host.fail_event_name) |fail_event_name| {
+        if (std.mem.eql(u8, event_name, fail_event_name)) return error.TestHookHostInjectedFailure;
     }
     var result = try makeObject(allocator);
     errdefer tools_common.deinitJsonValue(allocator, result);
@@ -2684,6 +2790,38 @@ fn testHookInvoke(
         }
         try messages.append(.{ .string = try allocator.dupe(u8, "hook context") });
         try putValue(allocator, &result.object, "messages", .{ .array = messages });
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_start")) {
+        host.session_start_calls += 1;
+        try std.testing.expectEqualStrings("session_start", event.object.get("type").?.string);
+        try std.testing.expectEqualStrings("startup", event.object.get("reason").?.string);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "resources_discover")) {
+        host.resources_discover_calls += 1;
+        try std.testing.expectEqualStrings("resources_discover", event.object.get("type").?.string);
+        try std.testing.expectEqualStrings("/tmp/lifecycle-forwarding", event.object.get("cwd").?.string);
+        try std.testing.expectEqualStrings("startup", event.object.get("reason").?.string);
+        var skills = std.json.Array.init(allocator);
+        try skills.append(.{ .string = try allocator.dupe(u8, "fixture/skills") });
+        try putValue(allocator, &result.object, "skillPaths", .{ .array = skills });
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "agent_start")) {
+        host.agent_start_calls += 1;
+        try std.testing.expectEqualStrings("agent_start", event.object.get("type").?.string);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "agent_end")) {
+        host.agent_end_calls += 1;
+        try std.testing.expectEqualStrings("agent_end", event.object.get("type").?.string);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_shutdown")) {
+        host.session_shutdown_calls += 1;
+        try std.testing.expectEqualStrings("session_shutdown", event.object.get("type").?.string);
+        try std.testing.expectEqualStrings("quit", event.object.get("reason").?.string);
         return result;
     }
     if (std.mem.eql(u8, event_name, "turn_start")) {
@@ -3183,6 +3321,111 @@ test "extension lifecycle hooks fire once per turn and message in agent order" {
     try std.testing.expectEqualStrings("turn_end", order_log.items[3]);
 }
 
+test "extension session and agent lifecycle hooks fire in canonical order" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("lifecycle reply")}, .{}) },
+    });
+
+    var order_log = std.ArrayList([]const u8).empty;
+    defer order_log.deinit(std.testing.allocator);
+    var fixture = TestHookHost{
+        .session_start = true,
+        .resources_discover = true,
+        .agent_start = true,
+        .turn_start = true,
+        .turn_end = true,
+        .agent_end = true,
+        .session_shutdown = true,
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/lifecycle-forwarding",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+
+    try session.prompt("hello lifecycle forwarding");
+    session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.session_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resources_discover_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.agent_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.turn_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.turn_end_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.agent_end_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.session_shutdown_calls);
+
+    const expected = [_][]const u8{
+        "session_start",
+        "resources_discover",
+        "agent_start",
+        "turn_start",
+        "turn_end",
+        "agent_end",
+        "session_shutdown",
+    };
+    try std.testing.expectEqual(expected.len, order_log.items.len);
+    for (expected, order_log.items) |expected_name, actual_name| {
+        try std.testing.expectEqualStrings(expected_name, actual_name);
+    }
+}
+
+test "native runtime adapter observes production session lifecycle event invocations" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("native lifecycle reply")}, .{}) },
+    });
+
+    const native_hooks = [_]extension_runtime.NativeHookDefinition{
+        .{ .event_name = "session_start", .extension_path = "native://lifecycle/session-start" },
+        .{ .event_name = "resources_discover", .extension_path = "native://lifecycle/resources" },
+        .{ .event_name = "agent_start", .extension_path = "native://lifecycle/agent-start" },
+        .{ .event_name = "turn_start", .extension_path = "native://lifecycle/turn-start" },
+        .{ .event_name = "turn_end", .extension_path = "native://lifecycle/turn-end" },
+        .{ .event_name = "agent_end", .extension_path = "native://lifecycle/agent-end" },
+        .{ .event_name = "session_shutdown", .extension_path = "native://lifecycle/session-shutdown" },
+    };
+    const descriptor = extension_runtime.NativeDescriptor{
+        .id = "com.pi.native-lifecycle-observer",
+        .name = "Native Lifecycle Observer",
+        .version = "0.1.0",
+        .description = "Observes production session lifecycle events.",
+        .hooks = &native_hooks,
+    };
+    var effects = native_runtime.NativeHostEffects{};
+    const adapter = try extension_runtime.startRuntimeAdapter(std.testing.allocator, std.testing.io, .{ .native = .{
+        .descriptor = &descriptor,
+        .host_effects = &effects,
+    } });
+    defer adapter.deinit();
+    try adapter.waitForReady(0);
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/native-lifecycle-forwarding",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = &.{adapter},
+    });
+    try session.prompt("hello native lifecycle");
+    session.deinit();
+
+    try std.testing.expectEqual(@as(u64, native_hooks.len), effects.extension_event_invocations);
+}
+
 test "extension lifecycle hooks run deterministically by host order" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{
@@ -3224,4 +3467,53 @@ test "extension lifecycle hooks run deterministically by host order" {
     try std.testing.expectEqualStrings("second", order_log.items[1]);
     try std.testing.expectEqual(@as(usize, 1), first.turn_start_calls);
     try std.testing.expectEqual(@as(usize, 1), second.turn_start_calls);
+}
+
+test "extension lifecycle observer failures do not block later subscribers" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("isolated reply")}, .{}) },
+    });
+
+    var order_log = std.ArrayList([]const u8).empty;
+    defer order_log.deinit(std.testing.allocator);
+    var failing = TestHookHost{
+        .agent_start = true,
+        .label = "failing",
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+        .fail_event_name = "agent_start",
+    };
+    var later = TestHookHost{
+        .agent_start = true,
+        .label = "later",
+        .order_log = &order_log,
+        .order_allocator = std.testing.allocator,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{ failing.adapter(), later.adapter() };
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/lifecycle-failure-isolation",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("hello failure isolation");
+
+    try std.testing.expectEqual(@as(usize, 0), failing.agent_start_calls);
+    try std.testing.expectEqual(@as(usize, 1), later.agent_start_calls);
+    try std.testing.expect(order_log.items.len >= 2);
+    try std.testing.expectEqualStrings("failing", order_log.items[0]);
+    try std.testing.expectEqualStrings("later", order_log.items[1]);
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 3);
+    const diagnostic = messages[messages.len - 1].assistant.error_message.?;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "agent_start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "TestHookHostInjectedFailure") != null);
 }

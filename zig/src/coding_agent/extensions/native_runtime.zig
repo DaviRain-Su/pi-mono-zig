@@ -186,6 +186,7 @@ pub const NativeHostEffects = struct {
     tool_uses: u64 = 0,
     agent_spawns: u64 = 0,
     agent_delegations: u64 = 0,
+    extension_event_invocations: u64 = 0,
 
     fn ensureSandboxPath(self: NativeHostEffects, path: []const u8) !void {
         const root = self.sandbox_root orelse return;
@@ -793,6 +794,7 @@ pub const NativeRuntime = struct {
             return null;
         }
         if (!self.state.registry.hasHook(event_name)) return null;
+        if (self.host_effects) |effects| effects.extension_event_invocations += 1;
         if (eventFailsRuntime(event, "native")) {
             try self.state.addDiagnostic(.host_error, .warning, "native hook returned configured non-fatal error");
             return null;
