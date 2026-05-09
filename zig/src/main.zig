@@ -1458,6 +1458,103 @@ test "runCli webview captures prepared launch context without leaking secrets" {
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
+test "runCli webview session flags preserve canonical session selection" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+
+    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
+    defer allocator.free(home_dir);
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+    const session_dir = try cli_test.makeTmpPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+
+    var seed_env = std.process.Environ.Map.init(allocator);
+    defer seed_env.deinit();
+    try seed_env.put("HOME", home_dir);
+    try seed_env.put("PI_FAUX_RESPONSE", "seed answer");
+
+    var seed_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer seed_stdout.deinit();
+    var seed_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer seed_stderr.deinit();
+    const seed_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &seed_env,
+        &.{ "--provider", "faux", "--print", "--session-dir", session_dir, "seed prompt" },
+        project_dir,
+        &seed_stdout.writer,
+        &seed_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), seed_exit);
+    try std.testing.expectEqualStrings("seed answer\n", seed_stdout.writer.buffered());
+
+    const source_session_file = (try coding_agent.session_manager.findMostRecentSession(allocator, std.testing.io, session_dir)).?;
+    defer allocator.free(source_session_file);
+
+    var webview_env = std.process.Environ.Map.init(allocator);
+    defer webview_env.deinit();
+    try webview_env.put("HOME", home_dir);
+    try webview_env.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    const cases = [_]struct {
+        args: []const []const u8,
+        expected_file: []const u8,
+    }{
+        .{ .args = &.{ "--webview", "--provider", "faux", "--session-dir", session_dir, "--session", source_session_file }, .expected_file = source_session_file },
+        .{ .args = &.{ "--webview", "--provider", "faux", "--session-dir", session_dir, "--continue" }, .expected_file = source_session_file },
+        .{ .args = &.{ "--webview", "--provider", "faux", "--session-dir", session_dir, "--resume" }, .expected_file = source_session_file },
+    };
+
+    for (cases) |case| {
+        var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stdout_capture.deinit();
+        var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+        defer stderr_capture.deinit();
+
+        const exit_code = try runCli(
+            allocator,
+            std.testing.io,
+            &webview_env,
+            case.args,
+            project_dir,
+            &stdout_capture.writer,
+            &stderr_capture.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "\"mode\":\"webview\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), case.expected_file) != null);
+        try std.testing.expect(std.mem.indexOf(u8, stdout_capture.writer.buffered(), "\"noSession\":false") != null);
+        try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+    }
+
+    var fork_stdout: std.Io.Writer.Allocating = .init(allocator);
+    defer fork_stdout.deinit();
+    var fork_stderr: std.Io.Writer.Allocating = .init(allocator);
+    defer fork_stderr.deinit();
+    const fork_exit = try runCli(
+        allocator,
+        std.testing.io,
+        &webview_env,
+        &.{ "--webview", "--provider", "faux", "--session-dir", session_dir, "--fork", source_session_file },
+        project_dir,
+        &fork_stdout.writer,
+        &fork_stderr.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), fork_exit);
+    const fork_out = fork_stdout.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, fork_out, "\"mode\":\"webview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_out, "\"sessionFile\":null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fork_out, source_session_file) == null);
+    try std.testing.expectEqualStrings("", fork_stderr.writer.buffered());
+}
+
 test "runCli rejects incompatible webview mode combinations before runtime dispatch" {
     const allocator = std.testing.allocator;
 
