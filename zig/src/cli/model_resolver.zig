@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const string_utils = ai.shared.string_utils;
 const cli = @import("args.zig");
 
 pub const ResolveCliModelResult = struct {
@@ -170,7 +171,7 @@ fn tryMatchModel(
         if (provider) |provider_name| {
             if (!std.ascii.eqlIgnoreCase(summary.provider, provider_name)) continue;
         }
-        if (!containsIgnoreCase(summary.id, pattern) and !containsIgnoreCase(summary.name, pattern)) continue;
+        if (!string_utils.containsIgnoreCase(summary.id, pattern) and !string_utils.containsIgnoreCase(summary.name, pattern)) continue;
 
         if (isBetterFuzzyCandidate(summary, best, provider == null)) best = summary;
     }
@@ -306,16 +307,6 @@ fn isAggregatorProvider(provider: []const u8) bool {
         std.mem.eql(u8, provider, "opencode-go") or
         std.mem.eql(u8, provider, "openrouter") or
         std.mem.eql(u8, provider, "vercel-ai-gateway");
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {

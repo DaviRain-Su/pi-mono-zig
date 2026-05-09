@@ -1,6 +1,7 @@
 const std = @import("std");
 const model_registry = @import("model_registry.zig");
 const http_client = @import("http_client.zig");
+const string_utils = @import("shared/string_utils.zig");
 const types = @import("types.zig");
 
 const DEFAULT_CONTEXT_WINDOW: u32 = 128000;
@@ -666,7 +667,7 @@ fn stringMatchesAny(value: []const u8, needles: []const []const u8) bool {
 
 fn resolveKind(base_url: []const u8, requested: DiscoveryKind) DiscoveryKind {
     if (requested != .auto) return requested;
-    if (containsIgnoreCase(base_url, "ollama") or std.mem.indexOf(u8, base_url, ":11434") != null) return .ollama;
+    if (string_utils.containsIgnoreCase(base_url, "ollama") or std.mem.indexOf(u8, base_url, ":11434") != null) return .ollama;
     return .openai;
 }
 
@@ -694,17 +695,6 @@ fn trimLeftScalar(value: []const u8, scalar: u8) []const u8 {
     var start: usize = 0;
     while (start < value.len and value[start] == scalar) : (start += 1) {}
     return value[start..];
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 const TestJsonServer = struct {

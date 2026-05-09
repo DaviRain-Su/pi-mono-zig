@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai = @import("ai");
 const provider_json = ai.provider_json;
+const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const auth = @import("../auth/auth.zig");
 const config_errors = @import("config_errors.zig");
@@ -1385,21 +1386,10 @@ fn parseDiscoveryKind(value: []const u8) ai.model_discovery.DiscoveryKind {
 }
 
 fn isLocalBaseUrl(value: []const u8) bool {
-    return containsIgnoreCase(value, "localhost") or
-        containsIgnoreCase(value, "127.0.0.1") or
-        containsIgnoreCase(value, "0.0.0.0") or
-        containsIgnoreCase(value, "[::1]");
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
+    return string_utils.containsIgnoreCase(value, "localhost") or
+        string_utils.containsIgnoreCase(value, "127.0.0.1") or
+        string_utils.containsIgnoreCase(value, "0.0.0.0") or
+        string_utils.containsIgnoreCase(value, "[::1]");
 }
 
 fn getStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {

@@ -25,6 +25,7 @@ pub const shared = struct {
     pub const responses_api = @import("shared/responses_api.zig");
     pub const simple_options = @import("shared/simple_options.zig");
     pub const sse_loop = @import("shared/sse_loop.zig");
+    pub const string_utils = @import("shared/string_utils.zig");
     pub const transform_messages = @import("shared/transform_messages.zig");
 };
 
@@ -125,6 +126,7 @@ test {
     _ = @import("shared/responses_api.zig");
     _ = @import("shared/simple_options.zig");
     _ = @import("shared/sse_loop.zig");
+    _ = @import("shared/string_utils.zig");
     _ = @import("shared/transform_messages.zig");
     _ = @import("providers/faux.zig");
 }

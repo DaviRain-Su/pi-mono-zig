@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider_json = @import("shared/provider_json.zig");
+const string_utils = @import("shared/string_utils.zig");
 const types = @import("types.zig");
 const models_generated = @import("models_generated.zig");
 
@@ -746,18 +747,7 @@ fn equalCanonicalReference(reference: []const u8, provider: []const u8, model_id
 }
 
 fn matchesPattern(model: types.Model, pattern: []const u8) bool {
-    return containsIgnoreCase(model.id, pattern) or containsIgnoreCase(model.name, pattern);
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
+    return string_utils.containsIgnoreCase(model.id, pattern) or string_utils.containsIgnoreCase(model.name, pattern);
 }
 
 fn isBetterMatch(candidate: types.Model, current: types.Model) bool {

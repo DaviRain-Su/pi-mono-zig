@@ -1,4 +1,5 @@
 const std = @import("std");
+const string_utils = @import("string_utils.zig");
 const types = @import("../types.zig");
 
 const overflow_patterns = [_][]const u8{
@@ -59,7 +60,7 @@ fn matchesOverflow(message: []const u8) bool {
 
 fn matchesAny(message: []const u8, patterns: []const []const u8) bool {
     for (patterns) |pattern| {
-        if (containsIgnoreCase(message, pattern)) return true;
+        if (string_utils.containsIgnoreCase(message, pattern)) return true;
     }
     return false;
 }
@@ -67,15 +68,11 @@ fn matchesAny(message: []const u8, patterns: []const []const u8) bool {
 fn startsWithStatusNoBody(message: []const u8, prefix: []const u8) bool {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, prefix)) return false;
-    return containsIgnoreCase(trimmed, "(no body)");
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return string_utils.containsIgnoreCase(trimmed, "(no body)");
 }
 
 fn supportsSilentOverflowDetection(message: types.AssistantMessage) bool {
-    return containsIgnoreCase(message.provider, "zai") or containsIgnoreCase(message.provider, "z.ai");
+    return string_utils.containsIgnoreCase(message.provider, "zai") or string_utils.containsIgnoreCase(message.provider, "z.ai");
 }
 
 test "isContextOverflow detects provider error patterns" {

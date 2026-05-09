@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const string_utils = ai.shared.string_utils;
 const auth = @import("../auth/auth.zig");
 const common = @import("../tools/common.zig");
 
@@ -371,22 +372,11 @@ fn fieldMatches(field: []const u8, pattern: []const u8, exact_when_plain: bool) 
     if (pattern.len == 0) return false;
     if (hasWildcard(pattern)) return wildcardMatchIgnoreCase(pattern, field);
     if (exact_when_plain) return std.ascii.eqlIgnoreCase(field, pattern);
-    return containsIgnoreCase(field, pattern);
+    return string_utils.containsIgnoreCase(field, pattern);
 }
 
 fn hasWildcard(pattern: []const u8) bool {
     return std.mem.indexOfAny(u8, pattern, "*?[") != null;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 fn wildcardMatchIgnoreCase(pattern: []const u8, text: []const u8) bool {
@@ -618,10 +608,10 @@ fn preferredInitialDefaultProvider(
 }
 
 fn isLocalBaseUrl(value: []const u8) bool {
-    return containsIgnoreCase(value, "localhost") or
-        containsIgnoreCase(value, "127.0.0.1") or
-        containsIgnoreCase(value, "0.0.0.0") or
-        containsIgnoreCase(value, "[::1]");
+    return string_utils.containsIgnoreCase(value, "localhost") or
+        string_utils.containsIgnoreCase(value, "127.0.0.1") or
+        string_utils.containsIgnoreCase(value, "0.0.0.0") or
+        string_utils.containsIgnoreCase(value, "[::1]");
 }
 
 fn resolveAvailableProviderAuthStatus(
@@ -1387,7 +1377,7 @@ test "filterAvailableModels supports scoped glob fuzzy and thinking suffix patte
     try std.testing.expect(anthropic_only.len > 0);
     for (anthropic_only) |entry| {
         try std.testing.expectEqualStrings("anthropic", entry.provider);
-        try std.testing.expect(containsIgnoreCase(entry.model_id, "sonnet"));
+        try std.testing.expect(string_utils.containsIgnoreCase(entry.model_id, "sonnet"));
     }
 
     const globbed = try filterAvailableModels(allocator, available, &.{"openrouter/*kimi-k2.6"});

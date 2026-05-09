@@ -1,5 +1,7 @@
 const std = @import("std");
+const ai = @import("ai");
 const agent = @import("agent");
+const string_utils = ai.shared.string_utils;
 const extension_host = @import("extension_host.zig");
 const extension_registry = @import("extension_registry.zig");
 const enforcement = @import("enforcement.zig");
@@ -230,43 +232,6 @@ fn isSafeRelativePathSuffix(suffix: []const u8) bool {
         if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
     }
     return true;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn isSensitiveDiagnosticString(value: []const u8) bool {
-    const needles = [_][]const u8{
-        "authorization",
-        "bearer",
-        "api_key",
-        "apikey",
-        "token",
-        "oauth",
-        "password",
-        "secret",
-        "credential",
-        "sk-",
-    };
-    for (needles) |needle| {
-        if (containsIgnoreCase(value, needle)) return true;
-    }
-    return false;
-}
-
-fn writeRedactedDiagnosticString(writer: *std.Io.Writer, value: []const u8) !void {
-    if (isSensitiveDiagnosticString(value)) {
-        try std.json.Stringify.value("[REDACTED]", .{}, writer);
-    } else {
-        try std.json.Stringify.value(value, .{}, writer);
-    }
 }
 
 fn nativeResourceLimitsToEnforcement(limits: NativeResourceLimits) enforcement.ResourceLimits {
@@ -517,7 +482,7 @@ pub const NativeHostApi = struct {
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
         if (enforcement.diagnosticTargetId(denial.operation, denial.target)) |target_id| {
-            try writeRedactedDiagnosticString(&envelope.writer, target_id);
+            try string_utils.writeRedactedDiagnosticString(&envelope.writer, target_id);
         } else {
             try envelope.writer.writeAll("null");
         }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const string_utils = ai.shared.string_utils;
 const common = @import("../tools/common.zig");
 const enforcement = @import("enforcement.zig");
 const extension_events = @import("extension_events.zig");
@@ -637,7 +638,7 @@ pub const ProtocolState = struct {
         try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
         try envelope.writer.writeAll(",\"target\":{\"id\":");
         if (denial.target.id) |target_id| {
-            try writeRedactedDiagnosticString(&envelope.writer, target_id);
+            try string_utils.writeRedactedDiagnosticString(&envelope.writer, target_id);
         } else {
             try envelope.writer.writeAll("null");
         }
@@ -1118,43 +1119,6 @@ fn parseSeverity(name: ?[]const u8) ?DiagnosticSeverity {
 fn stripTrailingCarriageReturn(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
     return line;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
-}
-
-fn isSensitiveDiagnosticString(value: []const u8) bool {
-    const needles = [_][]const u8{
-        "authorization",
-        "bearer",
-        "api_key",
-        "apikey",
-        "token",
-        "oauth",
-        "password",
-        "secret",
-        "credential",
-        "sk-",
-    };
-    for (needles) |needle| {
-        if (containsIgnoreCase(value, needle)) return true;
-    }
-    return false;
-}
-
-fn writeRedactedDiagnosticString(writer: *std.Io.Writer, value: []const u8) !void {
-    if (isSensitiveDiagnosticString(value)) {
-        try std.json.Stringify.value("[REDACTED]", .{}, writer);
-    } else {
-        try std.json.Stringify.value(value, .{}, writer);
-    }
 }
 
 fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {

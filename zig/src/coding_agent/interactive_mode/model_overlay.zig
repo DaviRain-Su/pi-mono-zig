@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const string_utils = ai.shared.string_utils;
 const config_mod = @import("../config/config.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const shared = @import("shared.zig");
@@ -433,13 +434,13 @@ fn availableModelMatchesSearch(entry: provider_config.AvailableModel, search: []
 }
 
 fn availableModelMatchesSearchToken(entry: provider_config.AvailableModel, search: []const u8) bool {
-    if (containsIgnoreCase(entry.model_id, search)) return true;
-    if (containsIgnoreCase(entry.display_name, search)) return true;
-    if (containsIgnoreCase(entry.provider, search)) return true;
+    if (string_utils.containsIgnoreCase(entry.model_id, search)) return true;
+    if (string_utils.containsIgnoreCase(entry.display_name, search)) return true;
+    if (string_utils.containsIgnoreCase(entry.provider, search)) return true;
 
     var provider_model_buffer: [512]u8 = undefined;
     const provider_model = std.fmt.bufPrint(&provider_model_buffer, "{s}/{s}", .{ entry.provider, entry.model_id }) catch return false;
-    return containsIgnoreCase(provider_model, search);
+    return string_utils.containsIgnoreCase(provider_model, search);
 }
 
 fn firstModelConfigError(allocator: std.mem.Allocator, runtime_config: ?*const config_mod.RuntimeConfig) !?[]u8 {
@@ -450,16 +451,6 @@ fn firstModelConfigError(allocator: std.mem.Allocator, runtime_config: ?*const c
         }
     }
     return null;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var index: usize = 0;
-    while (index + needle.len <= haystack.len) : (index += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 fn setEnabledIds(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay, next_ids: ?[][]u8) !void {

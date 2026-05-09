@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
@@ -1682,29 +1683,25 @@ fn isRetryableError(message: ai.AssistantMessage, context_window: u32) bool {
     const error_message = message.error_message orelse return false;
     if (isContextOverflow(message, context_window)) return false;
 
-    return containsIgnoreCase(error_message, "overloaded") or
-        containsIgnoreCase(error_message, "rate limit") or
-        containsIgnoreCase(error_message, "too many requests") or
-        containsIgnoreCase(error_message, "service unavailable") or
-        containsIgnoreCase(error_message, "server error") or
-        containsIgnoreCase(error_message, "internal error") or
-        containsIgnoreCase(error_message, "network error") or
-        containsIgnoreCase(error_message, "connection error") or
-        containsIgnoreCase(error_message, "connection refused") or
-        containsIgnoreCase(error_message, "connection lost") or
-        containsIgnoreCase(error_message, "socket hang up") or
-        containsIgnoreCase(error_message, "fetch failed") or
-        containsIgnoreCase(error_message, "timeout") or
-        containsIgnoreCase(error_message, "timed out") or
-        containsIgnoreCase(error_message, "429") or
-        containsIgnoreCase(error_message, "500") or
-        containsIgnoreCase(error_message, "502") or
-        containsIgnoreCase(error_message, "503") or
-        containsIgnoreCase(error_message, "504");
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return string_utils.containsIgnoreCase(error_message, "overloaded") or
+        string_utils.containsIgnoreCase(error_message, "rate limit") or
+        string_utils.containsIgnoreCase(error_message, "too many requests") or
+        string_utils.containsIgnoreCase(error_message, "service unavailable") or
+        string_utils.containsIgnoreCase(error_message, "server error") or
+        string_utils.containsIgnoreCase(error_message, "internal error") or
+        string_utils.containsIgnoreCase(error_message, "network error") or
+        string_utils.containsIgnoreCase(error_message, "connection error") or
+        string_utils.containsIgnoreCase(error_message, "connection refused") or
+        string_utils.containsIgnoreCase(error_message, "connection lost") or
+        string_utils.containsIgnoreCase(error_message, "socket hang up") or
+        string_utils.containsIgnoreCase(error_message, "fetch failed") or
+        string_utils.containsIgnoreCase(error_message, "timeout") or
+        string_utils.containsIgnoreCase(error_message, "timed out") or
+        string_utils.containsIgnoreCase(error_message, "429") or
+        string_utils.containsIgnoreCase(error_message, "500") or
+        string_utils.containsIgnoreCase(error_message, "502") or
+        string_utils.containsIgnoreCase(error_message, "503") or
+        string_utils.containsIgnoreCase(error_message, "504");
 }
 
 fn shouldAutoCompact(context_tokens: u32, context_window: u32, settings: CompactionSettings) bool {
