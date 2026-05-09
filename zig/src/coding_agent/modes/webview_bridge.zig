@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = @import("ai");
 const agent = @import("agent");
 const json_event_wire = @import("json_event_wire.zig");
@@ -838,6 +839,9 @@ fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
 }
 
 fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
     const z_path = try allocator.dupeZ(u8, path);
     defer allocator.free(z_path);
     var buffer: [std.fs.max_path_bytes]u8 = undefined;

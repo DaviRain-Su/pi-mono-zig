@@ -129,7 +129,7 @@ pub fn runWebViewMode(
     try stderr.print(
         "PI_WEBVIEW_START pid={d} provider={s} model={s} backend={s} asset={s} asset_source={s}\n",
         .{
-            std.c.getpid(),
+            if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.c.getpid(),
             options.provider,
             options.model.id,
             @tagName(options.backend.backend),
@@ -237,7 +237,6 @@ fn resolveAssetInRoot(
     source: ResolvedFrontendAsset.Source,
 ) !ResolvedFrontendAsset {
     const asset_path = webview_bridge.resolveAssetRequest(allocator, root, "index.html") catch |err| switch (err) {
-        error.FileNotFound => return error.AssetNotFound,
         error.AssetPathDenied => return error.AssetNotFound,
         else => return err,
     };
