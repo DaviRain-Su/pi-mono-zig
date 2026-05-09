@@ -997,7 +997,7 @@ test "completeSimple returns final assistant message from simple options" {
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_simple_calls);
 }
 
-test "stream returns terminal error stream for unknown provider lookup failure" {
+test "ISS-401 stream returns terminal error stream for unknown provider lookup failure" {
     api_registry.clear();
     defer api_registry.clear();
 
@@ -1021,7 +1021,7 @@ test "stream returns terminal error stream for unknown provider lookup failure" 
     );
 }
 
-test "stream converts provider setup callback failure into terminal error stream" {
+test "ISS-401 stream converts provider setup callback failure into terminal error stream" {
     api_registry.clear();
     defer api_registry.clear();
     failing_stream_calls = 0;
@@ -1053,7 +1053,7 @@ test "stream converts provider setup callback failure into terminal error stream
     );
 }
 
-test "complete and streamSimple preserve provider failure stream semantics" {
+test "ISS-401 complete and streamSimple preserve provider failure stream semantics" {
     api_registry.clear();
     defer api_registry.clear();
 
@@ -1097,7 +1097,7 @@ test "complete and streamSimple preserve provider failure stream semantics" {
     try std.testing.expectEqualStrings("CallbackFailed", result.error_message.?);
 }
 
-test "complete and streamSimple preserve partial runtime provider failure stream semantics" {
+test "ISS-401 complete and streamSimple preserve partial runtime provider failure stream semantics" {
     api_registry.clear();
     defer api_registry.clear();
 
@@ -1148,7 +1148,7 @@ test "complete and streamSimple preserve partial runtime provider failure stream
     try std.testing.expectEqualStrings("partial", result.content[0].text.text);
 }
 
-test "pre-start abort takes precedence over provider lookup and setup failures" {
+test "ISS-401 pre-start abort takes precedence over provider lookup and setup failures" {
     api_registry.clear();
     defer api_registry.clear();
     failing_stream_calls = 0;

@@ -2567,6 +2567,82 @@ fn abortedPartialToolCallStreamForAgentLoopTest(
     return stream;
 }
 
+fn runtimeErrorToolCallStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    const partial_tool = ai.ToolCall{
+        .id = "runtime-error-partial",
+        .name = "echo",
+        .arguments = .{ .string = "borrowed partial args" },
+        .thought_signature = "borrowed runtime signature",
+    };
+
+    const terminal_args = try jsonStringObject(allocator, "value", "should-not-run");
+    const terminal_tool_calls = try allocator.alloc(ai.ToolCall, 1);
+    terminal_tool_calls[0] = .{
+        .id = try allocator.dupe(u8, "runtime-error-terminal"),
+        .name = try allocator.dupe(u8, "echo"),
+        .arguments = terminal_args,
+    };
+    const terminal_content = try allocator.alloc(ai.ContentBlock, 2);
+    terminal_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "partial before runtime error") } };
+    terminal_content[1] = .{ .tool_call = terminal_tool_calls[0] };
+
+    const final_message = ai.AssistantMessage{
+        .content = terminal_content,
+        .tool_calls = terminal_tool_calls,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "ProviderParseFailure",
+        .timestamp = 2,
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    errdefer stream.deinit();
+    stream.push(.{ .event_type = .start, .message = template });
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    stream.push(.{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "partial before runtime error",
+    });
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
+    stream.push(.{
+        .event_type = .toolcall_delta,
+        .content_index = 1,
+        .delta = "{\"value\":\"should-not-run\"}",
+    });
+    stream.push(.{
+        .event_type = .toolcall_end,
+        .content_index = 1,
+        .tool_call = partial_tool,
+    });
+    stream.push(.{
+        .event_type = .error_event,
+        .message = final_message,
+        .error_message = final_message.error_message,
+    });
+    return stream;
+}
+
 const MalformedPartialArgsCapture = struct {
     saw_malformed_toolcall_delta: bool = false,
 };
@@ -3633,6 +3709,87 @@ test "ISS-401 aborted stream cleans partial accumulator tool state" {
     try std.testing.expectEqual(@as(usize, 1), capture.message_end_count);
 }
 
+test "ISS-401 runtime error stream cleans partial tool state and skips terminal tool calls" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording:test:partial-runtime-error-cleanup",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const fixture = try std.testing.allocator.create(CountedToolFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = countedEchoToolExecute,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = model,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        runtimeErrorToolCallStreamForAgentLoopTest,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(ai.StopReason.error_reason, result[1].assistant.stop_reason);
+    try std.testing.expectEqualStrings("ProviderParseFailure", result[1].assistant.error_message.?);
+    try std.testing.expectEqualStrings("partial before runtime error", result[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings("runtime-error-terminal", result[1].assistant.content[1].tool_call.id);
+    try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
+
+    var terminal_assistant_messages: usize = 0;
+    var turn_end_count: usize = 0;
+    var agent_end_count: usize = 0;
+    for (capture.events.items) |event| {
+        try std.testing.expect(event.event_type != .tool_execution_start);
+        try std.testing.expect(event.event_type != .tool_execution_end);
+        switch (event.event_type) {
+            .message_end => if (event.message) |message| switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason == .error_reason) terminal_assistant_messages += 1;
+                },
+                else => {},
+            },
+            .turn_end => turn_end_count += 1,
+            .agent_end => agent_end_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminal_assistant_messages);
+    try std.testing.expectEqual(@as(usize, 1), turn_end_count);
+    try std.testing.expectEqual(@as(usize, 1), agent_end_count);
+}
+
 test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
     const allocator = std.testing.allocator;
 
@@ -3999,7 +4156,7 @@ test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
     try std.testing.expectEqual(@as(usize, 1), end_count);
 }
 
-test "ISS-407 message_update payload is callback-scoped and retained consumers clone" {
+test "ISS-401 ISS-407 message_update payload is callback-scoped and retained consumers clone" {
     var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
@@ -4050,7 +4207,7 @@ test "ISS-407 message_update payload is callback-scoped and retained consumers c
     try std.testing.expectEqualStrings("borrowed update", retained_content[0].text.text);
 }
 
-test "VAL-CROSS-002 terminal error with partial tool call suppresses tool execution" {
+test "ISS-401 VAL-CROSS-002 terminal error with partial tool call suppresses tool execution" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
     defer registration.unregister();
@@ -4118,7 +4275,7 @@ test "VAL-CROSS-002 terminal error with partial tool call suppresses tool execut
     }
 }
 
-test "VAL-CROSS-002 terminal abort with partial tool call suppresses tool execution" {
+test "ISS-401 VAL-CROSS-002 terminal abort with partial tool call suppresses tool execution" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
     defer registration.unregister();
@@ -4412,7 +4569,7 @@ test "ISS-404 parallel after_tool_call finalizes in completion order and emits m
     try std.testing.expectEqualStrings("tool-2", results[1].tool_call_id);
 }
 
-test "executeToolCallsParallel returns tool result content that survives task arena cleanup" {
+test "ISS-401 executeToolCallsParallel returns tool result content that survives task arena cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
