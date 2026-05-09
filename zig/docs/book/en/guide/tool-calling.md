@@ -319,19 +319,19 @@ Each tool_result must carry its `tool_use_id` — the LLM matches by id, not ord
 Not every tool_call should be allowed. **The `bash` tool can run any command — do you really want to give the LLM that power**?
 :::
 
-pi-mono-zig uses 12 **capabilities** ([coding_agent dossier §6](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界)) for control:
+pi-mono-zig uses 12 canonical **capability grants** ([coding_agent dossier §6](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界)) for control:
 
 ```
-file_read    file_write    network_request    shell_run
-env_read     model_call    session_read       session_write
-ui_notify    tool_use      agent_spawn        agent_delegate
+file.read      file.write      network.request  shell.run
+env.read       model.call      session.read     session.write
+ui.notify      tool.use        agent.spawn      agent.delegate
 ```
 
-At each tool execution, the framework checks "does this principal have the required grant?" — denied if not. **An SDK consumer can construct a "file_read only" principal to lock the agent down to read-only mode.**
+At each tool execution, the framework checks "does this principal have the required grant?" — denied if not. **An SDK consumer can construct a `file.read`-only principal to lock the agent down to read-only mode.**
 
 ```mermaid
 flowchart LR
-    Call[LLM wants bash] --> Check{principal has<br/>shell_run grant?}
+    Call[LLM wants bash] --> Check{principal has<br/>shell.run grant?}
     Check -->|yes| Exec[execute]
     Check -->|no| Deny[is_error: true<br/>"Permission denied"]
 ```

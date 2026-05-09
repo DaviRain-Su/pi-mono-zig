@@ -138,17 +138,21 @@ feature.
 
 ## Capability Policy and Approval Semantics
 
-Wasm extensions start with no ambient authority. The canonical v0 capability ids
+Wasm extensions start with no ambient authority. The canonical capability grants
 are:
 
 - `file.read`
 - `file.write`
-- `network`
-- `shell`
-- `env`
-- `model`
-- `session`
+- `network.request`
+- `shell.run`
+- `env.read`
+- `model.call`
+- `session.read`
+- `session.write`
 - `ui.notify`
+- `tool.use`
+- `agent.spawn`
+- `agent.delegate`
 
 Capability semantics:
 
@@ -166,22 +170,28 @@ Capability semantics:
 
 For v0, no host functions are exposed to Wasm plugins, so the only accepted
 capability set for executable tools is empty unless a later host feature adds a
-specific enforcement branch and tests for approvals and denials.
+specific enforcement branch and tests for approvals and denials. Broad historical
+aliases such as `network`, `shell`, `env`, `model`, or `session` are not
+normative manifest/policy vocabulary.
 
 Canonical capability ids map one-to-one to host enforcement branches. Native
 and browser hosts must use the same `denied_capability` category for
 requested-but-unapproved declarations and runtime/import attempts:
 
-| Capability id | Enforcement branch | Browser runtime/import fixture |
+| Capability grant | Enforcement branch | Browser runtime/import fixture |
 | --- | --- | --- |
 | `file.read` | `filesystem.read` | `pi:filesystem/read` |
 | `file.write` | `filesystem.write` | `pi:filesystem/write` |
-| `network` | `network.request` | `pi:network/fetch` |
-| `shell` | `shell.process` | `pi:shell/run` |
-| `env` | `environment.variable` | `pi:environment/get` |
-| `model` | `model.call` | `pi:model/call` |
-| `session` | `session.state` | `pi:session/get` |
+| `network.request` | `network.request` | `pi:network/fetch` |
+| `shell.run` | `shell.run` | `pi:shell/run` |
+| `env.read` | `env.read` | `pi:environment/get` |
+| `model.call` | `model.call` | `pi:model/call` |
+| `session.read` | `session.read` | `pi:session/get` |
+| `session.write` | `session.write` | `pi:session/set` |
 | `ui.notify` | `ui.notification` | `pi:ui/notify` |
+| `tool.use` | `tool.use` | `pi:tool/use` |
+| `agent.spawn` | `agent.spawn` | `pi:agent/spawn` |
+| `agent.delegate` | `agent.delegate` | `pi:agent/delegate` |
 
 ## Validation and Dependency Policy
 

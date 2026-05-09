@@ -1454,6 +1454,15 @@ pi.registerShortcut("ctrl+shift+p", {
 });
 ```
 
+Shortcut dispatch is resolved by the interactive input path after extensions
+are loaded and enabled. Reserved built-in bindings remain protected. For
+non-reserved conflicts, pi emits deterministic diagnostics and dispatches only
+the resolved shortcut owner. Duplicate extension shortcuts resolve
+deterministically, invalid shortcut strings are ignored or diagnosed safely, and
+unrelated editor/overlay/auth/prompt-worker input passes through unchanged.
+Handlers receive the owning extension command identity; do not infer ownership
+from the raw shortcut string.
+
 ### pi.registerFlag(name, options)
 
 Register a CLI flag.
@@ -2100,6 +2109,13 @@ If a slot renderer is not defined or throws:
 ## Custom UI
 
 Extensions can interact with users via `ctx.ui` methods and customize how messages/tools render.
+
+Phase 1 Zig parity covers the lower-layer bridge for `ctx.ui.notify` and
+`ctx.ui.setStatus` (`extension_ui_request` fields, severity/status behavior,
+and `responseRequired` correlation). The broader TypeScript product UI surface
+documented below—dialogs, custom components, widgets, overlays, editor
+replacement, and theme controls—remains product UI behavior rather than a Phase
+1 lower-layer validation gate.
 
 **For custom components, see [tui.md](tui.md)** which has copy-paste patterns for:
 - Selection dialogs (SelectList)

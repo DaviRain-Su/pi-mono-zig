@@ -63,8 +63,11 @@ approval semantics and enforcement branches.
 
 The v0 surface is tools-only. Commands, widgets, editor hooks, provider
 registration, shortcuts, themes, prompts, skills, model/session mutation, UI
-hooks, shell access, filesystem access, network access, and environment access
-are deferred to later contracts.
+hooks, shell access, filesystem access, network access, environment access,
+Web Simulator, Workflow/Wiki/QA/Review product presets, marketplace,
+publisher/signing, remote package/runtime URLs, and direct native dynamic-library
+path authoring are deferred to later contracts or separate product/distribution
+surfaces.
 
 Hosts must reject v0 manifest declarations for non-tool surfaces, or ignore
 runtime-only non-tool attempts, with deterministic diagnostics. In both cases

@@ -166,20 +166,22 @@ Hooks are the event queue between extension and host. pi-mono partitions 35 hook
 
 | Group | Count | Representative | Purpose |
 | --- | --- | --- | --- |
-| `session.*` | 8 | `session.start`, `session.before_compact` | Session switch / fork / compact lifecycle |
-| `agent.*` | 5 | `agent.start`, `agent.end`, `agent.model_select` | Agent overall lifecycle |
-| `turn.*` | 5 | `turn.start`, `turn.end`, `message.update` | Single-turn lifecycle |
-| `tool.*` | 7 | `tool.call`, `tool.result`, `tool.execution_*` | Tool execution |
-| `input.*` | 2 | `input.user_text`, `input.user_bash` | User input interception |
-| `provider.*` | 3 | `provider.before_request`, `context` | LLM request/response |
-| `resources.*` | 1 | `resources.discover` | Startup resource contribution |
+| Session | 8 | `session_start`, `session_before_compact` | Session switch / fork / compact lifecycle |
+| Agent | 5 | `agent_start`, `agent_end`, `model_select` | Agent overall lifecycle |
+| Turn | 5 | `turn_start`, `turn_end`, `message_update` | Single-turn lifecycle |
+| Tool | 7 | `tool_call`, `tool_result`, `tool_execution_*` | Tool execution |
+| Input | 2 | `input`, `user_bash` | User input interception |
+| Provider | 3 | `before_provider_request`, `context` | LLM request/response |
+| Resources | 1 | `resources_discover` | Startup resource contribution |
+
+Underscore names are the canonical extension API and JSONL/RPC wire spelling. Dot-form names such as `tool.call` may appear only as historical or conceptual group labels, not as subscriber names or event `type` values.
 
 ### 7.5.1 Two kinds of hooks
 
-**Notify** (`X.Y`): handler observes, **cannot change the result**.
+**Notify** (canonical underscore event names): handler observes, **cannot change the result**.
 
 ```c
-// e.g. turn.end - notifies a turn finished, extension records token count
+// e.g. turn_end - notifies a turn finished, extension records token count
 int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e, ...) {
     if (t == PI_HOOK_TURN_END) {
         my_telemetry.record_tokens(...);
@@ -188,10 +190,10 @@ int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e, ...) {
 }
 ```
 
-**Intercept** (`X.before_Y`): handler can **cancel the operation or modify args**.
+**Intercept** (`*_before_*`, `before_*`, or mutating hooks such as `tool_call`): handler can **cancel the operation or modify args**.
 
 ```c
-// e.g. tool.call - intercept before tool executes
+// e.g. tool_call - intercept before tool executes
 int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e,
             pi_hook_result_t* out) {
     if (t == PI_HOOK_TOOL_CALL) {
@@ -211,11 +213,11 @@ int handle(void* ud, pi_hook_event_type_t t, const pi_hook_event_t* e,
 1. **Order**: handlers fire in extension load order, sequentially
 2. **Async**: each handler awaited before the next
 3. **Error isolation**: a handler's exception doesn't affect others; logged only
-4. **Result chaining**: for `context` / `tool.call`-class hooks, later handlers see modifications from earlier handlers
+4. **Result chaining**: for `context` / `tool_call`-class hooks, later handlers see modifications from earlier handlers
 
 ## 7.6 Tool interception — the killer feature
 
-If you could keep only two hooks, **`tool.call` and `tool.result` must stay**. They give extensions the **governance** capability — the watershed where the system goes from "toy" to "product."
+If you could keep only two hooks, **`tool_call` and `tool_result` must stay**. They give extensions the **governance** capability — the watershed where the system goes from "toy" to "product."
 
 ### 7.6.1 What interception can do
 
@@ -225,7 +227,7 @@ flowchart LR
     classDef block fill:#7f1d1d,stroke:#dc2626,color:#fff
     classDef mod fill:#78350f,stroke:#d97706,color:#fff
 
-    LLM[LLM wants<br/>bash 'rm -rf /'] --> Hook[tool.call hook]
+    LLM[LLM wants<br/>bash 'rm -rf /'] --> Hook[tool_call hook]
     Hook --> Decide{Extension decides}
     Decide -->|allow| Pass[execute]:::good
     Decide -->|block| Block[return error]:::block
@@ -238,7 +240,7 @@ flowchart LR
 ```typescript
 // permission-gate.ts (simplified)
 export default (api) => {
-  api.on('tool.call', async (event) => {
+  api.on('tool_call', async (event) => {
     if (event.tool_name === 'bash' && containsDangerous(event.args)) {
       const ok = await api.ui.confirm({
         title: 'Dangerous command detected',
@@ -256,11 +258,11 @@ export default (api) => {
 
 ### 7.6.3 Interception chains: stacking extensions
 
-If 5 extensions all subscribe to `tool.call`, they fire in load order — any returning `cancel: true` short-circuits:
+If 5 extensions all subscribe to `tool_call`, they fire in load order — any returning `cancel: true` short-circuits:
 
 ```mermaid
 flowchart LR
-    Call[tool.call fires] --> E1[Ext 1: permission check]
+    Call[tool_call fires] --> E1[Ext 1: permission check]
     E1 -->|allow| E2[Ext 2: rewrite args]
     E2 -->|modified| E3[Ext 3: log]
     E3 -->|allow| E4[Ext 4: confirm dialog]
@@ -273,7 +275,7 @@ This gives users a **composable security model** — stack independent extension
 
 ## 7.7 Capability boundaries and load-time checks
 
-Recall [coding_agent dossier](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界): 12 capabilities (`file.read` / `shell.run` / `network.request` / ...). The extension system checks them at **two** moments:
+Recall [coding_agent dossier](/internals/coding-agent#6-enforcement-12-个-capability-的能力边界): 12 canonical grants (`file.read`, `file.write`, `network.request`, `shell.run`, `env.read`, `model.call`, `session.read`, `session.write`, `ui.notify`, `tool.use`, `agent.spawn`, `agent.delegate`). The extension system checks them at **two** moments:
 
 ```mermaid
 flowchart TB
@@ -303,7 +305,7 @@ Extension sends via stdout:
   {"method":"ready"}
   {"method":"register_tool","name":"my_tool","label":"...","description":"...","parameters":{...}}
   {"method":"register_command","name":"slash_foo","handler_id":"h1"}
-  {"method":"subscribe_hook","hook":"tool.call","handler_id":"h2"}
+  {"method":"subscribe_hook","hook":"tool_call","handler_id":"h2"}
 
 Host sends via stdin:
   {"method":"invoke_tool","name":"my_tool","args":{...},"id":42}
@@ -311,7 +313,7 @@ Extension replies:
   {"method":"tool_result","id":42,"content":[...],"is_error":false}
 
 Host fires a hook:
-  {"method":"hook","handler_id":"h2","event":{"type":"tool.call","args":{...}},"id":43}
+  {"method":"hook","handler_id":"h2","event":{"type":"tool_call","args":{...}},"id":43}
 Extension replies:
   {"method":"hook_result","id":43,"cancel":false}
 
@@ -391,8 +393,8 @@ Chapter 4 (provider abstraction) and Chapter 6 (coding agent in practice) will b
 | --- | --- |
 | Three-tier model | Native / Process_JSONL / WASM runtimes |
 | Lifecycle hooks | 35 event subscription points across 7 groups |
-| Intercept hook | `X.before_Y`-named, can cancel or modify args |
-| Notify hook | `X.Y`-named, observes only |
+| Intercept hook | `*_before_*`, `before_*`, or mutating hook such as `tool_call`; can cancel or modify args |
+| Notify hook | canonical underscore event name; observes only |
 | Capability | 12 permission items, checked at load and run time |
 | process_jsonl | Subprocess + JSONL stdio protocol; cross-language primary path |
 | Event bus | Soft-coupled pub/sub for inter-extension communication |
