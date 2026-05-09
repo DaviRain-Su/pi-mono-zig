@@ -265,6 +265,7 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
         .signal = stream_options.signal,
         .max_retry_delay_ms = stream_options.max_retry_delay_ms,
         .metadata = stream_options.metadata,
+        .provider = stream_options.provider,
         .bedrock_region = stream_options.bedrock_region,
         .bedrock_profile = stream_options.bedrock_profile,
         .bedrock_bearer_token = stream_options.bedrock_bearer_token,
@@ -274,11 +275,18 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
         .bedrock_request_metadata = stream_options.bedrock_request_metadata,
     };
 
-    const reasoning = stream_options.bedrock_reasoning orelse return base;
+    var bedrock_opts: types.BedrockStreamOptions = .{};
+    if (stream_options.provider == .bedrock) {
+        bedrock_opts = stream_options.provider.bedrock;
+    } else {
+        bedrock_opts.reasoning = stream_options.bedrock_reasoning;
+        bedrock_opts.thinking_budgets = stream_options.bedrock_thinking_budgets;
+    }
+    const reasoning = bedrock_opts.reasoning orelse return base;
     if (isAnthropicClaudeModel(model)) {
         if (supportsAdaptiveThinking(model.id, model.name)) {
             base.bedrock_reasoning = reasoning;
-            base.bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
+            base.bedrock_thinking_budgets = bedrock_opts.thinking_budgets;
             return base;
         }
 
@@ -286,10 +294,10 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
             base.max_tokens orelse 0,
             model.max_tokens,
             reasoning,
-            stream_options.bedrock_thinking_budgets,
+            bedrock_opts.thinking_budgets,
         );
         base.max_tokens = adjusted.max_tokens;
-        var budgets = stream_options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+        var budgets = bedrock_opts.thinking_budgets orelse types.ThinkingBudgets{};
         switch (simple_options.clampReasoning(reasoning).?) {
             .minimal => budgets.minimal = adjusted.thinking_budget,
             .low => budgets.low = adjusted.thinking_budget,
@@ -302,7 +310,7 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
     }
 
     base.bedrock_reasoning = reasoning;
-    base.bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
+    base.bedrock_thinking_budgets = bedrock_opts.thinking_budgets;
     return base;
 }
 
@@ -349,7 +357,13 @@ fn buildRequestPayloadWithFixtureEnv(
     }
 
     if (options) |stream_options| {
-        if (try buildRequestMetadataValue(allocator, stream_options.bedrock_request_metadata)) |request_metadata| {
+        var bedrock_opts: types.BedrockStreamOptions = .{};
+        if (stream_options.provider == .bedrock) {
+            bedrock_opts = stream_options.provider.bedrock;
+        } else {
+            bedrock_opts.request_metadata = stream_options.bedrock_request_metadata;
+        }
+        if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |request_metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
         }
         if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options, fixture_env)) |additional_fields| {
