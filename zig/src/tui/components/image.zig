@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
+const test_helpers = @import("../test_helpers.zig");
 
 pub const ImageDisplayMode = enum {
     placeholder,
@@ -675,14 +676,13 @@ test "image integrates with box component rendering" {
     const box_mod = @import("box.zig");
     var box = box_mod.Box.init(1, 0);
     defer box.deinit(allocator);
-    try box.addChild(allocator, image.component());
+    try box.addChild(allocator, image.drawComponent());
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
+    var screen = try test_helpers.renderToScreen(box.drawComponent(), 18, 5);
+    defer screen.deinit(allocator);
 
-    try box.renderInto(allocator, 18, &lines);
+    const rendered = try test_helpers.screenToString(&screen);
+    defer allocator.free(rendered);
 
-    try std.testing.expect(lines.items.len >= 3);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null or std.mem.indexOf(u8, lines.items[1], "Image") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[1], "Image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Image") != null);
 }

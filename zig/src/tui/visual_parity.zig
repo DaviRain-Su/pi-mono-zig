@@ -43,7 +43,7 @@ test "vaxis m8 visual parity snapshots cover spacer text box select list and loa
     var box = box_mod.Box.init(1, 0);
     defer box.deinit(allocator);
     const boxed_text = text_mod.Text{ .text = "box", .padding_x = 0, .padding_y = 0 };
-    try box.addChild(allocator, boxed_text.component());
+    try box.addChild(allocator, boxed_text.drawComponent());
     try expectSnapshot(box.drawComponent(), 9, 3,
         \\┌───────┐
         \\│ box   │
