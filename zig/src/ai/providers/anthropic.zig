@@ -315,22 +315,32 @@ pub fn buildRequestPayload(
     }
 
     if (options) |stream_options| {
+        var anthropic_opts: types.AnthropicStreamOptions = .{};
+        if (stream_options.provider == .anthropic) {
+            anthropic_opts = stream_options.provider.anthropic;
+        } else {
+            anthropic_opts.thinking_enabled = stream_options.anthropic_thinking_enabled;
+            anthropic_opts.thinking_budget_tokens = stream_options.anthropic_thinking_budget_tokens;
+            anthropic_opts.thinking_display = stream_options.anthropic_thinking_display;
+            anthropic_opts.effort = stream_options.anthropic_effort;
+            anthropic_opts.tool_choice = stream_options.anthropic_tool_choice;
+        }
         if (stream_options.temperature) |temperature| {
-            if (stream_options.anthropic_thinking_enabled != true) {
+            if (anthropic_opts.thinking_enabled != true) {
                 try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
             }
         }
 
         if (model.reasoning) {
-            if (stream_options.anthropic_thinking_enabled == true) {
-                const display = anthropicThinkingDisplayString(stream_options.anthropic_thinking_display orelse .summarized);
+            if (anthropic_opts.thinking_enabled == true) {
+                const display = anthropicThinkingDisplayString(anthropic_opts.thinking_display orelse .summarized);
                 var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (supportsAdaptiveThinking(model)) {
                     try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "adaptive") });
                     try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
                     try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
 
-                    if (stream_options.anthropic_effort) |effort| {
+                    if (anthropic_opts.effort) |effort| {
                         var output_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                         try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, anthropicEffortString(effort)) });
                         try payload.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
@@ -340,12 +350,12 @@ pub fn buildRequestPayload(
                     try thinking.put(
                         allocator,
                         try allocator.dupe(u8, "budget_tokens"),
-                        .{ .integer = @intCast(stream_options.anthropic_thinking_budget_tokens orelse 1024) },
+                        .{ .integer = @intCast(anthropic_opts.thinking_budget_tokens orelse 1024) },
                     );
                     try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
                     try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
                 }
-            } else if (stream_options.anthropic_thinking_enabled == false) {
+            } else if (anthropic_opts.thinking_enabled == false) {
                 var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "disabled") });
                 try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
@@ -364,7 +374,7 @@ pub fn buildRequestPayload(
             }
         }
 
-        if (stream_options.anthropic_tool_choice) |tool_choice| {
+        if (anthropic_opts.tool_choice) |tool_choice| {
             try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try buildToolChoiceValue(allocator, tool_choice, is_oauth));
         }
     }
@@ -2889,7 +2899,13 @@ fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Cont
 fn shouldUseInterleavedThinkingBeta(model: types.Model, options: ?types.StreamOptions) bool {
     if (supportsAdaptiveThinking(model)) return false;
     if (options) |stream_options| {
-        return stream_options.anthropic_interleaved_thinking orelse true;
+        var anthropic_opts: types.AnthropicStreamOptions = .{};
+        if (stream_options.provider == .anthropic) {
+            anthropic_opts = stream_options.provider.anthropic;
+        } else {
+            anthropic_opts.interleaved_thinking = stream_options.anthropic_interleaved_thinking;
+        }
+        return anthropic_opts.interleaved_thinking orelse true;
     }
     return true;
 }
