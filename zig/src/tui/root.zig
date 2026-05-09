@@ -30,7 +30,6 @@ pub const components = struct {
     pub const table = @import("components/table.zig");
 };
 
-pub const Component = component.Component;
 pub const DrawComponent = draw.Component;
 pub const DrawContext = draw.DrawContext;
 pub const DrawSize = draw.Size;
