@@ -203,7 +203,7 @@ pub fn fauxToolCall(
     return .{ .tool_call = .{
         .id = id,
         .name = try allocator.dupe(u8, name),
-        .arguments = try cloneJsonValue(allocator, arguments),
+        .arguments = try provider_json.cloneValue(allocator, arguments),
     } };
 }
 
@@ -408,7 +408,7 @@ fn toolsToJsonArray(allocator: std.mem.Allocator, tools: []const types.Tool) !st
         var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+        try object.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
         try array.append(.{ .object = object });
     }
     return array;
@@ -467,14 +467,6 @@ fn estimatePromptUsage(
 
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
     return usage;
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
 }
 
 fn deinitContentBlocks(allocator: std.mem.Allocator, blocks: []const types.ContentBlock) void {
@@ -539,7 +531,7 @@ fn deinitToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) void 
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    deinitJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, message: *types.AssistantMessage) void {
@@ -618,7 +610,7 @@ fn buildStreamPlan(
                 const finalized_tool_call = types.ToolCall{
                     .id = try allocator.dupe(u8, tool_call.id),
                     .name = try allocator.dupe(u8, tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+                    .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
                     .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
                 };
                 var tool_call_transferred = false;
@@ -1090,7 +1082,7 @@ test "VAL-MSG-002 VAL-MSG-011 ISS-110 faux tool-call thought signature stays inl
     var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try arguments.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
     const arguments_value = std.json.Value{ .object = arguments };
-    defer deinitJsonValue(allocator, arguments_value);
+    defer provider_json.freeValue(allocator, arguments_value);
 
     const tool_call = types.ToolCall{
         .id = "tool-1",
@@ -1141,19 +1133,19 @@ test "review matrix faux streams thinking multiple tools and empty success" {
     var first_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try first_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
     const first_args_value = std.json.Value{ .object = first_args };
-    defer deinitJsonValue(allocator, first_args_value);
+    defer provider_json.freeValue(allocator, first_args_value);
 
     var second_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try second_args.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = 2 });
     const second_args_value = std.json.Value{ .object = second_args };
-    defer deinitJsonValue(allocator, second_args_value);
+    defer provider_json.freeValue(allocator, second_args_value);
 
     const first_tool = try fauxToolCall(allocator, "weather", first_args_value, .{ .id = "tool-weather" });
     defer switch (first_tool) {
         .tool_call => |value| {
             allocator.free(value.id);
             allocator.free(value.name);
-            deinitJsonValue(allocator, value.arguments);
+            provider_json.freeValue(allocator, value.arguments);
         },
         else => unreachable,
     };
@@ -1162,7 +1154,7 @@ test "review matrix faux streams thinking multiple tools and empty success" {
         .tool_call => |value| {
             allocator.free(value.id);
             allocator.free(value.name);
-            deinitJsonValue(allocator, value.arguments);
+            provider_json.freeValue(allocator, value.arguments);
         },
         else => unreachable,
     };
@@ -1466,14 +1458,14 @@ test "registerFauxProvider aborts mid-toolcall stream and stops emitting events"
     try arguments.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, "abcdefghijklmnopqrstuvwxyz") });
     try arguments.put(allocator, try allocator.dupe(u8, "count"), .{ .integer = 123456789 });
     const arguments_value = std.json.Value{ .object = arguments };
-    defer deinitJsonValue(allocator, arguments_value);
+    defer provider_json.freeValue(allocator, arguments_value);
 
     const tool_call = try fauxToolCall(allocator, "echo", arguments_value, .{ .id = "tool-1" });
     defer switch (tool_call) {
         .tool_call => |value| {
             allocator.free(value.id);
             allocator.free(value.name);
-            deinitJsonValue(allocator, value.arguments);
+            provider_json.freeValue(allocator, value.arguments);
         },
         else => unreachable,
     };

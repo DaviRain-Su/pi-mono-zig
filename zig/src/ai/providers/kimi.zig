@@ -57,7 +57,7 @@ pub const KimiProvider = struct {
         }
 
         const payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         var json_out: std.Io.Writer.Allocating = .init(allocator);
         defer json_out.deinit();
@@ -474,7 +474,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     errdefer function_object.deinit(allocator);
     try function_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
     try function_object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-    try function_object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+    try function_object.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
     try object.put(allocator, try allocator.dupe(u8, "function"), .{ .object = function_object });
     return .{ .object = object };
 }
@@ -873,7 +873,7 @@ fn finishCurrentBlock(
                     const name = try allocator.dupe(u8, std.mem.trim(u8, tool_call.name.items, " "));
                     errdefer allocator.free(name);
                     const arguments = try parseStreamingJsonToValue(allocator, std.mem.trim(u8, tool_call.partial_args.items, " "));
-                    errdefer freeJsonValue(allocator, arguments);
+                    errdefer provider_json.freeValue(allocator, arguments);
                     break :blk .{
                         .id = id,
                         .name = name,
@@ -975,15 +975,7 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
         return provider_json.emptyObjectValue(allocator);
     };
     defer parsed.deinit();
-    return try cloneJsonValue(allocator, parsed.value);
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -999,7 +991,7 @@ fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) vo
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
@@ -1031,7 +1023,7 @@ test "buildRequestPayload uses kimi-specific fields" {
     const allocator = std.testing.allocator;
 
     var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
-    defer freeJsonValue(allocator, tool_schema);
+    defer provider_json.freeValue(allocator, tool_schema);
     try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
 
     const tools = &[_]types.Tool{
@@ -1082,7 +1074,7 @@ test "buildRequestPayload uses kimi-specific fields" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, options);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("kimi-k2.6", payload.object.get("model").?.string);
     try std.testing.expect(payload.object.get("max_completion_tokens") != null);

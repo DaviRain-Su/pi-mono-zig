@@ -35,12 +35,12 @@ pub const GoogleProvider = struct {
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -349,7 +349,7 @@ fn processGoogleSseData(
                                 if (name_value == null or name_value.? != .string) continue;
 
                                 const args = if (function_call_value.object.get("args")) |args_value|
-                                    try cloneJsonValue(allocator, args_value)
+                                    try provider_json.cloneValue(allocator, args_value)
                                 else
                                     try emptyJsonObject(allocator);
 
@@ -587,7 +587,7 @@ fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std
         var declaration = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try declaration.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try declaration.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try cloneJsonValue(allocator, tool.parameters));
+        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try provider_json.cloneValue(allocator, tool.parameters));
         try function_declarations.append(.{ .object = declaration });
     }
 
@@ -644,7 +644,7 @@ fn buildAssistantMessageValue(
             .tool_call => |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -661,7 +661,7 @@ fn buildAssistantMessageValue(
             for (tool_calls) |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -951,14 +951,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 test "VAL-MSG-010 Google skips failed assistants" {
     const allocator = std.testing.allocator;
     const model = types.Model{
@@ -1003,7 +995,7 @@ test "VAL-MSG-010 Google skips failed assistants" {
         } },
         .{ .user = .{ .content = &final_user, .timestamp = 4 } },
     } }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const contents = payload.object.get("contents").?.array;
     try std.testing.expectEqual(@as(usize, 2), contents.items.len);
@@ -1018,7 +1010,7 @@ test "buildRequestPayload includes contents, tools, generation config, and think
     try tool_schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
     try tool_schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "get_weather",
@@ -1061,7 +1053,7 @@ test "buildRequestPayload includes contents, tools, generation config, and think
             .budget_tokens = 8192,
         },
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const contents = payload.object.get("contents").?;
     try std.testing.expect(contents == .array);
@@ -1117,7 +1109,7 @@ test "VAL-MSG-004 VAL-MSG-011 Google same-model request signature parity fixture
     var tool_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try tool_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
     const tool_args_value = std.json.Value{ .object = tool_args };
-    defer freeJsonValue(allocator, tool_args_value);
+    defer provider_json.freeValue(allocator, tool_args_value);
 
     const inline_content = [_]types.ContentBlock{
         .{ .text = .{ .text = "signed text", .text_signature = "ts-text-sig" } },
@@ -1175,7 +1167,7 @@ test "VAL-MSG-004 VAL-MSG-011 Google same-model request signature parity fixture
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const contents = payload.object.get("contents").?.array;
     const inline_parts = contents.items[0].object.get("parts").?.array;
@@ -1206,7 +1198,7 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
     var tool_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try tool_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
     const tool_args_value = std.json.Value{ .object = tool_args };
-    defer freeJsonValue(allocator, tool_args_value);
+    defer provider_json.freeValue(allocator, tool_args_value);
 
     const context = types.Context{
         .messages = &[_]types.Message{
@@ -1253,7 +1245,7 @@ test "buildRequestPayload converts assistant tool calls and tool results" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const contents = payload.object.get("contents").?;
     try std.testing.expect(contents == .array);
@@ -1843,7 +1835,7 @@ test "VAL-MISC-004 buildGenerationConfigValue disabled thinking emits thinkingBu
     const gen_config = try buildGenerationConfigValue(allocator, model, .{
         .google_thinking = .{ .enabled = false },
     });
-    defer freeJsonValue(allocator, gen_config);
+    defer provider_json.freeValue(allocator, gen_config);
 
     const thinking_config = gen_config.object.get("thinkingConfig");
     try std.testing.expect(thinking_config != null);
@@ -1870,7 +1862,7 @@ test "VAL-MISC-004 buildGenerationConfigValue non-reasoning model omits thinking
     const gen_config = try buildGenerationConfigValue(allocator, model, .{
         .google_thinking = .{ .enabled = false },
     });
-    defer freeJsonValue(allocator, gen_config);
+    defer provider_json.freeValue(allocator, gen_config);
 
     // Non-reasoning model must not get thinkingConfig regardless of the option
     try std.testing.expect(gen_config.object.get("thinkingConfig") == null);
@@ -1904,7 +1896,7 @@ test "VAL-MISC-005 buildToolResultMessageValue Gemini 3 nests images inside func
 
     var result = try buildToolResultMessageValue(allocator, model, &messages);
     defer result.image_turns.deinit(allocator);
-    defer freeJsonValue(allocator, result.value);
+    defer provider_json.freeValue(allocator, result.value);
 
     // No separate image turns for Gemini 3+
     try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);
@@ -1948,10 +1940,10 @@ test "VAL-MISC-005 buildToolResultMessageValue Gemini 2.x puts images in separat
 
     var result = try buildToolResultMessageValue(allocator, model, &messages);
     defer {
-        for (result.image_turns.items) |*turn| freeJsonValue(allocator, turn.*);
+        for (result.image_turns.items) |*turn| provider_json.freeValue(allocator, turn.*);
         result.image_turns.deinit(allocator);
     }
-    defer freeJsonValue(allocator, result.value);
+    defer provider_json.freeValue(allocator, result.value);
 
     // One separate image turn for Gemini 2.x
     try std.testing.expectEqual(@as(usize, 1), result.image_turns.items.len);
@@ -1993,7 +1985,7 @@ test "VAL-MISC-005 non-Gemini model nests images inside functionResponse.parts" 
 
     var result = try buildToolResultMessageValue(allocator, model, &messages);
     defer result.image_turns.deinit(allocator);
-    defer freeJsonValue(allocator, result.value);
+    defer provider_json.freeValue(allocator, result.value);
 
     // Non-Gemini model: no separate image turns
     try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);
@@ -2028,7 +2020,7 @@ test "VAL-MISC-005 model without image input_types omits images entirely" {
 
     var result = try buildToolResultMessageValue(allocator, model, &messages);
     defer result.image_turns.deinit(allocator);
-    defer freeJsonValue(allocator, result.value);
+    defer provider_json.freeValue(allocator, result.value);
 
     // No image turns and no parts in functionResponse
     try std.testing.expectEqual(@as(usize, 0), result.image_turns.items.len);

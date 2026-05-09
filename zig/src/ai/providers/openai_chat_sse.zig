@@ -123,7 +123,7 @@ fn deinitSseParseState(state: *SseParseState) void {
         for (state.tool_calls.items) |tool_call| {
             allocator.free(tool_call.id);
             allocator.free(tool_call.name);
-            freeJsonValue(allocator, tool_call.arguments);
+            provider_json.freeValue(allocator, tool_call.arguments);
             if (tool_call.thought_signature) |sig| allocator.free(sig);
         }
         state.tool_calls.deinit(allocator);
@@ -693,7 +693,7 @@ fn finishStreamingBlocks(
                 errdefer allocator.free(name);
                 const args_str = std.mem.trim(u8, tool_call.partial_args.items, " ");
                 const args = try parseStreamingJsonToValue(allocator, args_str);
-                errdefer freeJsonValue(allocator, args);
+                errdefer provider_json.freeValue(allocator, args);
                 // Transfer thought_signature ownership from the active block to
                 // the final tool call; null out the active block field so
                 // deinitActiveToolCallBlock does not double-free.
@@ -709,7 +709,7 @@ fn finishStreamingBlocks(
                 try content_blocks.append(allocator, types.ContentBlock{ .tool_call = .{
                     .id = try allocator.dupe(u8, final_tool_call.id),
                     .name = try allocator.dupe(u8, final_tool_call.name),
-                    .arguments = try cloneJsonValue(allocator, final_tool_call.arguments),
+                    .arguments = try provider_json.cloneValue(allocator, final_tool_call.arguments),
                     .thought_signature = if (thought_sig) |sig| try allocator.dupe(u8, sig) else null,
                 } });
                 stream_ptr.push(.{
@@ -743,15 +743,7 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
     };
     defer parsed.deinit();
     // Need to clone the value since parsed will be deinit'd
-    return cloneJsonValue(allocator, parsed.value);
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
+    return provider_json.cloneValue(allocator, parsed.value);
 }
 
 pub fn parseChunkUsage(

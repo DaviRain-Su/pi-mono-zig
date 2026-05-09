@@ -56,12 +56,12 @@ pub const GoogleGeminiCliProvider = struct {
         project_id: []const u8,
     ) !void {
         var payload = try buildRequestPayload(allocator, model, context, project_id, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -190,11 +190,11 @@ fn buildInnerRequestValue(
     }
 
     const generation_config = try buildGenerationConfigValue(allocator, model, options);
-    errdefer freeJsonValue(allocator, generation_config);
+    errdefer provider_json.freeValue(allocator, generation_config);
     if (generation_config == .object and generation_config.object.count() > 0) {
         try request.put(allocator, try allocator.dupe(u8, "generationConfig"), generation_config);
     } else {
-        freeJsonValue(allocator, generation_config);
+        provider_json.freeValue(allocator, generation_config);
     }
 
     if (context.tools) |tools| {
@@ -511,7 +511,7 @@ fn processGeminiCliCandidateContent(
                 if (name_value == null or name_value.? != .string) continue;
 
                 const args = if (function_call_value.object.get("args")) |args_value|
-                    try cloneJsonValue(allocator, args_value)
+                    try provider_json.cloneValue(allocator, args_value)
                 else
                     try emptyJsonObject(allocator);
 
@@ -733,7 +733,7 @@ fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std
         var declaration = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try declaration.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try declaration.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try cloneJsonValue(allocator, tool.parameters));
+        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try provider_json.cloneValue(allocator, tool.parameters));
         try function_declarations.append(.{ .object = declaration });
     }
 
@@ -790,7 +790,7 @@ fn buildAssistantMessageValue(
             .tool_call => |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -807,7 +807,7 @@ fn buildAssistantMessageValue(
             for (tool_calls) |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -1043,14 +1043,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 fn extractErrorMessage(body: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     return if (trimmed.len == 0) body else trimmed;
@@ -1098,7 +1090,7 @@ test "buildRequestPayload wraps Gemini CLI request envelope and session auth fie
             .budget_tokens = 512,
         },
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("project-123", payload.object.get("project").?.string);
     try std.testing.expectEqualStrings("gemini-2.5-flash", payload.object.get("model").?.string);

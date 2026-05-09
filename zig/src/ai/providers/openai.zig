@@ -49,7 +49,7 @@ pub const OpenAIProvider = struct {
     ) !void {
         // Build request payload
         const payload = try buildFinalRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         // Serialize payload to JSON
         var json_out: std.Io.Writer.Allocating = .init(allocator);
@@ -199,12 +199,8 @@ pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]con
 
 /// Recursively free a JSON value and all its children, including ObjectMap keys.
 /// Use this only for values where ALL keys and strings were allocated by the same allocator.
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    freeJsonValue(allocator, value);
+    provider_json.freeValue(allocator, value);
 }
 
 fn processCacheRetentionEnv() ?[]const u8 {
@@ -353,7 +349,7 @@ pub fn buildRequestSnapshotValueWithCacheRetentionEnv(
     pi_cache_retention_env: ?[]const u8,
 ) !std.json.Value {
     var payload = try buildFinalRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, pi_cache_retention_env);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     var headers = try buildRequestHeadersWithCacheRetentionEnv(allocator, model, options, pi_cache_retention_env);
     defer provider_stream.deinitOwnedHeaders(allocator, &headers);
@@ -437,7 +433,7 @@ fn normalizeSemanticHeaders(
 
         const next_value = std.json.Value{ .string = try allocator.dupe(u8, value) };
         if (semantic.getPtr(lower)) |existing| {
-            freeJsonValue(allocator, existing.*);
+            provider_json.freeValue(allocator, existing.*);
             existing.* = next_value;
         } else {
             try semantic.put(allocator, try allocator.dupe(u8, lower), next_value);
@@ -489,7 +485,7 @@ test "buildRequestPayload basic" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload == .object);
     const model_val = payload.object.get("model").?;
@@ -527,7 +523,7 @@ test "buildRequestPayload with developer role for reasoning model" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?;
     try std.testing.expectEqual(@as(usize, 1), messages.array.items.len);
@@ -552,7 +548,7 @@ test "buildRequestPayload with tools" {
     };
 
     var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
-    defer freeJsonValue(allocator, tool_schema);
+    defer provider_json.freeValue(allocator, tool_schema);
     try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
 
     const tools = &[_]types.Tool{
@@ -571,7 +567,7 @@ test "buildRequestPayload with tools" {
 
     {
         const payload = try buildRequestPayload(allocator, model, context, null);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         const tools_val = payload.object.get("tools").?;
         try std.testing.expect(tools_val == .array);
@@ -615,7 +611,7 @@ test "buildRequestPayload with image content" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?;
     const user_msg = messages.array.items[0];
@@ -837,7 +833,7 @@ test "buildRequestPayload uses production cache retention resolver for prompt ca
         .session_id = "session-env-long",
         .cache_retention = .unset,
     }, "long");
-    defer freeJsonValue(allocator, env_long_payload);
+    defer provider_json.freeValue(allocator, env_long_payload);
     try std.testing.expectEqualStrings("session-env-long", env_long_payload.object.get("prompt_cache_key").?.string);
     try std.testing.expectEqualStrings("24h", env_long_payload.object.get("prompt_cache_retention").?.string);
 
@@ -845,7 +841,7 @@ test "buildRequestPayload uses production cache retention resolver for prompt ca
         .session_id = "session-short",
         .cache_retention = .short,
     }, "long");
-    defer freeJsonValue(allocator, explicit_short_payload);
+    defer provider_json.freeValue(allocator, explicit_short_payload);
     try std.testing.expectEqualStrings("session-short", explicit_short_payload.object.get("prompt_cache_key").?.string);
     try std.testing.expect(explicit_short_payload.object.get("prompt_cache_retention") == null);
 
@@ -853,7 +849,7 @@ test "buildRequestPayload uses production cache retention resolver for prompt ca
         .session_id = "session-none",
         .cache_retention = .none,
     }, "long");
-    defer freeJsonValue(allocator, explicit_none_payload);
+    defer provider_json.freeValue(allocator, explicit_none_payload);
     try std.testing.expect(explicit_none_payload.object.get("prompt_cache_key") == null);
     try std.testing.expect(explicit_none_payload.object.get("prompt_cache_retention") == null);
 
@@ -861,7 +857,7 @@ test "buildRequestPayload uses production cache retention resolver for prompt ca
         .session_id = "session-default-short",
         .cache_retention = .unset,
     }, null);
-    defer freeJsonValue(allocator, omitted_without_env_payload);
+    defer provider_json.freeValue(allocator, omitted_without_env_payload);
     try std.testing.expectEqualStrings("session-default-short", omitted_without_env_payload.object.get("prompt_cache_key").?.string);
     try std.testing.expect(omitted_without_env_payload.object.get("prompt_cache_retention") == null);
 }
@@ -872,7 +868,7 @@ test "buildRequestHeaders uses production cache retention resolver for session a
     var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try compat.put(allocator, try allocator.dupe(u8, "sendSessionAffinityHeaders"), .{ .bool = true });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "openrouter-session-affinity",
@@ -911,7 +907,7 @@ test "buildRequestPayload uses production cache retention resolver for Anthropic
     var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try compat.put(allocator, try allocator.dupe(u8, "cacheControlFormat"), .{ .string = try allocator.dupe(u8, "anthropic") });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "anthropic-cache-control",
@@ -937,7 +933,7 @@ test "buildRequestPayload uses production cache retention resolver for Anthropic
     const env_long_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
         .cache_retention = .unset,
     }, "long");
-    defer freeJsonValue(allocator, env_long_payload);
+    defer provider_json.freeValue(allocator, env_long_payload);
     const env_long_messages = env_long_payload.object.get("messages").?.array.items;
     const env_long_instruction_content = env_long_messages[0].object.get("content").?.array.items;
     const env_long_cache_control = env_long_instruction_content[0].object.get("cache_control").?.object;
@@ -947,7 +943,7 @@ test "buildRequestPayload uses production cache retention resolver for Anthropic
     const explicit_short_payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
         .cache_retention = .short,
     }, "long");
-    defer freeJsonValue(allocator, explicit_short_payload);
+    defer provider_json.freeValue(allocator, explicit_short_payload);
     const explicit_short_messages = explicit_short_payload.object.get("messages").?.array.items;
     const explicit_short_instruction_content = explicit_short_messages[0].object.get("content").?.array.items;
     const explicit_short_cache_control = explicit_short_instruction_content[0].object.get("cache_control").?.object;
@@ -972,7 +968,7 @@ test "buildRequestPayload transforms orphaned tool calls and normalizes ids" {
     const assistant_arguments = std.json.Value{
         .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}),
     };
-    defer freeJsonValue(allocator, assistant_arguments);
+    defer provider_json.freeValue(allocator, assistant_arguments);
 
     const assistant = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
@@ -1000,7 +996,7 @@ test "buildRequestPayload transforms orphaned tool calls and normalizes ids" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), messages.len);
@@ -1038,7 +1034,7 @@ test "buildRequestPayload omits empty tools array" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("tools") == null);
 }
@@ -1050,7 +1046,7 @@ test "buildAssistantMessage separates thinking from text" {
     try compat.put(allocator, try allocator.dupe(u8, "requiresThinkingAsText"), .{ .bool = false });
     try compat.put(allocator, try allocator.dupe(u8, "requiresReasoningContentOnAssistantMessages"), .{ .bool = true });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "deepseek-reasoner",
@@ -1079,7 +1075,7 @@ test "buildAssistantMessage separates thinking from text" {
     };
 
     const message = (try buildAssistantMessage(allocator, model, assistant)).?;
-    defer freeJsonValue(allocator, message);
+    defer provider_json.freeValue(allocator, message);
 
     try std.testing.expectEqualStrings("final answer", message.object.get("content").?.string);
     try std.testing.expectEqualStrings("internal reasoning", message.object.get("reasoning_content").?.string);

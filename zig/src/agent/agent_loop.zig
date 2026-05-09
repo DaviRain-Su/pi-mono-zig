@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const provider_json = ai.provider_json;
 const types = @import("types.zig");
 
 pub const AgentLoopError = error{
@@ -16,7 +17,7 @@ const PreparedToolCall = struct {
     finalized: bool = false,
 
     fn deinit(self: *PreparedToolCall, allocator: std.mem.Allocator) void {
-        deinitJsonValue(allocator, self.args);
+        provider_json.freeValue(allocator, self.args);
     }
 };
 
@@ -1037,7 +1038,7 @@ fn prepareToolCall(
             )
         else
             try createErrorToolResult(allocator, "InvalidToolArguments");
-        deinitJsonValue(allocator, args);
+        provider_json.freeValue(allocator, args);
         return .{ .immediate = .{
             .result = result,
             .is_error = true,
@@ -1051,7 +1052,7 @@ fn prepareToolCall(
             .args = &args,
             .context = current_context,
         }, signal) catch |err| {
-            deinitJsonValue(allocator, args);
+            provider_json.freeValue(allocator, args);
             return .{ .immediate = .{
                 .result = try createErrorToolResult(allocator, @errorName(err)),
                 .is_error = true,
@@ -1060,7 +1061,7 @@ fn prepareToolCall(
 
         if (before_result) |result| {
             if (result.block) {
-                deinitJsonValue(allocator, args);
+                provider_json.freeValue(allocator, args);
                 return .{ .immediate = .{
                     .result = try createErrorToolResult(
                         allocator,
@@ -1087,7 +1088,7 @@ fn prepareToolCallArguments(
     if (tool.prepare_arguments) |prepare_arguments| {
         return try prepare_arguments(allocator, args);
     }
-    return try cloneJsonValue(allocator, args);
+    return try provider_json.cloneValue(allocator, args);
 }
 
 const SchemaValidationIssue = struct {
@@ -1646,7 +1647,7 @@ fn cloneToolResult(
 ) !types.AgentToolResult {
     return .{
         .content = try cloneContentBlocks(allocator, result.content),
-        .details = if (result.details) |details| try cloneJsonValue(allocator, details) else null,
+        .details = if (result.details) |details| try provider_json.cloneValue(allocator, details) else null,
         .is_error = result.is_error,
     };
 }
@@ -1765,8 +1766,8 @@ fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolC
     const name = try allocator.dupe(u8, tool_call.name);
     errdefer allocator.free(name);
 
-    const arguments = try cloneJsonValue(allocator, tool_call.arguments);
-    errdefer deinitJsonValue(allocator, arguments);
+    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
+    errdefer provider_json.freeValue(allocator, arguments);
 
     const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
     errdefer if (thought_signature) |signature| allocator.free(signature);
@@ -1783,7 +1784,7 @@ fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    deinitJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn sameContentBlocks(
@@ -1859,81 +1860,6 @@ fn expectUserText(message: types.AgentMessage, expected: []const u8) !void {
             try std.testing.expectEqualStrings(expected, user.content[0].text.text);
         },
         else => return error.UnexpectedMessageRole,
-    }
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |v| .{ .bool = v },
-        .integer => |v| .{ .integer = v },
-        .float => |v| .{ .float = v },
-        .number_string => |v| .{ .number_string = try allocator.dupe(u8, v) },
-        .string => |v| .{ .string = try allocator.dupe(u8, v) },
-        .array => |arr| blk: {
-            var clone = std.json.Array.init(allocator);
-            errdefer {
-                for (clone.items) |item| deinitJsonValue(allocator, item);
-                clone.deinit();
-            }
-            for (arr.items) |item| {
-                const cloned_item = try cloneJsonValue(allocator, item);
-                var item_transferred = false;
-                errdefer if (!item_transferred) deinitJsonValue(allocator, cloned_item);
-
-                try clone.append(cloned_item);
-                item_transferred = true;
-            }
-            break :blk .{ .array = clone };
-        },
-        .object => |obj| blk: {
-            var clone = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            errdefer {
-                var iter = clone.iterator();
-                while (iter.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    deinitJsonValue(allocator, entry.value_ptr.*);
-                }
-                clone.deinit(allocator);
-            }
-            var iterator = obj.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                var key_transferred = false;
-                errdefer if (!key_transferred) allocator.free(key);
-
-                const cloned_value = try cloneJsonValue(allocator, entry.value_ptr.*);
-                var value_transferred = false;
-                errdefer if (!value_transferred) deinitJsonValue(allocator, cloned_value);
-
-                try clone.put(allocator, key, cloned_value);
-                key_transferred = true;
-                value_transferred = true;
-            }
-            break :blk .{ .object = clone };
-        },
-    };
-}
-
-fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string => |v| allocator.free(v),
-        .string => |v| allocator.free(v),
-        .array => |array| {
-            for (array.items) |item| deinitJsonValue(allocator, item);
-            var array_mut = array;
-            array_mut.deinit();
-        },
-        .object => |object| {
-            var object_mut = object;
-            var iterator = object_mut.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                deinitJsonValue(allocator, entry.value_ptr.*);
-            }
-            object_mut.deinit(allocator);
-        },
     }
 }
 
@@ -2708,7 +2634,7 @@ fn requireValuePrepareArguments(
     args: std.json.Value,
 ) !std.json.Value {
     _ = try getStringArg(args, "value");
-    return try cloneJsonValue(allocator, args);
+    return try provider_json.cloneValue(allocator, args);
 }
 
 fn failingToolExecute(
@@ -3889,7 +3815,7 @@ test "ISS-403 cloneToolCall allocation failures clean partial clones" {
     const allocator = std.testing.allocator;
 
     const source_args = try jsonStringObject(allocator, "query", "owned source");
-    defer deinitJsonValue(allocator, source_args);
+    defer provider_json.freeValue(allocator, source_args);
 
     const source = ai.ToolCall{
         .id = "tool-with-owned-args",
@@ -3917,7 +3843,7 @@ test "ISS-403 cloneContentBlocks allocation failures unwind owned blocks once" {
     const allocator = std.testing.allocator;
 
     const tool_args = try jsonStringObject(allocator, "query", "content tool args");
-    defer deinitJsonValue(allocator, tool_args);
+    defer provider_json.freeValue(allocator, tool_args);
 
     const source = [_]ai.ContentBlock{
         .{ .text = .{

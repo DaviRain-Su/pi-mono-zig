@@ -104,12 +104,12 @@ pub const AnthropicProvider = struct {
         }
 
         var payload = try buildRequestPayload(allocator, model, context, resolved_options.options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (resolved_options.options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -298,7 +298,7 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
 
     const cache_control = try buildCacheControl(allocator, compat, if (options) |stream_options| stream_options.cache_retention else .short);
-    defer if (cache_control) |value| freeJsonValue(allocator, value);
+    defer if (cache_control) |value| provider_json.freeValue(allocator, value);
 
     const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
     const system_value = try buildSystemPromptValue(allocator, context.system_prompt, is_oauth, cache_control);
@@ -473,7 +473,7 @@ test "VAL-MSG-010 Anthropic skips failed assistants" {
         } },
         .{ .user = .{ .content = &final_user, .timestamp = 4 } },
     } }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
@@ -487,7 +487,7 @@ test "buildRequestPayload includes system tools and cache control without defaul
     var tool_params = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try tool_params.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "string") });
     const tool_params_value = std.json.Value{ .object = tool_params };
-    defer freeJsonValue(allocator, tool_params_value);
+    defer provider_json.freeValue(allocator, tool_params_value);
 
     const tools = &[_]types.Tool{.{
         .name = "read",
@@ -522,7 +522,7 @@ test "buildRequestPayload includes system tools and cache control without defaul
         .max_tokens = 4096,
         .cache_retention = .long,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const object = payload.object;
     try std.testing.expectEqualStrings("claude-3-7-sonnet-latest", object.get("model").?.string);
@@ -538,7 +538,7 @@ test "buildRequestPayload applies Claude Code stealth mode for oauth" {
 
     const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "todoWrite",
@@ -566,7 +566,7 @@ test "buildRequestPayload applies Claude Code stealth mode for oauth" {
     const payload = try buildRequestPayload(allocator, model, context, .{
         .api_key = oauth_token_placeholder,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const system_val = payload.object.get("system").?;
     try std.testing.expect(system_val == .array);
@@ -1529,7 +1529,7 @@ test "buildRequestPayload adds eager_input_streaming by default" {
 
     const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "todoWrite",
@@ -1553,7 +1553,7 @@ test "buildRequestPayload adds eager_input_streaming by default" {
         .messages = &[_]types.Message{},
         .tools = tools,
     }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const first_tool = payload.object.get("tools").?.array.items[0];
     try std.testing.expect(first_tool == .object);
@@ -1565,7 +1565,7 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
 
     const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "todoWrite",
@@ -1576,7 +1576,7 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try compat.put(allocator, try allocator.dupe(u8, "supportsEagerToolInputStreaming"), .{ .bool = false });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "claude-sonnet-4-5",
@@ -1597,7 +1597,7 @@ test "github-copilot compat disables eager_input_streaming and enables legacy be
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const first_tool = payload.object.get("tools").?.array.items[0];
     try std.testing.expect(first_tool == .object);
@@ -1649,7 +1649,7 @@ test "kimi-coding api-key payload does not inject Claude Code identity" {
 
     const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "todoWrite",
@@ -1676,7 +1676,7 @@ test "kimi-coding api-key payload does not inject Claude Code identity" {
     }, .{
         .api_key = "placeholder-auth-value",
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("kimi-for-coding", payload.object.get("model").?.string);
     const system = payload.object.get("system").?;
@@ -1696,7 +1696,7 @@ test "buildRequestPayload omits anthropic long cache ttl when compat disables it
     var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try compat.put(allocator, try allocator.dupe(u8, "supportsLongCacheRetention"), .{ .bool = false });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "claude-sonnet-4-5",
@@ -1717,7 +1717,7 @@ test "buildRequestPayload omits anthropic long cache ttl when compat disables it
     }, .{
         .cache_retention = .long,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const system = payload.object.get("system").?.array.items[0];
     try std.testing.expect(system == .object);
@@ -1747,7 +1747,7 @@ test "buildRequestPayload supports disabled thinking and temperature" {
         .temperature = 0.25,
         .anthropic_thinking_enabled = false,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const thinking = payload.object.get("thinking").?.object;
     try std.testing.expectEqualStrings("disabled", thinking.get("type").?.string);
@@ -1775,7 +1775,7 @@ test "buildRequestPayload supports adaptive thinking effort" {
         .anthropic_thinking_enabled = true,
         .anthropic_effort = .max,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const thinking = payload.object.get("thinking").?.object;
     try std.testing.expectEqualStrings("adaptive", thinking.get("type").?.string);
@@ -1808,7 +1808,7 @@ test "buildRequestPayload supports budget thinking display and tool choice" {
         .anthropic_thinking_display = .omitted,
         .anthropic_tool_choice = .{ .tool = "todoWrite" },
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const thinking = payload.object.get("thinking").?.object;
     try std.testing.expectEqualStrings("enabled", thinking.get("type").?.string);
@@ -1874,7 +1874,7 @@ test "resolveStreamOptions falls back to env api key before building payload" {
     const payload = try buildRequestPayload(allocator, model, .{
         .messages = &[_]types.Message{},
     }, resolved.options);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("system").? == .array);
 }
@@ -2173,9 +2173,9 @@ fn finalizeOutputFromPartials(
             .tool_call => |tool| {
                 var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
                 defer parsed_arguments.deinit();
-                const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+                const arguments = try provider_json.cloneValue(allocator, parsed_arguments.value);
                 const final_tool_call = blk: {
-                    errdefer freeJsonValue(allocator, arguments);
+                    errdefer provider_json.freeValue(allocator, arguments);
                     const id = try allocator.dupe(u8, tool.id);
                     errdefer allocator.free(id);
                     const name = try allocator.dupe(u8, tool.name);
@@ -2749,9 +2749,9 @@ fn handleContentBlockStop(
         .tool_call => |tool| {
             var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
             defer parsed_arguments.deinit();
-            const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+            const arguments = try provider_json.cloneValue(allocator, parsed_arguments.value);
             const final_tool_call = blk: {
-                errdefer freeJsonValue(allocator, arguments);
+                errdefer provider_json.freeValue(allocator, arguments);
                 const id = try allocator.dupe(u8, tool.id);
                 errdefer allocator.free(id);
                 const name = try allocator.dupe(u8, tool.name);
@@ -2849,8 +2849,6 @@ fn buildToolsValue(
 ) !std.json.Value {
     return anthropic_json.buildToolsValue(allocator, tools, is_oauth, supports_eager_tool_input_streaming, cache_control);
 }
-
-
 
 fn applyAuthHeaders(
     allocator: std.mem.Allocator,
@@ -3229,7 +3227,7 @@ fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) vo
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
@@ -3257,14 +3255,6 @@ fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.Assist
         allocator.free(tool_calls);
     }
     if (message.response_id) |response_id| allocator.free(response_id);
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return anthropic_json.cloneJsonValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    anthropic_json.freeJsonValue(allocator, value);
 }
 
 fn deinitJsonArrayItems(allocator: std.mem.Allocator, array: *std.json.Array) void {

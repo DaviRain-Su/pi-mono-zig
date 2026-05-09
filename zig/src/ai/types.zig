@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const provider_json = @import("shared/provider_json.zig");
 
 /// Canonical ordering for caller abort-signal classification across AI
 /// stream entry points, provider setup paths, and HTTP streaming setup.
@@ -398,29 +399,7 @@ fn freeToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |string| allocator.free(string),
-        .number_string => |number_string| allocator.free(number_string),
-        .array => |array| {
-            for (array.items) |item| freeJsonValue(allocator, item);
-            var mutable = array;
-            mutable.deinit();
-        },
-        .object => |object| {
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var mutable = object;
-            mutable.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 pub const ToolResultMessage = struct {
@@ -844,7 +823,7 @@ fn makeOwnedToolCallForTest(
     errdefer allocator.free(name);
 
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer freeJsonValue(allocator, .{ .object = object });
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
     const key = try allocator.dupe(u8, "city");
     errdefer allocator.free(key);
     const city = try allocator.dupe(u8, city_value);

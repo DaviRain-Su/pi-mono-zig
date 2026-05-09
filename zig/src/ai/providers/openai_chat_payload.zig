@@ -3,16 +3,8 @@ const types = @import("../types.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) anyerror!std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    freeJsonValue(allocator, value);
+    provider_json.freeValue(allocator, value);
 }
 
 /// Mirror TypeScript Array.prototype.filter(Boolean) semantics for parsed
@@ -115,12 +107,12 @@ pub fn buildFinalRequestPayloadWithCacheRetentionEnv(
     pi_cache_retention_env: ?[]const u8,
 ) !std.json.Value {
     var payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, pi_cache_retention_env);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     if (options) |opts| {
         if (opts.on_payload) |on_payload| {
             if (try on_payload(allocator, payload, model)) |replacement| {
-                freeJsonValue(allocator, payload);
+                provider_json.freeValue(allocator, payload);
                 payload = replacement;
             }
         }
@@ -165,7 +157,7 @@ pub fn buildRequestPayloadWithCacheRetentionEnv(
     try appendToolPayloadFields(allocator, &payload, context, compat, has_tool_history);
 
     if (try buildCompatCacheControl(allocator, compat, cache_retention)) |cache_control| {
-        defer freeJsonValue(allocator, cache_control);
+        defer provider_json.freeValue(allocator, cache_control);
         try applyAnthropicCacheControl(allocator, &payload, cache_control);
     }
 
@@ -275,7 +267,7 @@ fn appendOptionPayloadFields(
             try payload.put(allocator, try allocator.dupe(u8, field), std.json.Value{ .integer = @intCast(max) });
         }
         if (opts.openai_tool_choice) |tool_choice| {
-            try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try cloneJsonValue(allocator, tool_choice));
+            try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try provider_json.cloneValue(allocator, tool_choice));
         }
     }
 
@@ -387,7 +379,7 @@ fn appendRoutingPayloadFields(
 ) !void {
     if (std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null) {
         if (compat.open_router_routing) |routing| {
-            try payload.put(allocator, try allocator.dupe(u8, "provider"), try cloneJsonValue(allocator, routing));
+            try payload.put(allocator, try allocator.dupe(u8, "provider"), try provider_json.cloneValue(allocator, routing));
         }
     }
 
@@ -397,10 +389,10 @@ fn appendRoutingPayloadFields(
                 var gateway = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 errdefer gateway.deinit(allocator);
                 if (routing.object.get("only")) |only| {
-                    try gateway.put(allocator, try allocator.dupe(u8, "only"), try cloneJsonValue(allocator, only));
+                    try gateway.put(allocator, try allocator.dupe(u8, "only"), try provider_json.cloneValue(allocator, only));
                 }
                 if (routing.object.get("order")) |order| {
-                    try gateway.put(allocator, try allocator.dupe(u8, "order"), try cloneJsonValue(allocator, order));
+                    try gateway.put(allocator, try allocator.dupe(u8, "order"), try provider_json.cloneValue(allocator, order));
                 }
                 var provider_options = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 errdefer provider_options.deinit(allocator);
@@ -444,7 +436,7 @@ fn applyAnthropicCacheControl(
         if (tools_value.* == .array and tools_value.array.items.len > 0) {
             const last_tool = &tools_value.array.items[tools_value.array.items.len - 1];
             if (last_tool.* == .object) {
-                try putJsonObjectFieldReplacing(allocator, &last_tool.object, "cache_control", try cloneJsonValue(allocator, cache_control));
+                try putJsonObjectFieldReplacing(allocator, &last_tool.object, "cache_control", try provider_json.cloneValue(allocator, cache_control));
             }
         }
     }
@@ -498,10 +490,10 @@ fn addCacheControlToTextContent(
             errdefer part.deinit(allocator);
             try part.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
             try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
-            try part.put(allocator, try allocator.dupe(u8, "cache_control"), try cloneJsonValue(allocator, cache_control));
+            try part.put(allocator, try allocator.dupe(u8, "cache_control"), try provider_json.cloneValue(allocator, cache_control));
             try parts.append(.{ .object = part });
 
-            freeJsonValue(allocator, content.*);
+            provider_json.freeValue(allocator, content.*);
             content.* = .{ .array = parts };
             return true;
         },
@@ -513,7 +505,7 @@ fn addCacheControlToTextContent(
                 if (part.* != .object) continue;
                 const part_type = objectStringField(part.object, "type") orelse continue;
                 if (std.mem.eql(u8, part_type, "text")) {
-                    try putJsonObjectFieldReplacing(allocator, &part.object, "cache_control", try cloneJsonValue(allocator, cache_control));
+                    try putJsonObjectFieldReplacing(allocator, &part.object, "cache_control", try provider_json.cloneValue(allocator, cache_control));
                     return true;
                 }
             }
@@ -536,7 +528,7 @@ fn putJsonObjectFieldReplacing(
     value: std.json.Value,
 ) !void {
     if (object.getPtr(key)) |existing| {
-        freeJsonValue(allocator, existing.*);
+        provider_json.freeValue(allocator, existing.*);
         existing.* = value;
     } else {
         try object.put(allocator, try allocator.dupe(u8, key), value);
@@ -692,7 +684,7 @@ pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: typ
     try putBoolValue(allocator, &object, "requiresReasoningContentOnAssistantMessages", compat.requires_reasoning_content_on_assistant_messages);
     try putBoolValue(allocator, &object, "requiresThinkingAsText", compat.requires_thinking_as_text);
     try putBoolValue(allocator, &object, "requiresToolResultName", compat.requires_tool_result_name);
-    try putObjectValue(allocator, &object, "openRouterRouting", if (compat.open_router_routing) |routing| try cloneJsonValue(allocator, routing) else try emptyObjectValue(allocator));
+    try putObjectValue(allocator, &object, "openRouterRouting", if (compat.open_router_routing) |routing| try provider_json.cloneValue(allocator, routing) else try emptyObjectValue(allocator));
     try putBoolValue(allocator, &object, "sendSessionAffinityHeaders", compat.send_session_affinity_headers);
     try putBoolValue(allocator, &object, "supportsDeveloperRole", compat.supports_developer_role);
     try putBoolValue(allocator, &object, "supportsLongCacheRetention", compat.supports_long_cache_retention);
@@ -702,7 +694,7 @@ pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: typ
     try putBoolValue(allocator, &object, "supportsUsageInStreaming", compat.supports_usage_in_streaming);
     try putStringValue(allocator, &object, "maxTokensField", compat.max_tokens_field);
     try putStringValue(allocator, &object, "thinkingFormat", compat.thinking_format);
-    try putObjectValue(allocator, &object, "vercelGatewayRouting", if (compat.vercel_gateway_routing) |routing| try cloneJsonValue(allocator, routing) else try emptyObjectValue(allocator));
+    try putObjectValue(allocator, &object, "vercelGatewayRouting", if (compat.vercel_gateway_routing) |routing| try provider_json.cloneValue(allocator, routing) else try emptyObjectValue(allocator));
     try putBoolValue(allocator, &object, "zaiToolStream", compat.zai_tool_stream);
     if (compat.cache_control_format) |format| {
         try putStringValue(allocator, &object, "cacheControlFormat", format);
@@ -968,7 +960,7 @@ pub fn buildAssistantMessage(allocator: std.mem.Allocator, model: types.Model, a
         else => false,
     };
     if (!has_content and !has_tool_calls) {
-        freeJsonValue(allocator, .{ .object = obj });
+        provider_json.freeValue(allocator, .{ .object = obj });
         return null;
     }
 
@@ -1014,7 +1006,7 @@ fn appendAssistantReasoningDetails(
             const parsed = std.json.parseFromSlice(std.json.Value, allocator, sig, .{}) catch continue;
             defer parsed.deinit();
             if (isFalseyJsonValue(parsed.value)) continue;
-            reasoning_details.append(try cloneJsonValue(allocator, parsed.value)) catch continue;
+            reasoning_details.append(try provider_json.cloneValue(allocator, parsed.value)) catch continue;
         }
     }
     if (reasoning_details.items.len > 0) {
@@ -1160,7 +1152,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool, compat: OpenA
     errdefer func_obj.deinit(allocator);
     try func_obj.put(allocator, try allocator.dupe(u8, "name"), std.json.Value{ .string = try allocator.dupe(u8, tool.name) });
     try func_obj.put(allocator, try allocator.dupe(u8, "description"), std.json.Value{ .string = try allocator.dupe(u8, tool.description) });
-    try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+    try func_obj.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
     if (compat.supports_strict_mode) {
         try func_obj.put(allocator, try allocator.dupe(u8, "strict"), std.json.Value{ .bool = false });
     }
@@ -1181,7 +1173,7 @@ test "Together compat uses non-standard chat payload fields" {
     const allocator = std.testing.allocator;
 
     var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
-    defer freeJsonValue(allocator, tool_schema);
+    defer provider_json.freeValue(allocator, tool_schema);
     try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
 
     const model = types.Model{
@@ -1211,7 +1203,7 @@ test "Together compat uses non-standard chat payload fields" {
         .session_id = "together-session",
         .cache_retention = .long,
     }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("store") == null);
     try std.testing.expect(payload.object.get("prompt_cache_key") == null);
@@ -1236,7 +1228,7 @@ test "Together reasoning payload preserves supported mapped effort" {
     try compat.put(allocator, try allocator.dupe(u8, "thinkingFormat"), .{ .string = try allocator.dupe(u8, "together") });
     try compat.put(allocator, try allocator.dupe(u8, "supportsReasoningEffort"), .{ .bool = true });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "deepseek-ai/DeepSeek-V4-Pro",
@@ -1256,12 +1248,12 @@ test "Together reasoning payload preserves supported mapped effort" {
     const enabled_payload = try buildRequestPayload(allocator, model, context, .{
         .openai_reasoning_effort = "high",
     });
-    defer freeJsonValue(allocator, enabled_payload);
+    defer provider_json.freeValue(allocator, enabled_payload);
     try std.testing.expectEqual(true, enabled_payload.object.get("reasoning").?.object.get("enabled").?.bool);
     try std.testing.expectEqualStrings("max", enabled_payload.object.get("reasoning_effort").?.string);
 
     const disabled_payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, disabled_payload);
+    defer provider_json.freeValue(allocator, disabled_payload);
     try std.testing.expectEqual(false, disabled_payload.object.get("reasoning").?.object.get("enabled").?.bool);
     try std.testing.expect(disabled_payload.object.get("reasoning_effort") == null);
 }

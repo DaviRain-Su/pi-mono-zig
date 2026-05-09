@@ -37,19 +37,11 @@ const tool_call_ownership_matrix = [_]ToolCallOwnershipCase{
     .{ .label = "Faux", .api = "faux", .provider = "faux", .model = "faux-contract-model", .contract = .normalized_inline, .built_in = false },
 };
 
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
@@ -107,8 +99,8 @@ fn ownedToolCallClone(allocator: std.mem.Allocator, tool_call: types.ToolCall) !
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
     errdefer allocator.free(name);
-    const arguments = try cloneJsonValue(allocator, tool_call.arguments);
-    errdefer freeJsonValue(allocator, arguments);
+    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
+    errdefer provider_json.freeValue(allocator, arguments);
     return .{
         .id = id,
         .name = name,

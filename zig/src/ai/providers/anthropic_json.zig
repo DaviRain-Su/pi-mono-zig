@@ -12,16 +12,8 @@ pub const AnthropicCompat = struct {
     supports_long_cache_retention: bool = true,
 };
 
-pub fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-pub fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 pub fn deinitJsonArrayItems(allocator: std.mem.Allocator, array: *std.json.Array) void {
-    for (array.items) |item| freeJsonValue(allocator, item);
+    for (array.items) |item| provider_json.freeValue(allocator, item);
     array.deinit();
 }
 
@@ -55,7 +47,7 @@ fn buildTextBlockObject(allocator: std.mem.Allocator, text: []const u8, cache_co
     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
     try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
     if (cache_control) |value| {
-        try object.put(allocator, try allocator.dupe(u8, "cache_control"), try cloneJsonValue(allocator, value));
+        try object.put(allocator, try allocator.dupe(u8, "cache_control"), try provider_json.cloneValue(allocator, value));
     }
     return .{ .object = object };
 }
@@ -69,7 +61,7 @@ fn buildRoleMessageObject(allocator: std.mem.Allocator, role: []const u8, conten
 
 fn applyCacheControlToBlock(allocator: std.mem.Allocator, block: *std.json.Value, cache_control: std.json.Value) !void {
     if (block.* != .object) return;
-    try block.object.put(allocator, try allocator.dupe(u8, "cache_control"), try cloneJsonValue(allocator, cache_control));
+    try block.object.put(allocator, try allocator.dupe(u8, "cache_control"), try provider_json.cloneValue(allocator, cache_control));
 }
 
 fn applyCacheControlToLastUserContent(allocator: std.mem.Allocator, message: *std.json.Value, cache_control: std.json.Value) !void {
@@ -208,7 +200,7 @@ pub fn buildAssistantMessageValue(
                 try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool_use") });
                 try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
                 try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool_call.name) else tool_call.name) });
-                try object.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try object.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
                 try content.append(.{ .object = object });
             },
         }
@@ -221,7 +213,7 @@ pub fn buildAssistantMessageValue(
                 try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool_use") });
                 try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
                 try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(tool_call.name) else tool_call.name) });
-                try object.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try object.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
                 try content.append(.{ .object = object });
             }
         }
@@ -355,23 +347,22 @@ pub fn buildToolsValue(
         try schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
         if (tool.parameters == .object) {
             if (tool.parameters.object.get("properties")) |properties| {
-                try schema.put(allocator, try allocator.dupe(u8, "properties"), try cloneJsonValue(allocator, properties));
+                try schema.put(allocator, try allocator.dupe(u8, "properties"), try provider_json.cloneValue(allocator, properties));
             } else {
                 try schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
             }
             if (tool.parameters.object.get("required")) |required| {
-                try schema.put(allocator, try allocator.dupe(u8, "required"), try cloneJsonValue(allocator, required));
+                try schema.put(allocator, try allocator.dupe(u8, "required"), try provider_json.cloneValue(allocator, required));
             }
         } else {
             try schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
         }
         try object.put(allocator, try allocator.dupe(u8, "input_schema"), .{ .object = schema });
         if (cache_control != null and index == tools.len - 1) {
-            try object.put(allocator, try allocator.dupe(u8, "cache_control"), try cloneJsonValue(allocator, cache_control.?));
+            try object.put(allocator, try allocator.dupe(u8, "cache_control"), try provider_json.cloneValue(allocator, cache_control.?));
         }
         try array.append(.{ .object = object });
     }
     return .{ .array = array };
 }
-
 

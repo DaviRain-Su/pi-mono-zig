@@ -76,7 +76,7 @@ pub const OpenAICodexResponsesProvider = struct {
         defer allocator.free(account_id);
 
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
@@ -86,7 +86,7 @@ pub const OpenAICodexResponsesProvider = struct {
                     return;
                 };
                 if (maybe_replacement) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -266,10 +266,10 @@ pub fn buildRequestSnapshotValue(
     snapshot_options: openai_responses.RequestSnapshotOptions,
 ) !std.json.Value {
     var payload = if (snapshot_options.payload_override) |override|
-        try cloneJsonValue(allocator, override)
+        try provider_json.cloneValue(allocator, override)
     else
         try buildRequestPayload(allocator, model, context, options);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     const api_key = if (options) |stream_options| stream_options.api_key orelse "fixture-api-key-redacted" else "fixture-api-key-redacted";
     const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key, " \t\r\n"));
@@ -388,7 +388,7 @@ fn appendAssistantInputItems(
                 if (types.thinkingSignature(thinking)) |signature| {
                     var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
                     defer parsed.deinit();
-                    try input.append(try cloneJsonValue(allocator, parsed.value));
+                    try input.append(try provider_json.cloneValue(allocator, parsed.value));
                 }
             },
             .text => |text| {
@@ -520,7 +520,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function") });
     try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
     try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-    try object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+    try object.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
     try object.put(allocator, try allocator.dupe(u8, "strict"), .null);
     return .{ .object = object };
 }
@@ -1015,10 +1015,10 @@ fn buildWebSocketRequestPayload(allocator: std.mem.Allocator, payload: std.json.
     if (payload == .object) {
         var iterator = payload.object.iterator();
         while (iterator.next()) |entry| {
-            try message.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
+            try message.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try provider_json.cloneValue(allocator, entry.value_ptr.*));
         }
     }
-    freeJsonValue(allocator, payload);
+    provider_json.freeValue(allocator, payload);
     return .{ .object = message };
 }
 
@@ -1218,19 +1218,11 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
@@ -1297,7 +1289,7 @@ test "VAL-MSG-010 Codex Responses skips failed assistants" {
         } },
         .{ .user = .{ .content = &user_content, .timestamp = 2 } },
     } }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const input = payload.object.get("input").?.array;
     try std.testing.expectEqual(@as(usize, 1), input.items.len);
@@ -1332,7 +1324,7 @@ test "buildRequestPayload uses Codex-specific request shape" {
         .session_id = "session-123",
         .cache_retention = .short,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload == .object);
     try std.testing.expectEqualStrings("gpt-5.1-codex", payload.object.get("model").?.string);
@@ -2220,7 +2212,7 @@ test "buildRequestPayload uses default instructions when no system prompt is pro
     };
 
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings(DEFAULT_CODEX_SYSTEM_PROMPT, payload.object.get("instructions").?.string);
 }
@@ -2242,7 +2234,7 @@ test "buildRequestPayload preserves requested Codex reasoning effort" {
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, .{
         .responses_reasoning_effort = .xhigh,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const reasoning = payload.object.get("reasoning").?;
     try std.testing.expect(reasoning == .object);
@@ -2253,7 +2245,7 @@ test "buildRequestPayload preserves requested Codex reasoning effort" {
 test "buildRequestPayload applies Codex request option parity fields" {
     const allocator = std.testing.allocator;
     var metadata = try initObject(allocator);
-    defer freeJsonValue(allocator, .{ .object = metadata });
+    defer provider_json.freeValue(allocator, .{ .object = metadata });
     try metadata.put(allocator, try allocator.dupe(u8, "fixture"), .{ .string = try allocator.dupe(u8, "codex-metadata-is-not-emitted") });
 
     const model = types.Model{
@@ -2277,7 +2269,7 @@ test "buildRequestPayload applies Codex request option parity fields" {
         .session_id = "codex-session",
         .metadata = .{ .object = metadata },
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("codex-session", payload.object.get("prompt_cache_key").?.string);
     try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
@@ -2313,7 +2305,7 @@ test "buildRequestPayload omits empty tools array" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("tools") == null);
 }

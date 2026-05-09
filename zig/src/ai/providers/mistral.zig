@@ -147,12 +147,12 @@ pub const MistralProvider = struct {
         }
 
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -253,7 +253,7 @@ pub fn buildRequestPayload(
             try payload.put(allocator, try allocator.dupe(u8, "max_tokens"), .{ .integer = @intCast(max_tokens) });
         }
         if (stream_options.metadata) |metadata| {
-            try payload.put(allocator, try allocator.dupe(u8, "metadata"), try cloneJsonValue(allocator, metadata));
+            try payload.put(allocator, try allocator.dupe(u8, "metadata"), try provider_json.cloneValue(allocator, metadata));
         }
         if (stream_options.mistral_reasoning_effort) |effort| {
             try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, effort) });
@@ -772,7 +772,7 @@ fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std
         try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function") });
         try function_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try function_object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try function_object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+        try function_object.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
         try function_object.put(allocator, try allocator.dupe(u8, "strict"), .{ .bool = false });
         try object.put(allocator, try allocator.dupe(u8, "function"), .{ .object = function_object });
         try tools_array.append(.{ .object = object });
@@ -825,7 +825,7 @@ fn buildToolCallValue(
 ) !std.json.Value {
     var function_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try function_object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
-    try function_object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, arguments));
+    try function_object.put(allocator, try allocator.dupe(u8, "arguments"), try provider_json.cloneValue(allocator, arguments));
 
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, id) });
@@ -1034,7 +1034,7 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
         return emptyJsonObject(allocator);
     };
     defer parsed.deinit();
-    return cloneJsonValue(allocator, parsed.value);
+    return provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn deriveMistralToolCallId(allocator: std.mem.Allocator, id: []const u8, attempt: usize) ![]const u8 {
@@ -1110,7 +1110,7 @@ fn cloneContentBlock(allocator: std.mem.Allocator, block: types.ContentBlock) !t
         .tool_call => |tool_call| .{ .tool_call = .{
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
-            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+            .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
             .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         } },
     };
@@ -1122,7 +1122,7 @@ fn cloneToolCallsSlice(allocator: std.mem.Allocator, tool_calls: []const types.T
         owned[index] = .{
             .id = try allocator.dupe(u8, tool_call.id),
             .name = try allocator.dupe(u8, tool_call.name),
-            .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+            .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
             .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
         };
     }
@@ -1181,14 +1181,6 @@ fn isAbortRequested(options: ?types.StreamOptions) bool {
 
 fn emptyJsonObject(allocator: std.mem.Allocator) !std.json.Value {
     return provider_json.emptyObjectValue(allocator);
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
 }
 
 test "VAL-MSG-010 Mistral skips failed assistants" {
@@ -1254,7 +1246,7 @@ test "VAL-MSG-010 Mistral skips failed assistants" {
         } },
         .{ .user = .{ .content = &final_user, .timestamp = 6 } },
     } }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 4), messages.items.len);
@@ -1275,12 +1267,12 @@ test "buildRequestPayload includes tools and normalized tool ids" {
     try tool_schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
     try tool_schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     var tool_args = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     try tool_args.put(allocator, try allocator.dupe(u8, "city"), .{ .string = try allocator.dupe(u8, "Berlin") });
     const tool_args_value = std.json.Value{ .object = tool_args };
-    defer freeJsonValue(allocator, tool_args_value);
+    defer provider_json.freeValue(allocator, tool_args_value);
 
     const context = types.Context{
         .system_prompt = "Use tools if needed.",
@@ -1342,7 +1334,7 @@ test "buildRequestPayload includes tools and normalized tool ids" {
         .max_tokens = 2048,
         .mistral_prompt_mode = "reasoning",
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("mistral-medium-latest", payload.object.get("model").?.string);
     try std.testing.expect(payload.object.get("messages").? == .array);
@@ -1388,7 +1380,7 @@ test "buildRequestPayload preserves reasoning_effort and unsupported image place
     const payload = try buildRequestPayload(allocator, model, context, .{
         .mistral_reasoning_effort = "high",
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expectEqualStrings("high", payload.object.get("reasoning_effort").?.string);
     const user_message = payload.object.get("messages").?.array.items[0].object;

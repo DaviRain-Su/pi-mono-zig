@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_json = @import("provider_json.zig");
 const types = @import("../types.zig");
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
@@ -44,7 +45,7 @@ pub fn transformMessages(
                     .tool_call_id = try cloneNormalizedToolCallId(allocator, tool_result.tool_call_id, &normalized_tool_call_ids),
                     .tool_name = try allocator.dupe(u8, tool_result.tool_name),
                     .content = try cloneUserLikeContent(allocator, tool_result.content, modelSupportsImages(model), NON_VISION_TOOL_IMAGE_PLACEHOLDER),
-                    .details = if (tool_result.details) |details| try cloneJsonValue(allocator, details) else null,
+                    .details = if (tool_result.details) |details| try provider_json.cloneValue(allocator, details) else null,
                     .is_error = tool_result.is_error,
                     .timestamp = tool_result.timestamp,
                 },
@@ -222,7 +223,7 @@ fn cloneToolCallWithTransform(
     return .{
         .id = id,
         .name = try allocator.dupe(u8, tool_call.name),
-        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
         .thought_signature = if (is_same_model) if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null else null,
     };
 }
@@ -375,7 +376,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types
     return .{
         .id = try allocator.dupe(u8, tool_call.id),
         .name = try allocator.dupe(u8, tool_call.name),
-        .arguments = try cloneJsonValue(allocator, tool_call.arguments),
+        .arguments = try provider_json.cloneValue(allocator, tool_call.arguments),
         .thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null,
     };
 }
@@ -429,42 +430,6 @@ fn modelSupportsImages(model: types.Model) bool {
     return false;
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |boolean| .{ .bool = boolean },
-        .integer => |integer| .{ .integer = integer },
-        .float => |float| .{ .float = float },
-        .number_string => |number_string| .{ .number_string = try allocator.dupe(u8, number_string) },
-        .string => |string| .{ .string = try allocator.dupe(u8, string) },
-        .array => |array| blk: {
-            var clone = std.json.Array.init(allocator);
-            errdefer {
-                for (clone.items) |item| freeJsonValue(allocator, item);
-                clone.deinit();
-            }
-            for (array.items) |item| try clone.append(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = clone };
-        },
-        .object => |object| blk: {
-            var clone = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer {
-                var iter = clone.iterator();
-                while (iter.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    freeJsonValue(allocator, entry.value_ptr.*);
-                }
-                clone.deinit(allocator);
-            }
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try clone.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try cloneJsonValue(allocator, entry.value_ptr.*));
-            }
-            break :blk .{ .object = clone };
-        },
-    };
-}
-
 fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
     switch (message) {
         .user => |user| {
@@ -474,7 +439,7 @@ fn freeMessage(allocator: std.mem.Allocator, message: types.Message) void {
             allocator.free(tool_result.tool_call_id);
             allocator.free(tool_result.tool_name);
             freeContentBlocks(allocator, tool_result.content);
-            if (tool_result.details) |details| freeJsonValue(allocator, details);
+            if (tool_result.details) |details| provider_json.freeValue(allocator, details);
         },
         .assistant => |assistant| {
             allocator.free(assistant.api);
@@ -520,29 +485,7 @@ fn freeToolCall(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .string => |string| allocator.free(string),
-        .number_string => |number_string| allocator.free(number_string),
-        .array => |array| {
-            for (array.items) |item| freeJsonValue(allocator, item);
-            var mutable = array;
-            mutable.deinit();
-        },
-        .object => |object| {
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            var mutable = object;
-            mutable.deinit(allocator);
-        },
-        else => {},
-    }
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn normalizeToolCallIdForTest(

@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_json = @import("shared/provider_json.zig");
 const types = @import("types.zig");
 const models_generated = @import("models_generated.zig");
 
@@ -170,7 +171,7 @@ pub const ModelRegistry = struct {
             break :blk parsed_compat.?.value;
         } else definition.compat;
         defer if (definition.openai_compat != null) {
-            if (compat) |value| deinitJsonValue(self.allocator, value);
+            if (compat) |value| provider_json.freeValue(self.allocator, value);
         };
 
         var generated_headers: ?std.StringHashMap([]const u8) = null;
@@ -540,8 +541,8 @@ fn cloneModel(allocator: std.mem.Allocator, model: types.Model) RegisterError!Mo
     var owned_headers = try cloneHeaders(allocator, model.headers);
     errdefer if (owned_headers) |*headers| deinitHeaders(allocator, headers);
 
-    const owned_compat = if (model.compat) |compat| try cloneJsonValue(allocator, compat) else null;
-    errdefer if (owned_compat) |compat| deinitJsonValue(allocator, compat);
+    const owned_compat = if (model.compat) |compat| try provider_json.cloneValue(allocator, compat) else null;
+    errdefer if (owned_compat) |compat| provider_json.freeValue(allocator, compat);
 
     var owned_thinking_level_map = if (model.thinking_level_map) |map| try cloneThinkingLevelMap(allocator, map) else null;
     errdefer if (owned_thinking_level_map) |*map| deinitThinkingLevelMap(allocator, map);
@@ -591,7 +592,7 @@ pub fn deinitOwnedModel(allocator: std.mem.Allocator, model: *types.Model) void 
         deinitHeaders(allocator, headers);
     }
     if (model.compat) |compat| {
-        deinitJsonValue(allocator, compat);
+        provider_json.freeValue(allocator, compat);
     }
     if (model.thinking_level_map) |*map| {
         deinitThinkingLevelMap(allocator, map);
@@ -679,70 +680,6 @@ fn deinitThinkingLevelMapping(allocator: std.mem.Allocator, mapping: ?types.Thin
     };
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return switch (value) {
-        .null => .null,
-        .bool => |v| .{ .bool = v },
-        .integer => |v| .{ .integer = v },
-        .float => |v| .{ .float = v },
-        .number_string => |v| .{ .number_string = try allocator.dupe(u8, v) },
-        .string => |v| .{ .string = try allocator.dupe(u8, v) },
-        .array => |array| blk: {
-            var cloned = std.json.Array.init(allocator);
-            errdefer {
-                for (cloned.items) |item| deinitJsonValue(allocator, item);
-                cloned.deinit();
-            }
-            for (array.items) |item| {
-                try cloned.append(try cloneJsonValue(allocator, item));
-            }
-            break :blk .{ .array = cloned };
-        },
-        .object => |object| blk: {
-            var cloned = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            errdefer {
-                var it = cloned.iterator();
-                while (it.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    deinitJsonValue(allocator, entry.value_ptr.*);
-                }
-                cloned.deinit(allocator);
-            }
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                try cloned.put(
-                    allocator,
-                    try allocator.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValue(allocator, entry.value_ptr.*),
-                );
-            }
-            break :blk .{ .object = cloned };
-        },
-    };
-}
-
-fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string => |v| allocator.free(v),
-        .string => |v| allocator.free(v),
-        .array => |array| {
-            for (array.items) |item| deinitJsonValue(allocator, item);
-            var array_mut = array;
-            array_mut.deinit();
-        },
-        .object => |object| {
-            var object_mut = object;
-            var iterator = object_mut.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                deinitJsonValue(allocator, entry.value_ptr.*);
-            }
-            object_mut.deinit(allocator);
-        },
-    }
-}
-
 fn buildOpenAICompatValue(allocator: std.mem.Allocator, compat: OpenAICompatDefinition) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer {
@@ -750,7 +687,7 @@ fn buildOpenAICompatValue(allocator: std.mem.Allocator, compat: OpenAICompatDefi
         var iterator = object_mut.iterator();
         while (iterator.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            deinitJsonValue(allocator, entry.value_ptr.*);
+            provider_json.freeValue(allocator, entry.value_ptr.*);
         }
         object_mut.deinit(allocator);
     }

@@ -14,7 +14,7 @@ pub fn writeRegistrySnapshotJson(
     writer: *std.Io.Writer,
 ) !void {
     const value = try buildRegistryJsonValue(allocator, registry);
-    defer deinitJsonValueLocal(allocator, value);
+    defer common.deinitJsonValue(allocator, value);
     try std.json.Stringify.value(value, .{}, writer);
 }
 
@@ -357,28 +357,6 @@ fn flagValueToJson(allocator: std.mem.Allocator, value: anytype) !std.json.Value
         .boolean => |b| .{ .bool = b },
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
     };
-}
-
-fn deinitJsonValueLocal(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string => |v| allocator.free(v),
-        .string => |s| allocator.free(s),
-        .array => |arr| {
-            for (arr.items) |item| deinitJsonValueLocal(allocator, item);
-            var mut = arr;
-            mut.deinit();
-        },
-        .object => |obj| {
-            var mut = obj;
-            var iter = mut.iterator();
-            while (iter.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                deinitJsonValueLocal(allocator, entry.value_ptr.*);
-            }
-            mut.deinit(allocator);
-        },
-    }
 }
 
 fn deinitResolvedCommandsLocal(allocator: std.mem.Allocator, commands: anytype) void {

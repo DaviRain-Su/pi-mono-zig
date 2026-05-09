@@ -86,12 +86,12 @@ pub const OpenAIResponsesProvider = struct {
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -232,7 +232,7 @@ pub fn buildRequestPayload(
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }
         if (stream_options.metadata) |metadata| {
-            try payload.put(allocator, try allocator.dupe(u8, "metadata"), try cloneJsonValue(allocator, metadata));
+            try payload.put(allocator, try allocator.dupe(u8, "metadata"), try provider_json.cloneValue(allocator, metadata));
         }
         if (stream_options.session_id) |session_id| {
             if (cache_retention != .none) {
@@ -957,7 +957,7 @@ fn finalizeActiveToolCallAt(
         if (item_value == .object) {
             if (item_value.object.get("arguments")) |arguments_value| {
                 if (arguments_value == .object or arguments_value == .array) {
-                    break :blk try cloneJsonValue(allocator, arguments_value);
+                    break :blk try provider_json.cloneValue(allocator, arguments_value);
                 }
                 if (arguments_value == .string) {
                     break :blk try parseStreamingJsonToValue(allocator, arguments_value.string);
@@ -968,7 +968,7 @@ fn finalizeActiveToolCallAt(
     } else try parseStreamingJsonToValue(allocator, tool_call.partial_json.items);
 
     const stored_tool_call = blk: {
-        errdefer freeJsonValue(allocator, arguments);
+        errdefer provider_json.freeValue(allocator, arguments);
         const id = try allocator.dupe(u8, final_id);
         errdefer allocator.free(id);
         const name = try allocator.dupe(u8, final_name);
@@ -1001,7 +1001,7 @@ fn finalizeActiveToolCallAt(
         .tool_call = .{
             .id = try allocator.dupe(u8, stored_tool_call.id),
             .name = try allocator.dupe(u8, stored_tool_call.name),
-            .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
+            .arguments = try provider_json.cloneValue(allocator, stored_tool_call.arguments),
         },
     });
     stored_tool_call_owned = false;
@@ -1221,7 +1221,7 @@ fn appendAssistantInputItems(
                 if (types.thinkingSignature(thinking)) |signature| {
                     var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
                     defer parsed.deinit();
-                    try input.append(try cloneJsonValue(allocator, parsed.value));
+                    try input.append(try provider_json.cloneValue(allocator, parsed.value));
                 }
             },
             .text => |text| {
@@ -1381,7 +1381,7 @@ fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Val
     try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "function") });
     try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
     try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-    try object.put(allocator, try allocator.dupe(u8, "parameters"), try cloneJsonValue(allocator, tool.parameters));
+    try object.put(allocator, try allocator.dupe(u8, "parameters"), try provider_json.cloneValue(allocator, tool.parameters));
     try object.put(allocator, try allocator.dupe(u8, "strict"), .{ .bool = false });
     return .{ .object = object };
 }
@@ -1425,10 +1425,10 @@ pub fn buildRequestSnapshotValue(
     snapshot_options: RequestSnapshotOptions,
 ) !std.json.Value {
     var payload = if (snapshot_options.payload_override) |override|
-        try cloneJsonValue(allocator, override)
+        try provider_json.cloneValue(allocator, override)
     else
         try buildRequestPayload(allocator, model, context, options);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
     if (resolved_options.api_key == null) resolved_options.api_key = "fixture-api-key-redacted";
@@ -1602,7 +1602,7 @@ pub fn normalizeSemanticHeaders(
 
         const next_value = std.json.Value{ .string = try allocator.dupe(u8, value) };
         if (semantic.getPtr(lower)) |existing| {
-            freeJsonValue(allocator, existing.*);
+            provider_json.freeValue(allocator, existing.*);
             existing.* = next_value;
         } else {
             try semantic.put(allocator, try allocator.dupe(u8, lower), next_value);
@@ -1872,7 +1872,7 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
         return .{ .object = try initObject(allocator) };
     };
     defer parsed.deinit();
-    return try cloneJsonValue(allocator, parsed.value);
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn mapStopReason(status: []const u8) types.StopReason {
@@ -1961,19 +1961,11 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types.ToolCall {
@@ -1981,8 +1973,8 @@ fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
     errdefer allocator.free(name);
-    const arguments = try cloneJsonValue(allocator, tool_call.arguments);
-    errdefer freeJsonValue(allocator, arguments);
+    const arguments = try provider_json.cloneValue(allocator, tool_call.arguments);
+    errdefer provider_json.freeValue(allocator, arguments);
     const thought_signature = if (tool_call.thought_signature) |signature| try allocator.dupe(u8, signature) else null;
     return .{
         .id = id,
@@ -2462,7 +2454,7 @@ test "VAL-MSG-010 OpenAI Responses skips failed assistants and replays valid res
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("previous_response_id") == null);
     const input = payload.object.get("input").?.array;
@@ -2510,7 +2502,7 @@ test "buildRequestPayload replays assistant history without previous_response_id
     };
 
     const payload = try buildRequestPayload(allocator, model, context, .{ .session_id = "sess-1" });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload == .object);
     try std.testing.expect(payload.object.get("previous_response_id") == null);
@@ -3200,7 +3192,7 @@ test "buildRequestPayload omits long cache retention when compat disables it" {
     var compat = try initObject(allocator);
     try compat.put(allocator, try allocator.dupe(u8, "supportsLongCacheRetention"), .{ .bool = false });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "gpt-5-mini",
@@ -3219,7 +3211,7 @@ test "buildRequestPayload omits long cache retention when compat disables it" {
         .session_id = "sess-1",
         .cache_retention = .long,
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("prompt_cache_key") != null);
     try std.testing.expect(payload.object.get("prompt_cache_retention") == null);
@@ -3250,7 +3242,7 @@ test "buildRequestPayload omits empty tools array" {
     };
 
     const payload = try buildRequestPayload(allocator, model, context, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("tools") == null);
 }
@@ -3261,7 +3253,7 @@ test "buildRequestHeaders omits session_id when compat disables it" {
     var compat = try initObject(allocator);
     try compat.put(allocator, try allocator.dupe(u8, "sendSessionIdHeader"), .{ .bool = false });
     const compat_value = std.json.Value{ .object = compat };
-    defer freeJsonValue(allocator, compat_value);
+    defer provider_json.freeValue(allocator, compat_value);
 
     const model = types.Model{
         .id = "gpt-5-mini",

@@ -175,12 +175,12 @@ pub const BedrockProvider = struct {
         defer timestamp.deinit(allocator);
 
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -390,12 +390,12 @@ pub fn buildRequestSnapshotValueWithFixtureEnv(
     }
 
     var payload = try buildRequestPayloadWithFixtureEnv(allocator, model, context, snapshot_options, fixture_env);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
     try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
     if (snapshot_options) |stream_options| {
         if (stream_options.on_payload) |callback| {
             if (try callback(allocator, payload, model)) |replacement| {
-                freeJsonValue(allocator, payload);
+                provider_json.freeValue(allocator, payload);
                 payload = replacement;
             }
         }
@@ -960,7 +960,7 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, model: types.Model, 
                 var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
                 try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
@@ -975,7 +975,7 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, model: types.Model, 
                 var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
                 try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try cloneJsonValue(allocator, tool_call.arguments));
+                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
@@ -1057,7 +1057,7 @@ fn buildToolConfigValue(
         try tool_spec.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
 
         var input_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try input_schema.put(allocator, try allocator.dupe(u8, "json"), try cloneJsonValue(allocator, tool.parameters));
+        try input_schema.put(allocator, try allocator.dupe(u8, "json"), try provider_json.cloneValue(allocator, tool.parameters));
         try tool_spec.put(allocator, try allocator.dupe(u8, "inputSchema"), .{ .object = input_schema });
 
         var tool_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
@@ -1677,7 +1677,7 @@ fn parseWrappedEventPayload(
 
     if (parsed.value != .object or !containsKnownEventField(parsed.value)) {
         const wrapped = try wrapEventValue(allocator, parsed.value, event_type, exception_type);
-        defer freeJsonValue(allocator, wrapped);
+        defer provider_json.freeValue(allocator, wrapped);
         try handleEventValue(allocator, stream_ptr, wrapped, output, content_blocks, tool_calls, active_blocks, state, model);
         return;
     }
@@ -1715,13 +1715,13 @@ fn wrapEventValue(
     errdefer object.deinit(allocator);
 
     if (event_type) |name| {
-        try object.put(allocator, try allocator.dupe(u8, name), try cloneJsonValue(allocator, value));
+        try object.put(allocator, try allocator.dupe(u8, name), try provider_json.cloneValue(allocator, value));
         return .{ .object = object };
     }
     if (exception_type) |name| {
         const field_name = try normalizeEventStreamExceptionName(allocator, name);
         defer allocator.free(field_name);
-        try object.put(allocator, try allocator.dupe(u8, field_name), try cloneJsonValue(allocator, value));
+        try object.put(allocator, try allocator.dupe(u8, field_name), try provider_json.cloneValue(allocator, value));
         return .{ .object = object };
     }
     return BedrockError.InvalidBedrockChunk;
@@ -2165,9 +2165,9 @@ fn handleContentBlockStop(
         .tool_call => |tool| {
             var parsed_arguments = try json_parse.parseStreamingJson(allocator, tool.partial_json.items);
             defer parsed_arguments.deinit();
-            const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+            const arguments = try provider_json.cloneValue(allocator, parsed_arguments.value);
             const final_tool_call = blk: {
-                errdefer freeJsonValue(allocator, arguments);
+                errdefer provider_json.freeValue(allocator, arguments);
                 const id = try allocator.dupe(u8, tool.id);
                 errdefer allocator.free(id);
                 const name = try allocator.dupe(u8, tool.name);
@@ -2255,9 +2255,9 @@ fn finalizeOutputFromPartials(
             .tool_call => |tool| {
                 var parsed_arguments = (try parseCompleteToolArguments(allocator, tool.partial_json.items)) orelse continue;
                 defer parsed_arguments.deinit();
-                const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+                const arguments = try provider_json.cloneValue(allocator, parsed_arguments.value);
                 const final_tool_call = blk: {
-                    errdefer freeJsonValue(allocator, arguments);
+                    errdefer provider_json.freeValue(allocator, arguments);
                     const id = try allocator.dupe(u8, tool.id);
                     errdefer allocator.free(id);
                     const name = try allocator.dupe(u8, tool.name);
@@ -2305,9 +2305,9 @@ fn collectOutputFromPartials(
             .tool_call => |tool| {
                 var parsed_arguments = (try parseCompleteToolArguments(allocator, tool.partial_json.items)) orelse continue;
                 defer parsed_arguments.deinit();
-                const arguments = try cloneJsonValue(allocator, parsed_arguments.value);
+                const arguments = try provider_json.cloneValue(allocator, parsed_arguments.value);
                 const final_tool_call = blk: {
-                    errdefer freeJsonValue(allocator, arguments);
+                    errdefer provider_json.freeValue(allocator, arguments);
                     const id = try allocator.dupe(u8, tool.id);
                     errdefer allocator.free(id);
                     const name = try allocator.dupe(u8, tool.name);
@@ -2788,10 +2788,6 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
     }
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
 fn putStringField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
     try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
 }
@@ -2853,7 +2849,7 @@ fn snapshotUsageValue(allocator: std.mem.Allocator, usage: types.Usage) !std.jso
 fn snapshotToolCallValue(allocator: std.mem.Allocator, tool_call: types.ToolCall) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
-    try object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+    try object.put(allocator, try allocator.dupe(u8, "arguments"), try provider_json.cloneValue(allocator, tool_call.arguments));
     try putStringField(allocator, &object, "id", tool_call.id);
     try putStringField(allocator, &object, "name", tool_call.name);
     return .{ .object = object };
@@ -2875,7 +2871,7 @@ fn snapshotContentBlockValue(allocator: std.mem.Allocator, block: types.ContentB
             try putStringField(allocator, &object, "type", "thinking");
         },
         .tool_call => |tool_call| {
-            try object.put(allocator, try allocator.dupe(u8, "arguments"), try cloneJsonValue(allocator, tool_call.arguments));
+            try object.put(allocator, try allocator.dupe(u8, "arguments"), try provider_json.cloneValue(allocator, tool_call.arguments));
             try putStringField(allocator, &object, "id", tool_call.id);
             try putStringField(allocator, &object, "name", tool_call.name);
             try putStringField(allocator, &object, "type", "toolCall");
@@ -2932,10 +2928,6 @@ fn snapshotStreamEvents(
 }
 
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    freeJsonValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     provider_json.freeValue(allocator, value);
 }
 
@@ -3118,7 +3110,7 @@ test "VAL-MSG-010 Bedrock skips failed assistants" {
         } },
         .{ .user = .{ .content = &final_user, .timestamp = 4 } },
     } }, null);
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const messages = payload.object.get("messages").?.array;
     try std.testing.expectEqual(@as(usize, 2), messages.items.len);
@@ -3133,7 +3125,7 @@ test "buildRequestPayload includes bedrock system messages inference config and 
     try tool_schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
     try tool_schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const context = types.Context{
         .system_prompt = "You are helpful.",
@@ -3167,7 +3159,7 @@ test "buildRequestPayload includes bedrock system messages inference config and 
         .max_tokens = 512,
         .google_tool_choice = "any",
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     const object = payload.object;
     try std.testing.expect(object.get("system") != null);

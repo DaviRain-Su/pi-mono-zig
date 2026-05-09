@@ -138,12 +138,12 @@ pub const GoogleVertexProvider = struct {
         auth_header: OwnedHeader,
     ) !void {
         var payload = try buildRequestPayload(allocator, model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -1074,7 +1074,7 @@ fn processVertexFunctionCallPart(
     if (name_value == null or name_value.? != .string) return;
 
     const args = if (function_call_value.object.get("args")) |args_value|
-        try cloneJsonValue(allocator, args_value)
+        try provider_json.cloneValue(allocator, args_value)
     else
         try emptyJsonObject(allocator);
 
@@ -1245,7 +1245,7 @@ fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std
         var declaration = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
         try declaration.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
         try declaration.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try cloneJsonValue(allocator, tool.parameters));
+        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try provider_json.cloneValue(allocator, tool.parameters));
         try function_declarations.append(.{ .object = declaration });
     }
 
@@ -1302,7 +1302,7 @@ fn buildAssistantMessageValue(
             .tool_call => |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -1319,7 +1319,7 @@ fn buildAssistantMessageValue(
             for (tool_calls) |tool_call| {
                 var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try cloneJsonValue(allocator, tool_call.arguments));
+                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
 
                 var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (tool_call.thought_signature) |signature| {
@@ -1646,14 +1646,6 @@ fn calculateCost(model: types.Model, usage: *types.Usage) void {
     usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 fn extractErrorMessage(body: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     return if (trimmed.len == 0) body else trimmed;
@@ -1666,7 +1658,7 @@ test "buildRequestPayload includes Vertex contents, tools, and thinking config" 
     try tool_schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
     try tool_schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
     const tool_schema_value = std.json.Value{ .object = tool_schema };
-    defer freeJsonValue(allocator, tool_schema_value);
+    defer provider_json.freeValue(allocator, tool_schema_value);
 
     const tools = &[_]types.Tool{.{
         .name = "get_weather",
@@ -1709,7 +1701,7 @@ test "buildRequestPayload includes Vertex contents, tools, and thinking config" 
             .budget_tokens = 8192,
         },
     });
-    defer freeJsonValue(allocator, payload);
+    defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("contents") != null);
     try std.testing.expect(payload.object.get("systemInstruction") != null);

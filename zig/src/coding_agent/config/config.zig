@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
+const provider_json = ai.provider_json;
 const agent = @import("agent");
 const auth = @import("../auth/auth.zig");
 const config_errors = @import("config_errors.zig");
@@ -1121,7 +1122,7 @@ fn loadAuthTokens(
     auth_tokens: *std.StringHashMap([]const u8),
 ) !void {
     const stored = try auth.readStoredCredentialsObject(allocator, io, path);
-    defer deinitJsonValue(allocator, stored);
+    defer provider_json.freeValue(allocator, stored);
     if (stored != .object) return;
 
     var iterator = stored.object.iterator();
@@ -1285,7 +1286,7 @@ fn loadModelsConfig(
                     else if (resolved_provider) |descriptor| descriptor.base_url else continue;
 
                     var headers = try parseHeaders(allocator, model_object.get("headers"));
-                    const compat = try cloneJsonValueOptional(allocator, model_object.get("compat"));
+                    const compat = if (model_object.get("compat")) |compat_value| try provider_json.cloneValue(allocator, compat_value) else null;
 
                     const input_types = try parseInputTypes(allocator, model_object.get("input"), existing_model);
                     defer allocator.free(input_types);
@@ -1322,7 +1323,7 @@ fn loadModelsConfig(
                     });
 
                     if (headers) |*map| deinitStringMap(allocator, map);
-                    if (compat) |value_compat| deinitJsonValue(allocator, value_compat);
+                    if (compat) |value_compat| provider_json.freeValue(allocator, value_compat);
 
                     register_result catch |err| try config_errors.appendError(allocator, errors, .register_model, path, err);
                 }
@@ -1708,75 +1709,6 @@ fn freeStringList(allocator: std.mem.Allocator, value: ?[]const []const u8) void
     const items = value orelse return;
     for (items) |item| allocator.free(item);
     allocator.free(items);
-}
-
-fn cloneJsonValueOptional(allocator: std.mem.Allocator, value: ?std.json.Value) !?std.json.Value {
-    if (value) |raw| return try cloneJsonValue(allocator, raw);
-    return null;
-}
-
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    switch (value) {
-        .null => return .null,
-        .bool => return .{ .bool = value.bool },
-        .integer => return .{ .integer = value.integer },
-        .float => return .{ .float = value.float },
-        .number_string => return .{ .number_string = try allocator.dupe(u8, value.number_string) },
-        .string => return .{ .string = try allocator.dupe(u8, value.string) },
-        .array => {
-            var array = std.json.Array.init(allocator);
-            errdefer {
-                for (array.items) |item| deinitJsonValue(allocator, item);
-                array.deinit();
-            }
-            for (value.array.items) |item| {
-                try array.append(try cloneJsonValue(allocator, item));
-            }
-            return .{ .array = array };
-        },
-        .object => {
-            var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            errdefer {
-                var iterator = object.iterator();
-                while (iterator.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    deinitJsonValue(allocator, entry.value_ptr.*);
-                }
-                object.deinit(allocator);
-            }
-            var iterator = value.object.iterator();
-            while (iterator.next()) |entry| {
-                try object.put(
-                    allocator,
-                    try allocator.dupe(u8, entry.key_ptr.*),
-                    try cloneJsonValue(allocator, entry.value_ptr.*),
-                );
-            }
-            return .{ .object = object };
-        },
-    }
-}
-
-fn deinitJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    switch (value) {
-        .null, .bool, .integer, .float => {},
-        .number_string => allocator.free(value.number_string),
-        .string => allocator.free(value.string),
-        .array => {
-            for (value.array.items) |item| deinitJsonValue(allocator, item);
-            var array = value.array;
-            array.deinit();
-        },
-        .object => {
-            var object = value.object;
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                deinitJsonValue(allocator, entry.value_ptr.*);
-            }
-            object.deinit(allocator);
-        },
-    }
 }
 
 pub fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {

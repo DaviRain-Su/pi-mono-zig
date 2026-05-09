@@ -68,12 +68,12 @@ pub const AzureOpenAIResponsesProvider = struct {
         request_model.id = deployment_name;
 
         var payload = try buildAzureRequestPayload(allocator, request_model, context, options);
-        defer freeJsonValue(allocator, payload);
+        defer provider_json.freeValue(allocator, payload);
 
         if (options) |stream_options| {
             if (stream_options.on_payload) |callback| {
                 if (try callback(allocator, payload, model)) |replacement| {
-                    freeJsonValue(allocator, payload);
+                    provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
             }
@@ -141,7 +141,7 @@ pub fn buildAzureRequestPayload(
     options: ?types.StreamOptions,
 ) !std.json.Value {
     var payload = try openai_responses.buildRequestPayload(allocator, request_model, context, options);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     try removeObjectField(allocator, &payload, "store");
     try removeObjectField(allocator, &payload, "prompt_cache_retention");
@@ -191,10 +191,10 @@ pub fn buildRequestSnapshotValueWithEnv(
     request_model.id = deployment_name;
 
     var payload = if (snapshot_options.payload_override) |override|
-        try cloneJsonValue(allocator, override)
+        try provider_json.cloneValue(allocator, override)
     else
         try buildAzureRequestPayload(allocator, request_model, context, options);
-    errdefer freeJsonValue(allocator, payload);
+    errdefer provider_json.freeValue(allocator, payload);
 
     const base_url = try resolveAzureBaseUrlWithEnv(allocator, model, options, env.azure_base_url, env.azure_resource_name);
     defer allocator.free(base_url);
@@ -1047,7 +1047,7 @@ fn removeObjectField(allocator: std.mem.Allocator, payload: *std.json.Value, fie
     while (iterator.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, field_name)) {
             allocator.free(entry.key_ptr.*);
-            freeJsonValue(allocator, entry.value_ptr.*);
+            provider_json.freeValue(allocator, entry.value_ptr.*);
             continue;
         }
         try new_object.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
@@ -1061,19 +1061,11 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
-
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
-
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
@@ -1253,7 +1245,7 @@ test "ISS-031 Azure request snapshot audits endpoint query and api-key semantics
             .provider_family = "azure-openai",
         },
     );
-    defer freeJsonValue(allocator, snapshot);
+    defer provider_json.freeValue(allocator, snapshot);
 
     const object = snapshot.object;
     try std.testing.expectEqualStrings("https://semantic-resource.openai.azure.com/openai/v1", object.get("baseUrl").?.string);

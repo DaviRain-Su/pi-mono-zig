@@ -159,7 +159,7 @@ pub fn finalizeCurrentBlock(
                     tool_call.partial_json.items;
                 const arguments = try parseStreamingJsonToValue(allocator, arguments_source);
                 const stored_tool_call = blk: {
-                    errdefer freeJsonValue(allocator, arguments);
+                    errdefer provider_json.freeValue(allocator, arguments);
                     const id = try allocator.dupe(u8, final_id);
                     errdefer allocator.free(id);
                     const name = try allocator.dupe(u8, final_name);
@@ -177,7 +177,7 @@ pub fn finalizeCurrentBlock(
                     .tool_call = .{
                         .id = try allocator.dupe(u8, stored_tool_call.id),
                         .name = try allocator.dupe(u8, stored_tool_call.name),
-                        .arguments = try cloneJsonValue(allocator, stored_tool_call.arguments),
+                        .arguments = try provider_json.cloneValue(allocator, stored_tool_call.arguments),
                     },
                 });
             },
@@ -306,26 +306,20 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
         return .{ .object = try initObject(allocator) };
     };
     defer parsed.deinit();
-    return try cloneJsonValue(allocator, parsed.value);
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return provider_json.cloneValue(allocator, value);
-}
 
-fn freeJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
-    provider_json.freeValue(allocator, value);
-}
 
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
-    freeJsonValue(allocator, tool_call.arguments);
+    provider_json.freeValue(allocator, tool_call.arguments);
 }
 
 fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
