@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("args.zig");
@@ -677,10 +678,25 @@ fn makeRuntimePrepTestPath(
     tmp: std.testing.TmpDir,
     sub_path: []const u8,
 ) ![]u8 {
-    const base = try tmp.dir.realpathAlloc(std.testing.io, ".", allocator);
+    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
+    defer allocator.free(cwd);
+    const tmp_path = try std.fs.path.resolve(allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
+    defer allocator.free(tmp_path);
+    const base = try runtimePrepRealpathAlloc(allocator, tmp_path);
     defer allocator.free(base);
     if (std.mem.eql(u8, sub_path, ".")) return try allocator.dupe(u8, base);
     return try std.fs.path.join(allocator, &.{ base, sub_path });
+}
+
+fn runtimePrepRealpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fs.path.resolve(allocator, &.{path});
+    }
+    const z_path = try allocator.dupeZ(u8, path);
+    defer allocator.free(z_path);
+    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return error.FileNotFound;
+    return allocator.dupe(u8, std.mem.span(resolved));
 }
 
 fn writeRuntimePrepProviderScript(
