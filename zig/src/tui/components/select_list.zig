@@ -202,7 +202,7 @@ pub const SelectList = struct {
         return self.draw(window, ctx);
     }
 
-    fn visibleStartIndex(self: *const SelectList) usize {
+    pub fn visibleStartIndex(self: *const SelectList) usize {
         const visible_count = @min(@max(self.max_visible, 1), self.items.len);
         if (visible_count == 0 or self.selectedIndex() < visible_count / 2) return 0;
 

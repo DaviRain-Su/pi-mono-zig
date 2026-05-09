@@ -2789,25 +2789,27 @@ const RenderHook = struct {
 const BorrowedLineListComponent = struct {
     lines: []const []u8,
 
-    pub fn component(self: *const BorrowedLineListComponent) tui.Component {
+    pub fn component(self: *const BorrowedLineListComponent) tui.draw.Component {
         return .{
             .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
+            .drawFn = drawOpaque,
         };
     }
 
-    pub fn renderIntoOpaque(
+    fn drawOpaque(
         ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *tui.LineList,
-    ) std.mem.Allocator.Error!void {
+        window: tui.vaxis.Window,
+        ctx: tui.draw.DrawContext,
+    ) std.mem.Allocator.Error!tui.draw.Size {
         const self: *const BorrowedLineListComponent = @ptrCast(@alignCast(ptr));
+        var lines = tui.component.LineList.empty;
         for (self.lines) |line| {
-            const fitted = try fitLine(allocator, line, width);
-            defer allocator.free(fitted);
-            try tui.component.appendOwnedLine(lines, allocator, fitted);
+            const fitted = try fitLine(ctx.arena, line, window.width);
+            defer ctx.arena.free(fitted);
+            try tui.component.appendOwnedLine(&lines, ctx.arena, fitted);
         }
+        try tui.cell_rows.renderLineListToWindow(window, lines.items, ctx.arena);
+        return .{ .width = window.width, .height = @min(lines.items.len, window.height) };
     }
 };
 
