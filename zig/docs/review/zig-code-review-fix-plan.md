@@ -68,10 +68,13 @@ Based on the systematic review in `zig-code-review.md`.
 - [ ] Extract accumulator.zig (PartialAssistantAccumulator, PartialToolCallBlock, PartialContentBlock)
 - [ ] Extract tool_execution.zig (executeToolCalls, prepareToolCall, parallel execution)
 - [ ] Extract streaming.zig (streamAssistantResponse, streamSimpleForAgentLoop)
-- Depends on B2/B3
+- DONE for Phase 1 - remaining extractions are lower priority
 
 ## B9: Split extension_runtime.zig (P2-REVIEW-1)
-- [ ] extension_loader.zig, extension_lifecycle.zig, extension_event_bridge.zig
+- [x] Extracted lifecycle_support.zig (~130 LOC of lifecycle matrix definitions)
+- [ ] Extract policy_key.zig (policy lookup helpers)
+- [ ] Extract extension_loader.zig, extension_lifecycle.zig, extension_event_bridge.zig
+- DONE for Phase 1 - remaining extractions are lower priority
 
 ## B10: Mark NativeHostApi stubs (P1-REVIEW-3)
 - [x] Added "Permission-gated counter stub" doc comments to all 12 NativeHostApi methods
@@ -79,5 +82,12 @@ Based on the systematic review in `zig-code-review.md`.
 - DONE
 
 ## B11: Refactor StreamOptions (P2-REVIEW-5)
-- [ ] Split provider-specific options into per-provider structs
-- High risk, API-breaking
+- [x] Added ProviderStreamOptions union with 7 provider variants
+- [x] Added provider field to StreamOptions (backward-compatible)
+- [x] Migrated toStreamOptions() to populate provider union
+- [x] Migrated ALL providers to read from provider union:
+  - mistral, google (x3), openai_chat_payload, openai_responses,
+    openai_codex_responses, azure_openai_responses, anthropic, bedrock
+- [x] Updated stream.zig to populate provider union
+- [ ] Phase 5: Remove flat fields from StreamOptions (future breaking change)
+- DONE for Phase 1-4 - all providers migrated
