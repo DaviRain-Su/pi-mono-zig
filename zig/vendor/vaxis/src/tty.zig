@@ -308,11 +308,7 @@ pub const WindowsTty = struct {
     }
 
     pub fn read(self: *const WindowsTty, buf: []u8) !usize {
-        var bytes_read: windows.DWORD = 0;
-        if (ReadFile(self.stdin, buf.ptr, @intCast(buf.len), &bytes_read, null) == .FALSE) {
-            return windows.unexpectedError(windows.GetLastError());
-        }
-        return bytes_read;
+        return posix.read(self.fd, buf);
     }
 
     pub fn nextEvent(self: *WindowsTty, parser: *Parser, paste_allocator: ?std.mem.Allocator) !Event {
@@ -742,7 +738,6 @@ pub const WindowsTty = struct {
     pub const PINPUT_RECORD = *INPUT_RECORD;
 
     pub extern "kernel32" fn ReadConsoleInputW(hConsoleInput: windows.HANDLE, lpBuffer: PINPUT_RECORD, nLength: windows.DWORD, lpNumberOfEventsRead: *windows.DWORD) callconv(.winapi) windows.BOOL;
-    pub extern "kernel32" fn ReadFile(hFile: windows.HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: windows.DWORD, lpNumberOfBytesRead: *windows.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) windows.BOOL;
     pub extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) windows.UINT;
     pub extern "kernel32" fn GetConsoleMode(kConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
     pub extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
