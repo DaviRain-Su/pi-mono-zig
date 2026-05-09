@@ -2631,6 +2631,73 @@ test "unified manifest validates runtime-specific entrypoint matrix" {
     }
 }
 
+test "typescript-facing native docs types schema validate against zig manifest contract" {
+    const allocator = std.testing.allocator;
+    const docs_manifest = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "../packages/coding-agent/docs/examples/pi-extension-native-v1.json",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(docs_manifest);
+
+    var result = try parseManifestText(
+        allocator,
+        "/tmp/native-authoring",
+        "/tmp/native-authoring/pi-extension.json",
+        docs_manifest,
+    );
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result == .valid);
+    try std.testing.expectEqualStrings("pi-extension.v1", result.valid.schema_version);
+    try std.testing.expectEqualStrings("com.pi.native.authoring", result.valid.id);
+    try std.testing.expectEqual(.native, result.valid.runtime_kind);
+    try std.testing.expectEqual(@as(usize, 1), result.valid.tools.array.items.len);
+
+    const snapshot = try result.valid.registrySnapshotJson(allocator);
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"kind\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"adapter\":\"zig-native-static-host\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"timeoutMs\":30000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"outputBytes\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"toolScopes\":[\"native.echo\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"owner\":{\"id\":\"com.pi.native.authoring\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"name\":\"native.echo\"") != null);
+
+    const docs_schema = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "../packages/coding-agent/docs/schemas/pi-extension.v1.authoring.schema.json",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(docs_schema);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"const\": \"pi-extension.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"descriptor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"library_path\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"dynamic_library_path\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"timeoutMs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"outputBytes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_schema, "\"toolScopes\"") != null);
+
+    const docs_types = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "../packages/coding-agent/docs/extension-manifest-authoring.types.ts",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(docs_types);
+    try std.testing.expect(std.mem.indexOf(u8, docs_types, "PiExtensionV1NativeManifest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_types, "\"pi-extension.v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_types, "\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_types, "PiNativeAbiVersion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_types, "PiExtensionNormalizedDeclarationMetadata") != null);
+}
+
 test "unified manifest defaults are stable visible and do not mutate source bytes" {
     const allocator = std.testing.allocator;
     const source =

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "pi-extension.v0",
+  "id": "com.pi.template.echo",
+  "name": "Pi Template Echo",
+  "version": "0.1.0",
+  "description": "Echoes a message through the public Zig WASM SDK boundary.",
+  "artifact": {
+    "kind": "wasm-component",
+    "path": "wasm/plugin.wasm"
+  },
+  "tool": {
+    "id": "template.echo",
+    "description": "Echo a string message.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "outputSchema": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "capabilities": [],
+  "resourceLimits": {
+    "timeoutMs": 30000,
+    "outputBytes": 1048576,
+    "toolScopes": []
+  }
+}

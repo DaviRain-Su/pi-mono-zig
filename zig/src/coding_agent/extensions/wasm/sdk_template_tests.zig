@@ -185,6 +185,55 @@ test "zig sdk template validation rejects dynamic native and product surfaces" {
     try expectInvalid(&slash_commands_result, "$.tool.outputSchema.metadata.slashCommands", "unsupported v0 trust/product surface");
 }
 
+test "typescript-facing wasm docs types schema validate against zig manifest contract" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(std.testing.io, "package", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "package/wasm", .default_dir);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "package/wasm/plugin.wasm", .data = "\x00asm" });
+    const package_root_z = try tmp.dir.realPathFileAlloc(std.testing.io, "package", allocator);
+    defer allocator.free(package_root_z);
+    const package_root = try allocator.dupe(u8, package_root_z);
+    defer allocator.free(package_root);
+
+    const docs_manifest = try readRepoFile(allocator, "../packages/coding-agent/docs/examples/pi-extension-wasm-v0.json");
+    defer allocator.free(docs_manifest);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "package/pi-extension.json", .data = docs_manifest });
+
+    var result = try wasm_manifest.validateManifestFile(allocator, std.testing.io, package_root);
+    defer result.deinit(allocator);
+    try std.testing.expect(result == .valid);
+    try std.testing.expectEqualStrings("pi-extension.v0", result.valid.schema_version);
+    try std.testing.expectEqualStrings("com.pi.template.echo", result.valid.id);
+    try std.testing.expectEqual(wasm_manifest.ArtifactKind.wasm_component, result.valid.artifact_kind);
+    try std.testing.expectEqualStrings("wasm/plugin.wasm", result.valid.artifact_path);
+    try std.testing.expectEqualStrings("template.echo", result.valid.tool_id);
+    try std.testing.expectEqual(@as(usize, 0), result.valid.requested_capabilities.len);
+    try std.testing.expectEqual(@as(usize, 0), result.valid.resource_limits.tool_scopes.len);
+    try std.testing.expectEqual(@as(u64, 30000), result.valid.resource_limits.timeout_ms.?);
+    try std.testing.expectEqual(@as(u64, 1048576), result.valid.resource_limits.output_bytes.?);
+
+    const docs_schema = try readRepoFile(allocator, "../packages/coding-agent/docs/schemas/pi-extension.v0.schema.json");
+    defer allocator.free(docs_schema);
+    try expectContains(docs_schema, "\"const\": \"pi-extension.v0\"");
+    try expectContains(docs_schema, "\"const\": \"wasm-component\"");
+    try expectContains(docs_schema, "\"inputSchema\"");
+    try expectContains(docs_schema, "\"outputSchema\"");
+    try expectContains(docs_schema, "\"resourceLimits\"");
+    try expectContains(docs_schema, "\"agent.delegate\"");
+    try expectNotContains(docs_schema, "\"native-dynamic\"");
+
+    const docs_types = try readRepoFile(allocator, "../packages/coding-agent/docs/extension-manifest-authoring.types.ts");
+    defer allocator.free(docs_types);
+    try expectContains(docs_types, "PiExtensionV0WasmManifest");
+    try expectContains(docs_types, "\"pi-extension.v0\"");
+    try expectContains(docs_types, "\"wasm-component\"");
+    try expectContains(docs_types, "PiExtensionResourceLimits");
+    try expectContains(docs_types, "PiExtensionDigestBoundPolicyPrincipal");
+}
+
 fn copyTemplateToTmp(allocator: std.mem.Allocator, tmp: anytype) ![]u8 {
     try tmp.dir.createDir(std.testing.io, "package", .default_dir);
     try tmp.dir.createDir(std.testing.io, "package/sdk", .default_dir);

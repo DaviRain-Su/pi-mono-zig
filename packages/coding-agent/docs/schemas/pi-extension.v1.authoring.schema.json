@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi.dev/schemas/pi-extension.v1.authoring.schema.json",
+  "title": "Pi Extension Manifest v1 Authoring Shape",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "runtime"],
+  "properties": {
+    "schemaVersion": {
+      "const": "pi-extension.v1"
+    },
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["kind", "entrypoint"],
+      "properties": {
+        "kind": {
+          "enum": ["typescript", "javascript", "process_jsonl", "wasm", "native", "future"]
+        },
+        "entrypoint": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "required": ["argv"],
+              "properties": {
+                "argv": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "required": ["artifactPath"],
+              "properties": {
+                "artifactPath": {
+                  "type": "string",
+                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+\\.wasm$"
+                }
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "required": ["descriptor"],
+              "properties": {
+                "descriptor": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "library_path": false,
+                "dynamic_library_path": false,
+                "remote_url": false
+              },
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "required": ["contract"],
+              "properties": {
+                "contract": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": true
+            }
+          ]
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "timeoutMs": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 30000
+            },
+            "outputBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 1048576
+            },
+            "toolScopes": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string"
+          },
+          "inputSchema": {
+            "type": "object"
+          },
+          "parameters": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "properties": {
+        "exports": {
+          "type": "array",
+          "default": []
+        },
+        "imports": {
+          "type": "array",
+          "default": []
+        }
+      },
+      "additionalProperties": true
+    },
+    "permissions": {
+      "type": "array"
+    },
+    "dependencies": {
+      "type": "array"
+    }
+  },
+  "additionalProperties": true
+}

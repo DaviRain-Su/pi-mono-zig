@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "pi-extension.v1",
+  "id": "com.pi.native.authoring",
+  "name": "Native Authoring Example",
+  "version": "0.1.0",
+  "description": "Documents the TypeScript-facing native manifest shape accepted by Zig validators.",
+  "runtime": {
+    "kind": "native",
+    "entrypoint": {
+      "descriptor": "native://static/example"
+    },
+    "limits": {
+      "timeoutMs": 30000,
+      "outputBytes": 1048576,
+      "toolScopes": ["native.echo"]
+    }
+  },
+  "tools": [
+    {
+      "name": "native.echo",
+      "description": "Echo a string through the native runtime boundary.",
+      "inputSchema": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "capabilities": {
+    "exports": [
+      {
+        "id": "native.echo",
+        "kind": "tool",
+        "version": "0.1.0"
+      }
+    ],
+    "imports": []
+  },
+  "permissions": [],
+  "dependencies": []
+}

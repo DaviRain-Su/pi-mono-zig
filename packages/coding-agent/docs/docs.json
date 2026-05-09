@@ -61,6 +61,10 @@
           "path": "packages.md"
         },
         {
+          "title": "Extension Manifest Authoring",
+          "path": "extension-manifest-authoring.md"
+        },
+        {
           "title": "Custom Models",
           "path": "models.md"
         },

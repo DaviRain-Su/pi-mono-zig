@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi.dev/schemas/pi-extension.v0.schema.json",
+  "title": "Pi WASM Extension Manifest v0",
+  "type": "object",
+  "required": ["schemaVersion", "id", "name", "version", "description", "artifact", "tool"],
+  "properties": {
+    "schemaVersion": {
+      "const": "pi-extension.v0"
+    },
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {
+          "const": "wasm-component"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+\\.wasm$"
+        }
+      },
+      "additionalProperties": true
+    },
+    "tool": {
+      "type": "object",
+      "required": ["id", "description", "inputSchema", "outputSchema"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "inputSchema": {
+          "type": "object"
+        },
+        "outputSchema": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": true
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "file.read",
+          "file.write",
+          "network.request",
+          "shell.run",
+          "env.read",
+          "model.call",
+          "session.read",
+          "session.write",
+          "ui.notify",
+          "tool.use",
+          "agent.spawn",
+          "agent.delegate"
+        ]
+      }
+    },
+    "resourceLimits": {
+      "type": "object",
+      "properties": {
+        "maxChildren": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "turns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputBytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "outputLines": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "toolScopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "not": {
+    "anyOf": [
+      {
+        "required": ["tools"]
+      },
+      {
+        "required": ["workflow"]
+      },
+      {
+        "required": ["workflowPreset"]
+      },
+      {
+        "required": ["wiki"]
+      },
+      {
+        "required": ["qa"]
+      },
+      {
+        "required": ["review"]
+      },
+      {
+        "required": ["webSimulator"]
+      },
+      {
+        "required": ["marketplace"]
+      },
+      {
+        "required": ["signing"]
+      },
+      {
+        "required": ["publisher"]
+      },
+      {
+        "required": ["remoteUrl"]
+      },
+      {
+        "required": ["remoteWasmUrl"]
+      },
+      {
+        "required": ["slashCommand"]
+      },
+      {
+        "required": ["slashCommands"]
+      }
+    ]
+  },
+  "additionalProperties": true
+}

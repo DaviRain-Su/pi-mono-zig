@@ -43,6 +43,7 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 - [Prompt templates](prompt-templates.md) - reusable prompts that expand from slash commands.
 - [Themes](themes.md) - built-in and custom terminal themes.
 - [Pi packages](packages.md) - bundle and share extensions, skills, prompts, and themes.
+- [Extension manifest authoring](extension-manifest-authoring.md) - `pi-extension.json` schema, examples, and TypeScript-facing types.
 - [Custom models](models.md) - add model entries for supported provider APIs.
 - [Custom providers](custom-provider.md) - implement custom APIs and OAuth flows.
 

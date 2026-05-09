@@ -150,6 +150,16 @@ If both are set, video takes precedence.
 
 ## Package Structure
 
+### `pi-extension.json` authoring manifests
+
+Zig SDK-backed WASM and native authoring use `pi-extension.json` manifests.
+The TypeScript-facing docs, types, schemas, and examples are parity references
+for the Zig validators only; they do not add TypeScript production runtime
+execution behavior.
+
+See [Extension Manifest Authoring](extension-manifest-authoring.md) for the
+WASM `pi-extension.v0` and native `pi-extension.v1` authoring shapes.
+
 ### Convention Directories
 
 If no `pi` manifest is present, pi auto-discovers resources from these directories:
