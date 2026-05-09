@@ -102,6 +102,23 @@ pub const PreparedExtensionCli = struct {
         unknown_flags: ?[]const cli.UnknownFlag,
         stderr: *std.Io.Writer,
     ) !bool {
+        return self.applyUnknownFlagsWithOptions(unknown_flags, stderr, false);
+    }
+
+    pub fn applyUnknownFlagsForRegistryDump(
+        self: *PreparedExtensionCli,
+        unknown_flags: ?[]const cli.UnknownFlag,
+        stderr: *std.Io.Writer,
+    ) !bool {
+        return self.applyUnknownFlagsWithOptions(unknown_flags, stderr, true);
+    }
+
+    fn applyUnknownFlagsWithOptions(
+        self: *PreparedExtensionCli,
+        unknown_flags: ?[]const cli.UnknownFlag,
+        stderr: *std.Io.Writer,
+        allow_registry_diagnostics: bool,
+    ) !bool {
         const raw_unknown_flags = unknown_flags orelse &.{};
 
         const parsed = try self.allocator.alloc(extension_flags.ParsedUnknownFlag, raw_unknown_flags.len);
@@ -125,6 +142,7 @@ pub const PreparedExtensionCli = struct {
 
         var saw_error = false;
         for (apply_result.diagnostics) |diagnostic| {
+            if (allow_registry_diagnostics and self.isRegistryDiagnostic(diagnostic)) continue;
             if (diagnostic.severity == .@"error") saw_error = true;
             try stderr.print(
                 "Error: {s} owner={s} source={s} flag=--{s} reason={s}: {s}\n",
@@ -162,6 +180,16 @@ pub const PreparedExtensionCli = struct {
         }
 
         return true;
+    }
+
+    fn isRegistryDiagnostic(self: *const PreparedExtensionCli, diagnostic: extension_flags.Diagnostic) bool {
+        for (self.registry.diagnostics.items) |registry_diagnostic| {
+            if (!std.mem.eql(u8, registry_diagnostic.code, diagnostic.code)) continue;
+            if (!std.mem.eql(u8, registry_diagnostic.owner, diagnostic.owner)) continue;
+            if (!std.mem.eql(u8, registry_diagnostic.flag_name, diagnostic.flag_name)) continue;
+            return true;
+        }
+        return false;
     }
 
     pub fn parsedCliFlagValues(self: *const PreparedExtensionCli) []const extension_registry.ParsedCliFlag {
@@ -290,27 +318,37 @@ fn snapshotWithRejectedFlagDiagnostics(
 ) ![]u8 {
     if (diagnostics.len == 0) return try allocator.dupe(u8, snapshot);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return try allocator.dupe(u8, snapshot);
+    const trimmed = std.mem.trimEnd(u8, snapshot, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') return try allocator.dupe(u8, snapshot);
 
-    var diagnostics_array = std.json.Array.init(allocator);
-    for (diagnostics) |diagnostic| {
-        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try entry.put(allocator, try allocator.dupe(u8, "severity"), .{ .string = try allocator.dupe(u8, switch (diagnostic.severity) {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    try writer.writer.writeAll(trimmed[0 .. trimmed.len - 1]);
+    if (trimmed.len > 2) try writer.writer.writeAll(",");
+    try writer.writer.writeAll("\"extensionFlagDiagnostics\":[");
+    for (diagnostics, 0..) |diagnostic, index| {
+        if (index > 0) try writer.writer.writeAll(",");
+        try writer.writer.writeAll("{\"severity\":");
+        try std.json.Stringify.value(std.json.Value{ .string = switch (diagnostic.severity) {
             .warning => "warning",
             .@"error" => "error",
-        }) });
-        try entry.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, diagnostic.code) });
-        try entry.put(allocator, try allocator.dupe(u8, "owner"), .{ .string = try allocator.dupe(u8, diagnostic.owner) });
-        try entry.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, diagnostic.source) });
-        try entry.put(allocator, try allocator.dupe(u8, "flag"), .{ .string = try allocator.dupe(u8, diagnostic.flag_name) });
-        try entry.put(allocator, try allocator.dupe(u8, "reason"), .{ .string = try allocator.dupe(u8, diagnostic.reason) });
-        try entry.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, diagnostic.message) });
-        try diagnostics_array.append(.{ .object = entry });
+        } }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"code\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.code }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"owner\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.owner }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"source\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.source }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"flag\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.flag_name }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"reason\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.reason }, .{}, &writer.writer);
+        try writer.writer.writeAll(",\"message\":");
+        try std.json.Stringify.value(std.json.Value{ .string = diagnostic.message }, .{}, &writer.writer);
+        try writer.writer.writeAll("}");
     }
-    try parsed.value.object.put(allocator, try allocator.dupe(u8, "extensionFlagDiagnostics"), .{ .array = diagnostics_array });
-    return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+    try writer.writer.writeAll("]}");
+    return try allocator.dupe(u8, writer.writer.buffered());
 }
 
 fn isEnabledValue(value: []const u8) bool {
