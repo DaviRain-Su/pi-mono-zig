@@ -3358,9 +3358,8 @@ pub fn renderChatItemInto(
     width: usize,
     theme: ?*const resources_mod.Theme,
     item: ChatItem,
-    lines: *tui.LineList,
-) !void {
-    try renderChatItemIntoAt(allocator, width, theme, item, 0, lines);
+) ![]const []const u8 {
+    return renderChatItemIntoAt(allocator, width, theme, item, 0);
 }
 
 pub fn renderChatItemIntoAt(
@@ -3369,9 +3368,8 @@ pub fn renderChatItemIntoAt(
     theme: ?*const resources_mod.Theme,
     item: ChatItem,
     now_ms: i64,
-    lines: *tui.LineList,
-) !void {
-    try renderChatItemIntoWithOptions(allocator, width, null, theme, item, now_ms, true, lines);
+) ![]const []const u8 {
+    return renderChatItemIntoWithOptions(allocator, width, null, theme, item, now_ms, true);
 }
 
 pub fn visibleChatTextAlloc(
@@ -3381,12 +3379,14 @@ pub fn visibleChatTextAlloc(
     var snapshot = try app_state.snapshotForRender(allocator);
     defer snapshot.deinit(allocator);
 
-    var lines = tui.LineList.empty;
-    defer freeLinesSafe(allocator, &lines);
-
     const width = @max(snapshot.chat_width, 1);
+    var all_lines = std.ArrayList([]const u8).empty;
+    defer {
+        for (all_lines.items) |line| allocator.free(line);
+        all_lines.deinit(allocator);
+    }
     for (snapshot.items) |item| {
-        try renderChatItemIntoWithOptions(
+        const lines = try renderChatItemIntoWithOptions(
             allocator,
             width,
             null,
@@ -3394,19 +3394,23 @@ pub fn visibleChatTextAlloc(
             item,
             0,
             snapshot.all_expanded,
-            &lines,
         );
+        defer {
+            for (lines) |line| allocator.free(line);
+            allocator.free(lines);
+        }
+        try all_lines.appendSlice(allocator, lines);
     }
 
-    const visible_rows = if (snapshot.chat_visible_rows == 0) lines.items.len else snapshot.chat_visible_rows;
-    const max_offset = lines.items.len -| visible_rows;
+    const visible_rows = if (snapshot.chat_visible_rows == 0) all_lines.items.len else snapshot.chat_visible_rows;
+    const max_offset = all_lines.items.len -| visible_rows;
     const offset = @min(snapshot.chat_scroll_offset, max_offset);
     const start = max_offset -| offset;
-    const end = @min(start + visible_rows, lines.items.len);
+    const end = @min(start + visible_rows, all_lines.items.len);
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
-    for (lines.items[start..end], 0..) |line, index| {
+    for (all_lines.items[start..end], 0..) |line, index| {
         if (index > 0) try writer.writer.writeAll("\n");
         try writer.writer.writeAll(std.mem.trim(u8, line, " "));
     }
@@ -3421,8 +3425,7 @@ fn renderChatItemIntoWithOptions(
     item: ChatItem,
     now_ms: i64,
     all_expanded: bool,
-    lines: *tui.LineList,
-) !void {
+) ![]const []const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch_allocator = arena.allocator();
@@ -3439,7 +3442,7 @@ fn renderChatItemIntoWithOptions(
     const window = tui.draw.rootWindow(&screen);
     window.clear();
     const rendered = try drawChatItem(window, scratch_allocator, keybindings, theme, item, 0, now_ms, all_expanded);
-    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered, lines);
+    return tui.cell_rows.screenRowsToLinesAlloc(allocator, &screen, width, rendered);
 }
 
 pub fn renderAssistantChatItemInto(
@@ -3447,9 +3450,8 @@ pub fn renderAssistantChatItemInto(
     width: usize,
     theme: ?*const resources_mod.Theme,
     text: []const u8,
-    lines: *tui.LineList,
-) !void {
-    try renderChatItemInto(allocator, width, theme, .{ .kind = .assistant, .text = @constCast(text) }, lines);
+) ![]const []const u8 {
+    return renderChatItemInto(allocator, width, theme, .{ .kind = .assistant, .text = @constCast(text) });
 }
 
 pub fn renderMarkdownChatItemInto(
@@ -3457,9 +3459,8 @@ pub fn renderMarkdownChatItemInto(
     width: usize,
     theme: ?*const resources_mod.Theme,
     text: []const u8,
-    lines: *tui.LineList,
-) !void {
-    try renderChatItemInto(allocator, width, theme, .{ .kind = .markdown, .text = @constCast(text) }, lines);
+) ![]const []const u8 {
+    return renderChatItemInto(allocator, width, theme, .{ .kind = .markdown, .text = @constCast(text) });
 }
 
 pub fn handleAppAgentEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
@@ -5079,23 +5080,24 @@ test "collapse m2 toggle preserves tail and clamps non-tail offset" {
 test "renderChatItemInto renders markdown chat items without assistant prefix" {
     const allocator = std.testing.allocator;
 
-    var lines = tui.LineList.empty;
-    defer tui.component.freeLines(allocator, &lines);
-
     const text = try allocator.dupe(u8,
         \\# Changelog
         \\- Added /changelog
     );
     defer allocator.free(text);
 
-    try renderChatItemInto(allocator, 40, null, .{
+    const lines = try renderChatItemInto(allocator, 40, null, .{
         .kind = .markdown,
         .text = text,
-    }, &lines);
+    });
+    defer {
+        for (lines) |line| allocator.free(line);
+        allocator.free(lines);
+    }
 
-    try std.testing.expect(renderedLinesContain(lines.items, "Changelog"));
-    try std.testing.expect(renderedLinesContain(lines.items, "• "));
-    try std.testing.expect(!renderedLinesContain(lines.items, ASSISTANT_PREFIX));
+    try std.testing.expect(renderedLinesContain(lines, "Changelog"));
+    try std.testing.expect(renderedLinesContain(lines, "• "));
+    try std.testing.expect(!renderedLinesContain(lines, ASSISTANT_PREFIX));
 }
 
 test "app state replaces streaming tool updates with the final tool result" {
