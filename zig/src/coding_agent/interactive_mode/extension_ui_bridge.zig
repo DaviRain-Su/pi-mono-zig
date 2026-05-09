@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent = @import("agent");
 const tui = @import("tui");
 const session_mod = @import("../sessions/session.zig");
 const extension_registry = @import("../extensions/extension_registry.zig");
@@ -240,9 +241,15 @@ pub const Bridge = struct {
         if (std.mem.eql(u8, request.method, "setStatus")) {
             const key = optionalString(payload, "statusKey") orelse optionalString(payload, "key") orelse "extension";
             const text = optionalString(payload, "statusText") orelse optionalString(payload, "text");
-            try app_state.setExtensionFooterStatus(key, text);
             if (text) |status_text| {
-                if (status_text.len > 0) try app_state.setStatus(status_text);
+                if (status_text.len > 0) {
+                    try app_state.setExtensionFooterStatus(key, status_text);
+                    try app_state.setStatus(status_text);
+                } else {
+                    try app_state.clearExtensionFooterStatus(key);
+                }
+            } else {
+                try app_state.clearExtensionFooterStatus(key);
             }
             try self.respondIfRequired(request, "{}");
             return;
@@ -693,6 +700,162 @@ fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: 
     try writer.writeAll(encoded);
 }
 
+const TestUiResponse = struct {
+    id: []u8,
+    payload_json: []u8,
+
+    fn deinit(self: *TestUiResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
+const TestRuntimeHost = struct {
+    allocator: std.mem.Allocator,
+    responses: std.ArrayList(TestUiResponse) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestRuntimeHost {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestRuntimeHost) void {
+        for (self.responses.items) |*response| response.deinit(self.allocator);
+        self.responses.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn adapter(self: *TestRuntimeHost) extension_runtime.RuntimeAdapter {
+        return .{ .ptr = self, .vtable = &vtable, .kind = .process_jsonl };
+    }
+
+    const vtable = extension_runtime.RuntimeAdapter.VTable{
+        .wait_for_ready = waitForReady,
+        .pending_count = pendingCount,
+        .diagnostic_count = diagnosticCount,
+        .diagnostic_category_count = diagnosticCategoryCount,
+        .has_shutdown_complete = hasShutdownComplete,
+        .registry_frames_applied = registryFramesApplied,
+        .has_registered_command = hasRegisteredCommand,
+        .has_registered_hook = hasRegisteredHook,
+        .snapshot_registry_json = snapshotRegistryJson,
+        .with_registry = withRegistry,
+        .apply_cli_flag_values = applyCliFlagValues,
+        .agent_tool = agentTool,
+        .take_ui_requests = takeUiRequests,
+        .send_extension_ui_response = sendExtensionUiResponse,
+        .send_extension_event_frame = sendExtensionEventFrame,
+        .invoke_extension_event = invokeExtensionEvent,
+        .shutdown = shutdown,
+        .deinit = runtimeDeinit,
+    };
+
+    fn host(ptr: *anyopaque) *TestRuntimeHost {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn waitForReady(_: *anyopaque, _: u64) !void {}
+    fn pendingCount(_: *anyopaque) usize {
+        return 0;
+    }
+    fn diagnosticCount(_: *anyopaque) usize {
+        return 0;
+    }
+    fn diagnosticCategoryCount(_: *anyopaque, _: extension_runtime.DiagnosticCategory) usize {
+        return 0;
+    }
+    fn hasShutdownComplete(_: *anyopaque) bool {
+        return true;
+    }
+    fn registryFramesApplied(_: *anyopaque) usize {
+        return 0;
+    }
+    fn hasRegisteredCommand(_: *anyopaque, _: []const u8) bool {
+        return false;
+    }
+    fn hasRegisteredHook(_: *anyopaque, _: []const u8) bool {
+        return false;
+    }
+    fn snapshotRegistryJson(_: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
+        return try allocator.dupe(u8, "{}");
+    }
+    fn withRegistry(_: *anyopaque, _: ?*anyopaque, _: extension_runtime.RegistryCallback) !void {}
+    fn applyCliFlagValues(_: *anyopaque, _: []const extension_registry.ParsedCliFlag) !void {}
+    fn agentTool(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !?agent.AgentTool {
+        return null;
+    }
+    fn takeUiRequests(_: *anyopaque, allocator: std.mem.Allocator) ![]extension_runtime.ExtensionUiRequest {
+        return try allocator.alloc(extension_runtime.ExtensionUiRequest, 0);
+    }
+    fn sendExtensionUiResponse(ptr: *anyopaque, id: []const u8, payload_json: []const u8) !void {
+        const self = host(ptr);
+        try self.responses.append(self.allocator, .{
+            .id = try self.allocator.dupe(u8, id),
+            .payload_json = try self.allocator.dupe(u8, payload_json),
+        });
+    }
+    fn sendExtensionEventFrame(_: *anyopaque, _: []const u8) void {}
+    fn invokeExtensionEvent(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: []const u8,
+        _: std.json.Value,
+        _: u64,
+    ) !?std.json.Value {
+        return null;
+    }
+    fn shutdown(_: *anyopaque) !void {}
+    fn runtimeDeinit(_: *anyopaque) void {}
+};
+
+fn makeUiRequest(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    method: []const u8,
+    response_required: bool,
+    payload_json: []const u8,
+) !extension_runtime.ExtensionUiRequest {
+    return .{
+        .id = try allocator.dupe(u8, id),
+        .method = try allocator.dupe(u8, method),
+        .response_required = response_required,
+        .payload_json = try allocator.dupe(u8, payload_json),
+    };
+}
+
+fn handleUiRequestForTest(
+    allocator: std.mem.Allocator,
+    bridge: *Bridge,
+    app_state: *rendering.AppState,
+    request: extension_runtime.ExtensionUiRequest,
+) !void {
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    var terminal: tui.Terminal = undefined;
+    var editor: tui.Editor = undefined;
+    var overlay: ?overlays.SelectorOverlay = null;
+    var live_resources = shared.LiveResources.init(.{
+        .cwd = "",
+        .system_prompt = "",
+        .session_dir = "",
+        .provider = "faux",
+    });
+    defer live_resources.deinit(allocator);
+    var session: session_mod.AgentSession = undefined;
+    try bridge.handleHostRequest(
+        request,
+        &env_map,
+        "",
+        &terminal,
+        &editor,
+        &overlay,
+        app_state,
+        &live_resources,
+        &session,
+        0,
+    );
+}
+
 test "extension dialog resolves select confirm input editor and cancel payloads" {
     const allocator = std.testing.allocator;
     var request = extension_runtime.ExtensionUiRequest{
@@ -787,4 +950,132 @@ test "extension bridge editor APIs mutate editor and hidden thinking label" {
     try state.setThinkingBlockVisibility(true);
     try bridge.handleHostRequest(label_request, &env_map, tmp_path, &terminal, &editor, &overlay, &state, &live, &session, 0);
     try std.testing.expectEqualStrings("Hidden thoughts", state.items.items[1].text);
+}
+
+test "extension UI notify maps info warning and error severity to status and chat state" {
+    const allocator = std.testing.allocator;
+    var bridge = Bridge.init(allocator, std.testing.io);
+    defer bridge.queued_dialogs.deinit(allocator);
+    var state = try rendering.AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var info = try makeUiRequest(allocator, "notify-info", "notify", false, "{\"message\":\"info notice\",\"notifyType\":\"info\"}");
+    defer info.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, info);
+    var info_snapshot = try state.snapshotForRender(allocator);
+    defer info_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("info notice", info_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 1), info_snapshot.items.len);
+
+    var warning = try makeUiRequest(allocator, "notify-warning", "notify", false, "{\"message\":\"careful\",\"notifyType\":\"warning\"}");
+    defer warning.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, warning);
+    var warning_snapshot = try state.snapshotForRender(allocator);
+    defer warning_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("careful", warning_snapshot.status.?);
+    try std.testing.expectEqual(rendering.ChatKind.info, warning_snapshot.items[1].kind);
+    try std.testing.expectEqualStrings("Warning: careful", warning_snapshot.items[1].text);
+
+    var err = try makeUiRequest(allocator, "notify-error", "notify", false, "{\"message\":\"broken\",\"notifyType\":\"error\"}");
+    defer err.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, err);
+    var error_snapshot = try state.snapshotForRender(allocator);
+    defer error_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("broken", error_snapshot.status.?);
+    try std.testing.expectEqual(rendering.ChatKind.@"error", error_snapshot.items[2].kind);
+    try std.testing.expectEqualStrings("broken", error_snapshot.items[2].text);
+}
+
+test "extension UI setStatus updates clears and isolates keyed footer status" {
+    const allocator = std.testing.allocator;
+    var bridge = Bridge.init(allocator, std.testing.io);
+    defer bridge.queued_dialogs.deinit(allocator);
+    var state = try rendering.AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var primary = try makeUiRequest(allocator, "status-primary", "setStatus", false, "{\"statusKey\":\"primary\",\"statusText\":\"building\"}");
+    defer primary.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, primary);
+
+    var secondary = try makeUiRequest(allocator, "status-secondary", "setStatus", false, "{\"statusKey\":\"secondary\",\"statusText\":\"watching\"}");
+    defer secondary.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, secondary);
+
+    var set_snapshot = try state.snapshotForRender(allocator);
+    defer set_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("watching", set_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 2), set_snapshot.extension_footer_statuses.len);
+    try std.testing.expectEqualStrings("building", set_snapshot.extension_footer_statuses[0]);
+    try std.testing.expectEqualStrings("watching", set_snapshot.extension_footer_statuses[1]);
+
+    var missing_clear = try makeUiRequest(allocator, "clear-missing", "setStatus", false, "{\"statusKey\":\"primary\"}");
+    defer missing_clear.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, missing_clear);
+    var missing_snapshot = try state.snapshotForRender(allocator);
+    defer missing_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("watching", missing_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 1), missing_snapshot.extension_footer_statuses.len);
+    try std.testing.expectEqualStrings("watching", missing_snapshot.extension_footer_statuses[0]);
+
+    var reset_primary = try makeUiRequest(allocator, "status-primary-again", "setStatus", false, "{\"statusKey\":\"primary\",\"statusText\":\"building-again\"}");
+    defer reset_primary.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, reset_primary);
+    var null_clear = try makeUiRequest(allocator, "clear-null", "setStatus", false, "{\"statusKey\":\"primary\",\"statusText\":null}");
+    defer null_clear.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, null_clear);
+    var null_snapshot = try state.snapshotForRender(allocator);
+    defer null_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("idle", null_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 1), null_snapshot.extension_footer_statuses.len);
+    try std.testing.expectEqualStrings("watching", null_snapshot.extension_footer_statuses[0]);
+
+    var update_secondary = try makeUiRequest(allocator, "status-secondary-again", "setStatus", false, "{\"statusKey\":\"secondary\",\"statusText\":\"done\"}");
+    defer update_secondary.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, update_secondary);
+    var empty_clear = try makeUiRequest(allocator, "clear-empty", "setStatus", false, "{\"statusKey\":\"secondary\",\"statusText\":\"\"}");
+    defer empty_clear.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, empty_clear);
+    var empty_snapshot = try state.snapshotForRender(allocator);
+    defer empty_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("idle", empty_snapshot.status.?);
+    try std.testing.expectEqual(@as(usize, 0), empty_snapshot.extension_footer_statuses.len);
+}
+
+test "extension UI notify and setStatus responseRequired controls correlated responses" {
+    const allocator = std.testing.allocator;
+    var bridge = Bridge.init(allocator, std.testing.io);
+    defer bridge.queued_dialogs.deinit(allocator);
+    var host = TestRuntimeHost.init(allocator);
+    defer host.deinit();
+    bridge.host = host.adapter();
+    var state = try rendering.AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    var fire_and_forget = try makeUiRequest(allocator, "notify-false", "notify", false, "{\"message\":\"background\",\"notifyType\":\"info\"}");
+    defer fire_and_forget.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, fire_and_forget);
+    try std.testing.expectEqual(@as(usize, 0), host.responses.items.len);
+
+    var required_notify = try makeUiRequest(allocator, "notify-true", "notify", true, "{\"message\":\"foreground\",\"notifyType\":\"info\"}");
+    defer required_notify.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, required_notify);
+    try std.testing.expectEqual(@as(usize, 1), host.responses.items.len);
+    try std.testing.expectEqualStrings("notify-true", host.responses.items[0].id);
+    try std.testing.expectEqualStrings("{}", host.responses.items[0].payload_json);
+
+    var required_status = try makeUiRequest(allocator, "status-true", "setStatus", true, "{\"statusKey\":\"bridge\",\"statusText\":\"ready\"}");
+    defer required_status.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, required_status);
+    try std.testing.expectEqual(@as(usize, 2), host.responses.items.len);
+    try std.testing.expectEqualStrings("status-true", host.responses.items[1].id);
+    try std.testing.expectEqualStrings("{}", host.responses.items[1].payload_json);
+    var status_snapshot = try state.snapshotForRender(allocator);
+    defer status_snapshot.deinit(allocator);
+    try std.testing.expectEqualStrings("ready", status_snapshot.status.?);
+    try std.testing.expectEqualStrings("ready", status_snapshot.extension_footer_statuses[0]);
+
+    var clear_no_response = try makeUiRequest(allocator, "status-false", "setStatus", false, "{\"statusKey\":\"bridge\",\"statusText\":\"\"}");
+    defer clear_no_response.deinit(allocator);
+    try handleUiRequestForTest(allocator, &bridge, &state, clear_no_response);
+    try std.testing.expectEqual(@as(usize, 2), host.responses.items.len);
 }

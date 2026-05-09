@@ -592,6 +592,34 @@ test "TS RPC wire extension UI frames preserve TypeScript field order" {
     );
 
     out.clearRetainingCapacity();
+    try writeExtensionUINotifyRequest(allocator, &out.writer, "ui_notify_warning", "Check this", "warning");
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_notify_warning\",\"method\":\"notify\",\"message\":\"Check this\",\"notifyType\":\"warning\"}\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeExtensionUINotifyRequest(allocator, &out.writer, "ui_notify_error", "Broken", "error");
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_notify_error\",\"method\":\"notify\",\"message\":\"Broken\",\"notifyType\":\"error\"}\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeExtensionUISetStatusRequest(allocator, &out.writer, "ui_status_set", "extension", "ready");
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_status_set\",\"method\":\"setStatus\",\"statusKey\":\"extension\",\"statusText\":\"ready\"}\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeExtensionUISetStatusRequest(allocator, &out.writer, "ui_status_clear", "extension", null);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"extension_ui_request\",\"id\":\"ui_status_clear\",\"method\":\"setStatus\",\"statusKey\":\"extension\"}\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
     try writeExtensionUISetWidgetRequest(allocator, &out.writer, "ui_widget", "status", &options, "aboveEditor");
     try std.testing.expectEqualStrings(
         "{\"type\":\"extension_ui_request\",\"id\":\"ui_widget\",\"method\":\"setWidget\",\"widgetKey\":\"status\",\"widgetLines\":[\"one\",\"two\"],\"widgetPlacement\":\"aboveEditor\"}\n",
