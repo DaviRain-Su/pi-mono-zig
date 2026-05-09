@@ -678,8 +678,8 @@ fn parseKeySpec(raw: []const u8) ?KeySpec {
 }
 
 test "keybinding definitions count matches action enum" {
-    try std.testing.expectEqual(41, DEFINITIONS.len);
-    try std.testing.expectEqual(41, @typeInfo(Action).@"enum".fields.len);
+    try std.testing.expectEqual(42, DEFINITIONS.len);
+    try std.testing.expectEqual(42, @typeInfo(Action).@"enum".fields.len);
 }
 
 test "keybinding definition IDs are unique" {
@@ -806,11 +806,11 @@ test "keybinding new defaults match TS" {
     try std.testing.expectEqual(Action.tree_filter_cycleBackward, defaults.actionForKeyWithModifiers(.{ .ctrl = 'o' }, .{ .shift = true }).?);
 }
 
-test "keybinding initDefaults produces 41 bindings" {
+test "keybinding initDefaults produces 42 bindings" {
     const allocator = std.testing.allocator;
     var defaults = try Keybindings.initDefaults(allocator);
     defer defaults.deinit();
-    try std.testing.expectEqual(@as(usize, 41), defaults.bindings.len);
+    try std.testing.expectEqual(@as(usize, 42), defaults.bindings.len);
 }
 
 test "keybinding parseKeySpec handles all new formats" {

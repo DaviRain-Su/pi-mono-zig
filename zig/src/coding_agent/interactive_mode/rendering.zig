@@ -2549,7 +2549,7 @@ fn drawTaskPanel(
             keybindings,
             snapshot,
             content_width,
-            layoutMode(content_width),
+            layoutMode(@as(usize, window.width)),
             now_ms,
         );
         _ = panel_inner.printSegment(.{
