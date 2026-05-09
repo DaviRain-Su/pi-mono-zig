@@ -1122,7 +1122,7 @@ test "native host operation gates allow only fake and sandbox side effects" {
     // Create test fixture files so real I/O succeeds within the sandbox.
     const read_fixture_path = try std.fs.path.join(allocator, &.{ sandbox_root, "read.txt" });
     defer allocator.free(read_fixture_path);
-    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = read_fixture_path, .data = "hello from sandbox" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sandbox/read.txt", .data = "hello from sandbox" });
 
     var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
     const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
@@ -1282,7 +1282,7 @@ fn toolContextProbeExecute(ctx: *ToolContext) !agent.AgentToolResult {
     } else "no-value";
 
     const text = try std.fmt.allocPrint(ctx.allocator, "id={s} value={s}", .{ ctx.tool_call_id, value });
-    errdefer ctx.allocator.free(text);
+    defer ctx.allocator.free(text);
 
     return .{
         .content = try tools_common.makeTextContent(ctx.allocator, text),

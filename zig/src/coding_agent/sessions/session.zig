@@ -3,6 +3,7 @@ const ai = @import("ai");
 const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const native_runtime = @import("../extensions/native_runtime.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const session_manager = @import("session_manager.zig");
 const tools_common = @import("../tools/common.zig");
@@ -1182,7 +1183,9 @@ fn expectToolResultContains(messages: []const agent.AgentMessage, tool_name: []c
     return error.ExpectedToolResultNotFound;
 }
 
-fn crossNativeEchoExecute(allocator: std.mem.Allocator, params: std.json.Value) !agent.AgentToolResult {
+fn crossNativeEchoExecute(ctx: *native_runtime.ToolContext) !agent.AgentToolResult {
+    const allocator = ctx.allocator;
+    const params = ctx.params;
     if (params != .object) return crossNativeInvalidInput(allocator);
     const value = params.object.get("value") orelse return crossNativeInvalidInput(allocator);
     if (value != .string) return crossNativeInvalidInput(allocator);
