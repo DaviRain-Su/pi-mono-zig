@@ -517,9 +517,74 @@ pub const GoogleThinkingOptions = struct {
     level: ?[]const u8 = null,
 };
 
-// TODO(review-B11): StreamOptions has 42+ fields, many provider-specific.
-// Split provider-specific options into per-provider structs; keep only
-// generic fields here plus a provider_options union or json.Value.
+// Provider-specific streaming options extracted from StreamOptions.
+// Each provider's stream() function accesses its variant via
+// `options.provider` (a ProviderStreamOptions union).
+pub const AnthropicStreamOptions = struct {
+    thinking_enabled: ?bool = null,
+    thinking_budget_tokens: ?u32 = null,
+    thinking_display: ?AnthropicThinkingDisplay = null,
+    effort: ?AnthropicEffort = null,
+    interleaved_thinking: ?bool = null,
+    tool_choice: ?AnthropicToolChoice = null,
+};
+
+pub const BedrockStreamOptions = struct {
+    region: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
+    bearer_token: ?[]const u8 = null,
+    tool_choice: ?BedrockToolChoice = null,
+    reasoning: ?ThinkingLevel = null,
+    thinking_budgets: ?ThinkingBudgets = null,
+    interleaved_thinking: ?bool = null,
+    thinking_display: ?AnthropicThinkingDisplay = null,
+    request_metadata: ?std.json.Value = null,
+};
+
+pub const AzureStreamOptions = struct {
+    api_version: ?[]const u8 = null,
+    resource_name: ?[]const u8 = null,
+    base_url: ?[]const u8 = null,
+    deployment_name: ?[]const u8 = null,
+};
+
+pub const GoogleStreamOptions = struct {
+    tool_choice: ?[]const u8 = null,
+    thinking: ?GoogleThinkingOptions = null,
+};
+
+pub const MistralStreamOptions = struct {
+    prompt_mode: ?[]const u8 = null,
+    reasoning_effort: ?[]const u8 = null,
+};
+
+pub const OpenAIChatStreamOptions = struct {
+    tool_choice: ?std.json.Value = null,
+    reasoning_effort: ?[]const u8 = null,
+};
+
+pub const ResponsesStreamOptions = struct {
+    reasoning_effort: ?ThinkingLevel = null,
+    reasoning_summary: ?[]const u8 = null,
+    service_tier: ?[]const u8 = null,
+    text_verbosity: ?[]const u8 = null,
+};
+
+pub const ProviderStreamOptions = union(enum) {
+    none,
+    anthropic: AnthropicStreamOptions,
+    azure: AzureStreamOptions,
+    bedrock: BedrockStreamOptions,
+    google: GoogleStreamOptions,
+    mistral: MistralStreamOptions,
+    openai: OpenAIChatStreamOptions,
+    responses: ResponsesStreamOptions,
+};
+
+// TODO(review-B11): Provider-specific fields are being migrated to
+// ProviderStreamOptions. During the transition, both flat fields and
+// the provider union are populated. Once all call sites migrate,
+// remove the flat provider-specific fields.
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
@@ -602,6 +667,11 @@ pub const StreamOptions = struct {
     mistral_prompt_mode: ?[]const u8 = null,
     /// Mistral reasoning effort, e.g. "high".
     mistral_reasoning_effort: ?[]const u8 = null,
+
+    /// Provider-specific options. During the B11 migration, both this
+    /// union and the legacy flat fields above are populated. New code
+    /// should read from this union; the flat fields will be removed.
+    provider: ProviderStreamOptions = .none,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -657,6 +727,38 @@ pub const SimpleStreamOptions = struct {
         opts.bedrock_reasoning = self.reasoning;
         opts.responses_reasoning_effort = self.reasoning;
         opts.bedrock_thinking_budgets = self.thinking_budgets;
+        // Populate provider union (B11 migration).
+        opts.provider = .{
+            .bedrock = .{
+                .region = self.bedrock_region,
+                .profile = self.bedrock_profile,
+                .bearer_token = self.bedrock_bearer_token,
+                .tool_choice = self.bedrock_tool_choice,
+                .reasoning = self.reasoning,
+                .thinking_budgets = self.thinking_budgets,
+                .interleaved_thinking = self.bedrock_interleaved_thinking,
+                .thinking_display = self.bedrock_thinking_display,
+                .request_metadata = self.bedrock_request_metadata,
+            },
+            .google = .{
+                .tool_choice = self.google_tool_choice,
+                .thinking = self.google_thinking,
+            },
+            .openai = .{
+                .tool_choice = self.openai_tool_choice,
+                .reasoning_effort = self.openai_reasoning_effort,
+            },
+            .azure = .{
+                .api_version = self.azure_api_version,
+                .resource_name = self.azure_resource_name,
+                .base_url = self.azure_base_url,
+                .deployment_name = self.azure_deployment_name,
+            },
+            .mistral = .{
+                .prompt_mode = self.mistral_prompt_mode,
+                .reasoning_effort = self.mistral_reasoning_effort,
+            },
+        };
         return opts;
     }
 };

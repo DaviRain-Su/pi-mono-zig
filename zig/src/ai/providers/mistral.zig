@@ -257,10 +257,18 @@ pub fn buildRequestPayload(
         if (stream_options.metadata) |metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "metadata"), try provider_json.cloneValue(allocator, metadata));
         }
-        if (stream_options.mistral_reasoning_effort) |effort| {
+        // B11 migration: read from provider union; fall back to flat field.
+        var mistral_opts: types.MistralStreamOptions = .{};
+        if (stream_options.provider == .mistral) {
+            mistral_opts = stream_options.provider.mistral;
+        } else {
+            mistral_opts.reasoning_effort = stream_options.mistral_reasoning_effort;
+            mistral_opts.prompt_mode = stream_options.mistral_prompt_mode;
+        }
+        if (mistral_opts.reasoning_effort) |effort| {
             try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, effort) });
         }
-        if (stream_options.mistral_prompt_mode) |mode| {
+        if (mistral_opts.prompt_mode) |mode| {
             try payload.put(allocator, try allocator.dupe(u8, "prompt_mode"), .{ .string = try allocator.dupe(u8, mode) });
         }
     }
