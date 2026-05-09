@@ -935,7 +935,7 @@ fn toolErrorDetails(
     return .{ .object = details };
 }
 
-fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]const ai.ContentBlock {
+pub fn parseContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]const ai.ContentBlock {
     if (value != .array) return error.UnsupportedHostMessageType;
     const blocks = try allocator.alloc(ai.ContentBlock, value.array.items.len);
     errdefer allocator.free(blocks);

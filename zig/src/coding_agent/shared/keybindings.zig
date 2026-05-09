@@ -598,7 +598,7 @@ fn parseBindingList(allocator: std.mem.Allocator, entries: []const []const u8) !
     return specs.toOwnedSlice(allocator);
 }
 
-fn parseKeySpec(raw: []const u8) ?KeySpec {
+pub fn parseKeySpec(raw: []const u8) ?KeySpec {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
 

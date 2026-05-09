@@ -3,6 +3,7 @@ const ai = @import("ai");
 const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const extension_protocol = @import("../extensions/extension_protocol.zig");
 const native_runtime = @import("../extensions/native_runtime.zig");
 const sdk = @import("../extensions/sdk.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
@@ -256,6 +257,9 @@ pub const AgentSession = struct {
     }
 
     pub fn deinit(self: *AgentSession) void {
+        if (self.extension_hook_context) |ctx| {
+            emitSessionShutdownHook(self.allocator, ctx, "quit") catch {};
+        }
         if (self.subscribed) {
             _ = self.agent.unsubscribe(self.subscriber);
             self.subscribed = false;
@@ -332,6 +336,10 @@ pub const AgentSession = struct {
     }
 
     pub fn compact(self: *AgentSession, custom_instructions: ?[]const u8) !CompactionResult {
+        if (self.extension_hook_context) |ctx| {
+            const cancelled = emitSessionBeforeCompactHook(self.allocator, ctx, custom_instructions) catch false;
+            if (cancelled) return error.SessionBeforeCompactCancelled;
+        }
         return try self.runCompactionWithLifecycle(.manual, custom_instructions, false);
     }
 
@@ -432,6 +440,10 @@ pub const AgentSession = struct {
         if (self.session_manager.getLeafId()) |leaf_id| {
             if (std.mem.eql(u8, leaf_id, target_id)) return .{};
         }
+        if (self.extension_hook_context) |ctx| {
+            const cancelled = emitSessionBeforeTreeHook(self.allocator, ctx, target_id, self.session_manager.getLeafId()) catch false;
+            if (cancelled) return error.SessionBeforeTreeCancelled;
+        }
 
         const target_entry = self.session_manager.getEntry(target_id) orelse return error.EntryNotFound;
         const new_leaf_id = treeNavigationLeaf(target_entry);
@@ -458,6 +470,10 @@ pub const AgentSession = struct {
         }
 
         try self.reloadFromSession();
+        const final_leaf_id = self.session_manager.getLeafId();
+        if (self.extension_hook_context) |ctx| {
+            emitSessionTreeHook(self.allocator, ctx, final_leaf_id, target_id, false) catch {};
+        }
         return .{
             .editor_text = editor_text,
             .summary_entry_id = summary_entry_id,
@@ -465,13 +481,39 @@ pub const AgentSession = struct {
     }
 
     pub fn setThinkingLevel(self: *AgentSession, thinking_level: agent.ThinkingLevel) !void {
+        const previous = self.agent.getThinkingLevel();
         self.agent.setThinkingLevel(thinking_level);
         _ = try self.session_manager.appendThinkingLevelChange(thinking_level);
+        if (self.extension_hook_context) |ctx| {
+            try emitThinkingLevelSelectHook(self.allocator, ctx, thinking_level, previous);
+        }
     }
 
     pub fn setModel(self: *AgentSession, model: ai.Model) !void {
+        const previous = self.agent.getModel();
         self.agent.setModel(model);
         _ = try self.session_manager.appendModelChange(model.provider, model.id);
+        if (self.extension_hook_context) |ctx| {
+            try emitModelSelectHook(self.allocator, ctx, model, previous, "set");
+        }
+    }
+
+    pub fn emitUserBashEvent(self: *AgentSession, command: []const u8, exclude_from_context: bool) !void {
+        if (self.extension_hook_context) |ctx| {
+            try emitUserBashHook(self.allocator, ctx, command, exclude_from_context, self.cwd);
+        }
+    }
+
+    pub fn emitSessionTreeEvent(self: *AgentSession, new_leaf_id: ?[]const u8, old_leaf_id: ?[]const u8, from_extension: bool) !void {
+        if (self.extension_hook_context) |ctx| {
+            try emitSessionTreeHook(self.allocator, ctx, new_leaf_id, old_leaf_id, from_extension);
+        }
+    }
+
+    pub fn emitResourcesDiscoverEvent(self: *AgentSession, reason: []const u8) !void {
+        if (self.extension_hook_context) |ctx| {
+            try emitResourcesDiscoverHook(self.allocator, ctx, self.cwd, reason);
+        }
     }
 
     pub fn setApiKey(self: *AgentSession, api_key: ?[]const u8) void {
@@ -624,6 +666,9 @@ pub const AgentSession = struct {
             .will_retry = will_retry,
             .error_message = null,
         } });
+        if (self.extension_hook_context) |ctx| {
+            emitSessionCompactHook(self.allocator, ctx, false) catch {};
+        }
         return result;
     }
 
@@ -755,6 +800,8 @@ pub const AgentSession = struct {
             instance.extension_event_subscriber.context = context;
             try instance.agent.subscribe(instance.extension_event_subscriber);
             instance.extension_event_subscribed = true;
+            emitSessionStartHook(allocator, context, "startup") catch {};
+            emitResourcesDiscoverHook(allocator, context, cwd, "startup") catch {};
         }
         return instance;
     }
@@ -966,10 +1013,16 @@ const ExtensionHookContext = struct {
 
     fn invokeLifecycle(self: *ExtensionHookContext, allocator: std.mem.Allocator, event: agent.AgentEvent) !void {
         const event_name = switch (event.event_type) {
+            .agent_start => "agent_start",
+            .agent_end => "agent_end",
             .turn_start => "turn_start",
-            .message_end => "message_end",
             .turn_end => "turn_end",
-            else => return,
+            .message_start => "message_start",
+            .message_update => "message_update",
+            .message_end => "message_end",
+            .tool_execution_start => "tool_execution_start",
+            .tool_execution_update => "tool_execution_update",
+            .tool_execution_end => "tool_execution_end",
         };
         if (!self.hasHook(event_name)) return;
 
@@ -1106,14 +1159,19 @@ fn afterToolCallHook(
     if (!context.hasHook("tool_result")) return null;
     var event = try toolCallEvent(allocator, "tool_result", after_context.tool_call, after_context.args);
     defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "toolCallId", after_context.tool_call.id);
     try putBool(allocator, &event.object, "isError", after_context.is_error);
-    try putToolResultSummary(allocator, &event.object, after_context.result);
+    try putToolResultEventFields(allocator, &event.object, after_context.result);
     const result = try context.invoke(allocator, "tool_result", event) orelse return null;
     defer tools_common.deinitJsonValue(allocator, result);
     var patch = agent.types.AfterToolCallResult{};
-    if (stringField(result, "content")) |content| {
-        patch.content = try tools_common.makeTextContent(allocator, content);
+    errdefer if (patch.content) |content| tools_common.deinitContentBlocks(allocator, content);
+    errdefer if (patch.details) |details| tools_common.deinitJsonValue(allocator, details);
+    if (objectField(result, "content")) |content_value| {
+        patch.content = switch (content_value) {
+            .array => try extension_protocol.parseContentBlocks(allocator, content_value),
+            .string => |text| try tools_common.makeTextContent(allocator, text),
+            else => null,
+        };
     }
     if (objectField(result, "details")) |details| {
         patch.details = try tools_common.cloneJsonValue(allocator, details);
@@ -1273,6 +1331,9 @@ fn makeLifecycleEventObject(
     errdefer tools_common.deinitJsonValue(allocator, payload);
     try putString(allocator, &payload.object, "type", event_name);
     try putInt(allocator, &payload.object, "turnIndex", @intCast(turn_index));
+    if (event.tool_call_id) |id| try putString(allocator, &payload.object, "toolCallId", id);
+    if (event.tool_name) |name| try putString(allocator, &payload.object, "toolName", name);
+    if (event.args) |args| try putValue(allocator, &payload.object, "args", try tools_common.cloneJsonValue(allocator, args));
     if (event.message) |message| try putMessageSummary(allocator, &payload.object, message);
     if (event.messages) |messages| try putMessagesSummary(allocator, &payload.object, messages);
     if (event.tool_results) |tool_results| {
@@ -1287,22 +1348,262 @@ fn makeLifecycleEventObject(
         }
         try putValue(allocator, &payload.object, "toolResults", .{ .array = array });
     }
+    if (event.partial_result) |partial| {
+        try putValue(allocator, &payload.object, "partialResult", try makeToolResultPayload(allocator, partial));
+    }
+    if (event.result) |result| {
+        try putValue(allocator, &payload.object, "result", try makeToolResultPayload(allocator, result));
+    }
+    if (event.is_error) |is_error| try putBool(allocator, &payload.object, "isError", is_error);
     return payload;
+}
+
+fn makeToolResultPayload(allocator: std.mem.Allocator, result: agent.types.AgentToolResult) !std.json.Value {
+    var payload = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, payload);
+    try putValue(allocator, &payload.object, "content", try contentBlocksToJsonArray(allocator, result.content));
+    if (result.details) |details| try putValue(allocator, &payload.object, "details", try tools_common.cloneJsonValue(allocator, details));
+    try putBool(allocator, &payload.object, "isError", result.is_error);
+    return payload;
+}
+
+fn modelToJsonValue(allocator: std.mem.Allocator, model: ai.Model) !std.json.Value {
+    var obj = try makeObject(allocator);
+    errdefer tools_common.deinitJsonValue(allocator, obj);
+    try putString(allocator, &obj.object, "id", model.id);
+    try putString(allocator, &obj.object, "name", model.name);
+    try putString(allocator, &obj.object, "api", model.api);
+    try putString(allocator, &obj.object, "provider", model.provider);
+    try putString(allocator, &obj.object, "baseUrl", model.base_url);
+    try putBool(allocator, &obj.object, "reasoning", model.reasoning);
+    return obj;
+}
+
+fn thinkingLevelToString(level: agent.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "off",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
+fn emitModelSelectHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    model: ai.Model,
+    previous_model: ai.Model,
+    source: []const u8,
+) !void {
+    if (!ctx.hasHook("model_select")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "model_select");
+    try putValue(allocator, &event.object, "model", try modelToJsonValue(allocator, model));
+    try putValue(allocator, &event.object, "previousModel", try modelToJsonValue(allocator, previous_model));
+    try putString(allocator, &event.object, "source", source);
+    const result = try ctx.invoke(allocator, "model_select", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitThinkingLevelSelectHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    level: agent.ThinkingLevel,
+    previous_level: agent.ThinkingLevel,
+) !void {
+    if (!ctx.hasHook("thinking_level_select")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "thinking_level_select");
+    try putString(allocator, &event.object, "level", thinkingLevelToString(level));
+    try putString(allocator, &event.object, "previousLevel", thinkingLevelToString(previous_level));
+    const result = try ctx.invoke(allocator, "thinking_level_select", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitSessionStartHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    reason: []const u8,
+) !void {
+    if (!ctx.hasHook("session_start")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_start");
+    try putString(allocator, &event.object, "reason", reason);
+    const result = try ctx.invoke(allocator, "session_start", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitSessionShutdownHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    reason: []const u8,
+) !void {
+    if (!ctx.hasHook("session_shutdown")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_shutdown");
+    try putString(allocator, &event.object, "reason", reason);
+    const result = try ctx.invoke(allocator, "session_shutdown", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitSessionCompactHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    from_extension: bool,
+) !void {
+    if (!ctx.hasHook("session_compact")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_compact");
+    try putBool(allocator, &event.object, "fromExtension", from_extension);
+    const result = try ctx.invoke(allocator, "session_compact", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitUserBashHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    command: []const u8,
+    exclude_from_context: bool,
+    cwd: []const u8,
+) !void {
+    if (!ctx.hasHook("user_bash")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "user_bash");
+    try putString(allocator, &event.object, "command", command);
+    try putBool(allocator, &event.object, "excludeFromContext", exclude_from_context);
+    try putString(allocator, &event.object, "cwd", cwd);
+    const result = try ctx.invoke(allocator, "user_bash", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitSessionTreeHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    new_leaf_id: ?[]const u8,
+    old_leaf_id: ?[]const u8,
+    from_extension: bool,
+) !void {
+    if (!ctx.hasHook("session_tree")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_tree");
+    if (new_leaf_id) |id| {
+        try putString(allocator, &event.object, "newLeafId", id);
+    } else {
+        try putValue(allocator, &event.object, "newLeafId", .null);
+    }
+    if (old_leaf_id) |id| {
+        try putString(allocator, &event.object, "oldLeafId", id);
+    } else {
+        try putValue(allocator, &event.object, "oldLeafId", .null);
+    }
+    try putBool(allocator, &event.object, "fromExtension", from_extension);
+    const result = try ctx.invoke(allocator, "session_tree", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitResourcesDiscoverHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    cwd: []const u8,
+    reason: []const u8,
+) !void {
+    if (!ctx.hasHook("resources_discover")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "resources_discover");
+    try putString(allocator, &event.object, "cwd", cwd);
+    try putString(allocator, &event.object, "reason", reason);
+    const result = try ctx.invoke(allocator, "resources_discover", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitSessionBeforeCompactHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    custom_instructions: ?[]const u8,
+) !bool {
+    if (!ctx.hasHook("session_before_compact")) return false;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_before_compact");
+    if (custom_instructions) |instructions| {
+        try putString(allocator, &event.object, "customInstructions", instructions);
+    }
+    const result = try ctx.invoke(allocator, "session_before_compact", event) orelse return false;
+    defer tools_common.deinitJsonValue(allocator, result);
+    return boolField(result, "cancel") orelse false;
+}
+
+fn emitSessionBeforeTreeHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    target_id: []const u8,
+    old_leaf_id: ?[]const u8,
+) !bool {
+    if (!ctx.hasHook("session_before_tree")) return false;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "session_before_tree");
+    try putString(allocator, &event.object, "targetId", target_id);
+    if (old_leaf_id) |id| {
+        try putString(allocator, &event.object, "oldLeafId", id);
+    } else {
+        try putValue(allocator, &event.object, "oldLeafId", .null);
+    }
+    const result = try ctx.invoke(allocator, "session_before_tree", event) orelse return false;
+    defer tools_common.deinitJsonValue(allocator, result);
+    return boolField(result, "cancel") orelse false;
 }
 
 fn toolCallEvent(allocator: std.mem.Allocator, event_name: []const u8, tool_call: ai.ToolCall, args: std.json.Value) !std.json.Value {
     var event = try makeObject(allocator);
     errdefer tools_common.deinitJsonValue(allocator, event);
     try putString(allocator, &event.object, "type", event_name);
-    try putString(allocator, &event.object, "name", tool_call.name);
-    try putString(allocator, &event.object, "id", tool_call.id);
+    try putString(allocator, &event.object, "toolName", tool_call.name);
+    try putString(allocator, &event.object, "toolCallId", tool_call.id);
     try putValue(allocator, &event.object, "input", try tools_common.cloneJsonValue(allocator, args));
     return event;
 }
 
-fn putToolResultSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, result: agent.types.AgentToolResult) !void {
-    try putString(allocator, object, "content", firstText(result.content) orelse "");
+fn putToolResultEventFields(allocator: std.mem.Allocator, object: *std.json.ObjectMap, result: agent.types.AgentToolResult) !void {
+    try putValue(allocator, object, "content", try contentBlocksToJsonArray(allocator, result.content));
     if (result.details) |details| try putValue(allocator, object, "details", try tools_common.cloneJsonValue(allocator, details));
+}
+
+fn contentBlocksToJsonArray(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) !std.json.Value {
+    var array = std.json.Array.init(allocator);
+    errdefer {
+        for (array.items) |item| tools_common.deinitJsonValue(allocator, item);
+        array.deinit();
+    }
+    for (blocks) |block| switch (block) {
+        .text => |text| {
+            var entry = try makeObject(allocator);
+            errdefer tools_common.deinitJsonValue(allocator, entry);
+            try putString(allocator, &entry.object, "type", "text");
+            try putString(allocator, &entry.object, "text", text.text);
+            try array.append(entry);
+        },
+        .image => |image| {
+            var entry = try makeObject(allocator);
+            errdefer tools_common.deinitJsonValue(allocator, entry);
+            try putString(allocator, &entry.object, "type", "image");
+            try putString(allocator, &entry.object, "data", image.data);
+            try putString(allocator, &entry.object, "mimeType", image.mime_type);
+            try array.append(entry);
+        },
+        else => {},
+    };
+    return .{ .array = array };
 }
 
 fn firstText(content: []const ai.ContentBlock) ?[]const u8 {
@@ -2536,22 +2837,57 @@ const TestHookHost = struct {
     input: bool = false,
     before_agent_start: bool = false,
     context: bool = false,
+    agent_start: bool = false,
+    agent_end: bool = false,
     turn_start: bool = false,
+    message_start: bool = false,
+    message_update: bool = false,
     message_end: bool = false,
     turn_end: bool = false,
     tool_call: bool = false,
     tool_result: bool = false,
+    tool_execution_start: bool = false,
+    tool_execution_update: bool = false,
+    tool_execution_end: bool = false,
+    model_select: bool = false,
+    thinking_level_select: bool = false,
+    session_start: bool = false,
+    session_shutdown: bool = false,
+    session_compact: bool = false,
+    session_tree: bool = false,
+    user_bash: bool = false,
+    resources_discover: bool = false,
+    session_before_compact: bool = false,
+    session_before_tree: bool = false,
+    cancel_session_before: bool = false,
     label: []const u8 = "",
     order_log: ?*std.ArrayList([]const u8) = null,
     order_allocator: ?std.mem.Allocator = null,
     input_calls: usize = 0,
     before_calls: usize = 0,
     context_calls: usize = 0,
+    agent_start_calls: usize = 0,
+    agent_end_calls: usize = 0,
     turn_start_calls: usize = 0,
+    message_start_calls: usize = 0,
+    message_update_calls: usize = 0,
     message_end_calls: usize = 0,
     turn_end_calls: usize = 0,
     tool_call_calls: usize = 0,
     tool_result_calls: usize = 0,
+    tool_execution_start_calls: usize = 0,
+    tool_execution_update_calls: usize = 0,
+    tool_execution_end_calls: usize = 0,
+    model_select_calls: usize = 0,
+    thinking_level_select_calls: usize = 0,
+    session_start_calls: usize = 0,
+    session_shutdown_calls: usize = 0,
+    session_compact_calls: usize = 0,
+    session_tree_calls: usize = 0,
+    user_bash_calls: usize = 0,
+    resources_discover_calls: usize = 0,
+    session_before_compact_calls: usize = 0,
+    session_before_tree_calls: usize = 0,
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
@@ -2596,11 +2932,28 @@ fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     if (std.mem.eql(u8, event_name, "input")) return host.input;
     if (std.mem.eql(u8, event_name, "before_agent_start")) return host.before_agent_start;
     if (std.mem.eql(u8, event_name, "context")) return host.context;
+    if (std.mem.eql(u8, event_name, "agent_start")) return host.agent_start;
+    if (std.mem.eql(u8, event_name, "agent_end")) return host.agent_end;
     if (std.mem.eql(u8, event_name, "turn_start")) return host.turn_start;
+    if (std.mem.eql(u8, event_name, "message_start")) return host.message_start;
+    if (std.mem.eql(u8, event_name, "message_update")) return host.message_update;
     if (std.mem.eql(u8, event_name, "message_end")) return host.message_end;
     if (std.mem.eql(u8, event_name, "turn_end")) return host.turn_end;
     if (std.mem.eql(u8, event_name, "tool_call")) return host.tool_call;
     if (std.mem.eql(u8, event_name, "tool_result")) return host.tool_result;
+    if (std.mem.eql(u8, event_name, "tool_execution_start")) return host.tool_execution_start;
+    if (std.mem.eql(u8, event_name, "tool_execution_update")) return host.tool_execution_update;
+    if (std.mem.eql(u8, event_name, "tool_execution_end")) return host.tool_execution_end;
+    if (std.mem.eql(u8, event_name, "model_select")) return host.model_select;
+    if (std.mem.eql(u8, event_name, "thinking_level_select")) return host.thinking_level_select;
+    if (std.mem.eql(u8, event_name, "session_start")) return host.session_start;
+    if (std.mem.eql(u8, event_name, "session_shutdown")) return host.session_shutdown;
+    if (std.mem.eql(u8, event_name, "session_compact")) return host.session_compact;
+    if (std.mem.eql(u8, event_name, "session_tree")) return host.session_tree;
+    if (std.mem.eql(u8, event_name, "user_bash")) return host.user_bash;
+    if (std.mem.eql(u8, event_name, "resources_discover")) return host.resources_discover;
+    if (std.mem.eql(u8, event_name, "session_before_compact")) return host.session_before_compact;
+    if (std.mem.eql(u8, event_name, "session_before_tree")) return host.session_before_tree;
     return false;
 }
 fn testHookSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
@@ -2686,8 +3039,24 @@ fn testHookInvoke(
         try putValue(allocator, &result.object, "messages", .{ .array = messages });
         return result;
     }
+    if (std.mem.eql(u8, event_name, "agent_start")) {
+        host.agent_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "agent_end")) {
+        host.agent_end_calls += 1;
+        return result;
+    }
     if (std.mem.eql(u8, event_name, "turn_start")) {
         host.turn_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "message_start")) {
+        host.message_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "message_update")) {
+        host.message_update_calls += 1;
         return result;
     }
     if (std.mem.eql(u8, event_name, "message_end")) {
@@ -2709,6 +3078,60 @@ fn testHookInvoke(
         host.tool_result_calls += 1;
         try putString(allocator, &result.object, "content", "patched result");
         try putBool(allocator, &result.object, "isError", false);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_start")) {
+        host.tool_execution_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_update")) {
+        host.tool_execution_update_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "tool_execution_end")) {
+        host.tool_execution_end_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "model_select")) {
+        host.model_select_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "thinking_level_select")) {
+        host.thinking_level_select_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_start")) {
+        host.session_start_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_shutdown")) {
+        host.session_shutdown_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_compact")) {
+        host.session_compact_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_tree")) {
+        host.session_tree_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "user_bash")) {
+        host.user_bash_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "resources_discover")) {
+        host.resources_discover_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_before_compact")) {
+        host.session_before_compact_calls += 1;
+        if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "session_before_tree")) {
+        host.session_before_tree_calls += 1;
+        if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
         return result;
     }
     return result;
@@ -3181,6 +3604,228 @@ test "extension lifecycle hooks fire once per turn and message in agent order" {
     try std.testing.expectEqualStrings("message_end", order_log.items[1]);
     try std.testing.expectEqualStrings("message_end", order_log.items[2]);
     try std.testing.expectEqualStrings("turn_end", order_log.items[3]);
+}
+
+test "Stage A: agent_start / agent_end / message_start / message_update events fire from agent loop" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("hello there")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .agent_start = true,
+        .agent_end = true,
+        .message_start = true,
+        .message_update = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-a-events",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("trigger Stage A events");
+
+    // agent_start fires exactly once at loop entry.
+    try std.testing.expectEqual(@as(usize, 1), fixture.agent_start_calls);
+    // agent_end fires exactly once at loop exit (any of the three exit paths).
+    try std.testing.expectEqual(@as(usize, 1), fixture.agent_end_calls);
+    // message_start fires for both the user message and the assistant message.
+    try std.testing.expect(fixture.message_start_calls >= 1);
+    // message_update fires at least once during assistant streaming.
+    try std.testing.expect(fixture.message_update_calls >= 1);
+}
+
+test "Stage G: resources_discover fires on session creation" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var fixture = TestHookHost{
+        .resources_discover = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-g-resources",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.resources_discover_calls);
+}
+
+test "Stage H: session_before_compact cancellation short-circuits compact()" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var fixture = TestHookHost{
+        .session_before_compact = true,
+        .cancel_session_before = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-h-compact",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try std.testing.expectError(error.SessionBeforeCompactCancelled, session.compact(null));
+    try std.testing.expectEqual(@as(usize, 1), fixture.session_before_compact_calls);
+}
+
+test "Stage G: emitUserBashEvent forwards user_bash to extension hooks" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var fixture = TestHookHost{
+        .user_bash = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-g-bash",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.emitUserBashEvent("ls -la", false);
+    try session.emitUserBashEvent("rm -rf /tmp/x", true);
+    try std.testing.expectEqual(@as(usize, 2), fixture.user_bash_calls);
+}
+
+test "Stage F: session_start fires on AgentSession.create and session_shutdown on deinit" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var fixture = TestHookHost{
+        .session_start = true,
+        .session_shutdown = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-f-events",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    // session_start fires once during create.
+    try std.testing.expectEqual(@as(usize, 1), fixture.session_start_calls);
+    try std.testing.expectEqual(@as(usize, 0), fixture.session_shutdown_calls);
+
+    session.deinit();
+    // session_shutdown fires during deinit (before the hook context tears down).
+    try std.testing.expectEqual(@as(usize, 1), fixture.session_shutdown_calls);
+}
+
+test "Stage C: model_select / thinking_level_select fire from session setters" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    var fixture = TestHookHost{
+        .model_select = true,
+        .thinking_level_select = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-c-events",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    // Switch the model to a fresh registration to trigger model_select.
+    const second_registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer second_registration.unregister();
+    try session.setModel(second_registration.getModel());
+    try std.testing.expectEqual(@as(usize, 1), fixture.model_select_calls);
+
+    // Change the thinking level to trigger thinking_level_select.
+    try session.setThinkingLevel(.medium);
+    try std.testing.expectEqual(@as(usize, 1), fixture.thinking_level_select_calls);
+}
+
+test "Stage B: tool_execution_start / update / end events forward to extension hooks" {
+    const allocator = std.testing.allocator;
+    var fixture = TestHookHost{
+        .tool_execution_start = true,
+        .tool_execution_update = true,
+        .tool_execution_end = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var hook_context = ExtensionHookContext{
+        .allocator = allocator,
+        .hosts = adapters[0..],
+        .timeout_ms = 1000,
+    };
+
+    // Build a synthetic args JSON value to thread through events.
+    var args = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, args);
+    try putString(allocator, &args.object, "value", "exec-input");
+
+    // tool_execution_start
+    try hook_context.invokeLifecycle(allocator, .{
+        .event_type = .tool_execution_start,
+        .tool_call_id = "exec-1",
+        .tool_name = "demo-tool",
+        .args = args,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_start_calls);
+
+    // tool_execution_update with a partial result
+    const partial_blocks = try tools_common.makeTextContent(allocator, "partial output");
+    defer tools_common.deinitContentBlocks(allocator, partial_blocks);
+    try hook_context.invokeLifecycle(allocator, .{
+        .event_type = .tool_execution_update,
+        .tool_call_id = "exec-1",
+        .tool_name = "demo-tool",
+        .args = args,
+        .partial_result = .{ .content = partial_blocks },
+    });
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_update_calls);
+
+    // tool_execution_end with final result + isError
+    const final_blocks = try tools_common.makeTextContent(allocator, "final output");
+    defer tools_common.deinitContentBlocks(allocator, final_blocks);
+    try hook_context.invokeLifecycle(allocator, .{
+        .event_type = .tool_execution_end,
+        .tool_call_id = "exec-1",
+        .tool_name = "demo-tool",
+        .args = args,
+        .result = .{ .content = final_blocks },
+        .is_error = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fixture.tool_execution_end_calls);
 }
 
 test "extension lifecycle hooks run deterministically by host order" {

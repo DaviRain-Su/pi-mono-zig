@@ -2,6 +2,8 @@ const std = @import("std");
 const tui = @import("tui");
 const session_mod = @import("../sessions/session.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const extension_registry = @import("../extensions/extension_registry.zig");
+const keybindings_mod = @import("../shared/keybindings.zig");
 const shared = @import("shared.zig");
 const overlays = @import("overlays.zig");
 const rendering = @import("rendering.zig");
@@ -66,6 +68,13 @@ pub const Bridge = struct {
         return .{
             .context = self,
             .callback = dispatchSlashCommand,
+        };
+    }
+
+    pub fn shortcutSink(self: *Bridge) shared.ExtensionShortcutSink {
+        return .{
+            .context = self,
+            .callback = dispatchExtensionShortcut,
         };
     }
 
@@ -377,6 +386,46 @@ fn dialogFromRequest(allocator: std.mem.Allocator, request: extension_runtime.Ex
         };
     }
     return null;
+}
+
+const ShortcutLookup = struct {
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    matched_command: ?[]u8 = null,
+    allocator: std.mem.Allocator,
+};
+
+fn dispatchExtensionShortcut(
+    context: ?*anyopaque,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+) anyerror!bool {
+    const self: *Bridge = @ptrCast(@alignCast(context orelse return false));
+    const host = self.host orelse return false;
+    var lookup = ShortcutLookup{
+        .key = key,
+        .modifiers = modifiers,
+        .allocator = self.allocator,
+    };
+    host.withRegistry(&lookup, captureMatchingShortcut) catch {};
+    const command_owned = lookup.matched_command orelse return false;
+    defer self.allocator.free(command_owned);
+    const slash_command = try std.fmt.allocPrint(self.allocator, "/{s}", .{command_owned});
+    defer self.allocator.free(slash_command);
+    return try dispatchSlashCommand(self, slash_command);
+}
+
+fn captureMatchingShortcut(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
+    const lookup: *ShortcutLookup = @ptrCast(@alignCast(context.?));
+    if (lookup.matched_command != null) return;
+    for (registry.shortcuts.items) |shortcut| {
+        const command_text = shortcut.command orelse continue;
+        const spec = keybindings_mod.parseKeySpec(shortcut.shortcut) orelse continue;
+        if (spec.matches(lookup.key, lookup.modifiers)) {
+            lookup.matched_command = try lookup.allocator.dupe(u8, command_text);
+            return;
+        }
+    }
 }
 
 fn dispatchSlashCommand(context: ?*anyopaque, raw_command: []const u8) anyerror!bool {

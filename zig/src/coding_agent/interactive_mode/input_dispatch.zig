@@ -655,6 +655,7 @@ pub fn submitEditorText(
             try app_state.setStatus("A bash command is already running. Press Esc to cancel it first.");
             return;
         }
+        session.emitUserBashEvent(bash_shortcut.command, bash_shortcut.exclude_from_context) catch {};
         if (!(try app_state.startBashExecution(allocator, session, bash_shortcut.command, bash_shortcut.exclude_from_context))) {
             try app_state.setStatus("A bash command is already running. Press Esc to cancel it first.");
             return;
@@ -1233,6 +1234,10 @@ fn dispatchKeyInputEvent(
     }
 
     if (try dispatchMainEditorShortcut(context, parsed, key, editor_len_before)) return;
+
+    if (context.overlay.* == null and context.auth_flow.* == null) {
+        if (try context.live_resources.dispatchExtensionShortcut(key, parsed.modifiers)) return;
+    }
 
     try handleInputKeyWithModifiers(
         context.allocator,

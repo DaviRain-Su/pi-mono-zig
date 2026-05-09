@@ -34,6 +34,12 @@ pub const ExtensionCommandSink = struct {
     callback: *const fn (context: ?*anyopaque, raw_command: []const u8) anyerror!bool,
 };
 
+const tui = @import("tui");
+pub const ExtensionShortcutSink = struct {
+    context: ?*anyopaque = null,
+    callback: *const fn (context: ?*anyopaque, key: tui.Key, modifiers: tui.keys.KeyModifiers) anyerror!bool,
+};
+
 /// Controls how a stored session cwd that no longer exists is handled when
 /// resuming/forking/opening a persisted session.
 ///
@@ -114,6 +120,7 @@ pub const LiveResources = struct {
     theme: ?*const resources_mod.Theme,
     terminal_name: []const u8,
     extension_command_sink: ?ExtensionCommandSink = null,
+    extension_shortcut_sink: ?ExtensionShortcutSink = null,
     reload_extension_tools_sink: ?ReloadExtensionToolsSink = null,
     startup_cli_extensions: []const []const u8,
     include_default_extensions: bool,
@@ -137,6 +144,11 @@ pub const LiveResources = struct {
     pub fn dispatchExtensionCommand(self: *LiveResources, raw_command: []const u8) !bool {
         const sink = self.extension_command_sink orelse return false;
         return try sink.callback(sink.context, raw_command);
+    }
+
+    pub fn dispatchExtensionShortcut(self: *LiveResources, key: tui.Key, modifiers: tui.keys.KeyModifiers) !bool {
+        const sink = self.extension_shortcut_sink orelse return false;
+        return try sink.callback(sink.context, key, modifiers);
     }
 
     pub fn deinit(self: *LiveResources, allocator: std.mem.Allocator) void {
