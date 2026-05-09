@@ -129,16 +129,26 @@ later Component Model version can move to richer WIT records and variants.
 
 ## Permission Model
 
-Plugins start with no ambient authority. Host capabilities must be explicit:
+Plugins start with no ambient authority. Host capabilities must be explicit and
+use the canonical grant ids:
 
-- file read
-- file write
-- network
-- shell
-- environment variables
-- model / LLM calls
-- session state
-- UI notifications
+- `file.read`
+- `file.write`
+- `network.request`
+- `shell.run`
+- `env.read`
+- `model.call`
+- `session.read`
+- `session.write`
+- `ui.notify`
+- `tool.use`
+- `agent.spawn`
+- `agent.delegate`
+
+Legacy broad labels such as "file read", "file write", "network", "shell",
+and "environment variables" are historical, non-normative shorthand only. Map
+them to the canonical grant set above before using any manifest, policy,
+schema, or diagnostic vocabulary.
 
 Each capability needs:
 
