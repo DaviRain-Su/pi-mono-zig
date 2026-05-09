@@ -149,16 +149,6 @@ pub const Box = struct {
         };
     }
 
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Box = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
-    }
-
     fn drawOpaque(
         ptr: *const anyopaque,
         window: vaxis.Window,
