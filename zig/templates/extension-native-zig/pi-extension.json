@@ -1,0 +1,50 @@
+{
+	"schemaVersion": "pi-extension.v1",
+	"id": "com.pi.native.template.echo",
+	"name": "Pi Native Zig Echo Template",
+	"version": "0.1.0",
+	"description": "A local/offline trusted-code Zig dynamic native tool extension template.",
+	"runtime": {
+		"kind": "native",
+		"entrypoint": {
+			"descriptor": "native://dynamic/com.pi.native.template.echo"
+		},
+		"limits": {
+			"timeoutMs": 30000,
+			"outputBytes": 65536,
+			"toolScopes": ["native.echo"]
+		}
+	},
+	"tools": [
+		{
+			"name": "native.echo",
+			"description": "Echoes a message field from the JSON input.",
+			"inputSchema": {
+				"type": "object",
+				"required": ["message"],
+				"properties": {
+					"message": { "type": "string" }
+				}
+			},
+			"outputSchema": {
+				"type": "object",
+				"required": ["message"],
+				"properties": {
+					"message": { "type": "string" }
+				}
+			}
+		}
+	],
+	"capabilities": {
+		"exports": [
+			{
+				"id": "native.echo",
+				"kind": "tool",
+				"version": "0.1.0"
+			}
+		],
+		"imports": []
+	},
+	"permissions": [],
+	"dependencies": []
+}
