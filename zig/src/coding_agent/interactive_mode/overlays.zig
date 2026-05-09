@@ -89,6 +89,12 @@ pub const InfoOverlay = struct {
     items: []tui.SelectItem,
     list: tui.SelectList,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 12 }, .{ .fill = 1 } },
+
     pub fn deinit(self: *InfoOverlay, allocator: std.mem.Allocator) void {
         allocator.free(self.title);
         allocator.free(self.hint);
@@ -98,6 +104,8 @@ pub const InfoOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -142,6 +150,12 @@ pub const ThemeOverlay = struct {
     items: []tui.SelectItem,
     list: tui.SelectList,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 2 }, .{ .fill = 1 } },
+
     pub fn deinit(self: *ThemeOverlay, allocator: std.mem.Allocator) void {
         for (self.choices) |choice| allocator.free(choice.name);
         allocator.free(self.choices);
@@ -151,6 +165,8 @@ pub const ThemeOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -168,6 +184,12 @@ pub const ForkOverlay = struct {
     items: []tui.SelectItem,
     list: tui.SelectList,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 4 }, .{ .fill = 1 } },
+
     pub fn deinit(self: *ForkOverlay, allocator: std.mem.Allocator) void {
         for (self.choices) |choice| {
             allocator.free(choice.entry_id);
@@ -180,6 +202,8 @@ pub const ForkOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -201,6 +225,12 @@ pub const AuthOverlay = struct {
     items: []tui.SelectItem,
     list: tui.SelectList,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 2 }, .{ .fill = 1 }, .{ .length = 18 } },
+
     pub fn deinit(self: *AuthOverlay, allocator: std.mem.Allocator) void {
         for (self.choices) |choice| {
             allocator.free(choice.provider_id);
@@ -213,6 +243,8 @@ pub const AuthOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -304,6 +336,11 @@ pub fn loadAuthOverlay(
         };
     }
 
+    const table_cells = try allocator.alloc(tui.TableCell, source.len * 3);
+    errdefer allocator.free(table_cells);
+    const table_rows = try allocator.alloc(tui.TableRow, source.len);
+    errdefer allocator.free(table_rows);
+
     for (source, 0..) |provider, index| {
         choices[index] = .{
             .provider_id = try allocator.dupe(u8, provider.id),
@@ -321,6 +358,14 @@ pub fn loadAuthOverlay(
                 },
             ),
         };
+        const cell_start = index * 3;
+        table_cells[cell_start] = .{ .text = " " };
+        table_cells[cell_start + 1] = .{ .text = provider.name };
+        table_cells[cell_start + 2] = .{ .text = switch (mode) {
+            .login => if (provider.auth_type == .oauth) "OAuth" else "API key",
+            .logout => if (provider.auth_type == .oauth) "OAuth" else "API key",
+        } };
+        table_rows[index] = .{ .cells = table_cells[cell_start .. cell_start + 3] };
     }
 
     return .{
@@ -332,6 +377,9 @@ pub fn loadAuthOverlay(
                 .items = items,
                 .max_visible = 8,
             },
+            .table_cells = table_cells,
+            .table_rows = table_rows,
+            .table_state = .{},
         },
     };
 }
@@ -460,6 +508,14 @@ pub fn loadInfoOverlay(
     items: []tui.SelectItem,
     max_visible: usize,
 ) !SelectorOverlay {
+    const table_cells = try allocator.alloc(tui.TableCell, items.len * 2);
+    const table_rows = try allocator.alloc(tui.TableRow, items.len);
+    for (items, 0..) |item, i| {
+        table_cells[i * 2] = .{ .text = item.label };
+        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
+        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
+    }
+
     return .{
         .info = .{
             .title = try allocator.dupe(u8, title),
@@ -469,6 +525,9 @@ pub fn loadInfoOverlay(
                 .items = items,
                 .max_visible = max_visible,
             },
+            .table_cells = table_cells,
+            .table_rows = table_rows,
+            .table_state = .{},
         },
     };
 }
@@ -656,6 +715,19 @@ pub fn loadThemeOverlay(
         if (is_active) selected_index = index;
     }
 
+    const table_cells = try allocator.alloc(tui.TableCell, themes.len * 2);
+    errdefer allocator.free(table_cells);
+    const table_rows = try allocator.alloc(tui.TableRow, themes.len);
+    errdefer allocator.free(table_rows);
+
+    for (themes, 0..) |theme, index| {
+        const is_active = std.mem.eql(u8, theme.name, active_name);
+        const cell_start = index * 2;
+        table_cells[cell_start] = .{ .text = if (is_active) "✓" else " " };
+        table_cells[cell_start + 1] = .{ .text = theme.name };
+        table_rows[index] = .{ .cells = table_cells[cell_start .. cell_start + 2] };
+    }
+
     return .{
         .theme = .{
             .choices = choices,
@@ -665,6 +737,9 @@ pub fn loadThemeOverlay(
                 .selected_index = selected_index,
                 .max_visible = 12,
             },
+            .table_cells = table_cells,
+            .table_rows = table_rows,
+            .table_state = .{ .selected_index = selected_index },
         },
     };
 }
@@ -800,6 +875,18 @@ pub fn loadForkOverlay(
     const items = try item_list.toOwnedSlice(allocator);
     errdefer freeOwnedSelectItems(allocator, items);
 
+    const table_cells = try allocator.alloc(tui.TableCell, items.len * 2);
+    errdefer allocator.free(table_cells);
+    const table_rows = try allocator.alloc(tui.TableRow, items.len);
+    errdefer allocator.free(table_rows);
+
+    for (items, 0..) |item, index| {
+        const cell_start = index * 2;
+        table_cells[cell_start] = .{ .text = item.description.? };
+        table_cells[cell_start + 1] = .{ .text = item.label };
+        table_rows[index] = .{ .cells = table_cells[cell_start .. cell_start + 2] };
+    }
+
     return .{
         .fork = .{
             .choices = choices,
@@ -809,6 +896,9 @@ pub fn loadForkOverlay(
                 .selected_index = items.len - 1,
                 .max_visible = 10,
             },
+            .table_cells = table_cells,
+            .table_rows = table_rows,
+            .table_state = .{ .selected_index = items.len - 1 },
         },
     };
 }

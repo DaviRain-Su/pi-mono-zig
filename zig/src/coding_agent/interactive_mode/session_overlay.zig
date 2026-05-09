@@ -30,6 +30,12 @@ pub const SessionOverlay = struct {
     rename_target_path: ?[]u8 = null,
     rename_text: []u8 = &.{},
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 28 }, .{ .fill = 1 } },
+
     pub fn deinit(self: *SessionOverlay, allocator: std.mem.Allocator) void {
         allocator.free(self.title);
         allocator.free(self.hint);
@@ -45,6 +51,8 @@ pub const SessionOverlay = struct {
         if (self.confirming_delete_path) |path| allocator.free(path);
         if (self.rename_target_path) |path| allocator.free(path);
         if (self.rename_text.len > 0) allocator.free(self.rename_text);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -169,6 +177,18 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
     overlay.list.items = items;
     overlay.list.selected_index = @min(overlay.list.selected_index, row_count - 1);
     overlay.list.max_visible = 12;
+
+    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
+    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
+    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
+    for (overlay.items, 0..) |item, i| {
+        table_cells[i * 2] = .{ .text = item.label };
+        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
+        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
+    }
+    overlay.table_cells = table_cells;
+    overlay.table_rows = table_rows;
 }
 
 pub fn toggleScope(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {

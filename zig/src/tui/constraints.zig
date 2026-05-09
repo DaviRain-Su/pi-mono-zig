@@ -41,7 +41,7 @@ pub fn splitHorizontal(
     const widths = try arena.alloc(usize, constraints.len);
     defer arena.free(widths);
 
-    solveWidths(constraints, available, widths);
+    solveSizes(constraints, available, widths);
 
     const rects = try arena.alloc(Rect, constraints.len);
     var x: u16 = area.x;
@@ -60,7 +60,43 @@ pub fn splitHorizontal(
     return rects;
 }
 
-fn solveWidths(constraints: []const Constraint, available: u16, out: []usize) void {
+/// Split a vertical area into rows based on constraints.
+/// Returns a slice of Rects (one per constraint), allocated from `arena`.
+/// Spacing between rows is subtracted from the total available height.
+pub fn splitVertical(
+    arena: std.mem.Allocator,
+    area: Rect,
+    constraints: []const Constraint,
+    spacing: u16,
+) std.mem.Allocator.Error![]Rect {
+    if (constraints.len == 0) return &[_]Rect{};
+
+    const total_spacing = spacing * @as(u16, @intCast(constraints.len -| 1));
+    const available: u16 = if (area.height > total_spacing) area.height - total_spacing else 0;
+
+    const heights = try arena.alloc(usize, constraints.len);
+    defer arena.free(heights);
+
+    solveSizes(constraints, available, heights);
+
+    const rects = try arena.alloc(Rect, constraints.len);
+    var y: u16 = area.y;
+    for (heights, 0..) |h, i| {
+        const height: u16 = @intCast(@min(h, @as(usize, std.math.maxInt(u16))));
+        rects[i] = .{
+            .x = area.x,
+            .y = y,
+            .width = area.width,
+            .height = height,
+        };
+        y += height;
+        if (i + 1 < constraints.len) y += spacing;
+    }
+
+    return rects;
+}
+
+fn solveSizes(constraints: []const Constraint, available: u16, out: []usize) void {
     std.debug.assert(constraints.len == out.len);
     if (constraints.len == 0) return;
 
@@ -289,6 +325,27 @@ test "split single constraint takes full width" {
 
     try std.testing.expectEqual(@as(usize, 1), rects.len);
     try std.testing.expectEqual(@as(u16, 50), rects[0].width);
+}
+
+test "split vertical distributes height" {
+    const arena = std.testing.allocator;
+    const area = Rect{ .x = 0, .y = 0, .width = 10, .height = 20 };
+    const constraints = &[_]Constraint{
+        .{ .length = 4 },
+        .{ .fill = 1 },
+        .{ .fill = 3 },
+    };
+
+    const rects = try splitVertical(arena, area, constraints, 1);
+    defer arena.free(rects);
+
+    try std.testing.expectEqual(@as(usize, 3), rects.len);
+    try std.testing.expectEqual(@as(u16, 4), rects[0].height);
+    try std.testing.expectEqual(@as(u16, 0), rects[0].y);
+    try std.testing.expectEqual(@as(u16, 4), rects[1].height);
+    try std.testing.expectEqual(@as(u16, 5), rects[1].y);
+    try std.testing.expectEqual(@as(u16, 10), rects[2].height);
+    try std.testing.expectEqual(@as(u16, 10), rects[2].y);
 }
 
 test "split empty constraints returns empty" {

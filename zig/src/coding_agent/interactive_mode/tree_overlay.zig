@@ -82,6 +82,12 @@ pub const Overlay = struct {
     label_text: []u8 = &.{},
     summary_target_id: ?[]u8 = null,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .fill = 1 }, .{ .length = 14 } },
+
     pub fn deinit(self: *Overlay, allocator: std.mem.Allocator) void {
         freeChoices(allocator, self.choices);
         freeOwnedSelectItems(allocator, self.items);
@@ -95,6 +101,8 @@ pub const Overlay = struct {
         if (self.label_target_id) |id| allocator.free(id);
         if (self.label_text.len > 0) allocator.free(self.label_text);
         if (self.summary_target_id) |id| allocator.free(id);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -323,6 +331,7 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *Overlay) !void {
         };
         overlay.list.items = overlay.items;
         overlay.list.selected_index = 0;
+        try rebuildTableData(allocator, overlay);
         return;
     }
 
@@ -347,6 +356,21 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *Overlay) !void {
     overlay.list.items = overlay.items;
     overlay.list.selected_index = selected_visible_index;
     overlay.list.max_visible = 12;
+    try rebuildTableData(allocator, overlay);
+}
+
+fn rebuildTableData(allocator: std.mem.Allocator, overlay: *Overlay) !void {
+    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
+    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
+    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
+    for (overlay.items, 0..) |item, i| {
+        table_cells[i * 2] = .{ .text = item.label };
+        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
+        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
+    }
+    overlay.table_cells = table_cells;
+    overlay.table_rows = table_rows;
 }
 
 fn refreshLabelMode(allocator: std.mem.Allocator, overlay: *Overlay) !void {
@@ -361,6 +385,7 @@ fn refreshLabelMode(allocator: std.mem.Allocator, overlay: *Overlay) !void {
     overlay.list.items = overlay.items;
     overlay.list.selected_index = 0;
     overlay.list.max_visible = 1;
+    try rebuildTableData(allocator, overlay);
 }
 
 fn refreshSummaryMode(allocator: std.mem.Allocator, overlay: *Overlay) !void {
@@ -378,6 +403,7 @@ fn refreshSummaryMode(allocator: std.mem.Allocator, overlay: *Overlay) !void {
     overlay.list.items = overlay.items;
     overlay.list.selected_index = 0;
     overlay.list.max_visible = labels.len;
+    try rebuildTableData(allocator, overlay);
 }
 
 fn nodePassesFilter(overlay: *const Overlay, node: NodeInfo) bool {

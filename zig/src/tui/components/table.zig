@@ -59,6 +59,11 @@ pub const TableState = struct {
     }
 };
 
+pub const SortOrder = enum {
+    ascending,
+    descending,
+};
+
 pub const Table = struct {
     rows: []const Row,
     header: ?Row = null,
@@ -67,6 +72,65 @@ pub const Table = struct {
     row_highlight_style: ?vaxis.Cell.Style = null,
     header_separator: bool = true,
     highlight_symbol: []const u8 = ">",
+
+    pub fn sortByColumn(
+        self: *Table,
+        allocator: std.mem.Allocator,
+        column_index: usize,
+        comptime order: SortOrder,
+    ) std.mem.Allocator.Error!void {
+        if (self.rows.len <= 1) return;
+        if (column_index >= self.columnCount()) return;
+
+        const sorted = try allocator.alloc(Row, self.rows.len);
+        std.mem.copyForwards(Row, sorted, self.rows);
+
+        const Context = struct {
+            col: usize,
+            pub fn lessThan(ctx: @This(), a: Row, b: Row) bool {
+                const a_text = if (ctx.col < a.cells.len) a.cells[ctx.col].text else "";
+                const b_text = if (ctx.col < b.cells.len) b.cells[ctx.col].text else "";
+                return switch (order) {
+                    .ascending => std.mem.lessThan(u8, a_text, b_text),
+                    .descending => std.mem.lessThan(u8, b_text, a_text),
+                };
+            }
+        };
+
+        std.sort.block(Row, sorted, Context{ .col = column_index }, Context.lessThan);
+        self.rows = sorted;
+    }
+
+    pub fn filter(
+        self: *Table,
+        allocator: std.mem.Allocator,
+        column_index: usize,
+        query: []const u8,
+    ) std.mem.Allocator.Error!void {
+        if (self.rows.len == 0 or query.len == 0) return;
+        if (column_index >= self.columnCount()) return;
+
+        var count: usize = 0;
+        for (self.rows) |row| {
+            const text = if (column_index < row.cells.len) row.cells[column_index].text else "";
+            if (std.mem.indexOf(u8, text, query) != null) {
+                count += 1;
+            }
+        }
+
+        if (count == self.rows.len) return;
+
+        const matched = try allocator.alloc(Row, count);
+        var i: usize = 0;
+        for (self.rows) |row| {
+            const text = if (column_index < row.cells.len) row.cells[column_index].text else "";
+            if (std.mem.indexOf(u8, text, query) != null) {
+                matched[i] = row;
+                i += 1;
+            }
+        }
+        self.rows = matched;
+    }
 
     pub fn draw(
         self: Table,
@@ -399,4 +463,56 @@ test "Table truncates overflowing text" {
     // Text should be truncated to fit column width
     const cell = window.readCell(0, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expect(cell.char.grapheme.len > 0);
+}
+
+test "Table sortByColumn orders rows ascending and descending" {
+    const allocator = std.testing.allocator;
+
+    const original_rows = &[_]Row{
+        .{ .cells = &.{ .{ .text = "Charlie" }, .{ .text = "3" } } },
+        .{ .cells = &.{ .{ .text = "Alpha" }, .{ .text = "1" } } },
+        .{ .cells = &.{ .{ .text = "Bravo" }, .{ .text = "2" } } },
+    };
+
+    var table = Table{
+        .rows = original_rows,
+        .widths = &.{ .{ .length = 10 }, .{ .length = 5 } },
+    };
+
+    try table.sortByColumn(allocator, 0, .ascending);
+    const ascending_rows = table.rows;
+    defer allocator.free(ascending_rows);
+
+    try std.testing.expectEqualStrings("Alpha", table.rows[0].cells[0].text);
+    try std.testing.expectEqualStrings("Bravo", table.rows[1].cells[0].text);
+    try std.testing.expectEqualStrings("Charlie", table.rows[2].cells[0].text);
+
+    try table.sortByColumn(allocator, 0, .descending);
+    defer allocator.free(table.rows);
+
+    try std.testing.expectEqualStrings("Charlie", table.rows[0].cells[0].text);
+    try std.testing.expectEqualStrings("Bravo", table.rows[1].cells[0].text);
+    try std.testing.expectEqualStrings("Alpha", table.rows[2].cells[0].text);
+}
+
+test "Table filter reduces rows by query" {
+    const allocator = std.testing.allocator;
+
+    const original_rows = &[_]Row{
+        .{ .cells = &.{ .{ .text = "OpenAI" }, .{ .text = "gpt-5" } } },
+        .{ .cells = &.{ .{ .text = "Anthropic" }, .{ .text = "claude" } } },
+        .{ .cells = &.{ .{ .text = "OpenRouter" }, .{ .text = "or-model" } } },
+    };
+
+    var table = Table{
+        .rows = original_rows,
+        .widths = &.{ .{ .length = 10 }, .{ .length = 10 } },
+    };
+
+    try table.filter(allocator, 0, "Open");
+    defer allocator.free(table.rows);
+
+    try std.testing.expectEqual(@as(usize, 2), table.rows.len);
+    try std.testing.expectEqualStrings("OpenAI", table.rows[0].cells[0].text);
+    try std.testing.expectEqualStrings("OpenRouter", table.rows[1].cells[0].text);
 }

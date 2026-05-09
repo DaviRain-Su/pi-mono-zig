@@ -43,6 +43,7 @@ pub const Insets = layout.Insets;
 pub const ViewportAnchor = layout.ViewportAnchor;
 pub const Constraint = constraints.Constraint;
 pub const splitHorizontal = constraints.splitHorizontal;
+pub const splitVertical = constraints.splitVertical;
 pub const Terminal = terminal.Terminal;
 pub const Backend = terminal.Backend;
 pub const Size = terminal.Size;

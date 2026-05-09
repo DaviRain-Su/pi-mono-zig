@@ -1,16 +1,14 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
-const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
 const theme_mod = @import("../theme.zig");
-const cell_rows = @import("../cell_rows.zig");
+const constraints = @import("../constraints.zig");
 
 pub const FlexChild = struct {
-    component: component_mod.Component,
-    draw_component: ?draw_mod.Component = null,
+    component: draw_mod.Component,
     basis: ?usize = null,
     grow: usize = 0,
     shrink: usize = 1,
@@ -39,46 +37,11 @@ pub const Flex = struct {
         try self.children.append(allocator, child);
     }
 
-    pub fn component(self: *const Flex) component_mod.Component {
-        return .{
-            .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
-        };
-    }
-
     pub fn drawComponent(self: *const Flex) draw_mod.Component {
         return .{
             .ptr = self,
             .drawFn = drawOpaque,
         };
-    }
-
-    pub fn renderInto(
-        self: *const Flex,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const effective_width = @max(width, 1);
-        const inner_width = if (effective_width > self.padding.horizontal())
-            effective_width - self.padding.horizontal()
-        else
-            1;
-
-        switch (self.direction) {
-            .column => try self.renderColumn(allocator, effective_width, inner_width, lines),
-            .row => try self.renderRow(allocator, effective_width, inner_width, lines),
-        }
-    }
-
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        const self: *const Flex = @ptrCast(@alignCast(ptr));
-        try self.renderInto(allocator, width, lines);
     }
 
     pub fn draw(
@@ -139,25 +102,39 @@ pub const Flex = struct {
         const natural_sizes = try ctx.arena.alloc(usize, rendered.len);
         for (rendered, 0..) |entry, index| natural_sizes[index] = entry.used_height;
 
+        const gap_total = self.gap * (rendered.len -| 1);
         const target_inner_height = if (self.height) |height|
             if (height > self.padding.vertical()) height - self.padding.vertical() else 0
         else
             null;
-        const gap_total = self.gap * (rendered.len -| 1);
-        const available_for_items = if (target_inner_height) |inner_height|
-            if (inner_height > gap_total) inner_height - gap_total else 0
-        else
-            null;
 
-        const assigned_sizes = try allocateMainSizes(
-            ctx.arena,
-            natural_sizes,
-            self.children.items,
-            available_for_items,
-            self.direction,
-            @max(@as(usize, inner_window.width), 1),
-            self.gap,
-        );
+        const assigned_sizes = if (target_inner_height) |_|
+            blk: {
+                const child_constraints = try ctx.arena.alloc(constraints.Constraint, self.children.items.len);
+                for (self.children.items, natural_sizes, 0..) |child, natural, i| {
+                    child_constraints[i] = if (child.basis) |b|
+                        .{ .length = b }
+                    else
+                        .{ .length = natural };
+                }
+                const rects = try constraints.splitVertical(
+                    ctx.arena,
+                    .{ .x = 0, .y = 0, .width = inner_window.width, .height = inner_window.height },
+                    child_constraints,
+                    @intCast(self.gap),
+                );
+                const sizes = try ctx.arena.alloc(usize, rects.len);
+                for (rects, 0..) |r, i| sizes[i] = r.height;
+                break :blk sizes;
+            }
+        else
+            blk: {
+                const sizes = try ctx.arena.alloc(usize, natural_sizes.len);
+                for (self.children.items, natural_sizes, 0..) |child, natural, i| {
+                    sizes[i] = child.basis orelse natural;
+                }
+                break :blk sizes;
+            };
 
         const actual_inner_height = if (target_inner_height) |height|
             @min(height, @as(usize, inner_window.height))
@@ -219,12 +196,13 @@ pub const Flex = struct {
         }
 
         const gap_total = self.gap * (self.children.items.len -| 1);
-        const available_for_items = if (inner_window.width > gap_total)
+        const available_for_items = if (@as(usize, inner_window.width) > gap_total)
             @as(usize, inner_window.width) - gap_total
         else
             0;
 
         const assigned_widths = try allocateRowWidths(ctx.arena, self.children.items, available_for_items);
+
         const rendered = try renderDrawChildrenWithWidths(
             ctx.arena,
             self.children.items,
@@ -248,7 +226,7 @@ pub const Flex = struct {
         const justify = try resolveJustify(ctx.arena, self.justify_content, extra, self.children.items.len);
 
         var cursor_x: usize = justify.leading;
-        for (rendered, 0..) |entry, index| {
+        for (rendered, assigned_widths, 0..) |entry, width, index| {
             if (cursor_x >= inner_window.width) break;
 
             const alignment = self.children.items[index].align_self orelse self.align_items;
@@ -261,11 +239,11 @@ pub const Flex = struct {
             const child_window = inner_window.child(.{
                 .x_off = @intCast(cursor_x),
                 .y_off = @intCast(y_off),
-                .width = @intCast(@max(assigned_widths[index], 1)),
+                .width = @intCast(width),
                 .height = @intCast(@max(child_height, 1)),
             });
-            blitAllocatingScreen(entry.screen, child_window, 0, assigned_widths[index], child_height);
-            cursor_x += assigned_widths[index];
+            blitAllocatingScreen(entry.screen, child_window, 0, width, child_height);
+            cursor_x += width;
             if (index + 1 < rendered.len) {
                 cursor_x += self.gap + justify.between[index];
             }
@@ -281,177 +259,7 @@ pub const Flex = struct {
         };
     }
 
-    fn renderColumn(
-        self: *const Flex,
-        allocator: std.mem.Allocator,
-        effective_width: usize,
-        inner_width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        if (self.children.items.len == 0) {
-            const target_height = self.height orelse 0;
-            const padding_height = self.padding.vertical();
-            try layout.appendBlankLines(
-                allocator,
-                lines,
-                @max(target_height, padding_height),
-                effective_width,
-            );
-            return;
-        }
 
-        const rendered = try renderChildren(allocator, self.children.items, inner_width);
-        defer freeRenderedChildren(allocator, rendered);
-
-        const natural_sizes = try allocator.alloc(usize, rendered.len);
-        defer allocator.free(natural_sizes);
-        for (rendered, 0..) |entry, index| natural_sizes[index] = entry.lines.items.len;
-
-        const target_inner_height = if (self.height) |height|
-            if (height > self.padding.vertical()) height - self.padding.vertical() else 0
-        else
-            null;
-
-        const gap_total = self.gap * (rendered.len -| 1);
-        const available_for_items = if (target_inner_height) |inner_height|
-            if (inner_height > gap_total) inner_height - gap_total else 0
-        else
-            null;
-
-        const assigned_sizes = try allocateMainSizes(
-            allocator,
-            natural_sizes,
-            self.children.items,
-            available_for_items,
-            self.direction,
-            inner_width,
-            self.gap,
-        );
-        defer allocator.free(assigned_sizes);
-
-        try layout.appendBlankLines(allocator, lines, self.padding.top, effective_width);
-
-        if (available_for_items) |available| {
-            const used = sumSizes(assigned_sizes);
-            const extra = available -| used;
-            const justify = try resolveJustify(allocator, self.justify_content, extra, rendered.len);
-            defer allocator.free(justify.between);
-
-            try layout.appendBlankLines(allocator, lines, justify.leading, effective_width);
-            for (rendered, 0..) |entry, index| {
-                try appendColumnChild(
-                    allocator,
-                    lines,
-                    entry.lines.items,
-                    assigned_sizes[index],
-                    self.children.items[index].align_self orelse self.align_items,
-                    effective_width,
-                    inner_width,
-                    self.padding,
-                );
-
-                if (index + 1 < rendered.len) {
-                    try layout.appendBlankLines(allocator, lines, self.gap + justify.between[index], effective_width);
-                }
-            }
-            try layout.appendBlankLines(allocator, lines, justify.trailing, effective_width);
-        } else {
-            for (rendered, 0..) |entry, index| {
-                try appendColumnChild(
-                    allocator,
-                    lines,
-                    entry.lines.items,
-                    assigned_sizes[index],
-                    self.children.items[index].align_self orelse self.align_items,
-                    effective_width,
-                    inner_width,
-                    self.padding,
-                );
-
-                if (index + 1 < rendered.len) {
-                    try layout.appendBlankLines(allocator, lines, self.gap, effective_width);
-                }
-            }
-        }
-
-        try layout.appendBlankLines(allocator, lines, self.padding.bottom, effective_width);
-    }
-
-    fn renderRow(
-        self: *const Flex,
-        allocator: std.mem.Allocator,
-        effective_width: usize,
-        inner_width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
-        if (self.children.items.len == 0) {
-            const target_height = self.height orelse 0;
-            const padding_height = self.padding.vertical();
-            try layout.appendBlankLines(
-                allocator,
-                lines,
-                @max(target_height, padding_height),
-                effective_width,
-            );
-            return;
-        }
-
-        const gap_total = self.gap * (self.children.items.len -| 1);
-        const available_for_items = if (inner_width > gap_total) inner_width - gap_total else 0;
-
-        const assigned_widths = try allocateRowWidths(allocator, self.children.items, available_for_items);
-        defer allocator.free(assigned_widths);
-
-        const rendered = try renderChildrenWithWidths(allocator, self.children.items, assigned_widths);
-        defer freeRenderedChildren(allocator, rendered);
-
-        var row_height: usize = 0;
-        for (rendered) |entry| row_height = @max(row_height, entry.lines.items.len);
-
-        const target_inner_height = if (self.height) |height|
-            if (height > self.padding.vertical()) height - self.padding.vertical() else 0
-        else
-            row_height;
-        row_height = @min(@max(row_height, target_inner_height), target_inner_height);
-
-        const used_width = sumSizes(assigned_widths);
-        const extra = available_for_items -| used_width;
-        const justify = try resolveJustify(allocator, self.justify_content, extra, self.children.items.len);
-        defer allocator.free(justify.between);
-
-        try layout.appendBlankLines(allocator, lines, self.padding.top, effective_width);
-
-        for (0..row_height) |row_index| {
-            var builder = std.ArrayList(u8).empty;
-            errdefer builder.deinit(allocator);
-
-            try builder.appendNTimes(allocator, ' ', self.padding.left + justify.leading);
-
-            for (rendered, 0..) |entry, index| {
-                const alignment = self.children.items[index].align_self orelse self.align_items;
-                const line_text = lineForRowChild(entry.lines.items, row_index, row_height, alignment);
-                const aligned = try layout.alignLineAlloc(allocator, line_text, assigned_widths[index], .stretch);
-                defer allocator.free(aligned);
-                try builder.appendSlice(allocator, aligned);
-
-                if (index + 1 < rendered.len) {
-                    try builder.appendNTimes(allocator, ' ', self.gap + justify.between[index]);
-                }
-            }
-
-            try builder.appendNTimes(allocator, ' ', self.padding.right + justify.trailing);
-            const fitted = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-            defer allocator.free(fitted);
-            try component_mod.appendOwnedLine(lines, allocator, fitted);
-            builder.deinit(allocator);
-        }
-
-        try layout.appendBlankLines(allocator, lines, self.padding.bottom, effective_width);
-    }
-};
-
-const RenderedChild = struct {
-    lines: component_mod.LineList,
 };
 
 const RenderedDrawChild = struct {
@@ -465,49 +273,6 @@ const JustifyDistribution = struct {
     trailing: usize,
     between: []usize,
 };
-
-fn renderChildren(
-    allocator: std.mem.Allocator,
-    children: []const FlexChild,
-    width: usize,
-) std.mem.Allocator.Error![]RenderedChild {
-    const rendered = try allocator.alloc(RenderedChild, children.len);
-    errdefer allocator.free(rendered);
-
-    for (children, 0..) |child, index| {
-        rendered[index] = .{ .lines = .empty };
-        errdefer {
-            for (rendered[0 .. index + 1]) |*entry| component_mod.freeLines(allocator, &entry.lines);
-        }
-        try child.component.renderInto(allocator, width, &rendered[index].lines);
-    }
-
-    return rendered;
-}
-
-fn renderChildrenWithWidths(
-    allocator: std.mem.Allocator,
-    children: []const FlexChild,
-    widths: []const usize,
-) std.mem.Allocator.Error![]RenderedChild {
-    const rendered = try allocator.alloc(RenderedChild, children.len);
-    errdefer allocator.free(rendered);
-
-    for (children, 0..) |child, index| {
-        rendered[index] = .{ .lines = .empty };
-        errdefer {
-            for (rendered[0 .. index + 1]) |*entry| component_mod.freeLines(allocator, &entry.lines);
-        }
-        try child.component.renderInto(allocator, widths[index], &rendered[index].lines);
-    }
-
-    return rendered;
-}
-
-fn freeRenderedChildren(allocator: std.mem.Allocator, rendered: []RenderedChild) void {
-    for (rendered) |*entry| component_mod.freeLines(allocator, &entry.lines);
-    allocator.free(rendered);
-}
 
 fn freeRenderedDrawChildren(allocator: std.mem.Allocator, rendered: []RenderedDrawChild) void {
     for (rendered) |entry| {
@@ -528,10 +293,9 @@ fn renderDrawChildren(
     errdefer allocator.free(rendered);
 
     for (children, 0..) |child, index| {
-        rendered[index] = try renderChildToScreen(
+        rendered[index] = try renderDrawComponentToScreen(
             allocator,
             child.component,
-            child.draw_component,
             width,
             max_height,
             theme,
@@ -555,10 +319,9 @@ fn renderDrawChildrenWithWidths(
     errdefer allocator.free(rendered);
 
     for (children, 0..) |child, index| {
-        rendered[index] = try renderChildToScreen(
+        rendered[index] = try renderDrawComponentToScreen(
             allocator,
             child.component,
-            child.draw_component,
             widths[index],
             max_height,
             theme,
@@ -569,20 +332,6 @@ fn renderDrawChildrenWithWidths(
     }
 
     return rendered;
-}
-
-fn renderChildToScreen(
-    allocator: std.mem.Allocator,
-    component: component_mod.Component,
-    draw_component: ?draw_mod.Component,
-    width: usize,
-    max_height: usize,
-    theme: ?*const theme_mod.Theme,
-) std.mem.Allocator.Error!RenderedDrawChild {
-    if (draw_component) |draw_component_value| {
-        return renderDrawComponentToScreen(allocator, draw_component_value, width, max_height, theme);
-    }
-    return renderLegacyComponentToScreen(allocator, component, width, max_height);
 }
 
 fn renderDrawComponentToScreen(
@@ -617,37 +366,6 @@ fn renderDrawComponentToScreen(
         .screen = rendered,
         .used_width = if (used_width == 0) @min(@as(usize, size.width), width) else used_width,
         .used_height = @min(@as(usize, size.height), max_height),
-    };
-}
-
-fn renderLegacyComponentToScreen(
-    allocator: std.mem.Allocator,
-    component: component_mod.Component,
-    width: usize,
-    max_height: usize,
-) std.mem.Allocator.Error!RenderedDrawChild {
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try component.renderInto(allocator, @max(width, 1), &lines);
-
-    const screen_height = @max(@min(lines.items.len, max_height), 1);
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = @intCast(screen_height),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-    try cell_rows.renderLineListToWindow(window, lines.items, allocator);
-
-    const rendered = try cloneScreen(allocator, &screen, width, screen_height);
-    return .{
-        .screen = rendered,
-        .used_width = usedColumnCount(rendered),
-        .used_height = @min(lines.items.len, max_height),
     };
 }
 
@@ -946,53 +664,6 @@ fn distributeAcrossSlots(slots: []usize, value: usize) void {
     }
 }
 
-fn appendColumnChild(
-    allocator: std.mem.Allocator,
-    lines: *component_mod.LineList,
-    child_lines: []const []u8,
-    target_height: usize,
-    alignment: layout.AlignItems,
-    effective_width: usize,
-    inner_width: usize,
-    padding: layout.Insets,
-) std.mem.Allocator.Error!void {
-    const visible_count = @min(target_height, child_lines.len);
-    for (child_lines[0..visible_count]) |child_line| {
-        const fitted = try layout.wrapInsetLineAlloc(allocator, child_line, inner_width, effective_width, padding, alignment);
-        defer allocator.free(fitted);
-        try component_mod.appendOwnedLine(lines, allocator, fitted);
-    }
-
-    const remaining = target_height - visible_count;
-    try layout.appendBlankLines(allocator, lines, remaining, effective_width);
-}
-
-fn lineForRowChild(
-    child_lines: []const []u8,
-    row_index: usize,
-    row_height: usize,
-    alignment: layout.AlignItems,
-) []const u8 {
-    if (child_lines.len >= row_height) {
-        const start_index = switch (alignment) {
-            .start, .stretch => 0,
-            .center => (child_lines.len - row_height) / 2,
-            .end => child_lines.len - row_height,
-        };
-        const index = start_index + row_index;
-        return if (index < child_lines.len) child_lines[index] else "";
-    }
-
-    const remaining = row_height - child_lines.len;
-    const top_padding = switch (alignment) {
-        .start, .stretch => 0,
-        .center => remaining / 2,
-        .end => remaining,
-    };
-    if (row_index < top_padding or row_index >= top_padding + child_lines.len) return "";
-    return child_lines[row_index - top_padding];
-}
-
 fn sumSizes(values: []const usize) usize {
     var total: usize = 0;
     for (values) |value| total += value;
@@ -1002,93 +673,81 @@ fn sumSizes(values: []const usize) usize {
 const StaticComponent = struct {
     lines: []const []const u8,
 
-    fn component(self: *const StaticComponent) component_mod.Component {
+    fn drawComponent(self: *const StaticComponent) draw_mod.Component {
         return .{
             .ptr = self,
-            .renderIntoFn = renderIntoOpaque,
+            .drawFn = draw,
         };
     }
 
-    fn renderIntoOpaque(
-        ptr: *const anyopaque,
-        allocator: std.mem.Allocator,
-        width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
+    fn draw(ptr: *const anyopaque, window: vaxis.Window, _: draw_mod.DrawContext) std.mem.Allocator.Error!draw_mod.Size {
         const self: *const StaticComponent = @ptrCast(@alignCast(ptr));
-        for (self.lines) |line| {
-            const fitted = try ansi.padRightVisibleAlloc(allocator, line, width);
-            defer allocator.free(fitted);
-            try component_mod.appendOwnedLine(lines, allocator, fitted);
+        window.clear();
+        for (self.lines, 0..) |line, row_index| {
+            if (row_index >= @as(usize, window.height)) break;
+            const row_window = window.child(.{ .y_off = @intCast(row_index), .height = 1 });
+            _ = row_window.printSegment(.{ .text = line }, .{ .wrap = .none });
         }
+        return .{
+            .width = window.width,
+            .height = @intCast(@min(self.lines.len, @as(usize, window.height))),
+        };
     }
 };
 
 test "flex row distributes width using grow factors" {
-    const allocator = std.testing.allocator;
-
     const left = StaticComponent{ .lines = &[_][]const u8{"L"} };
     const right = StaticComponent{ .lines = &[_][]const u8{"R"} };
 
     var flex = Flex.init(.row);
-    defer flex.deinit(allocator);
+    defer flex.deinit(std.testing.allocator);
     flex.gap = 1;
-    try flex.addChild(allocator, .{ .component = left.component(), .basis = 4, .grow = 1 });
-    try flex.addChild(allocator, .{ .component = right.component(), .basis = 4, .grow = 2 });
+    try flex.addChild(std.testing.allocator, .{ .component = left.drawComponent(), .basis = 4, .grow = 1 });
+    try flex.addChild(std.testing.allocator, .{ .component = right.drawComponent(), .basis = 4, .grow = 2 });
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try flex.renderInto(allocator, 16, &lines);
+    var screen = try test_helpers.renderToScreen(flex.drawComponent(), 16, 1);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 16), ansi.visibleWidth(lines.items[0]));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "L") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "R") != null);
+    try test_helpers.expectCell(&screen, 0, 0, "L", .{});
+    try test_helpers.expectCell(&screen, 8, 0, "R", .{});
 }
 
 test "flex row shrinks oversized children" {
-    const allocator = std.testing.allocator;
-
     const left = StaticComponent{ .lines = &[_][]const u8{"left"} };
     const right = StaticComponent{ .lines = &[_][]const u8{"right"} };
 
     var flex = Flex.init(.row);
-    defer flex.deinit(allocator);
+    defer flex.deinit(std.testing.allocator);
     flex.gap = 1;
-    try flex.addChild(allocator, .{ .component = left.component(), .basis = 8, .shrink = 1 });
-    try flex.addChild(allocator, .{ .component = right.component(), .basis = 8, .shrink = 1 });
+    try flex.addChild(std.testing.allocator, .{ .component = left.drawComponent(), .basis = 8, .shrink = 1 });
+    try flex.addChild(std.testing.allocator, .{ .component = right.drawComponent(), .basis = 8, .shrink = 1 });
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try flex.renderInto(allocator, 10, &lines);
+    var screen = try test_helpers.renderToScreen(flex.drawComponent(), 10, 1);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), lines.items.len);
-    try std.testing.expectEqual(@as(usize, 10), ansi.visibleWidth(lines.items[0]));
+    try test_helpers.expectCell(&screen, 0, 0, "l", .{});
+    try test_helpers.expectCell(&screen, 5, 0, "r", .{});
 }
 
 test "flex column applies padding gap and centering" {
-    const allocator = std.testing.allocator;
-
     const one = StaticComponent{ .lines = &[_][]const u8{"one"} };
     const two = StaticComponent{ .lines = &[_][]const u8{"two"} };
 
     var flex = Flex.init(.column);
-    defer flex.deinit(allocator);
+    defer flex.deinit(std.testing.allocator);
     flex.padding = layout.Insets.symmetric(1, 2);
     flex.gap = 1;
     flex.height = 8;
     flex.justify_content = .center;
     flex.align_items = .center;
-    try flex.addChild(allocator, .{ .component = one.component() });
-    try flex.addChild(allocator, .{ .component = two.component() });
+    try flex.addChild(std.testing.allocator, .{ .component = one.drawComponent() });
+    try flex.addChild(std.testing.allocator, .{ .component = two.drawComponent() });
 
-    var lines = component_mod.LineList.empty;
-    defer component_mod.freeLines(allocator, &lines);
-    try flex.renderInto(allocator, 12, &lines);
+    var screen = try test_helpers.renderToScreen(flex.drawComponent(), 12, 8);
+    defer screen.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 8), lines.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[2], "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[4], "two") != null);
+    try test_helpers.expectCell(&screen, 4, 2, "o", .{});
+    try test_helpers.expectCell(&screen, 4, 4, "t", .{});
 }
 
 test "flex draw row uses child windows for gap placement" {
@@ -1099,11 +758,11 @@ test "flex draw row uses child windows for gap placement" {
     defer flex.deinit(std.testing.allocator);
     flex.gap = 1;
     try flex.addChild(std.testing.allocator, .{
-        .component = left.component(),
+        .component = left.drawComponent(),
         .basis = 2,
     });
     try flex.addChild(std.testing.allocator, .{
-        .component = right.component(),
+        .component = right.drawComponent(),
         .basis = 3,
     });
 
@@ -1122,8 +781,8 @@ test "flex draw column applies padding and vertical gap" {
     defer flex.deinit(std.testing.allocator);
     flex.padding = layout.Insets.symmetric(1, 2);
     flex.gap = 1;
-    try flex.addChild(std.testing.allocator, .{ .component = top.component() });
-    try flex.addChild(std.testing.allocator, .{ .component = bottom.component() });
+    try flex.addChild(std.testing.allocator, .{ .component = top.drawComponent() });
+    try flex.addChild(std.testing.allocator, .{ .component = bottom.drawComponent() });
 
     var screen = try test_helpers.renderToScreen(flex.drawComponent(), 8, 5);
     defer screen.deinit(std.testing.allocator);

@@ -29,6 +29,12 @@ pub const ModelOverlay = struct {
     current_model_id: []u8 = &.{},
     config_error: ?[]u8 = null,
 
+    // Table rendering data (parallel to items, excluding error/empty rows)
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 2 }, .{ .length = 14 }, .{ .fill = 1 }, .{ .length = 12 } },
+
     pub fn deinit(self: *ModelOverlay, allocator: std.mem.Allocator) void {
         allocator.free(self.hint);
         if (self.search.len > 0) allocator.free(self.search);
@@ -39,6 +45,8 @@ pub const ModelOverlay = struct {
         if (self.scoped_models.len > 0) allocator.free(self.scoped_models);
         freeModelChoices(allocator, self.choices);
         freeOwnedSelectItems(allocator, self.items);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -60,6 +68,12 @@ pub const ScopedModelsOverlay = struct {
     search: []u8 = &.{},
     dirty: bool = false,
 
+    // Table rendering data (parallel to choices, excluding empty row)
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 2 }, .{ .length = 3 }, .{ .fill = 1 }, .{ .length = 12 } },
+
     pub fn deinit(self: *ScopedModelsOverlay, allocator: std.mem.Allocator) void {
         allocator.free(self.hint);
         freeScopedModelChoices(allocator, self.choices);
@@ -68,6 +82,8 @@ pub const ScopedModelsOverlay = struct {
         freeOwnedStrings(allocator, self.all_ids);
         if (self.enabled_ids) |ids| freeOwnedStrings(allocator, ids);
         if (self.search.len > 0) allocator.free(self.search);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -196,6 +212,42 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *ModelOverlay) !void {
     overlay.list.items = items;
     overlay.list.selected_index = selected_index;
     overlay.list.max_visible = 12;
+
+    // Build table rows (only for actual model entries, not error/empty rows)
+    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
+    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    overlay.table_cells = &[_]tui.TableCell{};
+    overlay.table_rows = &[_]tui.TableRow{};
+
+    if (!has_empty_result and visible_models.items.len > 0) {
+        const col_count: usize = 4;
+        const table_row_count = visible_models.items.len;
+        const total_cells = table_row_count * col_count;
+
+        const table_cells = try allocator.alloc(tui.TableCell, total_cells);
+        errdefer allocator.free(table_cells);
+
+        const table_rows = try allocator.alloc(tui.TableRow, table_row_count);
+        errdefer allocator.free(table_rows);
+
+        for (visible_models.items, 0..) |entry, index| {
+            const is_current = std.mem.eql(u8, entry.provider, overlay.current_provider) and
+                std.mem.eql(u8, entry.model_id, overlay.current_model_id);
+            const cell_start = index * col_count;
+
+            table_cells[cell_start] = .{ .text = if (is_current) "✓" else " " };
+            table_cells[cell_start + 1] = .{ .text = provider_config.providerDisplayName(entry.provider) };
+            table_cells[cell_start + 2] = .{ .text = entry.display_name };
+            table_cells[cell_start + 3] = .{ .text = provider_config.providerAuthStatusLabel(entry.auth_status) };
+
+            table_rows[index] = .{ .cells = table_cells[cell_start .. cell_start + col_count] };
+        }
+
+        overlay.table_cells = table_cells;
+        overlay.table_rows = table_rows;
+        overlay.table_state = .{ .selected_index = selected_index };
+    }
+
     overlay.hint = try formatModelOverlayHint(allocator, overlay);
 }
 
@@ -315,6 +367,44 @@ pub fn refreshScoped(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay
     overlay.list.items = items;
     overlay.list.selected_index = @min(overlay.list.selected_index, row_count - 1);
     overlay.list.max_visible = 8;
+
+    // Build table rows (only for actual model entries, not empty row)
+    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
+    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    overlay.table_cells = &[_]tui.TableCell{};
+    overlay.table_rows = &[_]tui.TableRow{};
+
+    if (!has_empty_result and filtered.items.len > 0) {
+        const col_count: usize = 4;
+        const table_row_count = filtered.items.len;
+        const total_cells = table_row_count * col_count;
+
+        const table_cells = try allocator.alloc(tui.TableCell, total_cells);
+        errdefer allocator.free(table_cells);
+
+        const table_rows = try allocator.alloc(tui.TableRow, table_row_count);
+        errdefer allocator.free(table_rows);
+
+        for (filtered.items, 0..) |model_index, index| {
+            const model = overlay.all_models[model_index];
+            const full_id = try formatModelFullId(allocator, model);
+            defer allocator.free(full_id);
+            const enabled = scopedModelIsEnabled(overlay.enabled_ids, full_id);
+            const cell_start = index * col_count;
+
+            table_cells[cell_start] = .{ .text = if (index == overlay.list.selected_index) ">" else " " };
+            table_cells[cell_start + 1] = .{ .text = if (overlay.enabled_ids == null) "" else if (enabled) "✓" else "✗" };
+            table_cells[cell_start + 2] = .{ .text = model.display_name };
+            table_cells[cell_start + 3] = .{ .text = provider_config.providerDisplayName(model.provider) };
+
+            table_rows[index] = .{ .cells = table_cells[cell_start .. cell_start + col_count] };
+        }
+
+        overlay.table_cells = table_cells;
+        overlay.table_rows = table_rows;
+        overlay.table_state = .{ .selected_index = overlay.list.selected_index };
+    }
+
     overlay.hint = try formatScopedModelsHint(allocator, overlay);
 }
 

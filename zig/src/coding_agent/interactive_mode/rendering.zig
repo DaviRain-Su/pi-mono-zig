@@ -2795,14 +2795,17 @@ const BorrowedLineListComponent = struct {
         ctx: tui.draw.DrawContext,
     ) std.mem.Allocator.Error!tui.draw.Size {
         const self: *const BorrowedLineListComponent = @ptrCast(@alignCast(ptr));
-        var lines = tui.component.LineList.empty;
-        for (self.lines) |line| {
+        const row_count = @min(self.lines.len, @as(usize, window.height));
+        for (self.lines[0..row_count], 0..) |line, row_index| {
             const fitted = try fitLine(ctx.arena, line, window.width);
             defer ctx.arena.free(fitted);
-            try tui.component.appendOwnedLine(&lines, ctx.arena, fitted);
+            const row_window = window.child(.{
+                .y_off = @intCast(row_index),
+                .height = 1,
+            });
+            _ = row_window.printSegment(.{ .text = fitted }, .{ .wrap = .none });
         }
-        try tui.cell_rows.renderLineListToWindow(window, lines.items, ctx.arena);
-        return .{ .width = window.width, .height = @min(lines.items.len, window.height) };
+        return .{ .width = window.width, .height = @intCast(row_count) };
     }
 };
 
@@ -2859,6 +2862,26 @@ pub const OverlayPanelComponent = struct {
             .ptr = self,
             .drawFn = drawOpaque,
         };
+    }
+
+    fn drawOverlayTable(
+        overlay: anytype,
+        list_window: tui.vaxis.Window,
+        ctx: tui.DrawContext,
+        theme: ?*const resources_mod.Theme,
+        highlight_style: tui.vaxis.Cell.Style,
+    ) std.mem.Allocator.Error!tui.DrawSize {
+        overlay.table_state.selected_index = overlay.list.selectedIndex();
+        var table = tui.Table{
+            .rows = overlay.table_rows,
+            .widths = overlay.table_widths,
+            .row_highlight_style = highlight_style,
+        };
+        return try table.draw(list_window, .{
+            .window = list_window,
+            .arena = ctx.arena,
+            .theme = theme,
+        }, &overlay.table_state);
     }
 
     pub fn draw(
@@ -2950,30 +2973,58 @@ pub const OverlayPanelComponent = struct {
             },
             else => {
                 if (row < content_window.height) {
-                    const overlay_list = switch (self.overlay.*) {
-                        .info => |*info_overlay| &info_overlay.list,
-                        .settings => |*settings_overlay| &settings_overlay.list,
-                        .session => |*session_overlay| &session_overlay.list,
-                        .model => |*model_overlay| &model_overlay.list,
-                        .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
-                        .theme => |*theme_overlay| &theme_overlay.list,
-                        .tree => |*tree_overlay| &tree_overlay.list,
-                        .fork => |*fork_overlay| &fork_overlay.list,
-                        .auth => |*auth_overlay| &auth_overlay.list,
-                        else => unreachable,
+                    const has_table = switch (self.overlay.*) {
+                        .info => |*o| o.table_rows.len > 0,
+                        .settings => |*o| o.table_rows.len > 0,
+                        .session => |*o| o.table_rows.len > 0,
+                        .model => |*o| o.table_rows.len > 0,
+                        .scoped_models => |*o| o.table_rows.len > 0,
+                        .theme => |*o| o.table_rows.len > 0,
+                        .tree => |*o| o.table_rows.len > 0,
+                        .fork => |*o| o.table_rows.len > 0,
+                        .auth => |*o| o.table_rows.len > 0,
+                        else => false,
                     };
-                    overlay_list.theme = self.theme;
-                    overlay_list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
                     const list_window = content_window.child(.{
                         .y_off = @intCast(row),
                         .height = content_window.height - @as(u16, @intCast(row)),
                     });
-                    const size = try overlay_list.draw(list_window, .{
-                        .window = list_window,
-                        .arena = ctx.arena,
-                        .theme = self.theme,
-                    });
-                    row += @as(usize, size.height);
+                    if (has_table) {
+                        const highlight_style = styleForToken(self.theme, .select_selected);
+                        switch (self.overlay.*) {
+                            .info => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .settings => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .session => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .model => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .scoped_models => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .theme => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .tree => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .fork => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            .auth => |*o| row += @as(usize, (try OverlayPanelComponent.drawOverlayTable(o, list_window, ctx, self.theme, highlight_style)).height),
+                            else => unreachable,
+                        }
+                    } else {
+                        const overlay_list = switch (self.overlay.*) {
+                            .info => |*info_overlay| &info_overlay.list,
+                            .settings => |*settings_overlay| &settings_overlay.list,
+                            .session => |*session_overlay| &session_overlay.list,
+                            .model => |*model_overlay| &model_overlay.list,
+                            .scoped_models => |*scoped_models_overlay| &scoped_models_overlay.list,
+                            .theme => |*theme_overlay| &theme_overlay.list,
+                            .tree => |*tree_overlay| &tree_overlay.list,
+                            .fork => |*fork_overlay| &fork_overlay.list,
+                            .auth => |*auth_overlay| &auth_overlay.list,
+                            else => unreachable,
+                        };
+                        overlay_list.theme = self.theme;
+                        overlay_list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
+                        const size = try overlay_list.draw(list_window, .{
+                            .window = list_window,
+                            .arena = ctx.arena,
+                            .theme = self.theme,
+                        });
+                        row += @as(usize, size.height);
+                    }
                 }
             },
         }

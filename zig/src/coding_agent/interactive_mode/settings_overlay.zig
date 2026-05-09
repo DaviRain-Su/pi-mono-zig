@@ -59,6 +59,12 @@ pub const Overlay = struct {
     runtime_config: ?*const config_mod.RuntimeConfig = null,
     session: *const session_mod.AgentSession,
 
+    // Table rendering data
+    table_rows: []tui.TableRow = &.{},
+    table_cells: []tui.TableCell = &.{},
+    table_state: tui.TableState = .{},
+    table_widths: []const tui.Constraint = &.{ .{ .length = 24 }, .{ .fill = 1 } },
+
     pub fn deinit(self: *Overlay, allocator: std.mem.Allocator) void {
         allocator.free(self.hint);
         freeChoices(allocator, self.choices);
@@ -67,6 +73,8 @@ pub const Overlay = struct {
         if (self.original_theme.len > 0) allocator.free(self.original_theme);
         for (self.available_themes) |theme| allocator.free(theme);
         allocator.free(self.available_themes);
+        if (self.table_cells.len > 0) allocator.free(self.table_cells);
+        if (self.table_rows.len > 0) allocator.free(self.table_rows);
         self.* = undefined;
     }
 };
@@ -150,6 +158,18 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *Overlay) !void {
     overlay.list.selected_index = @min(overlay.list.selected_index, overlay.items.len - 1);
     overlay.list.max_visible = 12;
     overlay.hint = try formatHint(allocator, overlay);
+
+    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
+    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
+    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
+    for (overlay.items, 0..) |item, i| {
+        table_cells[i * 2] = .{ .text = item.label };
+        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
+        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
+    }
+    overlay.table_cells = table_cells;
+    overlay.table_rows = table_rows;
 }
 
 pub fn updateSearch(allocator: std.mem.Allocator, overlay: *Overlay, next_search: []const u8) !void {
