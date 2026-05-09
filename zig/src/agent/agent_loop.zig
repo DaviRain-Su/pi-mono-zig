@@ -474,7 +474,7 @@ fn ownedDeltaStreamForAgentLoopTest(
     _: ?ai.types.SimpleStreamOptions,
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = std.heap.page_allocator;
+    const result_allocator = allocator;
     const text = try result_allocator.dupe(u8, "streamed response");
     const content = try result_allocator.alloc(ai.ContentBlock, 1);
     content[0] = .{ .text = .{ .text = text } };
@@ -517,7 +517,7 @@ fn toolCallStreamForAgentLoopTest(
     _: ?ai.types.SimpleStreamOptions,
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = std.heap.page_allocator;
+    const result_allocator = allocator;
     var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
     try args_object.put(
         result_allocator,
@@ -570,7 +570,7 @@ fn crossPartialUpdateStreamForAgentLoopTest(
     _: ?ai.types.SimpleStreamOptions,
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = std.heap.page_allocator;
+    const result_allocator = allocator;
     var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
     try args_object.put(
         result_allocator,
@@ -805,7 +805,7 @@ fn malformedPartialToolCallStreamForAgentLoopTest(
     _: ?ai.types.SimpleStreamOptions,
     _: ?*anyopaque,
 ) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = std.heap.page_allocator;
+    const result_allocator = allocator;
     const final_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
     const tool_call = ai.ToolCall{
         .id = try result_allocator.dupe(u8, "call_bad_args"),

@@ -1806,10 +1806,8 @@ fn makeAssistantTextMessage(
     stop_reason: ai.StopReason,
     error_message: ?[]const u8,
 ) !ai.AssistantMessage {
-    _ = allocator;
-
-    const content = try std.heap.page_allocator.alloc(ai.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = try std.heap.page_allocator.dupe(u8, text) } };
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
     return .{
         .content = content,
         .tool_calls = null,
@@ -1818,7 +1816,7 @@ fn makeAssistantTextMessage(
         .model = model.id,
         .usage = ai.Usage.init(),
         .stop_reason = stop_reason,
-        .error_message = if (error_message) |message| try std.heap.page_allocator.dupe(u8, message) else null,
+        .error_message = if (error_message) |message| try allocator.dupe(u8, message) else null,
         .timestamp = 0,
     };
 }
