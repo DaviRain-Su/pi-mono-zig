@@ -227,6 +227,35 @@ pub fn entriesEqual(left: LockEntry, right: LockEntry) bool {
         std.mem.eql(u8, left.package_root_sha256, right.package_root_sha256);
 }
 
+pub fn nativePolicyLookupKeyFromLockEntry(
+    allocator: std.mem.Allocator,
+    entry: LockEntry,
+) ![]u8 {
+    const schema_version = entry.manifest_schema_version orelse native_manifest.SCHEMA_VERSION;
+    const extension_id = entry.manifest_id orelse "";
+    const extension_version = entry.manifest_version orelse "";
+    const artifact_path = entry.artifact_path orelse "";
+    const artifact_sha256 = entry.artifact_sha256 orelse "";
+    const artifact_os = entry.artifact_os orelse "";
+    const artifact_arch = entry.artifact_arch orelse "";
+    return std.fmt.allocPrint(
+        allocator,
+        "native:locked:{s}:{s}:{s}:{s}:{s}:native:{s}:{s}:{s}:{s}:{s}",
+        .{
+            entry.scope.jsonName(),
+            entry.source_identity,
+            schema_version,
+            extension_id,
+            extension_version,
+            entry.package_root_sha256,
+            artifact_sha256,
+            artifact_path,
+            artifact_os,
+            artifact_arch,
+        },
+    );
+}
+
 fn optEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null and right == null) return true;
     if (left == null or right == null) return false;

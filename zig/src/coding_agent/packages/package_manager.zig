@@ -435,6 +435,7 @@ const WasmPackageListMetadata = struct {
     artifact_arch: ?[]u8 = null,
     package_root_sha256: []u8,
     policy_lookup_key: []u8,
+    policy_status: []u8,
     scope: []u8,
     trust_status: []u8,
 
@@ -450,6 +451,7 @@ const WasmPackageListMetadata = struct {
         if (self.artifact_arch) |value| allocator.free(value);
         allocator.free(self.package_root_sha256);
         allocator.free(self.policy_lookup_key);
+        allocator.free(self.policy_status);
         allocator.free(self.scope);
         allocator.free(self.trust_status);
         self.* = undefined;
@@ -1251,28 +1253,7 @@ fn nativePolicyLookupKeyFromLockEntry(
     allocator: std.mem.Allocator,
     entry: provenance_lockfile.LockEntry,
 ) ![]u8 {
-    const schema_version = entry.manifest_schema_version orelse native_manifest.SCHEMA_VERSION;
-    const extension_id = entry.manifest_id orelse "";
-    const extension_version = entry.manifest_version orelse "";
-    const artifact_path = entry.artifact_path orelse "";
-    const artifact_sha256 = entry.artifact_sha256 orelse "";
-    const artifact_os = entry.artifact_os orelse "";
-    const artifact_arch = entry.artifact_arch orelse "";
-    return std.fmt.allocPrint(
-        allocator,
-        "native:manifest:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{
-            entry.scope.jsonName(),
-            schema_version,
-            extension_id,
-            extension_version,
-            entry.package_root_sha256,
-            artifact_sha256,
-            artifact_path,
-            artifact_os,
-            artifact_arch,
-        },
-    );
+    return provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, entry);
 }
 
 fn policyLookupKeyFromLockEntry(
@@ -2781,6 +2762,7 @@ fn writeListEntryMetadata(
     if (metadata.artifact_arch) |arch| try stdout.print("    artifact arch: {s}\n", .{arch});
     try stdout.print("    package root sha256: {s}\n", .{metadata.package_root_sha256});
     try stdout.print("    artifact sha256: {s}\n", .{metadata.artifact_sha256});
+    try stdout.print("    policy: {s}\n", .{metadata.policy_status});
     try stdout.print("    approval target: {s}\n", .{redacted_policy});
 }
 
@@ -2862,6 +2844,8 @@ fn loadWasmPackageListMetadata(
         if (entry.manifest_kind.len == 0 or !(std.mem.eql(u8, entry.manifest_kind, "wasm-extension") or std.mem.eql(u8, entry.manifest_kind, "native-extension"))) return null;
         const policy_key = try policyLookupKeyFromLockEntry(allocator, entry);
         errdefer allocator.free(policy_key);
+        const policy_status = try localPackagePolicyStatusForList(allocator, io, options, policy_key);
+        errdefer allocator.free(policy_status);
         const trust_status = try localWasmTrustStatusForList(allocator, io, options, source, is_project, entry);
         errdefer allocator.free(trust_status);
         return .{
@@ -2876,11 +2860,26 @@ fn loadWasmPackageListMetadata(
             .artifact_arch = if (entry.artifact_arch) |value| try allocator.dupe(u8, value) else null,
             .package_root_sha256 = try allocator.dupe(u8, entry.package_root_sha256),
             .policy_lookup_key = policy_key,
+            .policy_status = policy_status,
             .scope = try allocator.dupe(u8, entry.scope.jsonName()),
             .trust_status = trust_status,
         };
     }
     return null;
+}
+
+fn localPackagePolicyStatusForList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ExecuteOptions,
+    policy_key: []const u8,
+) ![]u8 {
+    var effective_settings = try loadEffectiveSettingsForPackageInstall(allocator, io, options);
+    defer effective_settings.deinit(allocator);
+    const policy = lookupExtensionPolicy(effective_settings, policy_key) orelse return allocator.dupe(u8, "denied");
+    if (policy.enabled) |enabled| if (!enabled) return allocator.dupe(u8, "denied");
+    if (policy.approved) |approved| if (!approved) return allocator.dupe(u8, "denied");
+    return allocator.dupe(u8, "authorized");
 }
 
 fn localWasmTrustStatusForList(
@@ -4030,7 +4029,7 @@ test "native dynamic package install validates artifact schema and writes select
     defer allocator.free(expected_stdout_arch);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_stdout_os) != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_stdout_arch) != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: native:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: native:locked:user:") != null);
 
     const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
     defer allocator.free(lockfile_path);
@@ -4052,6 +4051,7 @@ test "native dynamic package install validates artifact schema and writes select
     try std.testing.expectEqual(@as(u8, 0), list_result.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "runtime: native") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "trust: locked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "policy: denied") != null);
 }
 
 test "native dynamic package install rejects missing selected artifacts without state" {

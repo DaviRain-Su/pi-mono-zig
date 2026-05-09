@@ -4,6 +4,8 @@ const extension_manifest = @import("../extensions/extension_manifest.zig");
 const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
 const ext_manifest = @import("../extensions/manifest.zig");
 const capability = @import("../extensions/capability.zig");
+const native_manifest = @import("../extensions/native/native_manifest.zig");
+const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
@@ -169,6 +171,32 @@ pub const LockedWasmPackageResolution = struct {
     diagnostics: []Diagnostic,
 
     pub fn deinit(self: *LockedWasmPackageResolution, allocator: std.mem.Allocator) void {
+        for (self.packages) |*package| package.deinit(allocator);
+        allocator.free(self.packages);
+        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
+        allocator.free(self.diagnostics);
+        self.* = undefined;
+    }
+};
+
+pub const LockedNativePackage = struct {
+    source_info: SourceInfo,
+    manifest: native_manifest.Manifest,
+    lock_entry: provenance_lockfile.LockEntry,
+
+    pub fn deinit(self: *LockedNativePackage, allocator: std.mem.Allocator) void {
+        self.source_info.deinit(allocator);
+        self.manifest.deinit(allocator);
+        self.lock_entry.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const LockedNativePackageResolution = struct {
+    packages: []LockedNativePackage,
+    diagnostics: []Diagnostic,
+
+    pub fn deinit(self: *LockedNativePackageResolution, allocator: std.mem.Allocator) void {
         for (self.packages) |*package| package.deinit(allocator);
         allocator.free(self.packages);
         for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
@@ -465,6 +493,34 @@ pub fn resolveConfiguredLockedWasmPackages(
 
     std.mem.sort(LockedWasmPackage, packages.items, {}, struct {
         fn lessThan(_: void, lhs: LockedWasmPackage, rhs: LockedWasmPackage) bool {
+            const left_scope = @intFromEnum(lhs.source_info.scope);
+            const right_scope = @intFromEnum(rhs.source_info.scope);
+            if (left_scope != right_scope) return left_scope < right_scope;
+            return std.mem.lessThan(u8, lhs.manifest.package_root, rhs.manifest.package_root);
+        }
+    }.lessThan);
+
+    return .{
+        .packages = try packages.toOwnedSlice(allocator),
+        .diagnostics = try diagnostics.toOwnedSlice(allocator),
+    };
+}
+
+pub fn resolveConfiguredLockedNativePackages(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ResolveResourcesOptions,
+) !LockedNativePackageResolution {
+    var diagnostics = std.ArrayList(Diagnostic).empty;
+    errdefer deinitDiagnosticsList(allocator, &diagnostics);
+    var packages = std.ArrayList(LockedNativePackage).empty;
+    errdefer deinitLockedNativePackageList(allocator, &packages);
+
+    try addLockedNativePackageSources(allocator, io, &packages, &diagnostics, options.project.packages, .project, options.cwd, options.agent_dir);
+    try addLockedNativePackageSources(allocator, io, &packages, &diagnostics, options.global.packages, .user, options.cwd, options.agent_dir);
+
+    std.mem.sort(LockedNativePackage, packages.items, {}, struct {
+        fn lessThan(_: void, lhs: LockedNativePackage, rhs: LockedNativePackage) bool {
             const left_scope = @intFromEnum(lhs.source_info.scope);
             const right_scope = @intFromEnum(rhs.source_info.scope);
             if (left_scope != right_scope) return left_scope < right_scope;
@@ -1136,6 +1192,78 @@ fn appendLockedWasmPackageIfValid(
     }
 }
 
+fn addLockedNativePackageSources(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: *std.ArrayList(LockedNativePackage),
+    diagnostics: *std.ArrayList(Diagnostic),
+    configured_packages: ?[]const PackageSourceConfig,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !void {
+    const package_list = configured_packages orelse return;
+    for (package_list) |pkg| {
+        const parsed = parseSource(pkg.source);
+        switch (parsed) {
+            .local => |local| {
+                const base_dir = switch (scope) {
+                    .project => try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" }),
+                    .user => agent_dir,
+                    .temporary => cwd,
+                };
+                defer if (scope == .project) allocator.free(base_dir);
+                const resolved = try resolvePath(allocator, base_dir, local.path);
+                defer allocator.free(resolved);
+                try appendLockedNativePackageIfValid(allocator, io, packages, diagnostics, resolved, pkg.source, scope, cwd, agent_dir);
+            },
+            .npm => |npm| {
+                const install_path = try npmInstallPath(allocator, scope, cwd, agent_dir, npm.name);
+                defer allocator.free(install_path);
+                if (!pathExists(io, install_path)) {
+                    try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "npm source is not installed", install_path));
+                    continue;
+                }
+                try appendLockedNativePackageIfValid(allocator, io, packages, diagnostics, install_path, pkg.source, scope, cwd, agent_dir);
+            },
+            .git => |git| {
+                const install_path = try gitInstallPath(allocator, scope, cwd, agent_dir, git.normalized);
+                defer allocator.free(install_path);
+                if (!pathExists(io, install_path)) {
+                    try diagnostics.append(allocator, try makeDiagnostic(allocator, "warning", "git source is not installed", install_path));
+                    continue;
+                }
+                try appendLockedNativePackageIfValid(allocator, io, packages, diagnostics, install_path, pkg.source, scope, cwd, agent_dir);
+            },
+        }
+    }
+}
+
+fn appendLockedNativePackageIfValid(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: *std.ArrayList(LockedNativePackage),
+    diagnostics: *std.ArrayList(Diagnostic),
+    package_root: []const u8,
+    source: []const u8,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !void {
+    if (try verifyLockedNativePackageDetailed(allocator, io, diagnostics, package_root, source, scope, cwd, agent_dir)) |package| {
+        for (packages.items) |existing| {
+            if (existing.lock_entry.scope == package.lock_entry.scope and
+                std.mem.eql(u8, existing.lock_entry.key, package.lock_entry.key))
+            {
+                var duplicate = package;
+                duplicate.deinit(allocator);
+                return;
+            }
+        }
+        try packages.append(allocator, package);
+    }
+}
+
 fn verifyLockedWasmPackageForResources(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1270,6 +1398,89 @@ fn verifyLockedWasmPackageDetailed(
     };
 }
 
+fn verifyLockedNativePackageDetailed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    package_root: []const u8,
+    source: []const u8,
+    scope: SourceScope,
+    cwd: []const u8,
+    agent_dir: []const u8,
+) !?LockedNativePackage {
+    if (scope == .temporary) return null;
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    defer allocator.free(manifest_path);
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(manifest_text);
+    if (!native_manifest.isNativeDynamicManifestText(allocator, manifest_text)) return null;
+
+    const provenance_scope: provenance_lockfile.Scope = if (scope == .project) .project else .user;
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
+    defer allocator.free(lock_path);
+
+    var current_result = try native_manifest.validateManifestText(allocator, package_root, manifest_text);
+    defer current_result.deinit(allocator);
+    if (current_result != .valid) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "package_validation_failed", "native package validation failed", manifest_path));
+        return null;
+    }
+
+    var loaded = try provenance_lockfile.readLockfile(allocator, io, provenance_scope, lock_path, "resolve");
+    defer loaded.deinit(allocator);
+    if (loaded.diagnostic) |diagnostic| {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, diagnostic.category, diagnostic.message, lock_path));
+        return null;
+    }
+    if (!pathExists(io, lock_path)) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lockfile", "missing extension provenance lockfile", lock_path));
+        return null;
+    }
+
+    var current_entry = try provenance_lockfile.createNativeLockEntry(allocator, provenance_scope, current_result.valid.package_root, &current_result.valid);
+    defer current_entry.deinit(allocator);
+    var matched_entry: ?provenance_lockfile.LockEntry = null;
+    for (loaded.entries) |entry| {
+        if (!std.mem.eql(u8, entry.key, current_entry.key)) continue;
+        if (provenance_lockfile.entriesEqual(entry, current_entry)) {
+            matched_entry = entry;
+            break;
+        }
+        try appendWasmProvenanceMismatchDiagnostic(allocator, diagnostics, entry, current_entry, source, scope, package_root);
+        return null;
+    }
+
+    if (matched_entry == null) {
+        try diagnostics.append(allocator, try makeDiagnostic(allocator, "missing_lock_entry", "missing extension provenance lock entry", lock_path));
+        return null;
+    }
+
+    const cloned_manifest = try cloneNativeManifest(allocator, current_result.valid);
+    errdefer {
+        var manifest = cloned_manifest;
+        manifest.deinit(allocator);
+    }
+    const cloned_entry = try matched_entry.?.clone(allocator);
+    errdefer {
+        var entry = cloned_entry;
+        entry.deinit(allocator);
+    }
+    return .{
+        .source_info = .{
+            .path = try allocator.dupe(u8, package_root),
+            .source = try allocator.dupe(u8, source),
+            .scope = scope,
+            .origin = .package,
+            .base_dir = try allocator.dupe(u8, package_root),
+        },
+        .manifest = cloned_manifest,
+        .lock_entry = cloned_entry,
+    };
+}
+
 fn manifestRequiresLegacyWasmLock(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1369,6 +1580,9 @@ fn firstLockIdentityMismatch(
     if (!optionalStringEqual(locked_entry.artifact_kind, current_entry.artifact_kind)) return .{ .field = "artifact.kind", .expected = locked_entry.artifact_kind orelse "", .actual = current_entry.artifact_kind orelse "" };
     if (!optionalStringEqual(locked_entry.artifact_path, current_entry.artifact_path)) return .{ .field = "artifact.path", .expected = locked_entry.artifact_path orelse "", .actual = current_entry.artifact_path orelse "" };
     if (!optionalStringEqual(locked_entry.artifact_absolute_path, current_entry.artifact_absolute_path)) return .{ .field = "artifact.absolutePath", .expected = locked_entry.artifact_absolute_path orelse "", .actual = current_entry.artifact_absolute_path orelse "" };
+    if (!optionalStringEqual(locked_entry.artifact_os, current_entry.artifact_os)) return .{ .field = "artifact.os", .expected = locked_entry.artifact_os orelse "", .actual = current_entry.artifact_os orelse "" };
+    if (!optionalStringEqual(locked_entry.artifact_arch, current_entry.artifact_arch)) return .{ .field = "artifact.arch", .expected = locked_entry.artifact_arch orelse "", .actual = current_entry.artifact_arch orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_sha256, current_entry.manifest_sha256)) return .{ .field = "digests.manifestSha256", .expected = locked_entry.manifest_sha256 orelse "", .actual = current_entry.manifest_sha256 orelse "" };
     return .{ .field = "unknown", .expected = "", .actual = "" };
 }
 
@@ -2817,6 +3031,82 @@ fn cloneWasmResourceLimits(allocator: std.mem.Allocator, limits: capability.Reso
     };
 }
 
+fn cloneNativeManifest(allocator: std.mem.Allocator, manifest: native_manifest.Manifest) !native_manifest.Manifest {
+    const package_root = try allocator.dupe(u8, manifest.package_root);
+    errdefer allocator.free(package_root);
+    const manifest_path = try allocator.dupe(u8, manifest.manifest_path);
+    errdefer allocator.free(manifest_path);
+    const manifest_sha256 = try allocator.dupe(u8, manifest.manifest_sha256);
+    errdefer allocator.free(manifest_sha256);
+    const schema_version = try allocator.dupe(u8, manifest.schema_version);
+    errdefer allocator.free(schema_version);
+    const id = try allocator.dupe(u8, manifest.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, manifest.name);
+    errdefer allocator.free(name);
+    const version = try allocator.dupe(u8, manifest.version);
+    errdefer allocator.free(version);
+    const description = try allocator.dupe(u8, manifest.description);
+    errdefer allocator.free(description);
+    const descriptor = try allocator.dupe(u8, manifest.descriptor);
+    errdefer allocator.free(descriptor);
+    const selected_artifact_path = try allocator.dupe(u8, manifest.selected_artifact_path);
+    errdefer allocator.free(selected_artifact_path);
+    const selected_artifact_absolute_path = try allocator.dupe(u8, manifest.selected_artifact_absolute_path);
+    errdefer allocator.free(selected_artifact_absolute_path);
+    const selected_artifact_os = try allocator.dupe(u8, manifest.selected_artifact_os);
+    errdefer allocator.free(selected_artifact_os);
+    const selected_artifact_arch = try allocator.dupe(u8, manifest.selected_artifact_arch);
+    errdefer allocator.free(selected_artifact_arch);
+    const selected_artifact_sha256 = try allocator.dupe(u8, manifest.selected_artifact_sha256);
+    errdefer allocator.free(selected_artifact_sha256);
+    const package_root_sha256 = try allocator.dupe(u8, manifest.package_root_sha256);
+    errdefer allocator.free(package_root_sha256);
+    const tool_name = try allocator.dupe(u8, manifest.tool_name);
+    errdefer allocator.free(tool_name);
+    const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, manifest.requested_capabilities);
+    errdefer allocator.free(requested_capabilities);
+    var resource_limits = try cloneNativeResourceLimits(allocator, manifest.resource_limits);
+    errdefer resource_limits.deinit(allocator);
+
+    return .{
+        .package_root = package_root,
+        .manifest_path = manifest_path,
+        .manifest_sha256 = manifest_sha256,
+        .schema_version = schema_version,
+        .id = id,
+        .name = name,
+        .version = version,
+        .description = description,
+        .descriptor = descriptor,
+        .selected_artifact_path = selected_artifact_path,
+        .selected_artifact_absolute_path = selected_artifact_absolute_path,
+        .selected_artifact_os = selected_artifact_os,
+        .selected_artifact_arch = selected_artifact_arch,
+        .selected_artifact_sha256 = selected_artifact_sha256,
+        .package_root_sha256 = package_root_sha256,
+        .tool_name = tool_name,
+        .requested_capabilities = requested_capabilities,
+        .resource_limits = resource_limits,
+    };
+}
+
+fn cloneNativeResourceLimits(allocator: std.mem.Allocator, limits: native_manifest.ResourceLimits) !native_manifest.ResourceLimits {
+    const tool_scopes = try allocator.alloc([]u8, limits.tool_scopes.len);
+    errdefer allocator.free(tool_scopes);
+    for (limits.tool_scopes, 0..) |scope, index| {
+        tool_scopes[index] = try allocator.dupe(u8, scope);
+        errdefer allocator.free(tool_scopes[index]);
+    }
+    return .{
+        .timeout_ms = limits.timeout_ms,
+        .output_bytes = limits.output_bytes,
+        .output_lines = limits.output_lines,
+        .turns = limits.turns,
+        .tool_scopes = tool_scopes,
+    };
+}
+
 fn sliceConst(items: [][]u8) []const []const u8 {
     return @ptrCast(items);
 }
@@ -2832,6 +3122,11 @@ fn deinitResolvedList(allocator: std.mem.Allocator, items: *std.ArrayList(Resolv
 }
 
 fn deinitLockedWasmPackageList(allocator: std.mem.Allocator, items: *std.ArrayList(LockedWasmPackage)) void {
+    for (items.items) |*item| item.deinit(allocator);
+    items.deinit(allocator);
+}
+
+fn deinitLockedNativePackageList(allocator: std.mem.Allocator, items: *std.ArrayList(LockedNativePackage)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.deinit(allocator);
 }
@@ -3397,6 +3692,91 @@ test "resolveConfiguredLockedWasmPackages discovers only configured scope locked
     try std.testing.expectEqualStrings("example.lockedRuntime", resolved.packages[0].manifest.tool_id);
     try std.testing.expectEqual(provenance_lockfile.Scope.user, resolved.packages[0].lock_entry.scope);
     try std.testing.expectEqualStrings(locked_root, resolved.packages[0].source_info.base_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), resolved.diagnostics.len);
+    try std.testing.expectEqualStrings("missing_lock_entry", resolved.diagnostics[0].kind);
+}
+
+test "resolveConfiguredLockedNativePackages enforces native lock provenance before runtime load" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/locked/native");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/unlocked/native");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const artifact_name = switch (@import("builtin").os.tag) {
+        .macos => "plugin.dylib",
+        .windows => "plugin.dll",
+        else => "plugin.so",
+    };
+    const host_os = switch (@import("builtin").os.tag) {
+        .macos => "macos",
+        .windows => "windows",
+        else => "linux",
+    };
+    const host_arch = switch (@import("builtin").cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => @tagName(@import("builtin").cpu.arch),
+    };
+    const manifest_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "com.example.locked-native",
+        \\  "name": "Locked Native",
+        \\  "version": "0.1.0",
+        \\  "description": "Locked native fixture.",
+        \\  "runtime": {{ "kind": "native", "entrypoint": {{ "descriptor": "native://dynamic/com.example.locked-native" }} }},
+        \\  "artifacts": [{{ "kind": "native-dynamic", "os": "{s}", "arch": "{s}", "path": "native/{s}" }}],
+        \\  "tools": [{{ "name": "native.locked", "description": "Locked.", "inputSchema": {{}}, "outputSchema": {{}} }}],
+        \\  "capabilities": {{ "exports": [{{ "id": "native.locked", "kind": "tool" }}], "imports": [] }},
+        \\  "permissions": [{{ "id": "file.read" }}]
+        \\}}
+    , .{ host_os, host_arch, artifact_name });
+    defer allocator.free(manifest_json);
+    inline for (&.{ "locked", "unlocked" }) |name| {
+        const manifest_path = try std.fmt.allocPrint(allocator, "repo/fixtures/{s}/pi-extension.json", .{name});
+        defer allocator.free(manifest_path);
+        const artifact_path = try std.fmt.allocPrint(allocator, "repo/fixtures/{s}/native/{s}", .{ name, artifact_name });
+        defer allocator.free(artifact_path);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = manifest_json });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_path, .data = "native-bytes" });
+    }
+
+    const cwd = try makeTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const locked_root = try makeTmpPath(allocator, tmp, "repo/fixtures/locked");
+    defer allocator.free(locked_root);
+    const unlocked_root = try makeTmpPath(allocator, tmp, "repo/fixtures/unlocked");
+    defer allocator.free(unlocked_root);
+
+    var manifest_result = try native_manifest.validateManifestFile(allocator, std.testing.io, locked_root);
+    defer manifest_result.deinit(allocator);
+    try std.testing.expect(manifest_result == .valid);
+    var lock_entry = try provenance_lockfile.createNativeLockEntry(allocator, .user, manifest_result.valid.package_root, &manifest_result.valid);
+    defer lock_entry.deinit(allocator);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, .user, cwd, agent_dir);
+    defer allocator.free(lock_path);
+    try provenance_lockfile.writeEntry(allocator, std.testing.io, .user, lock_path, lock_entry);
+
+    var locked_config = PackageSourceConfig{ .source = try allocator.dupe(u8, locked_root) };
+    defer locked_config.deinit(allocator);
+    var unlocked_config = PackageSourceConfig{ .source = try allocator.dupe(u8, unlocked_root) };
+    defer unlocked_config.deinit(allocator);
+
+    var resolved = try resolveConfiguredLockedNativePackages(allocator, std.testing.io, .{
+        .cwd = cwd,
+        .agent_dir = agent_dir,
+        .global = .{ .packages = &.{ locked_config, unlocked_config } },
+    });
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), resolved.packages.len);
+    try std.testing.expectEqualStrings("com.example.locked-native", resolved.packages[0].manifest.id);
+    try std.testing.expectEqualStrings("native.locked", resolved.packages[0].manifest.tool_name);
+    try std.testing.expectEqualStrings(artifact_name, std.fs.path.basename(resolved.packages[0].lock_entry.artifact_path.?));
     try std.testing.expectEqual(@as(usize, 1), resolved.diagnostics.len);
     try std.testing.expectEqualStrings("missing_lock_entry", resolved.diagnostics[0].kind);
 }
