@@ -104,12 +104,15 @@ fn applyAnthropicSimpleOptions(
 
     if (options.reasoning == null) {
         stream_options.anthropic_thinking_enabled = false;
+        stream_options.provider = .{ .anthropic = .{ .thinking_enabled = false } };
         return;
     }
 
     stream_options.anthropic_thinking_enabled = true;
     if (supportsAdaptiveAnthropicThinking(model)) {
-        stream_options.anthropic_effort = mapThinkingLevelToAnthropicEffort(model, options.reasoning.?);
+        const effort = mapThinkingLevelToAnthropicEffort(model, options.reasoning.?);
+        stream_options.anthropic_effort = effort;
+        stream_options.provider = .{ .anthropic = .{ .thinking_enabled = true, .effort = effort } };
         return;
     }
 
@@ -122,6 +125,7 @@ fn applyAnthropicSimpleOptions(
     );
     stream_options.max_tokens = adjusted.max_tokens;
     stream_options.anthropic_thinking_budget_tokens = adjusted.thinking_budget;
+    stream_options.provider = .{ .anthropic = .{ .thinking_enabled = true, .thinking_budget_tokens = adjusted.thinking_budget } };
 }
 
 fn applyMistralSimpleOptions(
@@ -135,8 +139,10 @@ fn applyMistralSimpleOptions(
 
     if (std.mem.eql(u8, model.id, "mistral-small-2603") or std.mem.eql(u8, model.id, "mistral-small-latest")) {
         stream_options.mistral_reasoning_effort = "high";
+        stream_options.provider = .{ .mistral = .{ .reasoning_effort = "high" } };
     } else {
         stream_options.mistral_prompt_mode = "reasoning";
+        stream_options.provider = .{ .mistral = .{ .prompt_mode = "reasoning" } };
     }
 }
 
@@ -154,10 +160,12 @@ fn applyResponsesSimpleOptions(
         return;
     }
 
-    stream_options.responses_reasoning_effort = if (model_registry.supportsXhigh(model))
+    const effort = if (model_registry.supportsXhigh(model))
         reasoning.?
     else
         simple_options_mod.clampReasoning(reasoning).?;
+    stream_options.responses_reasoning_effort = effort;
+    stream_options.provider = .{ .responses = .{ .reasoning_effort = effort } };
 }
 
 fn supportsAdaptiveAnthropicThinking(model: types.Model) bool {
