@@ -1256,57 +1256,25 @@ pub const Registry = struct {
     /// clearUiHooksForReload because they have separate lifecycle
     /// semantics.
     pub fn clearStaticRegistrationsForExtension(self: *Registry, extension_path: []const u8) void {
-        var tool_index = self.tools.items.len;
-        while (tool_index > 0) {
-            tool_index -= 1;
-            if (std.mem.eql(u8, self.tools.items[tool_index].extension_path, extension_path)) {
-                var removed = self.tools.orderedRemove(tool_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var command_index = self.commands.items.len;
-        while (command_index > 0) {
-            command_index -= 1;
-            if (std.mem.eql(u8, self.commands.items[command_index].extension_path, extension_path)) {
-                var removed = self.commands.orderedRemove(command_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var shortcut_index = self.shortcuts.items.len;
-        while (shortcut_index > 0) {
-            shortcut_index -= 1;
-            if (std.mem.eql(u8, self.shortcuts.items[shortcut_index].extension_path, extension_path)) {
-                var removed = self.shortcuts.orderedRemove(shortcut_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var flag_index = self.flags.items.len;
-        while (flag_index > 0) {
-            flag_index -= 1;
-            if (std.mem.eql(u8, self.flags.items[flag_index].extension_path, extension_path)) {
-                var removed = self.flags.orderedRemove(flag_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var provider_index = self.providers.items.len;
-        while (provider_index > 0) {
-            provider_index -= 1;
-            if (std.mem.eql(u8, self.providers.items[provider_index].extension_path, extension_path)) {
-                var removed = self.providers.orderedRemove(provider_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var capability_index = self.capabilities.items.len;
-        while (capability_index > 0) {
-            capability_index -= 1;
-            if (std.mem.eql(u8, self.capabilities.items[capability_index].extension_path, extension_path)) {
-                var removed = self.capabilities.orderedRemove(capability_index);
-                removed.deinit(self.allocator);
+        inline for (&[_][]const u8{
+            "tools",
+            "commands",
+            "shortcuts",
+            "flags",
+            "providers",
+            "capabilities",
+            "workflow_surface_diagnostics",
+            "message_renderers",
+            "hooks",
+            "resource_discoveries",
+        }) |field_name| {
+            var index = @field(self, field_name).items.len;
+            while (index > 0) {
+                index -= 1;
+                if (std.mem.eql(u8, @field(self, field_name).items[index].extension_path, extension_path)) {
+                    var removed = @field(self, field_name).orderedRemove(index);
+                    removed.deinit(self.allocator);
+                }
             }
         }
 
@@ -1316,42 +1284,6 @@ pub const Registry = struct {
             if (std.mem.eql(u8, self.workflows.items[workflow_index].extension_path, extension_path)) {
                 self.clearWorkflowSurfaceDiagnostics(self.workflows.items[workflow_index].id, extension_path);
                 var removed = self.workflows.orderedRemove(workflow_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var workflow_diagnostic_index = self.workflow_surface_diagnostics.items.len;
-        while (workflow_diagnostic_index > 0) {
-            workflow_diagnostic_index -= 1;
-            if (std.mem.eql(u8, self.workflow_surface_diagnostics.items[workflow_diagnostic_index].extension_path, extension_path)) {
-                var removed = self.workflow_surface_diagnostics.orderedRemove(workflow_diagnostic_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var renderer_index = self.message_renderers.items.len;
-        while (renderer_index > 0) {
-            renderer_index -= 1;
-            if (std.mem.eql(u8, self.message_renderers.items[renderer_index].extension_path, extension_path)) {
-                var removed = self.message_renderers.orderedRemove(renderer_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var hook_index = self.hooks.items.len;
-        while (hook_index > 0) {
-            hook_index -= 1;
-            if (std.mem.eql(u8, self.hooks.items[hook_index].extension_path, extension_path)) {
-                var removed = self.hooks.orderedRemove(hook_index);
-                removed.deinit(self.allocator);
-            }
-        }
-
-        var discovery_index = self.resource_discoveries.items.len;
-        while (discovery_index > 0) {
-            discovery_index -= 1;
-            if (std.mem.eql(u8, self.resource_discoveries.items[discovery_index].extension_path, extension_path)) {
-                var removed = self.resource_discoveries.orderedRemove(discovery_index);
                 removed.deinit(self.allocator);
             }
         }

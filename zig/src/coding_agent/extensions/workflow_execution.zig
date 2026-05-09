@@ -287,22 +287,7 @@ pub fn executeWorkflow(
     var result = try ExecutionResult.init(allocator, descriptor);
     errdefer result.deinit(allocator);
 
-    if (try validateWorkflowInputJsonSchema(allocator, descriptor.input_schema, input, "$", options.replay)) |failure| {
-        var owned_failure = failure;
-        defer owned_failure.deinit(allocator);
-        result.state = .failed;
-        result.replay_metadata.terminal_state = result.state;
-        try appendDiagnostic(
-            allocator,
-            &result,
-            "workflow.input_schema_invalid",
-            descriptor.id,
-            null,
-            owned_failure.path,
-            owned_failure.message,
-        );
-        return result;
-    }
+    if (try validateWorkflowInput(allocator, descriptor, input, &result, options.replay)) return result;
 
     if (options.replay) {
         if (try replayDescriptorMetadataMismatch(allocator, descriptor, &result, options)) return result;
@@ -435,15 +420,52 @@ pub fn executeWorkflow(
         try appendReplayStep(allocator, &result.replay_metadata, step, step_index, .completed, step.replay_mode);
     }
 
+    try finalizeWorkflowResult(allocator, descriptor, &result, &last_output, options);
+    return result;
+}
+
+fn validateWorkflowInput(
+    allocator: std.mem.Allocator,
+    descriptor: WorkflowDescriptor,
+    input: std.json.Value,
+    result: *ExecutionResult,
+    replay: bool,
+) !bool {
+    if (try validateWorkflowInputJsonSchema(allocator, descriptor.input_schema, input, "$", replay)) |failure| {
+        var owned_failure = failure;
+        defer owned_failure.deinit(allocator);
+        result.state = .failed;
+        result.replay_metadata.terminal_state = result.state;
+        try appendDiagnostic(
+            allocator,
+            result,
+            "workflow.input_schema_invalid",
+            descriptor.id,
+            null,
+            owned_failure.path,
+            owned_failure.message,
+        );
+        return true;
+    }
+    return false;
+}
+
+fn finalizeWorkflowResult(
+    allocator: std.mem.Allocator,
+    descriptor: WorkflowDescriptor,
+    result: *ExecutionResult,
+    last_output: *?std.json.Value,
+    options: ExecutionOptions,
+) !void {
     if (result.state == .completed) {
-        const output = last_output orelse .null;
+        const output = last_output.* orelse .null;
         if (try validateJsonSchema(allocator, descriptor.output_schema, output, "$")) |failure| {
             var owned_failure = failure;
             defer owned_failure.deinit(allocator);
             result.state = .failed;
             try appendDiagnostic(
                 allocator,
-                &result,
+                result,
                 "workflow.output_schema_invalid",
                 descriptor.id,
                 null,
@@ -453,9 +475,9 @@ pub fn executeWorkflow(
         }
     }
 
-    if (last_output) |output| {
+    if (last_output.*) |output| {
         result.output = output;
-        last_output = null;
+        last_output.* = null;
     }
     result.replay_metadata.terminal_state = result.state;
     if (options.replay) {
@@ -463,11 +485,10 @@ pub fn executeWorkflow(
             if (recorded_state != result.state) {
                 result.state = .replay_blocked;
                 result.replay_metadata.terminal_state = result.state;
-                try appendDiagnostic(allocator, &result, "workflow.replay_metadata_mismatch", descriptor.id, null, "$.replay.terminalState", "recorded workflow terminal state does not match current replay result");
+                try appendDiagnostic(allocator, result, "workflow.replay_metadata_mismatch", descriptor.id, null, "$.replay.terminalState", "recorded workflow terminal state does not match current replay result");
             }
         }
     }
-    return result;
 }
 
 fn validateWorkflowInputJsonSchema(

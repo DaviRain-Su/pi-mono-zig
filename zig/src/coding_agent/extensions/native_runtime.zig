@@ -130,21 +130,27 @@ pub const NativeDescriptor = struct {
         return wasm_manifest.denyFirstUnapprovedCapability(self.requested_capabilities, approved_capabilities, phase, mode);
     }
 
+    const forbidden_fields = &[_][]const u8{
+        "library_path",
+        "dynamic_library_path",
+        "executable_command",
+        "process_command",
+        "remote_url",
+        "workflow_preset",
+        "wiki_preset",
+        "qa_preset",
+        "review_preset",
+        "spawn_policy",
+        "automatic_spawn",
+        "orchestration_policy",
+        "model_selection_ui",
+        "approval_ui",
+    };
+
     pub fn firstForbiddenField(self: NativeDescriptor) ?[]const u8 {
-        if (self.library_path != null) return "library_path";
-        if (self.dynamic_library_path != null) return "dynamic_library_path";
-        if (self.executable_command != null) return "executable_command";
-        if (self.process_command != null) return "process_command";
-        if (self.remote_url != null) return "remote_url";
-        if (self.workflow_preset != null) return "workflow_preset";
-        if (self.wiki_preset != null) return "wiki_preset";
-        if (self.qa_preset != null) return "qa_preset";
-        if (self.review_preset != null) return "review_preset";
-        if (self.spawn_policy != null) return "spawn_policy";
-        if (self.automatic_spawn != null) return "automatic_spawn";
-        if (self.orchestration_policy != null) return "orchestration_policy";
-        if (self.model_selection_ui != null) return "model_selection_ui";
-        if (self.approval_ui != null) return "approval_ui";
+        inline for (forbidden_fields) |name| {
+            if (@field(self, name) != null) return name;
+        }
         return null;
     }
 };

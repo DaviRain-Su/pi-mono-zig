@@ -506,7 +506,13 @@ fn validateReviewTestMatrix(allocator: std.mem.Allocator, io: std.Io, path: []co
         else => return err,
     };
     defer allocator.free(bytes);
-    try validateReviewTestMatrixBytes(bytes);
+    validateReviewTestMatrixBytes(bytes) catch |err| {
+        std.debug.print(
+            "{s}: error: matrix row contains unresolved missing/partial/unknown cell marker\n",
+            .{path},
+        );
+        return err;
+    };
 }
 
 fn validateReviewTestMatrixBytes(bytes: []const u8) !void {
@@ -529,10 +535,6 @@ fn validateReviewTestMatrixBytes(bytes: []const u8) !void {
             std.mem.indexOf(u8, trimmed, "⚠️") != null or
             hasUnknownMatrixCell(trimmed))
         {
-            std.debug.print(
-                "docs/review/05_test_matrix.md:{d}: error: matrix row contains unresolved missing/partial/unknown cell marker: {s}\n",
-                .{ line_number, trimmed },
-            );
             return error.UnresolvedReviewMatrixCell;
         }
     }

@@ -3322,11 +3322,11 @@ test "runAgentLoop sends fallback tool arguments through normal validation" {
         null,
         null,
     );
-    try std.testing.expectEqual(@as(usize, 3), result.len);
-    try std.testing.expectEqualStrings("echo", result[1].tool_result.tool_name);
-    try std.testing.expect(result[1].tool_result.is_error);
-    try std.testing.expectEqualStrings("InvalidToolArguments", result[1].tool_result.content[0].text.text);
-    try std.testing.expectEqualStrings("done", result[2].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("echo", result[2].tool_result.tool_name);
+    try std.testing.expect(result[2].tool_result.is_error);
+    try std.testing.expectEqualStrings("InvalidToolArguments", result[2].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("done", result[3].assistant.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 0), fixture.execute_count);
 }
 
