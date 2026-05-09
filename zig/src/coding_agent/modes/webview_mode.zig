@@ -17,6 +17,7 @@ const MacosNative = if (builtin.os.tag == .macos) struct {
         bridge_context: ?*anyopaque,
         handle_request: *const fn (?*anyopaque, [*:0]const u8, [*:0]const u8) callconv(.c) ?[*:0]u8,
         free_response: *const fn (?*anyopaque, [*:0]u8) callconv(.c) void,
+        close_active_work: *const fn (?*anyopaque) callconv(.c) void,
     ) c_int;
     extern fn pi_webview_macos_last_error() ?[*:0]const u8;
 } else struct {};
@@ -286,6 +287,7 @@ fn runNativeWebView(
         bridge,
         nativeBridgeHandleRequest,
         nativeBridgeFreeResponse,
+        nativeBridgeCloseActiveWork,
     );
     if (result != 0) {
         if (MacosNative.pi_webview_macos_last_error()) |message| {
@@ -321,6 +323,11 @@ fn nativeBridgeHandleRequest(
 fn nativeBridgeFreeResponse(_: ?*anyopaque, response_z: [*:0]u8) callconv(.c) void {
     const response = std.mem.span(response_z);
     std.heap.c_allocator.free(response_z[0 .. response.len + 1]);
+}
+
+fn nativeBridgeCloseActiveWork(context: ?*anyopaque) callconv(.c) void {
+    const bridge: *webview_bridge.BridgeHost = @ptrCast(@alignCast(context orelse return));
+    _ = bridge.closeAndAbortActiveWork();
 }
 
 fn runBridgeSmokePrompt(

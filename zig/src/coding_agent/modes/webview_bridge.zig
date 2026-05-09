@@ -1005,9 +1005,8 @@ test "webview abort cancels active generation suppresses late events and support
         .token_size = .{ .min = 1, .max = 1 },
     });
     defer registration.unregister();
-    const slow_blocks = [_]faux.FauxContentBlock{faux.fauxText(
-        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
-    )};
+    const slow_text = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+    const slow_blocks = [_]faux.FauxContentBlock{faux.fauxText(slow_text)};
     const retry_blocks = [_]faux.FauxContentBlock{faux.fauxText("retry succeeded")};
     try registration.setResponses(&[_]faux.FauxResponseStep{
         .{ .message = faux.fauxAssistantMessage(slow_blocks[0..], .{}) },
@@ -1054,6 +1053,7 @@ test "webview abort cancels active generation suppresses late events and support
     try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"status\":\"aborted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminalOutcome\":\"abort\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminal\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, slow_text) == null);
     try std.testing.expect(!bridge.active_generation.load(.seq_cst));
 
     var capture = PromptEventCapture.init(allocator, "session", "turn");

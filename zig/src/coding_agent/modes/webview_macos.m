@@ -8,6 +8,7 @@
 static char pi_webview_last_error_buffer[1024] = {0};
 typedef char *(*PiWebViewHandleRequestFn)(void *context, const char *json, const char *origin);
 typedef void (*PiWebViewFreeResponseFn)(void *context, char *response);
+typedef void (*PiWebViewCloseActiveWorkFn)(void *context);
 
 static void pi_webview_set_last_error(NSString *message) {
     const char *utf8 = message ? [message UTF8String] : "unknown error";
@@ -185,7 +186,12 @@ static void pi_webview_stop_app(void) {
     if (self.autoCloseMs > 0) {
         dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)self.autoCloseMs * NSEC_PER_MSEC);
         dispatch_after(deadline, dispatch_get_main_queue(), ^{
-            pi_webview_stop_app();
+            NSWindow *window = [webView window];
+            if (window != nil) {
+                [window performClose:nil];
+            } else {
+                pi_webview_stop_app();
+            }
         });
     }
 }
@@ -223,11 +229,22 @@ static void pi_webview_stop_app(void) {
 @end
 
 @interface PiWebViewWindowDelegate : NSObject <NSWindowDelegate>
+@property(nonatomic) void *bridgeContext;
+@property(nonatomic) PiWebViewCloseActiveWorkFn closeActiveWork;
+@property(nonatomic) BOOL closeNotified;
 @end
 
 @implementation PiWebViewWindowDelegate
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
+    if (!self.closeNotified) {
+        self.closeNotified = YES;
+        if (self.closeActiveWork != NULL) {
+            self.closeActiveWork(self.bridgeContext);
+        }
+        fprintf(stderr, "PI_WEBVIEW_WINDOW_CLOSE pid=%d\n", getpid());
+        fflush(stderr);
+    }
     pi_webview_stop_app();
 }
 @end
@@ -238,7 +255,8 @@ int pi_webview_macos_run(
     int auto_close_ms,
     void *bridge_context,
     PiWebViewHandleRequestFn handle_request,
-    PiWebViewFreeResponseFn free_response
+    PiWebViewFreeResponseFn free_response,
+    PiWebViewCloseActiveWorkFn close_active_work
 ) {
     pi_webview_last_error_buffer[0] = '\0';
 
@@ -296,6 +314,8 @@ int pi_webview_macos_run(
         webView.UIDelegate = uiDelegate;
 
         PiWebViewWindowDelegate *windowDelegate = [[PiWebViewWindowDelegate alloc] init];
+        windowDelegate.bridgeContext = bridge_context;
+        windowDelegate.closeActiveWork = close_active_work;
         window.delegate = windowDelegate;
         window.contentView = webView;
 

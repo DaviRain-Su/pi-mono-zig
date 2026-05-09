@@ -718,12 +718,12 @@ fn emitChunks(
 
 fn makeAbortedMessage(message: types.AssistantMessage) types.AssistantMessage {
     return .{
-        .content = message.content,
-        .tool_calls = message.tool_calls,
+        .content = message.content[0..0],
+        .tool_calls = null,
         .api = message.api,
         .provider = message.provider,
         .model = message.model,
-        .response_id = message.response_id,
+        .response_id = null,
         .usage = message.usage,
         .stop_reason = .aborted,
         .error_message = "Request was aborted",
@@ -1312,6 +1312,7 @@ test "registerFauxProvider aborts mid-stream and stops emitting events" {
     defer deinitAssistantMessage(allocator, &result);
     try std.testing.expectEqual(types.StopReason.aborted, result.stop_reason);
     try std.testing.expectEqualStrings("Request was aborted", result.error_message.?);
+    try std.testing.expectEqual(@as(usize, 0), result.content.len);
     try std.testing.expectEqual(@as(usize, 0), registration.getPendingResponseCount());
     try std.testing.expectEqual(@as(usize, 1), registration.state.call_count);
 }
