@@ -203,7 +203,13 @@ fn buildInnerRequestValue(
         if (tools.len > 0) {
             try request.put(allocator, try allocator.dupe(u8, "tools"), try buildToolsValue(allocator, tools));
             if (options) |stream_options| {
-                if (stream_options.google_tool_choice) |tool_choice| {
+                var google_opts: types.GoogleStreamOptions = .{};
+                if (stream_options.provider == .google) {
+                    google_opts = stream_options.provider.google;
+                } else {
+                    google_opts.tool_choice = stream_options.google_tool_choice;
+                }
+                if (google_opts.tool_choice) |tool_choice| {
                     try request.put(allocator, try allocator.dupe(u8, "toolConfig"), try buildToolConfigValue(allocator, tool_choice));
                 }
             }
@@ -705,7 +711,13 @@ fn buildGenerationConfigValue(
         if (stream_options.max_tokens) |max_tokens| {
             try generation_config.put(allocator, try allocator.dupe(u8, "maxOutputTokens"), .{ .integer = @intCast(max_tokens) });
         }
-        if (stream_options.google_thinking) |thinking| {
+        var google_opts: types.GoogleStreamOptions = .{};
+        if (stream_options.provider == .google) {
+            google_opts = stream_options.provider.google;
+        } else {
+            google_opts.thinking = stream_options.google_thinking;
+        }
+        if (google_opts.thinking) |thinking| {
             if (model.reasoning) {
                 var thinking_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (thinking.enabled) {
