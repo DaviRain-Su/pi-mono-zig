@@ -230,3 +230,117 @@ pub const ResourceLimits = struct {
         self.* = undefined;
     }
 };
+
+test "capability canonical ids map to explicit enforcement branches" {
+    const expected = [_]struct {
+        capability: Capability,
+        id: []const u8,
+        branch: CapabilityEnforcementBranch,
+    }{
+        .{ .capability = .file_read, .id = "file.read", .branch = .filesystem_read },
+        .{ .capability = .file_write, .id = "file.write", .branch = .filesystem_write },
+        .{ .capability = .network_request, .id = "network.request", .branch = .network_request },
+        .{ .capability = .shell_run, .id = "shell.run", .branch = .shell_process },
+        .{ .capability = .env_read, .id = "env.read", .branch = .environment_variable },
+        .{ .capability = .model_call, .id = "model.call", .branch = .model_call },
+        .{ .capability = .session_read, .id = "session.read", .branch = .session_read },
+        .{ .capability = .session_write, .id = "session.write", .branch = .session_write },
+        .{ .capability = .ui_notify, .id = "ui.notify", .branch = .ui_notification },
+        .{ .capability = .tool_use, .id = "tool.use", .branch = .tool_execution },
+        .{ .capability = .agent_spawn, .id = "agent.spawn", .branch = .agent_spawn },
+        .{ .capability = .agent_delegate, .id = "agent.delegate", .branch = .agent_delegate },
+    };
+
+    try std.testing.expectEqual(CANONICAL_CAPABILITIES.len, expected.len);
+    try std.testing.expectEqual(@typeInfo(Capability).@"enum".fields.len, expected.len);
+    for (expected) |entry| {
+        try std.testing.expectEqualStrings(entry.id, entry.capability.jsonName());
+        try std.testing.expectEqual(entry.capability, parseCapability(entry.id).?);
+        try std.testing.expectEqual(entry.branch, entry.capability.enforcementBranch());
+    }
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("filesystem"));
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("session"));
+    try std.testing.expectEqual(@as(?Capability, null), parseCapability("cap-wiki"));
+}
+
+test "capability canonical ids match TypeScript parity fixture" {
+    const fixture_path = "../packages/coding-agent/test/fixtures/extension-security-grants.json";
+    const bytes = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, fixture_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .array);
+    const fixture_capabilities = parsed.value.array.items;
+    try std.testing.expectEqual(CANONICAL_CAPABILITIES.len, fixture_capabilities.len);
+
+    for (CANONICAL_CAPABILITIES, fixture_capabilities) |cap, fixture| {
+        try std.testing.expect(fixture == .string);
+        try std.testing.expectEqualStrings(cap.jsonName(), fixture.string);
+    }
+}
+
+test "capability requested but unapproved declarations are denied deterministically" {
+    for (CANONICAL_CAPABILITIES) |cap| {
+        const diagnostic = denyFirstUnapprovedCapability(&.{cap}, &.{}, .initialize, "manifest-request").?;
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqual(cap, diagnostic.capability);
+        try std.testing.expectEqual(cap.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.initialize, diagnostic.phase);
+        try std.testing.expectEqualStrings("manifest-request", diagnostic.mode);
+    }
+
+    try std.testing.expectEqual(
+        @as(?CapabilityDenialDiagnostic, null),
+        denyFirstUnapprovedCapability(&.{ .shell_run, .network_request }, &.{ .shell_run, .network_request }, .initialize, "manifest-request"),
+    );
+    try std.testing.expectEqual(
+        Capability.shell_run,
+        denyFirstUnapprovedCapability(&.{.shell_run}, &.{.network_request}, .initialize, "manifest-request").?.capability,
+    );
+}
+
+test "capability runtime denials use same ids and category as manifest requests" {
+    for (CANONICAL_CAPABILITIES) |cap| {
+        const diagnostic = denyRuntimeCapability(cap, .call, "runtime/import");
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqualStrings(cap.jsonName(), diagnostic.capability.jsonName());
+        try std.testing.expectEqual(cap.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.call, diagnostic.phase);
+        try std.testing.expectEqualStrings("runtime/import", diagnostic.mode);
+    }
+}
+
+test "capability runtime import mappings share canonical denial vocabulary" {
+    const expected = [_]struct {
+        module_name: []const u8,
+        field_name: []const u8,
+        capability: Capability,
+    }{
+        .{ .module_name = "pi:filesystem", .field_name = "read", .capability = .file_read },
+        .{ .module_name = "pi:filesystem", .field_name = "write", .capability = .file_write },
+        .{ .module_name = "pi:network", .field_name = "fetch", .capability = .network_request },
+        .{ .module_name = "pi:shell", .field_name = "run", .capability = .shell_run },
+        .{ .module_name = "pi:environment", .field_name = "get", .capability = .env_read },
+        .{ .module_name = "pi:model", .field_name = "call", .capability = .model_call },
+        .{ .module_name = "pi:session", .field_name = "get", .capability = .session_read },
+        .{ .module_name = "pi:session", .field_name = "set", .capability = .session_write },
+        .{ .module_name = "pi:ui", .field_name = "notify", .capability = .ui_notify },
+        .{ .module_name = "pi:tool", .field_name = "use", .capability = .tool_use },
+        .{ .module_name = "pi:agent", .field_name = "spawn", .capability = .agent_spawn },
+        .{ .module_name = "pi:agent", .field_name = "delegate", .capability = .agent_delegate },
+    };
+
+    for (expected) |entry| {
+        const diagnostic = denyRuntimeImport(entry.module_name, entry.field_name, .load, "runtime/import").?;
+        try std.testing.expectEqualStrings("denied_capability", diagnostic.category);
+        try std.testing.expectEqual(entry.capability, diagnostic.capability);
+        try std.testing.expectEqualStrings(entry.capability.jsonName(), diagnostic.capabilityId());
+        try std.testing.expectEqual(entry.capability.enforcementBranch(), diagnostic.branch);
+        try std.testing.expectEqual(.load, diagnostic.phase);
+        try std.testing.expectEqualStrings("runtime/import", diagnostic.mode);
+    }
+    try std.testing.expectEqual(@as(?CapabilityDenialDiagnostic, null), denyRuntimeImport("pi:unknown", "call", .load, "runtime/import"));
+}
+
