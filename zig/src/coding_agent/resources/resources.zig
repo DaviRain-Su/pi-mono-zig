@@ -1463,6 +1463,9 @@ fn provenanceEntryKeyForSource(allocator: std.mem.Allocator, source: []const u8,
 }
 
 fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (@import("builtin").os.tag == .windows) {
+        return std.fs.path.resolve(allocator, &.{path}) catch allocator.dupe(u8, path);
+    }
     const z_path = try allocator.dupeZ(u8, path);
     defer allocator.free(z_path);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
