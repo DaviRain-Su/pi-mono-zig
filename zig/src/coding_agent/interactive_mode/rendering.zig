@@ -2178,21 +2178,14 @@ pub const ScreenComponent = struct {
 
         const reserved_lines: usize = task_panel_lines.items.len + prompt_lines.items.len + queued_lines.items.len + 1 + autocomplete_lines.items.len;
         const chat_capacity = if (self.height > reserved_lines) self.height - reserved_lines else 1;
-        const max_offset = chat_lines.items.len -| chat_capacity;
         self.state.updateChatScrollLayout(chat_lines.items.len, chat_capacity, task_panel_lines.items.len, width);
-        const chat_component = BorrowedLineListComponent{ .lines = chat_lines.items };
-        const chat_viewport = tui.Viewport{
-            .child = chat_component.component(),
-            .height = chat_capacity,
-            .anchor = .bottom,
-            .scroll_offset = @min(snapshot.chat_scroll_offset, max_offset),
-            .show_indicators = true,
-            .theme = self.theme,
-        };
         for (task_panel_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
-        try chat_viewport.renderInto(allocator, width, lines);
+        const chat_start = @min(snapshot.chat_scroll_offset, chat_lines.items.len);
+        for (chat_lines.items[chat_start..]) |line| {
+            try tui.component.appendOwnedLine(lines, allocator, line);
+        }
         for (queued_lines.items) |line| {
             try tui.component.appendOwnedLine(lines, allocator, line);
         }
