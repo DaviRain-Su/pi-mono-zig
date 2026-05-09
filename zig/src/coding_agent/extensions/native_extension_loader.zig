@@ -313,7 +313,7 @@ fn jsonStringifyField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key
 test "buildNativeDescriptor with missing dynamic_library_path falls back gracefully" {
     const allocator = std.testing.allocator;
     const manifest_text =
-        \\"{"schemaVersion":"pi-extension.v1","id":"com.pi.native-dl","name":"Native DL","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"dynamic_library_path":"libnonexistent.dylib"}},"tools":[{"name":"native.dl.tool","description":"DL tool","inputSchema":{"type":"object"}}]}
+        \\{"schemaVersion":"pi-extension.v1","id":"com.pi.native-dl","name":"Native DL","version":"1.0.0","runtime":{"kind":"native","entrypoint":{"dynamic_library_path":"libnonexistent.dylib"}},"tools":[{"name":"native.dl.tool","description":"DL tool","inputSchema":{"type":"object"}}]}
     ;
     var result = try extension_manifest.parseManifestText(allocator, "/tmp/pkg", "/tmp/pkg/pi-extension.json", manifest_text);
     defer result.deinit(allocator);
