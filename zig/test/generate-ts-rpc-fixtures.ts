@@ -614,6 +614,8 @@ function emitM5TextTurn(
 	emit({ type: "turn_start" } satisfies AgentEvent);
 	emit({ type: "message_start", message: user } satisfies AgentEvent);
 	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "before_provider_request", messages: [user] } satisfies AgentEvent);
+	emit({ type: "after_provider_response" } satisfies AgentEvent);
 	emit({ type: "message_start", message: emptyAssistant } satisfies AgentEvent);
 
 	const started = m5Assistant([{ type: "text", text: "" }], usageValue, options.stopReason, options.errorMessage);
@@ -658,6 +660,8 @@ function emitM5Thinking(emit: (event: AgentSessionEvent) => void): void {
 	emit({ type: "turn_start" } satisfies AgentEvent);
 	emit({ type: "message_start", message: user } satisfies AgentEvent);
 	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "before_provider_request", messages: [user] } satisfies AgentEvent);
+	emit({ type: "after_provider_response" } satisfies AgentEvent);
 	emit({ type: "message_start", message: emptyAssistant } satisfies AgentEvent);
 	const thinkingStarted = m5Assistant([{ type: "thinking", thinking: "" }], usageValue);
 	emit({
@@ -731,6 +735,8 @@ function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
 	emit({ type: "turn_start" } satisfies AgentEvent);
 	emit({ type: "message_start", message: user } satisfies AgentEvent);
 	emit({ type: "message_end", message: user } satisfies AgentEvent);
+	emit({ type: "before_provider_request", messages: [user] } satisfies AgentEvent);
+	emit({ type: "after_provider_response" } satisfies AgentEvent);
 	emit({ type: "message_start", message: firstEmpty } satisfies AgentEvent);
 	emit({
 		type: "message_update",
@@ -775,6 +781,8 @@ function emitM5Tool(emit: (event: AgentSessionEvent) => void): void {
 	const secondUsage = m5Usage(1110, 1, 32, 1110, 2253);
 	const secondEmpty = m5Assistant([], secondUsage);
 	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "before_provider_request", messages: [user, toolAssistant, toolResultMessage] } satisfies AgentEvent);
+	emit({ type: "after_provider_response" } satisfies AgentEvent);
 	emit({ type: "message_start", message: secondEmpty } satisfies AgentEvent);
 	const textStarted = m5Assistant([{ type: "text", text: "" }], secondUsage);
 	emit({
@@ -807,6 +815,8 @@ function emitM5Retry(emit: (event: AgentSessionEvent) => void): void {
 	const retryAssistant = m5Assistant([], m5Usage(0, 0, 0, 0, 0), "error", "No more faux responses queued");
 	emit({ type: "agent_start" } satisfies AgentEvent);
 	emit({ type: "turn_start" } satisfies AgentEvent);
+	emit({ type: "before_provider_request", messages: [{ role: "user", content: "retry", timestamp: 0 }] } satisfies AgentEvent);
+	emit({ type: "after_provider_response" } satisfies AgentEvent);
 	emit({ type: "message_start", message: retryAssistant } satisfies AgentEvent);
 	emit({ type: "message_end", message: retryAssistant } satisfies AgentEvent);
 	emit({ type: "turn_end", message: retryAssistant, toolResults: [] } satisfies AgentEvent);

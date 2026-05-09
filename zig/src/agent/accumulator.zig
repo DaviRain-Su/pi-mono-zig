@@ -202,18 +202,37 @@ pub const PartialAssistantAccumulator = struct {
         template: ai.AssistantMessage,
     ) !ai.AssistantMessage {
         var partial = template;
-        var content = try allocator.alloc(ai.ContentBlock, self.blocks.items.len);
-        errdefer allocator.free(content);
-
-        for (self.blocks.items, 0..) |block, i| {
-            content[i] = switch (block) {
-                .text => |text| .{ .text = .{ .text = try allocator.dupe(u8, text.items) } },
-                .thinking => |thinking| .{ .thinking = .{ .thinking = try allocator.dupe(u8, thinking.items), .signature = null, .redacted = false } },
-                .tool_call => |tool_call| try buildPartialToolCallBlock(allocator, tool_call),
-            };
+        var content_list = std.ArrayList(ai.ContentBlock).empty;
+        errdefer {
+            for (content_list.items) |item| {
+                switch (item) {
+                    .text => |text| allocator.free(text.text),
+                    .thinking => |thinking| allocator.free(thinking.thinking),
+                    .tool_call => |tool_call| content_clone.deinitToolCall(allocator, tool_call),
+                    else => {},
+                }
+            }
+            content_list.deinit(allocator);
         }
 
-        partial.content = content;
+        for (self.blocks.items) |block| {
+            switch (block) {
+                .text => |text| {
+                    try content_list.append(allocator, .{ .text = .{ .text = try allocator.dupe(u8, text.items) } });
+                },
+                .thinking => |thinking| {
+                    try content_list.append(allocator, .{ .thinking = .{ .thinking = try allocator.dupe(u8, thinking.items), .signature = null, .redacted = false } });
+                },
+                .tool_call => |tool_call| {
+                    if (tool_call.final_tool_call == null) {
+                        continue;
+                    }
+                    try content_list.append(allocator, try buildPartialToolCallBlock(allocator, tool_call));
+                },
+            }
+        }
+
+        partial.content = try content_list.toOwnedSlice(allocator);
         partial.tool_calls = null;
         return partial;
     }

@@ -81,6 +81,12 @@ pub fn agentEventToJsonValue(allocator: std.mem.Allocator, event: agent.AgentEve
             }
             if (event.is_error) |is_error| try putBoolField(&object, allocator, "isError", is_error);
         },
+        .before_provider_request => {
+            if (event.messages) |messages| {
+                try putField(&object, allocator, "messages", try messagesToJsonValue(allocator, messages));
+            }
+        },
+        .after_provider_response => {},
     }
 
     return .{ .object = object };

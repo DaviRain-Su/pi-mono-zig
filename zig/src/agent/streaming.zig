@@ -64,9 +64,16 @@ pub fn streamAssistantResponse(
         .reasoning = if (config.reasoning) |reasoning| mapThinkingLevel(reasoning) else null,
     };
 
+    try emit(emit_context, .{
+        .event_type = .before_provider_request,
+        .messages = transformed_messages,
+    });
     const active_stream_fn = stream_fn orelse streamSimpleForAgentLoop;
     var stream = try active_stream_fn(allocator, io, config.model, llm_context, options, config.stream_context);
     defer stream.deinit();
+    try emit(emit_context, .{
+        .event_type = .after_provider_response,
+    });
 
     var partial_template: ?ai.AssistantMessage = null;
     var partial_accumulator = accumulator.PartialAssistantAccumulator.init(allocator);
@@ -193,6 +200,34 @@ fn emitPartialMessageUpdate(
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+
+    // For toolcall_end events, temporarily remove the final_tool_call so
+    // the partial message content matches TypeScript golden fixtures
+    // (empty content until message_end).
+    var saved_final_tool_call: ?ai.ToolCall = null;
+    if (assistant_message_event.event_type == .toolcall_end) {
+        const content_index = assistant_message_event.content_index orelse 0;
+        if (partial_accumulator.blocks.items.len > content_index) {
+            switch (partial_accumulator.blocks.items[content_index]) {
+                .tool_call => |*tool_call| {
+                    saved_final_tool_call = tool_call.final_tool_call;
+                    tool_call.final_tool_call = null;
+                },
+                else => {},
+            }
+        }
+    }
+    defer if (assistant_message_event.event_type == .toolcall_end) {
+        const content_index = assistant_message_event.content_index orelse 0;
+        if (partial_accumulator.blocks.items.len > content_index) {
+            switch (partial_accumulator.blocks.items[content_index]) {
+                .tool_call => |*tool_call| {
+                    tool_call.final_tool_call = saved_final_tool_call;
+                },
+                else => {},
+            }
+        }
+    };
 
     // `partial_accumulator` owns long-lived partial bytes with the parent
     // allocator, while this arena owns the callback-scoped message shape

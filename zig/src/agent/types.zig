@@ -233,6 +233,8 @@ pub const AgentEventType = enum {
     tool_execution_start,
     tool_execution_update,
     tool_execution_end,
+    before_provider_request,
+    after_provider_response,
 };
 
 pub const AgentEvent = struct {

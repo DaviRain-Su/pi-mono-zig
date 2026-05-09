@@ -1023,6 +1023,8 @@ const ExtensionHookContext = struct {
             .tool_execution_start => "tool_execution_start",
             .tool_execution_update => "tool_execution_update",
             .tool_execution_end => "tool_execution_end",
+            .before_provider_request => "before_provider_request",
+            .after_provider_response => "after_provider_response",
         };
         if (!self.hasHook(event_name)) return;
 
@@ -2860,6 +2862,8 @@ const TestHookHost = struct {
     session_before_compact: bool = false,
     session_before_tree: bool = false,
     cancel_session_before: bool = false,
+    before_provider_request: bool = false,
+    after_provider_response: bool = false,
     label: []const u8 = "",
     order_log: ?*std.ArrayList([]const u8) = null,
     order_allocator: ?std.mem.Allocator = null,
@@ -2888,6 +2892,8 @@ const TestHookHost = struct {
     resources_discover_calls: usize = 0,
     session_before_compact_calls: usize = 0,
     session_before_tree_calls: usize = 0,
+    before_provider_request_calls: usize = 0,
+    after_provider_response_calls: usize = 0,
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
@@ -2954,6 +2960,8 @@ fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     if (std.mem.eql(u8, event_name, "resources_discover")) return host.resources_discover;
     if (std.mem.eql(u8, event_name, "session_before_compact")) return host.session_before_compact;
     if (std.mem.eql(u8, event_name, "session_before_tree")) return host.session_before_tree;
+    if (std.mem.eql(u8, event_name, "before_provider_request")) return host.before_provider_request;
+    if (std.mem.eql(u8, event_name, "after_provider_response")) return host.after_provider_response;
     return false;
 }
 fn testHookSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
@@ -3132,6 +3140,14 @@ fn testHookInvoke(
     if (std.mem.eql(u8, event_name, "session_before_tree")) {
         host.session_before_tree_calls += 1;
         if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "before_provider_request")) {
+        host.before_provider_request_calls += 1;
+        return result;
+    }
+    if (std.mem.eql(u8, event_name, "after_provider_response")) {
+        host.after_provider_response_calls += 1;
         return result;
     }
     return result;
@@ -3664,6 +3680,37 @@ test "Stage G: resources_discover fires on session creation" {
     defer session.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), fixture.resources_discover_calls);
+}
+
+test "Stage J: before_provider_request / after_provider_response fire around stream boundary" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("response body")}, .{}) },
+    });
+
+    var fixture = TestHookHost{
+        .before_provider_request = true,
+        .after_provider_response = true,
+    };
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/stage-j-provider",
+        .system_prompt = "system",
+        .model = registration.getModel(),
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.prompt("trigger one provider request");
+
+    // Each turn issues exactly one provider request: before fires once, after fires once.
+    try std.testing.expectEqual(@as(usize, 1), fixture.before_provider_request_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.after_provider_response_calls);
 }
 
 test "Stage H: session_before_compact cancellation short-circuits compact()" {
