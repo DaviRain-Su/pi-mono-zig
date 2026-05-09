@@ -1,10 +1,10 @@
 const std = @import("std");
-const wasm_manifest = @import("wasm/wasm_manifest.zig");
+const capability = @import("capability.zig");
 
-pub const Grant = wasm_manifest.Capability;
-pub const Branch = wasm_manifest.CapabilityEnforcementBranch;
-pub const Phase = wasm_manifest.LifecyclePhase;
-pub const CANONICAL_GRANTS = wasm_manifest.CANONICAL_CAPABILITIES;
+pub const Grant = capability.Capability;
+pub const Branch = capability.CapabilityEnforcementBranch;
+pub const Phase = capability.LifecyclePhase;
+pub const CANONICAL_GRANTS = capability.CANONICAL_CAPABILITIES;
 
 pub const Principal = struct {
     runtime_kind: []const u8,
@@ -494,7 +494,7 @@ test "enforcement runtime imports map to exactly one operation branch" {
     for (expected) |entry| {
         const operation = operationForRuntimeImport(entry.module_name, entry.field_name).?;
         try std.testing.expectEqual(entry.operation, operation);
-        try std.testing.expectEqual(entry.operation.requiredGrant(), wasm_manifest.runtimeImportCapability(entry.module_name, entry.field_name).?);
+        try std.testing.expectEqual(entry.operation.requiredGrant(), capability.runtimeImportCapability(entry.module_name, entry.field_name).?);
         try std.testing.expectEqual(entry.operation.requiredGrant().enforcementBranch(), operation.branch());
     }
     try std.testing.expectEqual(@as(?Operation, null), operationForRuntimeImport("pi:agent", "unknown"));

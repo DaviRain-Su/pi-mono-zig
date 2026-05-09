@@ -2,7 +2,8 @@ const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
 const extension_manifest = @import("../extensions/extension_manifest.zig");
 const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
-const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
+const ext_manifest = @import("../extensions/manifest.zig");
+const capability = @import("../extensions/capability.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
@@ -152,7 +153,7 @@ pub const ResolvedPaths = struct {
 
 pub const LockedWasmPackage = struct {
     source_info: SourceInfo,
-    manifest: wasm_manifest.Manifest,
+    manifest: ext_manifest.Manifest,
     lock_entry: provenance_lockfile.LockEntry,
 
     pub fn deinit(self: *LockedWasmPackage, allocator: std.mem.Allocator) void {
@@ -1146,7 +1147,7 @@ fn verifyLockedWasmPackageForResources(
     agent_dir: []const u8,
 ) !bool {
     if (scope == .temporary) return true;
-    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, ext_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
     if (!pathExists(io, manifest_path)) return true;
     if (!try manifestRequiresLegacyWasmLock(allocator, io, manifest_path)) return true;
@@ -1155,8 +1156,8 @@ fn verifyLockedWasmPackageForResources(
     const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
     defer allocator.free(lock_path);
 
-    var current_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
-        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    var current_result = try ext_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = capability.CANONICAL_CAPABILITIES[0..],
     });
     defer current_result.deinit(allocator);
     if (current_result != .valid) {
@@ -1199,7 +1200,7 @@ fn verifyLockedWasmPackageDetailed(
     agent_dir: []const u8,
 ) !?LockedWasmPackage {
     if (scope == .temporary) return null;
-    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
+    const manifest_path = try std.fs.path.join(allocator, &.{ package_root, ext_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
     if (!pathExists(io, manifest_path)) return null;
     if (!try manifestRequiresLegacyWasmLock(allocator, io, manifest_path)) return null;
@@ -1208,8 +1209,8 @@ fn verifyLockedWasmPackageDetailed(
     const lock_path = try provenance_lockfile.lockfilePath(allocator, provenance_scope, cwd, agent_dir);
     defer allocator.free(lock_path);
 
-    var current_result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
-        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    var current_result = try ext_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
+        .approved_capabilities = capability.CANONICAL_CAPABILITIES[0..],
     });
     defer current_result.deinit(allocator);
     if (current_result != .valid) {
@@ -1248,8 +1249,8 @@ fn verifyLockedWasmPackageDetailed(
 
     const cloned_manifest = try cloneWasmManifest(allocator, current_result.valid);
     errdefer {
-        var manifest = cloned_manifest;
-        manifest.deinit(allocator);
+        var manifest_copy = cloned_manifest;
+        manifest_copy.deinit(allocator);
     }
     const cloned_entry = try matched_entry.?.clone(allocator);
     errdefer {
@@ -1286,7 +1287,7 @@ fn manifestRequiresLegacyWasmLock(
     const schema_value = parsed.value.object.get("schemaVersion") orelse return true;
     if (schema_value != .string) return true;
     if (std.mem.eql(u8, schema_value.string, extension_manifest.SCHEMA_VERSION)) return false;
-    return std.mem.eql(u8, schema_value.string, wasm_manifest.SCHEMA_VERSION);
+    return std.mem.eql(u8, schema_value.string, ext_manifest.SCHEMA_VERSION);
 }
 
 fn appendWasmProvenanceMismatchDiagnostic(
@@ -1359,9 +1360,9 @@ fn firstLockIdentityMismatch(
     if (!optionalStringEqual(locked_entry.source_specifier, current_entry.source_specifier)) return .{ .field = "source.specifier", .expected = locked_entry.source_specifier orelse "", .actual = current_entry.source_specifier orelse "" };
     if (!std.mem.eql(u8, locked_entry.manifest_kind, current_entry.manifest_kind)) return .{ .field = "manifest.kind", .expected = locked_entry.manifest_kind, .actual = current_entry.manifest_kind };
     if (!optionalStringEqual(locked_entry.manifest_schema_version, current_entry.manifest_schema_version)) return .{ .field = "manifest.schemaVersion", .expected = locked_entry.manifest_schema_version orelse "", .actual = current_entry.manifest_schema_version orelse "" };
-    if (!optionalStringEqual(locked_entry.manifest_id, current_entry.manifest_id)) return .{ .field = "manifest.id", .expected = locked_entry.manifest_id orelse "", .actual = current_entry.manifest_id orelse "" };
-    if (!optionalStringEqual(locked_entry.manifest_name, current_entry.manifest_name)) return .{ .field = "manifest.name", .expected = locked_entry.manifest_name orelse "", .actual = current_entry.manifest_name orelse "" };
-    if (!optionalStringEqual(locked_entry.manifest_version, current_entry.manifest_version)) return .{ .field = "manifest.version", .expected = locked_entry.manifest_version orelse "", .actual = current_entry.manifest_version orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_id, current_entry.manifest_id)) return .{ .field = "source_manifest.id", .expected = locked_entry.manifest_id orelse "", .actual = current_entry.manifest_id orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_name, current_entry.manifest_name)) return .{ .field = "source_manifest.name", .expected = locked_entry.manifest_name orelse "", .actual = current_entry.manifest_name orelse "" };
+    if (!optionalStringEqual(locked_entry.manifest_version, current_entry.manifest_version)) return .{ .field = "source_manifest.version", .expected = locked_entry.manifest_version orelse "", .actual = current_entry.manifest_version orelse "" };
     if (!optionalStringEqual(locked_entry.manifest_tool_id, current_entry.manifest_tool_id)) return .{ .field = "manifest.toolId", .expected = locked_entry.manifest_tool_id orelse "", .actual = current_entry.manifest_tool_id orelse "" };
     if (!std.mem.eql(u8, locked_entry.package_root, current_entry.package_root)) return .{ .field = "packageRoot", .expected = locked_entry.package_root, .actual = current_entry.package_root };
     if (!std.mem.eql(u8, locked_entry.manifest_path, current_entry.manifest_path)) return .{ .field = "manifestPath", .expected = locked_entry.manifest_path, .actual = current_entry.manifest_path };
@@ -1397,13 +1398,13 @@ fn collectPackageResourceRoot(
     filter: FilterSet,
     seed: MetadataSeed,
 ) !void {
-    var manifest = try readPiManifest(allocator, io, package_root);
-    defer manifest.deinit(allocator);
+    var package_manifest = try readPiManifest(allocator, io, package_root);
+    defer package_manifest.deinit(allocator);
 
-    try collectKindFromPackage(allocator, io, extensions, diagnostics, package_root, .extension, filter.forKind(.extension), manifest.extension_entries, seed);
-    try collectKindFromPackage(allocator, io, skills, diagnostics, package_root, .skill, filter.forKind(.skill), manifest.skill_entries, seed);
-    try collectKindFromPackage(allocator, io, prompts, diagnostics, package_root, .prompt, filter.forKind(.prompt), manifest.prompt_entries, seed);
-    try collectKindFromPackage(allocator, io, themes, diagnostics, package_root, .theme, filter.forKind(.theme), manifest.theme_entries, seed);
+    try collectKindFromPackage(allocator, io, extensions, diagnostics, package_root, .extension, filter.forKind(.extension), package_manifest.extension_entries, seed);
+    try collectKindFromPackage(allocator, io, skills, diagnostics, package_root, .skill, filter.forKind(.skill), package_manifest.skill_entries, seed);
+    try collectKindFromPackage(allocator, io, prompts, diagnostics, package_root, .prompt, filter.forKind(.prompt), package_manifest.prompt_entries, seed);
+    try collectKindFromPackage(allocator, io, themes, diagnostics, package_root, .theme, filter.forKind(.theme), package_manifest.theme_entries, seed);
 }
 
 const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
@@ -2740,40 +2741,40 @@ fn freeOwnedStringArrayList(allocator: std.mem.Allocator, list: *std.ArrayList([
     list.deinit(allocator);
 }
 
-fn cloneWasmManifest(allocator: std.mem.Allocator, manifest: wasm_manifest.Manifest) !wasm_manifest.Manifest {
-    const package_root = try allocator.dupe(u8, manifest.package_root);
+fn cloneWasmManifest(allocator: std.mem.Allocator, source_manifest: ext_manifest.Manifest) !ext_manifest.Manifest {
+    const package_root = try allocator.dupe(u8, source_manifest.package_root);
     errdefer allocator.free(package_root);
-    const manifest_path = try allocator.dupe(u8, manifest.manifest_path);
+    const manifest_path = try allocator.dupe(u8, source_manifest.manifest_path);
     errdefer allocator.free(manifest_path);
-    const schema_version = try allocator.dupe(u8, manifest.schema_version);
+    const schema_version = try allocator.dupe(u8, source_manifest.schema_version);
     errdefer allocator.free(schema_version);
-    const id = try allocator.dupe(u8, manifest.id);
+    const id = try allocator.dupe(u8, source_manifest.id);
     errdefer allocator.free(id);
-    const name = try allocator.dupe(u8, manifest.name);
+    const name = try allocator.dupe(u8, source_manifest.name);
     errdefer allocator.free(name);
-    const version = try allocator.dupe(u8, manifest.version);
+    const version = try allocator.dupe(u8, source_manifest.version);
     errdefer allocator.free(version);
-    const description = try allocator.dupe(u8, manifest.description);
+    const description = try allocator.dupe(u8, source_manifest.description);
     errdefer allocator.free(description);
-    const artifact_path = try allocator.dupe(u8, manifest.artifact_path);
+    const artifact_path = try allocator.dupe(u8, source_manifest.artifact_path);
     errdefer allocator.free(artifact_path);
-    const artifact_absolute_path = try allocator.dupe(u8, manifest.artifact_absolute_path);
+    const artifact_absolute_path = try allocator.dupe(u8, source_manifest.artifact_absolute_path);
     errdefer allocator.free(artifact_absolute_path);
-    const artifact_sha256 = try allocator.dupe(u8, manifest.artifact_sha256);
+    const artifact_sha256 = try allocator.dupe(u8, source_manifest.artifact_sha256);
     errdefer allocator.free(artifact_sha256);
-    const package_root_sha256 = try allocator.dupe(u8, manifest.package_root_sha256);
+    const package_root_sha256 = try allocator.dupe(u8, source_manifest.package_root_sha256);
     errdefer allocator.free(package_root_sha256);
-    const tool_id = try allocator.dupe(u8, manifest.tool_id);
+    const tool_id = try allocator.dupe(u8, source_manifest.tool_id);
     errdefer allocator.free(tool_id);
-    const tool_description = try allocator.dupe(u8, manifest.tool_description);
+    const tool_description = try allocator.dupe(u8, source_manifest.tool_description);
     errdefer allocator.free(tool_description);
-    const input_schema_json = try allocator.dupe(u8, manifest.input_schema_json);
+    const input_schema_json = try allocator.dupe(u8, source_manifest.input_schema_json);
     errdefer allocator.free(input_schema_json);
-    const output_schema_json = try allocator.dupe(u8, manifest.output_schema_json);
+    const output_schema_json = try allocator.dupe(u8, source_manifest.output_schema_json);
     errdefer allocator.free(output_schema_json);
-    const requested_capabilities = try allocator.dupe(wasm_manifest.Capability, manifest.requested_capabilities);
+    const requested_capabilities = try allocator.dupe(capability.Capability, source_manifest.requested_capabilities);
     errdefer allocator.free(requested_capabilities);
-    var resource_limits = try cloneWasmResourceLimits(allocator, manifest.resource_limits);
+    var resource_limits = try cloneWasmResourceLimits(allocator, source_manifest.resource_limits);
     errdefer resource_limits.deinit(allocator);
 
     return .{
@@ -2784,7 +2785,7 @@ fn cloneWasmManifest(allocator: std.mem.Allocator, manifest: wasm_manifest.Manif
         .name = name,
         .version = version,
         .description = description,
-        .artifact_kind = manifest.artifact_kind,
+        .artifact_kind = source_manifest.artifact_kind,
         .artifact_path = artifact_path,
         .artifact_absolute_path = artifact_absolute_path,
         .artifact_sha256 = artifact_sha256,
@@ -2798,7 +2799,7 @@ fn cloneWasmManifest(allocator: std.mem.Allocator, manifest: wasm_manifest.Manif
     };
 }
 
-fn cloneWasmResourceLimits(allocator: std.mem.Allocator, limits: wasm_manifest.ResourceLimits) !wasm_manifest.ResourceLimits {
+fn cloneWasmResourceLimits(allocator: std.mem.Allocator, limits: capability.ResourceLimits) !capability.ResourceLimits {
     const tool_scopes = try allocator.alloc([]u8, limits.tool_scopes.len);
     errdefer allocator.free(tool_scopes);
     for (limits.tool_scopes, 0..) |scope, index| {
@@ -3368,8 +3369,8 @@ test "resolveConfiguredLockedWasmPackages discovers only configured scope locked
     const unlocked_root = try makeTmpPath(allocator, tmp, "repo/fixtures/unlocked");
     defer allocator.free(unlocked_root);
 
-    var manifest_result = try wasm_manifest.validateManifestFileWithOptions(allocator, std.testing.io, locked_root, .{
-        .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
+    var manifest_result = try ext_manifest.validateManifestFileWithOptions(allocator, std.testing.io, locked_root, .{
+        .approved_capabilities = capability.CANONICAL_CAPABILITIES[0..],
     });
     defer manifest_result.deinit(allocator);
     try std.testing.expect(manifest_result == .valid);

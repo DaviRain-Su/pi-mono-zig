@@ -5,7 +5,7 @@ const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const auth = @import("../auth/auth.zig");
 const config_errors = @import("config_errors.zig");
-const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
+const capability = @import("../extensions/capability.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
 const migrations = @import("migrations.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -1109,8 +1109,8 @@ fn isResourceLimitField(value: []const u8) bool {
 }
 
 fn isCanonicalExtensionGrant(value: []const u8) bool {
-    for (wasm_manifest.CANONICAL_CAPABILITIES) |capability| {
-        if (std.mem.eql(u8, capability.jsonName(), value)) return true;
+    for (capability.CANONICAL_CAPABILITIES) |canonical_capability| {
+        if (std.mem.eql(u8, canonical_capability.jsonName(), value)) return true;
     }
     return false;
 }
