@@ -1,12 +1,12 @@
 // TODO(review-B8): This file still covers too many concerns
-// (accumulator, tool execution, streaming). JSON schema validation
-// has been extracted to json_schema.zig. Next: accumulator and
-// tool execution modules.
+// (tool execution, streaming). accumulator.zig and json_schema.zig
+// have been extracted. Next: tool execution and streaming modules.
 const std = @import("std");
 const ai = @import("ai");
 const provider_json = ai.provider_json;
 const types = @import("types.zig");
 const json_schema = @import("json_schema.zig");
+const accumulator = @import("accumulator.zig");
 
 pub const AgentLoopError = error{
     MissingAssistantResult,
@@ -48,252 +48,6 @@ const FinalizedToolCallOutcome = struct {
 /// - Partial arguments are exposed in the callback-scoped partial assistant
 ///   message only when another assistant block anchors the transcript row.
 ///   A standalone leading tool call is hidden from message.content until the
-///   final message_end so the TUI does not render a blank id/name tool row.
-/// - Tool execution and session persistence use only the final assistant
-///   message after done/error; partial tool-call snapshots are display-only.
-const PartialToolCallBlock = struct {
-    arguments: std.ArrayList(u8) = .empty,
-    final_tool_call: ?ai.ToolCall = null,
-
-    fn deinit(self: *PartialToolCallBlock, allocator: std.mem.Allocator) void {
-        self.arguments.deinit(allocator);
-        if (self.final_tool_call) |tool_call| deinitToolCall(allocator, tool_call);
-        self.* = undefined;
-    }
-
-    fn appendDelta(self: *PartialToolCallBlock, allocator: std.mem.Allocator, delta: []const u8) !void {
-        try self.arguments.appendSlice(allocator, delta);
-    }
-
-    fn setFinal(self: *PartialToolCallBlock, allocator: std.mem.Allocator, tool_call: ai.ToolCall) !void {
-        const cloned = try cloneToolCall(allocator, tool_call);
-        if (self.final_tool_call) |existing| deinitToolCall(allocator, existing);
-        self.final_tool_call = cloned;
-    }
-};
-
-const PartialContentBlock = union(enum) {
-    text: std.ArrayList(u8),
-    thinking: std.ArrayList(u8),
-    tool_call: PartialToolCallBlock,
-
-    fn deinit(self: *PartialContentBlock, allocator: std.mem.Allocator) void {
-        switch (self.*) {
-            .text => |*text| text.deinit(allocator),
-            .thinking => |*thinking| thinking.deinit(allocator),
-            .tool_call => |*tool_call| tool_call.deinit(allocator),
-        }
-        self.* = undefined;
-    }
-};
-
-const PartialAssistantAccumulator = struct {
-    allocator: std.mem.Allocator,
-    blocks: std.ArrayList(PartialContentBlock) = .empty,
-    index_map: std.ArrayList(?usize) = .empty,
-    ended_blocks: std.ArrayList(bool) = .empty,
-
-    fn init(allocator: std.mem.Allocator) PartialAssistantAccumulator {
-        return .{ .allocator = allocator };
-    }
-
-    fn deinit(self: *PartialAssistantAccumulator) void {
-        for (self.blocks.items) |*block| block.deinit(self.allocator);
-        self.blocks.deinit(self.allocator);
-        self.index_map.deinit(self.allocator);
-        self.ended_blocks.deinit(self.allocator);
-    }
-
-    // Explicit provider content indices are opened only by *_start events.
-    // Sparse starts are allowed, but *_delta/*_end for an unmapped explicit
-    // index are rejected instead of silently creating phantom content blocks.
-    fn indexFor(
-        self: *PartialAssistantAccumulator,
-        event: ai.AssistantMessageEvent,
-        allow_new_explicit_index: bool,
-    ) !usize {
-        if (event.content_index) |content_index| {
-            const requested: usize = @intCast(content_index);
-            if (requested < self.index_map.items.len) {
-                if (self.index_map.items[requested]) |mapped| {
-                    if (self.isEnded(mapped)) return AgentLoopError.PartialContentIndexReused;
-                    return mapped;
-                }
-            }
-            if (!allow_new_explicit_index) return AgentLoopError.PartialContentOutOfOrder;
-            while (self.index_map.items.len <= requested) {
-                try self.index_map.append(self.allocator, null);
-            }
-            const mapped = self.blocks.items.len;
-            self.index_map.items[requested] = mapped;
-            return mapped;
-        }
-        return if (self.blocks.items.len == 0) 0 else self.blocks.items.len - 1;
-    }
-
-    fn isEnded(self: *PartialAssistantAccumulator, index: usize) bool {
-        return index < self.ended_blocks.items.len and self.ended_blocks.items[index];
-    }
-
-    fn markEnded(self: *PartialAssistantAccumulator, index: usize) void {
-        std.debug.assert(index < self.ended_blocks.items.len);
-        self.ended_blocks.items[index] = true;
-    }
-
-    fn ensureIndex(self: *PartialAssistantAccumulator, index: usize) !void {
-        while (self.blocks.items.len <= index) {
-            try self.blocks.ensureUnusedCapacity(self.allocator, 1);
-            try self.ended_blocks.ensureUnusedCapacity(self.allocator, 1);
-            const next_index = self.blocks.items.len;
-            self.blocks.items.len = next_index + 1;
-            self.blocks.items[next_index] = .{ .text = .empty };
-            self.ended_blocks.items.len = next_index + 1;
-            self.ended_blocks.items[next_index] = false;
-        }
-    }
-
-    fn ensureText(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .text => |*text| return text,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .text = .empty };
-                return &self.blocks.items[index].text;
-            },
-        }
-    }
-
-    fn ensureThinking(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .thinking => |*thinking| return thinking,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .thinking = .empty };
-                return &self.blocks.items[index].thinking;
-            },
-        }
-    }
-
-    fn ensureToolCall(self: *PartialAssistantAccumulator, index: usize) !*PartialToolCallBlock {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .tool_call => |*tool_call| return tool_call,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .tool_call = .{} };
-                return &self.blocks.items[index].tool_call;
-            },
-        }
-    }
-
-    fn applyEvent(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !void {
-        switch (event.event_type) {
-            .text_start => {
-                const index = try self.indexFor(event, true);
-                const text = try self.ensureText(index);
-                text.clearRetainingCapacity();
-            },
-            .text_delta => {
-                const index = try self.indexFor(event, false);
-                const text = try self.ensureText(index);
-                if (event.delta) |delta| try text.appendSlice(self.allocator, delta);
-            },
-            .text_end => {
-                const index = try self.indexFor(event, false);
-                const text = try self.ensureText(index);
-                text.clearRetainingCapacity();
-                if (event.content) |content| try text.appendSlice(self.allocator, content);
-                self.markEnded(index);
-            },
-            .thinking_start => {
-                const index = try self.indexFor(event, true);
-                const thinking = try self.ensureThinking(index);
-                thinking.clearRetainingCapacity();
-            },
-            .thinking_delta => {
-                const index = try self.indexFor(event, false);
-                const thinking = try self.ensureThinking(index);
-                if (event.delta) |delta| try thinking.appendSlice(self.allocator, delta);
-            },
-            .thinking_end => {
-                const index = try self.indexFor(event, false);
-                const thinking = try self.ensureThinking(index);
-                thinking.clearRetainingCapacity();
-                if (event.content) |content| try thinking.appendSlice(self.allocator, content);
-                self.markEnded(index);
-            },
-            .toolcall_start => {
-                const index = try self.indexFor(event, true);
-                _ = try self.ensureToolCall(index);
-            },
-            .toolcall_delta => {
-                const index = try self.indexFor(event, false);
-                const tool_call = try self.ensureToolCall(index);
-                if (event.delta) |delta| try tool_call.appendDelta(self.allocator, delta);
-            },
-            .toolcall_end => {
-                const index = try self.indexFor(event, false);
-                const tool_call = try self.ensureToolCall(index);
-                if (event.tool_call) |final_tool_call| try tool_call.setFinal(self.allocator, final_tool_call);
-                self.markEnded(index);
-            },
-            else => {},
-        }
-    }
-
-    fn buildMessage(
-        self: *PartialAssistantAccumulator,
-        allocator: std.mem.Allocator,
-        template: ai.AssistantMessage,
-    ) !ai.AssistantMessage {
-        if (self.blocks.items.len == 1 and self.blocks.items[0] == .tool_call) {
-            var partial = template;
-            partial.content = &[_]ai.ContentBlock{};
-            partial.tool_calls = null;
-            return partial;
-        }
-
-        var content = try allocator.alloc(ai.ContentBlock, self.blocks.items.len);
-        for (self.blocks.items, 0..) |*block, index| {
-            content[index] = switch (block.*) {
-                .text => |text| .{ .text = .{ .text = text.items } },
-                .thinking => |thinking| .{ .thinking = .{ .thinking = thinking.items } },
-                .tool_call => |tool_call| try buildPartialToolCallBlock(allocator, tool_call),
-            };
-        }
-
-        var partial = template;
-        partial.content = content;
-        partial.tool_calls = null;
-        return partial;
-    }
-};
-
-fn buildPartialToolCallBlock(
-    allocator: std.mem.Allocator,
-    tool_call: PartialToolCallBlock,
-) !ai.ContentBlock {
-    if (tool_call.final_tool_call) |final_tool_call| {
-        return .{ .tool_call = final_tool_call };
-    }
-
-    const parsed = ai.json_parse.parseStreamingJson(allocator, tool_call.arguments.items) catch null;
-    const arguments: std.json.Value = if (parsed) |value| switch (value.value) {
-        .object => value.value,
-        else => try emptyJsonObject(allocator),
-    } else try emptyJsonObject(allocator);
-    return .{ .tool_call = .{
-        .id = "",
-        .name = "",
-        .arguments = arguments,
-    } };
-}
-
-fn emptyJsonObject(allocator: std.mem.Allocator) !std.json.Value {
-    return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
-}
 
 const UpdateEmitterContext = struct {
     emit_context: ?*anyopaque,
@@ -616,7 +370,7 @@ fn streamAssistantResponse(
     defer stream.deinit();
 
     var partial_template: ?ai.AssistantMessage = null;
-    var partial_accumulator = PartialAssistantAccumulator.init(allocator);
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(allocator);
     defer partial_accumulator.deinit();
     var saw_message_start = false;
 
@@ -1421,7 +1175,7 @@ fn emitPartialMessageUpdate(
     emit: types.AgentEventCallback,
     template: ai.AssistantMessage,
     assistant_message_event: ai.AssistantMessageEvent,
-    partial_accumulator: *PartialAssistantAccumulator,
+    partial_accumulator: *accumulator.PartialAssistantAccumulator,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1551,7 +1305,7 @@ fn deinitContentBlocks(
 }
 
 /// Tool-call clone ownership audit:
-/// - `PartialToolCallBlock.setFinal` retains at most one cloned final tool call
+/// - `accumulator.PartialToolCallBlock.setFinal` retains at most one cloned final tool call
 ///   and releases the previous clone only after the replacement clone succeeds.
 /// - `cloneContentBlock` retains cloned inline tool calls inside a cloned
 ///   content slice; `cloneContentBlocks` unwinds initialized blocks on error,
@@ -3517,7 +3271,7 @@ test "ISS-401 runtime error stream cleans partial tool state and skips terminal 
 test "ISS-403 cloneToolCall retainers deinit replacement and cloned content" {
     const allocator = std.testing.allocator;
 
-    var partial_tool_call = PartialToolCallBlock{};
+    var partial_tool_call = accumulator.PartialToolCallBlock{};
     try partial_tool_call.setFinal(allocator, .{
         .id = "first-tool",
         .name = "lookup",
@@ -3574,10 +3328,10 @@ fn checkCloneContentBlocksAllocation(allocator: std.mem.Allocator, source: []con
     }
 }
 
-test "ISS-403 PartialToolCallBlock keeps existing final tool call on replacement allocation failure" {
+test "ISS-403 accumulator.PartialToolCallBlock keeps existing final tool call on replacement allocation failure" {
     const allocator = std.testing.allocator;
 
-    var partial_tool_call = PartialToolCallBlock{};
+    var partial_tool_call = accumulator.PartialToolCallBlock{};
     defer partial_tool_call.deinit(allocator);
 
     try partial_tool_call.setFinal(allocator, .{
@@ -3669,16 +3423,16 @@ test "ISS-403 cloneContentBlocks allocation failures unwind owned blocks once" {
 }
 
 test "ISS-406 partial accumulator rejects stale explicit content_index reuse after end" {
-    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
-    defer accumulator.deinit();
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
 
-    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
-    try accumulator.applyEvent(.{
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try partial_accumulator.applyEvent(.{
         .event_type = .text_delta,
         .content_index = 0,
         .delta = "draft",
     });
-    try accumulator.applyEvent(.{
+    try partial_accumulator.applyEvent(.{
         .event_type = .text_end,
         .content_index = 0,
         .content = "final text",
@@ -3686,7 +3440,7 @@ test "ISS-406 partial accumulator rejects stale explicit content_index reuse aft
 
     try std.testing.expectError(
         AgentLoopError.PartialContentIndexReused,
-        accumulator.applyEvent(.{
+        partial_accumulator.applyEvent(.{
             .event_type = .text_delta,
             .content_index = 0,
             .delta = " stale delta",
@@ -3694,7 +3448,7 @@ test "ISS-406 partial accumulator rejects stale explicit content_index reuse aft
     );
     try std.testing.expectError(
         AgentLoopError.PartialContentIndexReused,
-        accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 }),
+        partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 }),
     );
 
     const template = ai.AssistantMessage{
@@ -3710,19 +3464,19 @@ test "ISS-406 partial accumulator rejects stale explicit content_index reuse aft
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const partial_message = try accumulator.buildMessage(arena.allocator(), template);
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
     try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
     try std.testing.expect(partial_message.content[0] == .text);
     try std.testing.expectEqualStrings("final text", partial_message.content[0].text.text);
 }
 
 test "ISS-400 partial accumulator rejects explicit deltas before start" {
-    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
-    defer accumulator.deinit();
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
 
     try std.testing.expectError(
         AgentLoopError.PartialContentOutOfOrder,
-        accumulator.applyEvent(.{
+        partial_accumulator.applyEvent(.{
             .event_type = .text_delta,
             .content_index = 0,
             .delta = "orphan text",
@@ -3730,7 +3484,7 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
     );
     try std.testing.expectError(
         AgentLoopError.PartialContentOutOfOrder,
-        accumulator.applyEvent(.{
+        partial_accumulator.applyEvent(.{
             .event_type = .thinking_delta,
             .content_index = 1,
             .delta = "orphan thinking",
@@ -3738,7 +3492,7 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
     );
     try std.testing.expectError(
         AgentLoopError.PartialContentOutOfOrder,
-        accumulator.applyEvent(.{
+        partial_accumulator.applyEvent(.{
             .event_type = .toolcall_delta,
             .content_index = 2,
             .delta = "{\"value\":\"orphan\"}",
@@ -3747,13 +3501,13 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
 
     // Sparse starts remain valid: the policy rejects non-start events for an
     // unmapped explicit provider index, not sparse provider content indices.
-    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 3 });
-    try accumulator.applyEvent(.{
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 3 });
+    try partial_accumulator.applyEvent(.{
         .event_type = .text_delta,
         .content_index = 3,
         .delta = "mapped text",
     });
-    try accumulator.applyEvent(.{
+    try partial_accumulator.applyEvent(.{
         .event_type = .text_end,
         .content_index = 3,
         .content = "mapped text",
@@ -3770,7 +3524,7 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const partial_message = try accumulator.buildMessage(arena.allocator(), template);
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
     try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
     try std.testing.expectEqualStrings("mapped text", partial_message.content[0].text.text);
 }
@@ -3881,11 +3635,11 @@ test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
 }
 
 test "ISS-401 ISS-407 message_update payload is callback-scoped and retained consumers clone" {
-    var accumulator = PartialAssistantAccumulator.init(std.testing.allocator);
-    defer accumulator.deinit();
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
 
-    try accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
-    try accumulator.applyEvent(.{
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try partial_accumulator.applyEvent(.{
         .event_type = .text_delta,
         .content_index = 0,
         .delta = "borrowed update",
@@ -3903,7 +3657,7 @@ test "ISS-401 ISS-407 message_update payload is callback-scoped and retained con
 
     var temp_buffer: [4096]u8 = undefined;
     var temp_allocator = std.heap.FixedBufferAllocator.init(&temp_buffer);
-    const partial_message = try accumulator.buildMessage(temp_allocator.allocator(), template);
+    const partial_message = try partial_accumulator.buildMessage(temp_allocator.allocator(), template);
 
     try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
     try std.testing.expect(partial_message.content[0] == .text);

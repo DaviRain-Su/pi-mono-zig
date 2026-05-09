@@ -872,7 +872,7 @@ fn deinitToolCallsPartial(allocator: std.mem.Allocator, tool_calls: []const ai.T
     }
 }
 
-fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
+pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, tool_call.name);
@@ -890,7 +890,7 @@ fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !ai.ToolC
     };
 }
 
-fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
+pub fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);
