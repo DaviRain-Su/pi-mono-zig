@@ -22,6 +22,10 @@ pub const Constraint = union(enum) {
     max: usize,
     ratio: struct { numerator: u32, denominator: u32 },
     fill: usize,
+    /// Flex constraint with basis, grow and shrink weights (like CSS flexbox).
+    /// Basis is the starting size, grow controls expansion when space remains,
+    /// shrink controls contraction when space is tight.
+    flex: struct { basis: usize, grow: usize = 0, shrink: usize = 1 },
 };
 
 /// Split a horizontal area into columns based on constraints.
@@ -103,11 +107,15 @@ fn solveSizes(constraints: []const Constraint, available: u16, out: []usize) voi
     @memset(out, 0);
 
     var remaining: usize = available;
-    var total_fill_weight: usize = 0;
     var fill_indices: [64]usize = undefined;
     var fill_count: usize = 0;
+    var fill_weight_total: usize = 0;
+    var flex_indices: [64]usize = undefined;
+    var flex_count: usize = 0;
+    var flex_grow_total: usize = 0;
+    var flex_shrink_total: usize = 0;
 
-    // Pass 1: resolve exact constraints
+    // Pass 1: resolve exact constraints and collect flex/fill items
     for (constraints, 0..) |c, i| {
         switch (c) {
             .length => |v| out[i] = v,
@@ -117,58 +125,29 @@ fn solveSizes(constraints: []const Constraint, available: u16, out: []usize) voi
                     out[i] = (@as(usize, available) * r.numerator) / r.denominator;
                 }
             },
-            .min, .max, .fill => {},
-        }
-    }
-
-    // Apply min constraints and collect fill items
-    for (constraints, 0..) |c, i| {
-        switch (c) {
-            .min => |v| {
-                out[i] = v;
-            },
-            .fill => |weight| {
+            .min => |v| out[i] = v,
+            .max => |v| out[i] = v,
+            .fill => |w| {
                 fill_indices[fill_count] = i;
                 fill_count += 1;
-                total_fill_weight += weight;
+                fill_weight_total += w;
             },
-            else => {},
+            .flex => |f| {
+                out[i] = f.basis;
+                flex_indices[flex_count] = i;
+                flex_count += 1;
+                flex_grow_total += f.grow;
+                flex_shrink_total += f.shrink;
+            },
         }
     }
 
-    // Apply max constraints and subtract exact widths from remaining
-    for (constraints, 0..) |c, i| {
-        switch (c) {
-            .max => |v| {
-                out[i] = v;
-                if (remaining >= out[i]) {
-                    remaining -= out[i];
-                } else {
-                    remaining = 0;
-                }
-            },
-            .length, .percentage, .ratio => {
-                if (remaining >= out[i]) {
-                    remaining -= out[i];
-                } else {
-                    remaining = 0;
-                }
-            },
-            .min => {
-                if (remaining >= out[i]) {
-                    remaining -= out[i];
-                } else {
-                    remaining = 0;
-                }
-            },
-            .fill => {},
-        }
-    }
+    // Subtract exact sizes from remaining
+    for (out) |w| remaining -|= w;
 
     // Pass 2: distribute remaining space to fill constraints
     if (fill_count > 0 and remaining > 0) {
-        if (total_fill_weight == 0) {
-            // Equal distribution if all weights are 0
+        if (fill_weight_total == 0) {
             const base = remaining / fill_count;
             var rem = remaining % fill_count;
             for (0..fill_count) |j| {
@@ -186,41 +165,81 @@ fn solveSizes(constraints: []const Constraint, available: u16, out: []usize) voi
                     .fill => |w| w,
                     else => unreachable,
                 };
-                const allocated = (remaining * weight) / total_fill_weight;
+                const allocated = (remaining * weight) / fill_weight_total;
                 out[idx] = allocated;
                 used += allocated;
             }
-            // Distribute rounding remainder
             var remainder = remaining - used;
             var j: usize = 0;
             while (remainder > 0 and j < fill_count) : (j += 1) {
-                const idx = fill_indices[j];
+                out[fill_indices[j]] += 1;
+                remainder -= 1;
+            }
+        }
+    }
+
+    // Recalculate remaining after fill
+    var sum: usize = 0;
+    for (out) |w| sum += w;
+    remaining = if (sum < available) available - sum else 0;
+
+    // Pass 3: distribute remaining to flex grow
+    if (flex_count > 0 and remaining > 0 and flex_grow_total > 0) {
+        var used: usize = 0;
+        for (0..flex_count) |j| {
+            const idx = flex_indices[j];
+            const weight = switch (constraints[idx]) {
+                .flex => |f| f.grow,
+                else => unreachable,
+            };
+            const allocated = (remaining * weight) / flex_grow_total;
+            out[idx] += allocated;
+            used += allocated;
+        }
+        var remainder = remaining - used;
+        var j: usize = 0;
+        while (remainder > 0 and j < flex_count) : (j += 1) {
+            const idx = flex_indices[j];
+            const f = switch (constraints[idx]) { .flex => |ff| ff, else => unreachable };
+            if (f.grow > 0) {
                 out[idx] += 1;
                 remainder -= 1;
             }
         }
     }
 
-    // Pass 3: apply min/max bounds to fill results
-    for (0..fill_count) |j| {
-        const idx = fill_indices[j];
-        // ensure fill gets at least 1 pixel if any space remains
-        _ = switch (constraints[idx]) {
-            .fill => |w| w,
-            else => unreachable,
-        };
-        // Check if there's an explicit min on this index from another constraint type
-        // (fill doesn't have min/max directly, but we ensure non-zero if space allows)
-        if (out[idx] == 0 and remaining > 0) {
-            out[idx] = 1;
+    // Pass 4: apply flex shrink if overallocated
+    sum = 0;
+    for (out) |w| sum += w;
+    if (sum > available and flex_shrink_total > 0) {
+        const excess = sum - available;
+        var used: usize = 0;
+        for (0..flex_count) |j| {
+            const idx = flex_indices[j];
+            const weight = switch (constraints[idx]) {
+                .flex => |f| f.shrink,
+                else => unreachable,
+            };
+            const delta = (excess * weight) / flex_shrink_total;
+            out[idx] -|= delta;
+            used += delta;
+        }
+        var remainder = excess - used;
+        var j: usize = 0;
+        while (remainder > 0 and j < flex_count) : (j += 1) {
+            const idx = flex_indices[j];
+            const f = switch (constraints[idx]) { .flex => |ff| ff, else => unreachable };
+            if (f.shrink > 0 and out[idx] > 0) {
+                out[idx] -= 1;
+                remainder -= 1;
+            }
         }
     }
 
-    // Clamp everything to available
-    var sum: usize = 0;
+    // Final clamp
+    sum = 0;
     for (out) |w| sum += w;
     if (sum > available) {
-        // Shrink from right to left
         var excess = sum - available;
         var i = out.len;
         while (excess > 0 and i > 0) {
@@ -355,4 +374,55 @@ test "split empty constraints returns empty" {
 
     const rects = try splitHorizontal(arena, area, constraints, 0);
     try std.testing.expectEqual(@as(usize, 0), rects.len);
+}
+
+test "split flex grow distributes extra space" {
+    const arena = std.testing.allocator;
+    const area = Rect{ .x = 0, .y = 0, .width = 20, .height = 1 };
+    const constraints = &[_]Constraint{
+        .{ .flex = .{ .basis = 4, .grow = 1 } },
+        .{ .flex = .{ .basis = 4, .grow = 2 } },
+    };
+
+    const rects = try splitHorizontal(arena, area, constraints, 0);
+    defer arena.free(rects);
+
+    try std.testing.expectEqual(@as(usize, 2), rects.len);
+    try std.testing.expectEqual(@as(u16, 8), rects[0].width); // 4 + 4*1/3
+    try std.testing.expectEqual(@as(u16, 12), rects[1].width); // 4 + 4*2/3
+}
+
+test "split flex shrink reduces oversized children" {
+    const arena = std.testing.allocator;
+    const area = Rect{ .x = 0, .y = 0, .width = 11, .height = 1 };
+    const constraints = &[_]Constraint{
+        .{ .flex = .{ .basis = 8, .shrink = 1 } },
+        .{ .flex = .{ .basis = 8, .shrink = 1 } },
+    };
+
+    const rects = try splitHorizontal(arena, area, constraints, 1);
+    defer arena.free(rects);
+
+    // available = 11 - 1 gap = 10; basis total = 16; excess = 6
+    // each shrinks by (6 * 1) / 2 = 3, so both become 5
+    try std.testing.expectEqual(@as(usize, 2), rects.len);
+    try std.testing.expectEqual(@as(u16, 5), rects[0].width);
+    try std.testing.expectEqual(@as(u16, 5), rects[1].width);
+}
+
+test "split flex with gap respects spacing" {
+    const arena = std.testing.allocator;
+    const area = Rect{ .x = 0, .y = 0, .width = 16, .height = 1 };
+    const constraints = &[_]Constraint{
+        .{ .flex = .{ .basis = 4, .grow = 1 } },
+        .{ .flex = .{ .basis = 4, .grow = 1 } },
+    };
+
+    const rects = try splitHorizontal(arena, area, constraints, 2);
+    defer arena.free(rects);
+
+    try std.testing.expectEqual(@as(usize, 2), rects.len);
+    try std.testing.expectEqual(@as(u16, 7), rects[0].width); // (16-2)/2 = 7
+    try std.testing.expectEqual(@as(u16, 7), rects[1].width);
+    try std.testing.expectEqual(@as(u16, 9), rects[1].x); // 7 + 2
 }

@@ -195,13 +195,26 @@ pub const Flex = struct {
             };
         }
 
-        const gap_total = self.gap * (self.children.items.len -| 1);
-        const available_for_items = if (@as(usize, inner_window.width) > gap_total)
-            @as(usize, inner_window.width) - gap_total
-        else
-            0;
+        const child_constraints = try ctx.arena.alloc(constraints.Constraint, self.children.items.len);
+        for (self.children.items, 0..) |child, i| {
+            child_constraints[i] = .{
+                .flex = .{
+                    .basis = child.basis orelse 0,
+                    .grow = child.grow,
+                    .shrink = child.shrink,
+                },
+            };
+        }
 
-        const assigned_widths = try allocateRowWidths(ctx.arena, self.children.items, available_for_items);
+        const rects = try constraints.splitHorizontal(
+            ctx.arena,
+            .{ .x = 0, .y = 0, .width = inner_window.width, .height = inner_window.height },
+            child_constraints,
+            @intCast(self.gap),
+        );
+
+        const assigned_widths = try ctx.arena.alloc(usize, rects.len);
+        for (rects, 0..) |r, i| assigned_widths[i] = r.width;
 
         const rendered = try renderDrawChildrenWithWidths(
             ctx.arena,
@@ -221,12 +234,14 @@ pub const Flex = struct {
             row_height;
         row_height = @min(@max(row_height, target_inner_height), @as(usize, inner_window.height));
 
+        const gap_total = self.gap * (self.children.items.len -| 1);
+        const available = @as(usize, inner_window.width) -| gap_total;
         const used_width = sumSizes(assigned_widths);
-        const extra = available_for_items -| used_width;
+        const extra = available -| used_width;
         const justify = try resolveJustify(ctx.arena, self.justify_content, extra, self.children.items.len);
 
         var cursor_x: usize = justify.leading;
-        for (rendered, assigned_widths, 0..) |entry, width, index| {
+        for (rendered, rects, 0..) |entry, rect, index| {
             if (cursor_x >= inner_window.width) break;
 
             const alignment = self.children.items[index].align_self orelse self.align_items;
@@ -239,11 +254,11 @@ pub const Flex = struct {
             const child_window = inner_window.child(.{
                 .x_off = @intCast(cursor_x),
                 .y_off = @intCast(y_off),
-                .width = @intCast(width),
+                .width = rect.width,
                 .height = @intCast(@max(child_height, 1)),
             });
-            blitAllocatingScreen(entry.screen, child_window, 0, width, child_height);
-            cursor_x += width;
+            blitAllocatingScreen(entry.screen, child_window, 0, rect.width, child_height);
+            cursor_x += rect.width;
             if (index + 1 < rendered.len) {
                 cursor_x += self.gap + justify.between[index];
             }
@@ -464,116 +479,6 @@ fn isBlankCell(cell: vaxis.Cell) bool {
     if (cell.default) return true;
     if (cell.char.grapheme.len == 0) return true;
     return std.mem.eql(u8, cell.char.grapheme, " ");
-}
-
-fn allocateMainSizes(
-    allocator: std.mem.Allocator,
-    natural_sizes: []const usize,
-    children: []const FlexChild,
-    available_for_items: ?usize,
-    direction: layout.Axis,
-    inner_width: usize,
-    gap: usize,
-) std.mem.Allocator.Error![]usize {
-    const assigned = try allocator.alloc(usize, children.len);
-    errdefer allocator.free(assigned);
-
-    if (available_for_items == null) {
-        for (natural_sizes, 0..) |natural, index| {
-            assigned[index] = children[index].basis orelse natural;
-        }
-        return assigned;
-    }
-
-    const available = available_for_items.?;
-    var basis_total: usize = 0;
-    var has_explicit_basis = false;
-    for (children, 0..) |child, index| {
-        assigned[index] = child.basis orelse natural_sizes[index];
-        if (child.basis != null) has_explicit_basis = true;
-        basis_total += assigned[index];
-    }
-
-    if (direction == .row and !has_explicit_basis) {
-        const equal_total = if (children.len == 0) 0 else available;
-        const base = if (children.len == 0) 0 else equal_total / children.len;
-        var remainder = if (children.len == 0) 0 else equal_total % children.len;
-        for (assigned) |*value| {
-            value.* = base + if (remainder > 0) blk: {
-                remainder -= 1;
-                break :blk @as(usize, 1);
-            } else 0;
-        }
-        return assigned;
-    }
-
-    if (basis_total < available) {
-        const extra = available - basis_total;
-        var grow_total: usize = 0;
-        for (children) |child| grow_total += child.grow;
-        if (grow_total > 0) {
-            distributeRemainder(assigned, children, extra, grow_total, true);
-        }
-    } else if (basis_total > available) {
-        const overflow = basis_total - available;
-        var shrink_total: usize = 0;
-        for (children) |child| shrink_total += child.shrink;
-        if (shrink_total > 0) {
-            distributeRemainder(assigned, children, overflow, shrink_total, false);
-        }
-    }
-
-    _ = inner_width;
-    _ = gap;
-    return assigned;
-}
-
-fn allocateRowWidths(
-    allocator: std.mem.Allocator,
-    children: []const FlexChild,
-    available: usize,
-) std.mem.Allocator.Error![]usize {
-    const natural_sizes = try allocator.alloc(usize, children.len);
-    defer allocator.free(natural_sizes);
-    @memset(natural_sizes, 0);
-    return allocateMainSizes(allocator, natural_sizes, children, available, .row, available, 0);
-}
-
-fn distributeRemainder(
-    sizes: []usize,
-    children: []const FlexChild,
-    amount: usize,
-    weight_total: usize,
-    grow: bool,
-) void {
-    if (amount == 0 or weight_total == 0) return;
-
-    var used: usize = 0;
-    for (children, 0..) |child, index| {
-        const weight = if (grow) child.grow else child.shrink;
-        if (weight == 0) continue;
-        const delta = (amount * weight) / weight_total;
-        used += delta;
-        if (grow) {
-            sizes[index] += delta;
-        } else {
-            sizes[index] -|= delta;
-        }
-    }
-
-    var remaining = amount -| used;
-    var index: usize = 0;
-    while (remaining > 0 and index < children.len) : (index += 1) {
-        const weight = if (grow) children[index].grow else children[index].shrink;
-        if (weight == 0) continue;
-        if (grow) {
-            sizes[index] += 1;
-        } else {
-            sizes[index] -|= 1;
-        }
-        remaining -= 1;
-        if (index + 1 == children.len and remaining > 0) index = 0;
-    }
 }
 
 fn resolveJustify(
