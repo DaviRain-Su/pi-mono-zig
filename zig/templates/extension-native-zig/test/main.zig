@@ -38,6 +38,7 @@ test "template local author validation rejects private loader fields" {
         \\      "descriptor": "native://dynamic/com.pi.native.template.echo",
         \\      "dynamic_library_path": "native/libpi_native_template_echo.dylib"
         \\    },
+        \\    "abi": {"name": "pi_native_extension_abi_v0", "minVersion": 0, "maxVersion": 0},
         \\    "limits": {"timeoutMs": 30000, "outputBytes": 65536, "toolScopes": ["native.echo"]}
         \\  },
         \\  "tools": [{"name": "native.echo", "inputSchema": {}, "outputSchema": {}}],

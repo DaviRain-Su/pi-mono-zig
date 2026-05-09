@@ -4,8 +4,19 @@ pub const SCHEMA_VERSION = "pi-extension.v1";
 pub const RUNTIME_KIND = "native";
 pub const ABI_NAME = "pi_native_extension_abi_v0";
 pub const ABI_VERSION: u32 = 0;
+pub const ABI_MIN_VERSION: u32 = 0;
+pub const ABI_MAX_VERSION: u32 = 0;
+pub const MAX_ABI_NAME_BYTES: usize = 256;
+pub const MAX_METADATA_BYTES: usize = 64 * 1024;
 pub const MAX_EXECUTE_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_EXECUTE_OUTPUT_BYTES: usize = 64 * 1024;
+pub const TRUSTED_CODE_SECURITY_LIMITATION =
+    "Dynamic native extensions are trusted local code, not sandboxed; capability policy gates only host-mediated APIs, so manifest provenance and exact digest-bound policy must pass before native library load.";
+
+pub const HostApiV0 = extern struct {
+    abi_version: u32,
+    reserved: ?*anyopaque = null,
+};
 
 pub const Metadata = struct {
     id: []const u8,
@@ -26,6 +37,9 @@ pub const ExpectedManifest = struct {
     tool_name: []const u8,
     timeout_ms: u64,
     output_bytes: u64,
+    abi_name: []const u8 = ABI_NAME,
+    abi_min_version: u32 = ABI_MIN_VERSION,
+    abi_max_version: u32 = ABI_MAX_VERSION,
 };
 
 pub fn staticMetadataJson(
@@ -40,7 +54,7 @@ pub fn staticMetadataJson(
 ) []const u8 {
     return "{\"schemaVersion\":\"" ++ SCHEMA_VERSION ++
         "\",\"runtime\":\"" ++ RUNTIME_KIND ++
-        "\",\"abi\":{\"name\":\"" ++ ABI_NAME ++ "\",\"version\":0}" ++
+        "\",\"abi\":{\"name\":\"" ++ ABI_NAME ++ "\",\"version\":0,\"minVersion\":0,\"maxVersion\":0}" ++
         ",\"id\":\"" ++ id ++
         "\",\"name\":\"" ++ name ++
         "\",\"version\":\"" ++ version ++
@@ -48,7 +62,9 @@ pub fn staticMetadataJson(
         "\",\"tool\":{\"name\":\"" ++ tool_name ++
         "\",\"description\":\"" ++ tool_description ++
         "\",\"inputSchema\":" ++ input_schema_json ++
-        ",\"outputSchema\":" ++ output_schema_json ++ "}}";
+        ",\"outputSchema\":" ++ output_schema_json ++ "}" ++
+        ",\"capabilities\":{\"exports\":[{\"id\":\"" ++ tool_name ++
+        "\",\"kind\":\"tool\",\"version\":\"" ++ version ++ "\"}],\"imports\":[]}}";
 }
 
 pub fn ptr(bytes: []const u8) [*]const u8 {
@@ -71,6 +87,8 @@ pub fn metadataJsonAlloc(allocator: std.mem.Allocator, metadata: Metadata) ![]u8
     try writer.writer.writeAll(",\"abi\":{\"name\":");
     try std.json.Stringify.value(ABI_NAME, .{}, &writer.writer);
     try writer.writer.print(",\"version\":{d}", .{ABI_VERSION});
+    try writer.writer.print(",\"minVersion\":{d}", .{ABI_MIN_VERSION});
+    try writer.writer.print(",\"maxVersion\":{d}", .{ABI_MAX_VERSION});
     try writer.writer.writeAll("},\"id\":");
     try std.json.Stringify.value(metadata.id, .{}, &writer.writer);
     try writer.writer.writeAll(",\"name\":");
@@ -87,7 +105,11 @@ pub fn metadataJsonAlloc(allocator: std.mem.Allocator, metadata: Metadata) ![]u8
     try writer.writer.writeAll(metadata.input_schema_json);
     try writer.writer.writeAll(",\"outputSchema\":");
     try writer.writer.writeAll(metadata.output_schema_json);
-    try writer.writer.writeAll("}}");
+    try writer.writer.writeAll("},\"capabilities\":{\"exports\":[{\"id\":");
+    try std.json.Stringify.value(metadata.tool_name, .{}, &writer.writer);
+    try writer.writer.writeAll(",\"kind\":\"tool\",\"version\":");
+    try std.json.Stringify.value(metadata.version, .{}, &writer.writer);
+    try writer.writer.writeAll("}],\"imports\":[]}}");
     return allocator.dupe(u8, writer.written());
 }
 
@@ -129,6 +151,12 @@ pub fn validateManifestTextAlloc(
         }
     }
     try expectNestedStringValue(allocator, entrypoint.object, "descriptor", expected.runtime_descriptor, "$.runtime.entrypoint.descriptor");
+
+    const abi = runtime.object.get("abi") orelse return invalidAlloc(allocator, "$.runtime.abi", "manifest.missing_required_field", "missing required field");
+    if (abi != .object) return invalidAlloc(allocator, "$.runtime.abi", "manifest.expected_object", "expected object");
+    try expectNestedStringValue(allocator, abi.object, "name", expected.abi_name, "$.runtime.abi.name");
+    try expectU64Value(allocator, abi.object, "minVersion", expected.abi_min_version, "$.runtime.abi.minVersion");
+    try expectU64Value(allocator, abi.object, "maxVersion", expected.abi_max_version, "$.runtime.abi.maxVersion");
 
     const limits = runtime.object.get("limits") orelse return invalidAlloc(allocator, "$.runtime.limits", "manifest.missing_required_field", "missing required field");
     if (limits != .object) return invalidAlloc(allocator, "$.runtime.limits", "manifest.expected_object", "expected object");
@@ -420,7 +448,7 @@ test "native sdk facade serializes metadata and execute envelopes deterministica
     });
     defer allocator.free(metadata);
     try std.testing.expectEqualStrings(
-        "{\"schemaVersion\":\"pi-extension.v1\",\"runtime\":\"native\",\"abi\":{\"name\":\"pi_native_extension_abi_v0\",\"version\":0},\"id\":\"com.example.native\",\"name\":\"Example Native\",\"version\":\"0.1.0\",\"description\":\"Native example.\",\"tool\":{\"name\":\"native.echo\",\"description\":\"Echo.\",\"inputSchema\":{\"type\":\"object\"},\"outputSchema\":{\"type\":\"object\"}}}",
+        "{\"schemaVersion\":\"pi-extension.v1\",\"runtime\":\"native\",\"abi\":{\"name\":\"pi_native_extension_abi_v0\",\"version\":0,\"minVersion\":0,\"maxVersion\":0},\"id\":\"com.example.native\",\"name\":\"Example Native\",\"version\":\"0.1.0\",\"description\":\"Native example.\",\"tool\":{\"name\":\"native.echo\",\"description\":\"Echo.\",\"inputSchema\":{\"type\":\"object\"},\"outputSchema\":{\"type\":\"object\"}},\"capabilities\":{\"exports\":[{\"id\":\"native.echo\",\"kind\":\"tool\",\"version\":\"0.1.0\"}],\"imports\":[]}}",
         metadata,
     );
 

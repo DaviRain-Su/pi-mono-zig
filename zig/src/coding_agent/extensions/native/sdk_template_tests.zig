@@ -35,13 +35,20 @@ test "native sdk template uses only public native sdk boundary names" {
     try expectContains(main_zig, "@import(\"pi-native-extension-sdk\")");
     try expectContains(main_zig, "pi_native_extension_abi_version");
     try expectContains(main_zig, "pi_native_extension_metadata_ptr");
+    try expectContains(main_zig, "pi_native_extension_init");
     try expectContains(main_zig, "pi_native_extension_execute");
+    try expectContains(main_zig, "pi_native_extension_execute_len");
+    try expectContains(main_zig, "pi_native_extension_free");
+    try expectContains(main_zig, "pi_native_extension_shutdown");
+    try expectContains(main_zig, "sdk.HostApiV0");
 
     const public_sdk = try readRepoFile(allocator, "src/coding_agent/extensions/native/pi_native_extension_sdk.zig");
     defer allocator.free(public_sdk);
     const template_sdk = try readRepoFile(allocator, TEMPLATE_ROOT ++ "/sdk/pi_native_extension_sdk.zig");
     defer allocator.free(template_sdk);
     try std.testing.expectEqualStrings(public_sdk, template_sdk);
+    try expectContains(public_sdk, "TRUSTED_CODE_SECURITY_LIMITATION");
+    try expectContains(public_sdk, "trusted local code, not sandboxed");
 }
 
 test "native sdk template builds standalone validates locally and emits package metadata" {
@@ -88,7 +95,7 @@ test "native sdk template builds standalone validates locally and emits package 
     _ = try std.Io.Dir.statFile(.cwd(), std.testing.io, artifact_path, .{});
 
     const invalid_manifest =
-        \\{"schemaVersion":"pi-extension.v1","id":"com.pi.native.template.echo","name":"Pi Native Zig Echo Template","version":"0.1.0","runtime":{"kind":"native","entrypoint":{"descriptor":"native://dynamic/com.pi.native.template.echo","dynamic_library_path":"native/lib.dylib"},"limits":{"timeoutMs":30000,"outputBytes":65536,"toolScopes":["native.echo"]}},"tools":[{"name":"native.echo","inputSchema":{},"outputSchema":{}}],"capabilities":{"exports":[{"id":"native.echo","kind":"tool","version":"0.1.0"}],"imports":[]}}
+        \\{"schemaVersion":"pi-extension.v1","id":"com.pi.native.template.echo","name":"Pi Native Zig Echo Template","version":"0.1.0","runtime":{"kind":"native","entrypoint":{"descriptor":"native://dynamic/com.pi.native.template.echo","dynamic_library_path":"native/lib.dylib"},"abi":{"name":"pi_native_extension_abi_v0","minVersion":0,"maxVersion":0},"limits":{"timeoutMs":30000,"outputBytes":65536,"toolScopes":["native.echo"]}},"tools":[{"name":"native.echo","inputSchema":{},"outputSchema":{}}],"capabilities":{"exports":[{"id":"native.echo","kind":"tool","version":"0.1.0"}],"imports":[]}}
     ;
     const invalid_result = try native_sdk.validateManifestTextAlloc(allocator, invalid_manifest, expectedManifest());
     defer allocator.free(invalid_result);

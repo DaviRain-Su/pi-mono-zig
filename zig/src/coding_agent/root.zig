@@ -37,6 +37,7 @@ pub const wasm_host_spike = @import("extensions/wasm/wasm_host_spike.zig");
 pub const wasm_sdk_template_tests = @import("extensions/wasm/sdk_template_tests.zig");
 pub const wasm_author_workflow_e2e_tests = @import("extensions/wasm/author_workflow_e2e_tests.zig");
 pub const native_sdk = @import("extensions/native/pi_native_extension_sdk.zig");
+pub const native_abi_contract = @import("extensions/native/native_abi_contract.zig");
 pub const native_manifest = @import("extensions/native/native_manifest.zig");
 pub const native_sdk_template_tests = @import("extensions/native/sdk_template_tests.zig");
 pub const package_manager = @import("packages/package_manager.zig");
@@ -139,6 +140,7 @@ test {
     _ = @import("extensions/wasm/sdk_template_tests.zig");
     _ = @import("extensions/wasm/author_workflow_e2e_tests.zig");
     _ = @import("extensions/native/pi_native_extension_sdk.zig");
+    _ = @import("extensions/native/native_abi_contract.zig");
     _ = @import("extensions/native/native_manifest.zig");
     _ = @import("extensions/native/sdk_template_tests.zig");
     _ = @import("packages/package_manager.zig");

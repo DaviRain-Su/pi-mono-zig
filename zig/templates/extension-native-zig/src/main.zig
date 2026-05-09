@@ -20,6 +20,7 @@ const metadata_json = sdk.staticMetadataJson(
 
 var execute_output: [sdk.MAX_EXECUTE_OUTPUT_BYTES]u8 = undefined;
 var execute_output_len: usize = 0;
+var initialized_abi_version: u32 = 0;
 
 export fn pi_native_extension_abi_version() u32 {
     return sdk.ABI_VERSION;
@@ -45,6 +46,11 @@ export fn pi_native_extension_validate() i32 {
     return 0;
 }
 
+export fn pi_native_extension_init(host_api: *const sdk.HostApiV0) i32 {
+    initialized_abi_version = host_api.abi_version;
+    return if (initialized_abi_version == sdk.ABI_VERSION) 0 else 1;
+}
+
 export fn pi_native_extension_execute(input_ptr: [*]const u8, input_len: usize) [*]const u8 {
     const input = input_ptr[0..input_len];
     const output = sdk.executeMessageEcho(&execute_output, input);
@@ -54,4 +60,17 @@ export fn pi_native_extension_execute(input_ptr: [*]const u8, input_len: usize) 
 
 export fn pi_native_extension_execute_len() usize {
     return execute_output_len;
+}
+
+export fn pi_native_extension_free(output_ptr: [*]const u8, output_len: usize) void {
+    _ = output_len;
+    if (output_ptr == execute_output[0..].ptr) {
+        execute_output_len = 0;
+    }
+}
+
+export fn pi_native_extension_shutdown() i32 {
+    initialized_abi_version = 0;
+    execute_output_len = 0;
+    return 0;
 }
