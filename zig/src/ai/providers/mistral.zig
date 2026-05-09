@@ -9,6 +9,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const test_stream_server = @import("test_stream_server.zig");
 
 const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
@@ -267,11 +268,7 @@ pub fn buildRequestPayload(
 }
 
 pub fn mapStopReason(reason: []const u8) types.StopReason {
-    if (std.mem.eql(u8, reason, "stop")) return .stop;
-    if (std.mem.eql(u8, reason, "length") or std.mem.eql(u8, reason, "model_length")) return .length;
-    if (std.mem.eql(u8, reason, "tool_calls")) return .tool_use;
-    if (std.mem.eql(u8, reason, "error")) return .error_reason;
-    return .stop;
+    return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.mistral_mappings, reason, .stop);
 }
 
 fn parseSseStreamLines(

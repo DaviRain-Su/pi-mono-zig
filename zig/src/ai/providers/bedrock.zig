@@ -9,6 +9,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const simple_options = @import("../shared/simple_options.zig");
 const openai = @import("openai.zig");
@@ -2429,13 +2430,9 @@ fn finalizeOutput(
 }
 
 pub fn mapStopReason(reason: []const u8) !types.StopReason {
-    if (std.mem.eql(u8, reason, "end_turn")) return .stop;
-    if (std.mem.eql(u8, reason, "stop_sequence")) return .stop;
-    if (std.mem.eql(u8, reason, "max_tokens")) return .length;
-    if (std.mem.eql(u8, reason, "model_context_window_exceeded")) return .length;
-    if (std.mem.eql(u8, reason, "tool_use")) return .tool_use;
-    if (std.mem.eql(u8, reason, "guardrail_intervened")) return .error_reason;
-    if (std.mem.eql(u8, reason, "content_filtered")) return .error_reason;
+    inline for (stop_reason_mod.bedrock_mappings) |mapping| {
+        if (std.mem.eql(u8, reason, mapping.literal)) return mapping.reason;
+    }
     return BedrockError.UnknownStopReason;
 }
 

@@ -18,6 +18,7 @@ const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 
 const ActiveTextBlock = struct {
     content_index: usize,
@@ -833,14 +834,8 @@ pub fn parseChunkUsage(
 pub fn mapStopReason(
     allocator: std.mem.Allocator,
     reason: []const u8,
-) !struct { stop_reason: types.StopReason, error_message: ?[]const u8 } {
-    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end")) return .{ .stop_reason = .stop, .error_message = null };
-    if (std.mem.eql(u8, reason, "length")) return .{ .stop_reason = .length, .error_message = null };
-    if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) return .{ .stop_reason = .tool_use, .error_message = null };
-    return .{
-        .stop_reason = .error_reason,
-        .error_message = try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{reason}),
-    };
+) !stop_reason_mod.StopReasonResult {
+    return try stop_reason_mod.mapStopReasonFromTableWithAllocMessage(allocator, &stop_reason_mod.openai_chat_mappings, reason);
 }
 
 /// Parse an OpenAI Chat SSE byte slice and return the final AssistantMessage.

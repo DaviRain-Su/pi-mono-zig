@@ -9,6 +9,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 const anthropic_json = @import("anthropic_json.zig");
@@ -373,12 +374,9 @@ pub fn buildRequestPayload(
 }
 
 pub fn mapStopReason(reason: []const u8) !types.StopReason {
-    if (std.mem.eql(u8, reason, "end_turn")) return .stop;
-    if (std.mem.eql(u8, reason, "max_tokens")) return .length;
-    if (std.mem.eql(u8, reason, "tool_use")) return .tool_use;
-    if (std.mem.eql(u8, reason, "pause_turn")) return .stop;
-    if (std.mem.eql(u8, reason, "stop_sequence")) return .stop;
-    if (std.mem.eql(u8, reason, "refusal") or std.mem.eql(u8, reason, "sensitive")) return .error_reason;
+    inline for (stop_reason_mod.anthropic_mappings) |mapping| {
+        if (std.mem.eql(u8, reason, mapping.literal)) return mapping.reason;
+    }
     return AnthropicError.UnknownStopReason;
 }
 

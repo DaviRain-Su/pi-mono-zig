@@ -7,6 +7,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const test_stream_server = @import("test_stream_server.zig");
 
 pub const GoogleProvider = struct {
@@ -897,9 +898,7 @@ fn mapToolChoice(tool_choice: []const u8) []const u8 {
 }
 
 fn mapStopReason(reason: []const u8) types.StopReason {
-    if (std.mem.eql(u8, reason, "STOP")) return .stop;
-    if (std.mem.eql(u8, reason, "MAX_TOKENS")) return .length;
-    return .error_reason;
+    return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.google_mappings, reason, .error_reason);
 }
 
 fn generateToolCallId(allocator: std.mem.Allocator, counter: *usize) ![]const u8 {

@@ -9,6 +9,7 @@ const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const responses_api = @import("../shared/responses_api.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 const test_stream_server = @import("test_stream_server.zig");
@@ -1154,11 +1155,7 @@ fn extractTopLevelErrorMessage(allocator: std.mem.Allocator, value: std.json.Val
 }
 
 fn mapStopReason(status: []const u8) types.StopReason {
-    if (std.mem.eql(u8, status, "completed")) return .stop;
-    if (std.mem.eql(u8, status, "incomplete")) return .length;
-    if (std.mem.eql(u8, status, "failed") or std.mem.eql(u8, status, "cancelled")) return .error_reason;
-    if (std.mem.eql(u8, status, "queued") or std.mem.eql(u8, status, "in_progress")) return .stop;
-    return .error_reason;
+    return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.openai_responses_mappings, status, .error_reason);
 }
 
 fn jsonIntegerToU32(maybe_value: ?std.json.Value) u32 {

@@ -9,6 +9,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+const stop_reason_mod = @import("../shared/stop_reason.zig");
 const env_api_keys = @import("../env_api_keys.zig");
 const openai = @import("openai.zig");
 const test_stream_server = @import("test_stream_server.zig");
@@ -960,13 +961,8 @@ fn extractU32Field(value: std.json.Value, key: []const u8) u32 {
     return 0;
 }
 
-fn mapStopReason(reason: []const u8) struct { stop_reason: types.StopReason, error_message: ?[]const u8 } {
-    if (std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "end")) return .{ .stop_reason = .stop, .error_message = null };
-    if (std.mem.eql(u8, reason, "length")) return .{ .stop_reason = .length, .error_message = null };
-    if (std.mem.eql(u8, reason, "tool_calls") or std.mem.eql(u8, reason, "function_call")) return .{ .stop_reason = .tool_use, .error_message = null };
-    if (std.mem.eql(u8, reason, "content_filter")) return .{ .stop_reason = .error_reason, .error_message = "Provider finish_reason: content_filter" };
-    if (std.mem.eql(u8, reason, "network_error")) return .{ .stop_reason = .error_reason, .error_message = "Provider finish_reason: network_error" };
-    return .{ .stop_reason = .error_reason, .error_message = reason };
+fn mapStopReason(reason: []const u8) stop_reason_mod.StopReasonResult {
+    return stop_reason_mod.mapStopReasonFromTableWithMessage(&stop_reason_mod.kimi_mappings, reason);
 }
 
 fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !std.json.Value {
