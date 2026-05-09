@@ -15,6 +15,20 @@
 			"toolScopes": ["native.echo"]
 		}
 	},
+	"artifacts": [
+		{
+			"kind": "native-dynamic",
+			"os": "macos",
+			"arch": "aarch64",
+			"path": "native/macos-aarch64/libpi_native_template_echo.dylib"
+		},
+		{
+			"kind": "native-dynamic",
+			"os": "macos",
+			"arch": "x86_64",
+			"path": "native/macos-x86_64/libpi_native_template_echo.dylib"
+		}
+	],
 	"tools": [
 		{
 			"name": "native.echo",

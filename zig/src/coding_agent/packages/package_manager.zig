@@ -3,6 +3,7 @@ const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
 const extension_manifest = @import("../extensions/extension_manifest.zig");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const native_manifest = @import("../extensions/native/native_manifest.zig");
 const policy_key_mod = @import("../extensions/policy_key.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -426,9 +427,12 @@ const WasmPackageListMetadata = struct {
     extension_id: []u8,
     extension_version: []u8,
     tool_id: []u8,
+    runtime_kind: []u8,
     package_root: []u8,
     artifact_absolute_path: []u8,
     artifact_sha256: []u8,
+    artifact_os: ?[]u8 = null,
+    artifact_arch: ?[]u8 = null,
     package_root_sha256: []u8,
     policy_lookup_key: []u8,
     scope: []u8,
@@ -438,9 +442,12 @@ const WasmPackageListMetadata = struct {
         allocator.free(self.extension_id);
         allocator.free(self.extension_version);
         allocator.free(self.tool_id);
+        allocator.free(self.runtime_kind);
         allocator.free(self.package_root);
         allocator.free(self.artifact_absolute_path);
         allocator.free(self.artifact_sha256);
+        if (self.artifact_os) |value| allocator.free(value);
+        if (self.artifact_arch) |value| allocator.free(value);
         allocator.free(self.package_root_sha256);
         allocator.free(self.policy_lookup_key);
         allocator.free(self.scope);
@@ -707,6 +714,9 @@ fn validateLocalPackageForInstall(
     if (schema_version) |version| {
         defer allocator.free(version);
         if (std.mem.eql(u8, version, extension_manifest.SCHEMA_VERSION)) {
+            if (native_manifest.isNativeDynamicManifestText(allocator, manifest_text)) {
+                return validateLocalNativePackageForInstall(allocator, io, package_root, is_project, stderr);
+            }
             const valid = try validateUnifiedExtensionPackageForInstall(
                 allocator,
                 io,
@@ -723,6 +733,24 @@ fn validateLocalPackageForInstall(
     }
 
     return validateLocalWasmPackageForInstall(allocator, io, package_root, manifest_path, is_project, stderr, options);
+}
+
+fn validateLocalNativePackageForInstall(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_root: []const u8,
+    is_project: bool,
+    stderr: *std.Io.Writer,
+) !LocalWasmInstallValidation {
+    var result = try native_manifest.validateManifestFile(allocator, io, package_root);
+    defer result.deinit(allocator);
+    if (result == .invalid) {
+        try writeNativeValidationDiagnostics(allocator, stderr, result.invalid);
+        return .invalid;
+    }
+    const source_identity = try allocator.dupe(u8, result.valid.package_root);
+    defer allocator.free(source_identity);
+    return .{ .valid = try provenance_lockfile.createNativeLockEntry(allocator, provenanceScope(is_project), source_identity, &result.valid) };
 }
 
 fn validateLocalWasmPackageForInstall(
@@ -1219,13 +1247,56 @@ fn wasmPolicyLookupKeyFromLockEntry(
     return policy_key_mod.wasmPolicyLookupKey(allocator, handoff);
 }
 
+fn nativePolicyLookupKeyFromLockEntry(
+    allocator: std.mem.Allocator,
+    entry: provenance_lockfile.LockEntry,
+) ![]u8 {
+    const schema_version = entry.manifest_schema_version orelse native_manifest.SCHEMA_VERSION;
+    const extension_id = entry.manifest_id orelse "";
+    const extension_version = entry.manifest_version orelse "";
+    const artifact_path = entry.artifact_path orelse "";
+    const artifact_sha256 = entry.artifact_sha256 orelse "";
+    const artifact_os = entry.artifact_os orelse "";
+    const artifact_arch = entry.artifact_arch orelse "";
+    return std.fmt.allocPrint(
+        allocator,
+        "native:manifest:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
+        .{
+            entry.scope.jsonName(),
+            schema_version,
+            extension_id,
+            extension_version,
+            entry.package_root_sha256,
+            artifact_sha256,
+            artifact_path,
+            artifact_os,
+            artifact_arch,
+        },
+    );
+}
+
+fn policyLookupKeyFromLockEntry(
+    allocator: std.mem.Allocator,
+    entry: provenance_lockfile.LockEntry,
+) ![]u8 {
+    if (std.mem.eql(u8, entry.manifest_kind, "native-extension")) {
+        return nativePolicyLookupKeyFromLockEntry(allocator, entry);
+    }
+    return wasmPolicyLookupKeyFromLockEntry(allocator, entry);
+}
+
+fn runtimeNameFromLockEntry(entry: provenance_lockfile.LockEntry) []const u8 {
+    if (std.mem.eql(u8, entry.manifest_kind, "native-extension")) return "native";
+    return "wasm";
+}
+
 fn writeWasmInstallDetails(
     allocator: std.mem.Allocator,
     stdout: *std.Io.Writer,
     source: []const u8,
     entry: provenance_lockfile.LockEntry,
 ) !void {
-    const policy_key = try wasmPolicyLookupKeyFromLockEntry(allocator, entry);
+    const policy_key = try policyLookupKeyFromLockEntry(allocator, entry);
     defer allocator.free(policy_key);
     const redacted_source = try redactDiagnosticValue(allocator, source);
     defer allocator.free(redacted_source);
@@ -1239,7 +1310,7 @@ fn writeWasmInstallDetails(
     try stdout.print("  extension: {s}@{s}\n", .{ entry.manifest_id orelse "<unknown>", entry.manifest_version orelse "<unknown>" });
     try stdout.print("  tool: {s}\n", .{entry.manifest_tool_id orelse "<unknown>"});
     try stdout.print("  scope: {s}\n", .{entry.scope.jsonName()});
-    try stdout.writeAll("  runtime: wasm\n");
+    try stdout.print("  runtime: {s}\n", .{runtimeNameFromLockEntry(entry)});
     try stdout.writeAll("  trust: locked\n");
     try stdout.print("  source: {s}\n", .{redacted_source});
     try stdout.print("  package root: {s}\n", .{redacted_root});
@@ -1248,8 +1319,28 @@ fn writeWasmInstallDetails(
     if (entry.artifact_sha256) |artifact_sha256| {
         try stdout.print("  artifact sha256: {s}\n", .{artifact_sha256});
     }
+    if (entry.artifact_os) |os| try stdout.print("  artifact os: {s}\n", .{os});
+    if (entry.artifact_arch) |arch| try stdout.print("  artifact arch: {s}\n", .{arch});
     try stdout.print("  approval target: {s}\n", .{redacted_policy});
     try stdout.writeAll("  next: add a matching extensionPolicies entry before normal tool use.\n");
+}
+
+fn writeNativeValidationDiagnostics(
+    allocator: std.mem.Allocator,
+    stderr: *std.Io.Writer,
+    diagnostics: []const native_manifest.Diagnostic,
+) !void {
+    if (diagnostics.len == 0) {
+        try stderr.writeAll("Error: invalid native extension package\n");
+        return;
+    }
+    for (diagnostics) |diagnostic| {
+        const path = try redactDiagnosticValue(allocator, diagnostic.path);
+        defer allocator.free(path);
+        const message = try redactDiagnosticValue(allocator, diagnostic.message);
+        defer allocator.free(message);
+        try stderr.print("Error: native manifest {s}: {s}\n", .{ path, message });
+    }
 }
 
 fn writeWasmValidationDiagnostics(
@@ -2680,12 +2771,14 @@ fn writeListEntryMetadata(
     const redacted_policy = try redactDiagnosticValue(allocator, metadata.policy_lookup_key);
     defer allocator.free(redacted_policy);
     try stdout.print("    scope: {s}\n", .{metadata.scope});
-    try stdout.writeAll("    runtime: wasm\n");
+    try stdout.print("    runtime: {s}\n", .{metadata.runtime_kind});
     try stdout.print("    trust: {s}\n", .{metadata.trust_status});
     try stdout.print("    extension: {s}@{s}\n", .{ metadata.extension_id, metadata.extension_version });
     try stdout.print("    tool: {s}\n", .{metadata.tool_id});
     try stdout.print("    package root: {s}\n", .{redacted_root});
     try stdout.print("    artifact: {s}\n", .{redacted_artifact});
+    if (metadata.artifact_os) |os| try stdout.print("    artifact os: {s}\n", .{os});
+    if (metadata.artifact_arch) |arch| try stdout.print("    artifact arch: {s}\n", .{arch});
     try stdout.print("    package root sha256: {s}\n", .{metadata.package_root_sha256});
     try stdout.print("    artifact sha256: {s}\n", .{metadata.artifact_sha256});
     try stdout.print("    approval target: {s}\n", .{redacted_policy});
@@ -2766,8 +2859,8 @@ fn loadWasmPackageListMetadata(
     if (loaded.diagnostic != null) return null;
     for (loaded.entries) |entry| {
         if (!std.mem.eql(u8, entry.key, key)) continue;
-        if (entry.manifest_kind.len == 0 or !std.mem.eql(u8, entry.manifest_kind, "wasm-extension")) return null;
-        const policy_key = try wasmPolicyLookupKeyFromLockEntry(allocator, entry);
+        if (entry.manifest_kind.len == 0 or !(std.mem.eql(u8, entry.manifest_kind, "wasm-extension") or std.mem.eql(u8, entry.manifest_kind, "native-extension"))) return null;
+        const policy_key = try policyLookupKeyFromLockEntry(allocator, entry);
         errdefer allocator.free(policy_key);
         const trust_status = try localWasmTrustStatusForList(allocator, io, options, source, is_project, entry);
         errdefer allocator.free(trust_status);
@@ -2775,9 +2868,12 @@ fn loadWasmPackageListMetadata(
             .extension_id = try allocator.dupe(u8, entry.manifest_id orelse "<unknown>"),
             .extension_version = try allocator.dupe(u8, entry.manifest_version orelse "<unknown>"),
             .tool_id = try allocator.dupe(u8, entry.manifest_tool_id orelse "<unknown>"),
+            .runtime_kind = try allocator.dupe(u8, runtimeNameFromLockEntry(entry)),
             .package_root = try allocator.dupe(u8, entry.package_root),
             .artifact_absolute_path = try allocator.dupe(u8, entry.artifact_absolute_path orelse ""),
             .artifact_sha256 = try allocator.dupe(u8, entry.artifact_sha256 orelse ""),
+            .artifact_os = if (entry.artifact_os) |value| try allocator.dupe(u8, value) else null,
+            .artifact_arch = if (entry.artifact_arch) |value| try allocator.dupe(u8, value) else null,
             .package_root_sha256 = try allocator.dupe(u8, entry.package_root_sha256),
             .policy_lookup_key = policy_key,
             .scope = try allocator.dupe(u8, entry.scope.jsonName()),
@@ -2959,10 +3055,20 @@ fn computeLocalWasmLockEntryNoDiagnostics(
 
     const manifest_path = try std.fs.path.join(allocator, &[_][]const u8{ package_root, wasm_manifest.MANIFEST_FILE_NAME });
     defer allocator.free(manifest_path);
-    _ = std.Io.Dir.statFile(.cwd(), io, manifest_path, .{}) catch |err| switch (err) {
+    const manifest_text = std.Io.Dir.readFileAlloc(.cwd(), io, manifest_path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return .absent,
         else => return err,
     };
+    defer allocator.free(manifest_text);
+
+    if (native_manifest.isNativeDynamicManifestText(allocator, manifest_text)) {
+        var native_result = try native_manifest.validateManifestText(allocator, package_root, manifest_text);
+        defer native_result.deinit(allocator);
+        if (native_result == .invalid) return .invalid;
+        const source_identity = try allocator.dupe(u8, native_result.valid.package_root);
+        defer allocator.free(source_identity);
+        return .{ .valid = try provenance_lockfile.createNativeLockEntry(allocator, provenanceScope(is_project), source_identity, &native_result.valid) };
+    }
 
     var result = try wasm_manifest.validateManifestFileWithOptions(allocator, io, package_root, .{
         .approved_capabilities = wasm_manifest.CANONICAL_CAPABILITIES[0..],
@@ -3830,6 +3936,152 @@ test "wasm package install rejects unsupported native dynamic artifacts without 
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "unsupported artifact kind") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "native-dylib") != null);
 
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, settings_path, .{}));
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, lockfile_path, .{}));
+}
+
+fn nativeTestHostOs() []const u8 {
+    const builtin = @import("builtin");
+    return switch (builtin.os.tag) {
+        .macos => "macos",
+        .windows => "windows",
+        else => "linux",
+    };
+}
+
+fn nativeTestHostArch() []const u8 {
+    const builtin = @import("builtin");
+    return switch (builtin.cpu.arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => @tagName(builtin.cpu.arch),
+    };
+}
+
+fn nativeTestLibrarySuffix() []const u8 {
+    const builtin = @import("builtin");
+    return switch (builtin.os.tag) {
+        .macos => ".dylib",
+        .windows => ".dll",
+        else => ".so",
+    };
+}
+
+test "native dynamic package install validates artifact schema and writes selected artifact provenance" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/native-dynamic/native");
+    const artifact_rel = try std.fmt.allocPrint(allocator, "native/plugin{s}", .{nativeTestLibrarySuffix()});
+    defer allocator.free(artifact_rel);
+    const artifact_sub_path = try std.fs.path.join(allocator, &.{ "repo/fixtures/native-dynamic", artifact_rel });
+    defer allocator.free(artifact_sub_path);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = artifact_sub_path, .data = "native-dynamic-bytes" });
+
+    const manifest = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "schemaVersion": "pi-extension.v1",
+        \\  "id": "com.example.native-dynamic",
+        \\  "name": "Native Dynamic",
+        \\  "version": "0.1.0",
+        \\  "description": "Native dynamic package.",
+        \\  "runtime": {{
+        \\    "kind": "native",
+        \\    "entrypoint": {{ "descriptor": "native://dynamic/com.example.native-dynamic" }},
+        \\    "limits": {{ "timeoutMs": 1000, "outputBytes": 4096, "toolScopes": ["native.echo"] }}
+        \\  }},
+        \\  "artifacts": [
+        \\    {{ "kind": "native-dynamic", "os": "{s}", "arch": "{s}", "path": "{s}" }}
+        \\  ],
+        \\  "tools": [
+        \\    {{ "name": "native.echo", "description": "Echo.", "inputSchema": {{}}, "outputSchema": {{}} }}
+        \\  ],
+        \\  "capabilities": {{ "exports": [{{ "id": "native.echo", "kind": "tool", "version": "0.1.0" }}], "imports": [] }},
+        \\  "permissions": [{{ "id": "file.read" }}]
+        \\}}
+    , .{ nativeTestHostOs(), nativeTestHostArch(), artifact_rel });
+    defer allocator.free(manifest);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native-dynamic/pi-extension.json", .data = manifest });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const install_result = try runCommand(allocator, &.{ "install", "./fixtures/native-dynamic" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), install_result.exit_code);
+    try std.testing.expectEqualStrings("", stderr_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "Installed ./fixtures/native-dynamic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "runtime: native") != null);
+    const expected_stdout_os = try std.fmt.allocPrint(allocator, "artifact os: {s}", .{nativeTestHostOs()});
+    defer allocator.free(expected_stdout_os);
+    const expected_stdout_arch = try std.fmt.allocPrint(allocator, "artifact arch: {s}", .{nativeTestHostArch()});
+    defer allocator.free(expected_stdout_arch);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_stdout_os) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, expected_stdout_arch) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "approval target: native:") != null);
+
+    const lockfile_path = try lockfilePathForTest(allocator, cwd, agent_dir, false);
+    defer allocator.free(lockfile_path);
+    const lockfile = try readSettings(allocator, lockfile_path);
+    defer allocator.free(lockfile);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"kind\": \"native-extension\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"kind\": \"native-dynamic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, "\"manifestSha256\"") != null);
+    const expected_lock_os = try std.fmt.allocPrint(allocator, "\"os\": \"{s}\"", .{nativeTestHostOs()});
+    defer allocator.free(expected_lock_os);
+    const expected_lock_arch = try std.fmt.allocPrint(allocator, "\"arch\": \"{s}\"", .{nativeTestHostArch()});
+    defer allocator.free(expected_lock_arch);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, expected_lock_os) != null);
+    try std.testing.expect(std.mem.indexOf(u8, lockfile, expected_lock_arch) != null);
+
+    stdout_buf.clearRetainingCapacity();
+    stderr_buf.clearRetainingCapacity();
+    const list_result = try runCommand(allocator, &.{"list"}, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 0), list_result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "runtime: native") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_buf.items, "trust: locked") != null);
+}
+
+test "native dynamic package install rejects missing selected artifacts without state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "repo/fixtures/native-missing/native");
+    const artifact_rel = try std.fmt.allocPrint(allocator, "native/missing{s}", .{nativeTestLibrarySuffix()});
+    defer allocator.free(artifact_rel);
+    const manifest = try std.fmt.allocPrint(allocator,
+        \\{{"schemaVersion":"pi-extension.v1","id":"com.example.native-missing","name":"Native Missing","version":"0.1.0","runtime":{{"kind":"native","entrypoint":{{"descriptor":"native://dynamic/com.example.native-missing"}}}},"artifacts":[{{"kind":"native-dynamic","os":"{s}","arch":"{s}","path":"{s}"}}],"tools":[{{"name":"native.echo","inputSchema":{{}},"outputSchema":{{}}}}],"capabilities":{{"exports":[],"imports":[]}}}}
+    , .{ nativeTestHostOs(), nativeTestHostArch(), artifact_rel });
+    defer allocator.free(manifest);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/fixtures/native-missing/pi-extension.json", .data = manifest });
+
+    const cwd = try makeAbsoluteTmpPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const agent_dir = try makeAbsoluteTmpPath(allocator, tmp, "home/.pi/agent");
+    defer allocator.free(agent_dir);
+    const options = ExecuteOptions{ .cwd = cwd, .agent_dir = agent_dir };
+    var stdout_buf: std.ArrayList(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayList(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
+
+    const result = try runCommand(allocator, &.{ "install", "./fixtures/native-missing" }, options, &stdout_buf, &stderr_buf);
+    try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+    try std.testing.expectEqualStrings("", stdout_buf.items);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_buf.items, "artifact file was not found") != null);
     const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
     defer allocator.free(settings_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.statFile(.cwd(), std.testing.io, settings_path, .{}));

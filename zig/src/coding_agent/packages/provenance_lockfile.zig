@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const native_manifest = @import("../extensions/native/native_manifest.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 
 pub const LOCKFILE_NAME = "extensions.lock.json";
@@ -60,7 +61,10 @@ pub const LockEntry = struct {
     artifact_kind: ?[]u8 = null,
     artifact_path: ?[]u8 = null,
     artifact_absolute_path: ?[]u8 = null,
+    artifact_os: ?[]u8 = null,
+    artifact_arch: ?[]u8 = null,
     artifact_sha256: ?[]u8 = null,
+    manifest_sha256: ?[]u8 = null,
     package_root_sha256: []u8,
 
     pub fn deinit(self: *LockEntry, allocator: std.mem.Allocator) void {
@@ -79,7 +83,10 @@ pub const LockEntry = struct {
         if (self.artifact_kind) |value| allocator.free(value);
         if (self.artifact_path) |value| allocator.free(value);
         if (self.artifact_absolute_path) |value| allocator.free(value);
+        if (self.artifact_os) |value| allocator.free(value);
+        if (self.artifact_arch) |value| allocator.free(value);
         if (self.artifact_sha256) |value| allocator.free(value);
+        if (self.manifest_sha256) |value| allocator.free(value);
         allocator.free(self.package_root_sha256);
         self.* = undefined;
     }
@@ -102,7 +109,10 @@ pub const LockEntry = struct {
             .artifact_kind = if (self.artifact_kind) |value| try allocator.dupe(u8, value) else null,
             .artifact_path = if (self.artifact_path) |value| try allocator.dupe(u8, value) else null,
             .artifact_absolute_path = if (self.artifact_absolute_path) |value| try allocator.dupe(u8, value) else null,
+            .artifact_os = if (self.artifact_os) |value| try allocator.dupe(u8, value) else null,
+            .artifact_arch = if (self.artifact_arch) |value| try allocator.dupe(u8, value) else null,
             .artifact_sha256 = if (self.artifact_sha256) |value| try allocator.dupe(u8, value) else null,
+            .manifest_sha256 = if (self.manifest_sha256) |value| try allocator.dupe(u8, value) else null,
             .package_root_sha256 = try allocator.dupe(u8, self.package_root_sha256),
         };
     }
@@ -161,6 +171,38 @@ pub fn createWasmLockEntry(
     };
 }
 
+pub fn createNativeLockEntry(
+    allocator: std.mem.Allocator,
+    scope: Scope,
+    source_identity: []const u8,
+    manifest: *const native_manifest.Manifest,
+) !LockEntry {
+    const key = try std.fmt.allocPrint(allocator, "local:{s}", .{source_identity});
+    errdefer allocator.free(key);
+    return .{
+        .key = key,
+        .scope = scope,
+        .source_type = try allocator.dupe(u8, "local"),
+        .source_identity = try allocator.dupe(u8, source_identity),
+        .manifest_kind = try allocator.dupe(u8, "native-extension"),
+        .manifest_schema_version = try allocator.dupe(u8, manifest.schema_version),
+        .manifest_id = try allocator.dupe(u8, manifest.id),
+        .manifest_name = try allocator.dupe(u8, manifest.name),
+        .manifest_version = try allocator.dupe(u8, manifest.version),
+        .manifest_tool_id = try allocator.dupe(u8, manifest.tool_name),
+        .package_root = try allocator.dupe(u8, manifest.package_root),
+        .manifest_path = try allocator.dupe(u8, manifest.manifest_path),
+        .artifact_kind = try allocator.dupe(u8, native_manifest.ARTIFACT_KIND),
+        .artifact_path = try allocator.dupe(u8, manifest.selected_artifact_path),
+        .artifact_absolute_path = try allocator.dupe(u8, manifest.selected_artifact_absolute_path),
+        .artifact_os = try allocator.dupe(u8, manifest.selected_artifact_os),
+        .artifact_arch = try allocator.dupe(u8, manifest.selected_artifact_arch),
+        .artifact_sha256 = try allocator.dupe(u8, manifest.selected_artifact_sha256),
+        .manifest_sha256 = try allocator.dupe(u8, manifest.manifest_sha256),
+        .package_root_sha256 = try allocator.dupe(u8, manifest.package_root_sha256),
+    };
+}
+
 pub fn entriesEqual(left: LockEntry, right: LockEntry) bool {
     return std.mem.eql(u8, left.key, right.key) and
         left.scope == right.scope and
@@ -178,7 +220,10 @@ pub fn entriesEqual(left: LockEntry, right: LockEntry) bool {
         optEql(left.artifact_kind, right.artifact_kind) and
         optEql(left.artifact_path, right.artifact_path) and
         optEql(left.artifact_absolute_path, right.artifact_absolute_path) and
+        optEql(left.artifact_os, right.artifact_os) and
+        optEql(left.artifact_arch, right.artifact_arch) and
         optEql(left.artifact_sha256, right.artifact_sha256) and
+        optEql(left.manifest_sha256, right.manifest_sha256) and
         std.mem.eql(u8, left.package_root_sha256, right.package_root_sha256);
 }
 
@@ -333,9 +378,13 @@ fn parseEntry(allocator: std.mem.Allocator, value: std.json.Value, index: usize)
         entry.artifact_kind = try requiredStringOwned(allocator, artifact.object, "artifact", "kind");
         entry.artifact_path = try requiredStringOwned(allocator, artifact.object, "artifact", "path");
         entry.artifact_absolute_path = try requiredStringOwned(allocator, artifact.object, "artifact", "absolutePath");
+        entry.artifact_os = try optionalStringOwned(allocator, artifact.object, "os");
+        entry.artifact_arch = try optionalStringOwned(allocator, artifact.object, "arch");
         entry.artifact_sha256 = try requiredStringOwned(allocator, artifact.object, "artifact", "sha256");
         if (!isSha256(entry.artifact_sha256.?)) return error.InvalidLockEntry;
     }
+    entry.manifest_sha256 = try optionalStringOwned(allocator, digests.object, "manifestSha256");
+    if (entry.manifest_sha256) |manifest_sha256| if (!isSha256(manifest_sha256)) return error.InvalidLockEntry;
     return entry;
 }
 
@@ -479,12 +528,24 @@ fn appendEntryJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), entry:
         try appendJsonString(allocator, out, entry.artifact_path.?);
         try out.appendSlice(allocator, ",\n        \"absolutePath\": ");
         try appendJsonString(allocator, out, entry.artifact_absolute_path.?);
+        if (entry.artifact_os) |os| {
+            try out.appendSlice(allocator, ",\n        \"os\": ");
+            try appendJsonString(allocator, out, os);
+        }
+        if (entry.artifact_arch) |arch| {
+            try out.appendSlice(allocator, ",\n        \"arch\": ");
+            try appendJsonString(allocator, out, arch);
+        }
         try out.appendSlice(allocator, ",\n        \"sha256\": ");
         try appendJsonString(allocator, out, entry.artifact_sha256.?);
         try out.appendSlice(allocator, "\n      }");
     }
     try out.appendSlice(allocator, ",\n      \"digests\": {\n        \"packageRootSha256\": ");
     try appendJsonString(allocator, out, entry.package_root_sha256);
+    if (entry.manifest_sha256) |manifest_sha256| {
+        try out.appendSlice(allocator, ",\n        \"manifestSha256\": ");
+        try appendJsonString(allocator, out, manifest_sha256);
+    }
     try out.appendSlice(allocator, "\n      }\n    }");
 }
 
