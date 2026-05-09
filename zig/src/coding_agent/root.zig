@@ -26,6 +26,7 @@ pub const workflow_execution = @import("extensions/workflow_execution.zig");
 pub const enforcement = @import("extensions/enforcement.zig");
 pub const capability = @import("extensions/capability.zig");
 pub const manifest = @import("extensions/manifest.zig");
+pub const native_process = @import("extensions/native_process.zig");
 pub const wasm_manifest = @import("extensions/wasm/wasm_manifest.zig");
 pub const wasm_sdk = @import("extensions/wasm/pi_extension_sdk.zig");
 pub const wasm_wit_contract = @import("extensions/wasm/wasm_wit_contract.zig");
@@ -120,6 +121,8 @@ test {
     _ = @import("extensions/enforcement.zig");
     _ = @import("extensions/capability.zig");
     _ = @import("extensions/manifest.zig");
+    _ = @import("extensions/native_process.zig");
+    _ = @import("extensions/sdk.zig");
     _ = @import("extensions/wasm/wasm_manifest.zig");
     _ = @import("extensions/wasm/pi_extension_sdk.zig");
     _ = @import("extensions/wasm/wasm_wit_contract.zig");

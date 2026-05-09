@@ -8,30 +8,14 @@ const extension_registry = @import("extension_registry.zig");
 const enforcement = @import("enforcement.zig");
 const tools_common = @import("../tools/common.zig");
 const capability = @import("capability.zig");
+const sdk = @import("sdk.zig");
+const native_process = @import("native_process.zig");
 
 pub const Registry = extension_registry.Registry;
 pub const RegistryCallback = *const fn (context: ?*anyopaque, registry: *const Registry) anyerror!void;
 
-/// Context passed to native extension tool execute functions.
-/// Provides access to the allocator, parsed parameters, abort signal,
-/// progress callbacks, and the host API for capability-gated operations.
-pub const ToolContext = struct {
-    allocator: std.mem.Allocator,
-    tool_call_id: []const u8,
-    params: std.json.Value,
-    signal: ?*const std.atomic.Value(bool),
-    on_update_context: ?*anyopaque,
-    on_update: ?agent.types.AgentToolUpdateCallback,
-    host_api: ?*NativeHostApi,
-
-    pub fn isAborted(self: ToolContext) bool {
-        if (self.signal) |s| return s.load(.acquire);
-        return false;
-    }
-};
-
 pub const NativeToolExecute = *const fn (
-    ctx: *ToolContext,
+    ctx: *sdk.ToolContext,
 ) anyerror!agent.AgentToolResult;
 
 pub const NativeToolDefinition = struct {
@@ -368,11 +352,37 @@ pub const NativeHostApi = struct {
         if (self.runtime.host_effects) |effects| effects.shell_runs += 1;
     }
 
-    /// Permission-gated counter stub. Enforces capability checks and records
-    /// the operation via host_effects, but does not read environment variables.
-    pub fn readEnv(self: *NativeHostApi, name: []const u8) !void {
+    /// Read an environment variable. Enforces `env_read` capability and
+    /// returns the variable value as an owned string.
+    pub fn readEnv(self: *NativeHostApi, name: []const u8) ![]u8 {
         try self.enforceOperation(.env_read, .{ .id = name }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| effects.env_reads += 1;
+        const env = currentProcessEnviron();
+        var env_map = try env.createMap(self.runtime.allocator);
+        defer env_map.deinit();
+        const value = env_map.get(name) orelse return error.EnvironmentVariableNotFound;
+        return try self.runtime.allocator.dupe(u8, value);
+    }
+
+    fn currentProcessEnviron() std.process.Environ {
+        const builtin = @import("builtin");
+        return switch (builtin.os.tag) {
+            .windows => .{ .block = .{ .use_global = true } },
+            else => blk: {
+                const c_environ = std.c.environ;
+                var env_count: usize = 0;
+                while (c_environ[env_count] != null) : (env_count += 1) {}
+                break :blk .{ .block = .{ .slice = c_environ[0..env_count :null] } };
+            },
+        };
+    }
+
+    /// Spawn a child process and capture stdout/stderr. Enforces `shell_run`
+    /// capability before performing the operation.
+    pub fn spawnProcess(self: *NativeHostApi, options: native_process.ProcessOptions) !native_process.ProcessResult {
+        try self.enforceOperation(.shell_run, .{ .id = options.argv[0] }, .initialize, "native/host-api", .{});
+        if (self.runtime.host_effects) |effects| effects.shell_runs += 1;
+        return native_process.spawnAndCollect(self.runtime.allocator, self.runtime.io, options);
     }
 
     /// Permission-gated counter stub. Enforces capability checks and records
@@ -863,14 +873,15 @@ fn nativeAgentToolExecute(
     const execute = binding.definition.execute orelse return error.NativeToolNotExecutable;
 
     var api = NativeHostApi{ .runtime = binding.runtime };
-    var ctx = ToolContext{
+    var ctx = sdk.ToolContext{
         .allocator = allocator,
         .tool_call_id = tool_call_id,
         .params = params,
         .signal = signal,
         .on_update_context = on_update_context,
         .on_update = on_update,
-        .host_api = &api,
+        .host_api_vtable = &native_host_api_vtable,
+        .host_api_ctx = &api,
     };
 
     return execute(&ctx) catch |err| switch (err) {
@@ -892,6 +903,76 @@ fn invalidNativeInputAgentToolResult(allocator: std.mem.Allocator) !agent.AgentT
         "{\"ok\":false,\"error\":{\"category\":\"invalid_input\",\"message\":\"execute input must be a JSON object with string field value\"}}",
     ) };
 }
+
+// Host API vtable functions — bridge opaque context to NativeHostApi methods.
+fn hostApiReadFile(ctx: *anyopaque, path: []const u8) anyerror![]u8 {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.readFile(path);
+}
+fn hostApiWriteFile(ctx: *anyopaque, path: []const u8, contents: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.writeFile(path, contents);
+}
+fn hostApiSpawnProcess(ctx: *anyopaque, options: native_process.ProcessOptions) anyerror!native_process.ProcessResult {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.spawnProcess(options);
+}
+fn hostApiReadEnv(ctx: *anyopaque, name: []const u8) anyerror![]u8 {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.readEnv(name);
+}
+fn hostApiRequestNetwork(ctx: *anyopaque, url: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.requestNetwork(url);
+}
+fn hostApiRunShell(ctx: *anyopaque, command: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.runShell(command);
+}
+fn hostApiCallModel(ctx: *anyopaque, model: []const u8, payload_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.callModel(model, payload_json);
+}
+fn hostApiReadSession(ctx: *anyopaque, session_id: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.readSession(session_id);
+}
+fn hostApiWriteSession(ctx: *anyopaque, session_id: []const u8, payload_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.writeSession(session_id, payload_json);
+}
+fn hostApiNotifyUi(ctx: *anyopaque, payload_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.notifyUi(payload_json);
+}
+fn hostApiUseTool(ctx: *anyopaque, name: []const u8, payload_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.useTool(name, payload_json);
+}
+fn hostApiSpawnAgent(ctx: *anyopaque, task_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.spawnAgent(task_json);
+}
+fn hostApiDelegateAgent(ctx: *anyopaque, task_json: []const u8) anyerror!void {
+    const self: *NativeHostApi = @ptrCast(@alignCast(ctx));
+    return self.delegateAgent(task_json);
+}
+
+const native_host_api_vtable: sdk.HostApiVTable = .{
+    .readFile = hostApiReadFile,
+    .writeFile = hostApiWriteFile,
+    .spawnProcess = hostApiSpawnProcess,
+    .readEnv = hostApiReadEnv,
+    .requestNetwork = hostApiRequestNetwork,
+    .runShell = hostApiRunShell,
+    .callModel = hostApiCallModel,
+    .readSession = hostApiReadSession,
+    .writeSession = hostApiWriteSession,
+    .notifyUi = hostApiNotifyUi,
+    .useTool = hostApiUseTool,
+    .spawnAgent = hostApiSpawnAgent,
+    .delegateAgent = hostApiDelegateAgent,
+};
 
 const native_enforcement_matrix_tool: NativeToolDefinition = .{
     .name = "native.enforcement.matrix",
@@ -943,7 +1024,12 @@ fn nativeAllowedOperationMatrixStart(api: *NativeHostApi) !void {
     try api.writeFile(write_path, "allowed");
     try api.requestNetwork("fake://network/request");
     try api.runShell("fake-shell --no-side-effects");
-    try api.readEnv("PI_FAKE_ENV");
+    if (api.readEnv("PI_FAKE_ENV")) |env_value| {
+        defer api.runtime.allocator.free(env_value);
+    } else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
     try api.callModel("fake-model", "{\"prompt\":\"allowed\"}");
     try api.readSession("session-allowed");
     try api.writeSession("session-allowed", "{\"allowed\":true}");
@@ -1272,7 +1358,7 @@ fn toolContextProbeStart(api: *NativeHostApi) !void {
     }
 }
 
-fn toolContextProbeExecute(ctx: *ToolContext) !agent.AgentToolResult {
+fn toolContextProbeExecute(ctx: *sdk.ToolContext) !agent.AgentToolResult {
     const value = if (ctx.params == .object) blk: {
         const field = ctx.params.object.get("value") orelse break :blk "no-value";
         break :blk switch (field) {
