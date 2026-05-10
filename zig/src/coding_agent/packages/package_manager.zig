@@ -9,6 +9,8 @@ const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const resources_mod = @import("../resources/resources.zig");
 const config_selector = @import("config_selector.zig");
 const package_command_parser = @import("package_command_parser.zig");
+const package_process_runner = @import("package_process_runner.zig");
+const package_sources = @import("package_sources.zig");
 const provenance_lockfile = @import("provenance_lockfile.zig");
 const self_update = @import("self_update.zig");
 
@@ -46,6 +48,23 @@ const ConfigSelectorState = config_selector.ConfigSelectorState;
 const loadSelectorState = config_selector.loadSelectorState;
 const saveSelectorState = config_selector.saveSelectorState;
 const ProvenanceScope = provenance_lockfile.Scope;
+const LocalPathMode = package_sources.LocalPathMode;
+const computeInstalledPath = package_sources.computeInstalledPath;
+const gitInstallPath = package_sources.gitInstallPath;
+const isGitSource = package_sources.isGitSource;
+const isLocalSource = package_sources.isLocalSource;
+const isNpmSource = package_sources.isNpmSource;
+const localProvenanceKeyForSource = package_sources.localProvenanceKeyForSource;
+const normalizePackageSourceForSettings = package_sources.normalizePackageSourceForSettings;
+const npmPackageName = package_sources.npmPackageName;
+const packageSourcesMatchForScope = package_sources.packageSourcesMatchForScope;
+const parseGitSource = package_sources.parseGitSource;
+const resolveLocalPathFromCwd = package_sources.resolveLocalPathFromCwd;
+const resolveLocalPathFromScopeBase = package_sources.resolveLocalPathFromScopeBase;
+const executeGitInstall = package_process_runner.executeGitInstall;
+const executeGitUpdate = package_process_runner.executeGitUpdate;
+const executeNpmInstall = package_process_runner.executeNpmInstall;
+const executeNpmUpdate = package_process_runner.executeNpmUpdate;
 
 pub const ConfigToggleAction = package_command_parser.ConfigToggleAction;
 pub const ConfigOptions = package_command_parser.ConfigOptions;
@@ -394,8 +413,6 @@ fn executeInstall(
     }
     return .{ .exit_code = 0 };
 }
-
-const LocalPathMode = enum { input, settings };
 
 const LocalWasmInstallValidation = union(enum) {
     absent,
@@ -1900,339 +1917,6 @@ fn findSuggestedConfiguredSource(
 
 const package_name = self_update.package_name;
 
-const GitSourceInfo = struct {
-    repo: []u8,
-    host: []u8,
-    path: []u8,
-    ref: ?[]u8 = null,
-
-    fn deinit(self: *GitSourceInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.repo);
-        allocator.free(self.host);
-        allocator.free(self.path);
-        if (self.ref) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-const PackageTool = enum { npm, git };
-const GitRefSplit = struct {
-    repo_part: []const u8,
-    ref: ?[]const u8,
-};
-
-fn isNpmSource(source: []const u8) bool {
-    return std.mem.startsWith(u8, source, "npm:");
-}
-
-fn isGitSource(source: []const u8) bool {
-    if (std.mem.startsWith(u8, source, "git:")) return true;
-    if (std.mem.startsWith(u8, source, "https://")) return true;
-    if (std.mem.startsWith(u8, source, "http://")) return true;
-    if (std.mem.startsWith(u8, source, "ssh://")) return true;
-    if (std.mem.startsWith(u8, source, "git://")) return true;
-    return false;
-}
-
-fn trimGitSuffix(path: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, path, ".git")) return path[0 .. path.len - ".git".len];
-    return path;
-}
-
-fn splitRef(source: []const u8) GitRefSplit {
-    if (std.mem.startsWith(u8, source, "git@")) {
-        const colon = std.mem.indexOfScalar(u8, source, ':') orelse return .{ .repo_part = source, .ref = null };
-        const after_colon = source[colon + 1 ..];
-        const at = std.mem.indexOfScalar(u8, after_colon, '@') orelse return .{ .repo_part = source, .ref = null };
-        if (at == 0 or at + 1 >= after_colon.len) return .{ .repo_part = source, .ref = null };
-        return .{
-            .repo_part = source[0 .. colon + 1 + at],
-            .ref = after_colon[at + 1 ..],
-        };
-    }
-
-    if (std.mem.indexOf(u8, source, "://")) |_| {
-        const scheme_end = std.mem.indexOf(u8, source, "://").? + "://".len;
-        const path_start = std.mem.indexOfScalarPos(u8, source, scheme_end, '/') orelse return .{ .repo_part = source, .ref = null };
-        const path = source[path_start + 1 ..];
-        const at = std.mem.indexOfScalar(u8, path, '@') orelse return .{ .repo_part = source, .ref = null };
-        if (at == 0 or at + 1 >= path.len) return .{ .repo_part = source, .ref = null };
-        return .{
-            .repo_part = source[0 .. path_start + 1 + at],
-            .ref = path[at + 1 ..],
-        };
-    }
-
-    const slash = std.mem.indexOfScalar(u8, source, '/') orelse return .{ .repo_part = source, .ref = null };
-    const path = source[slash + 1 ..];
-    const at = std.mem.indexOfScalar(u8, path, '@') orelse return .{ .repo_part = source, .ref = null };
-    if (at == 0 or at + 1 >= path.len) return .{ .repo_part = source, .ref = null };
-    return .{
-        .repo_part = source[0 .. slash + 1 + at],
-        .ref = path[at + 1 ..],
-    };
-}
-
-fn parseGitSource(allocator: std.mem.Allocator, source: []const u8) !?GitSourceInfo {
-    const without_prefix = if (std.mem.startsWith(u8, source, "git:")) source["git:".len..] else source;
-    if (!std.mem.startsWith(u8, source, "git:") and
-        !(std.mem.startsWith(u8, without_prefix, "https://") or
-            std.mem.startsWith(u8, without_prefix, "http://") or
-            std.mem.startsWith(u8, without_prefix, "ssh://") or
-            std.mem.startsWith(u8, without_prefix, "git://")))
-    {
-        return null;
-    }
-
-    const split = splitRef(without_prefix);
-    const repo_part = split.repo_part;
-    const ref_owned = if (split.ref) |value| try allocator.dupe(u8, value) else null;
-    errdefer if (ref_owned) |value| allocator.free(value);
-
-    var repo_owned: []u8 = undefined;
-    var host_slice: []const u8 = undefined;
-    var path_slice: []const u8 = undefined;
-
-    if (std.mem.startsWith(u8, repo_part, "git@")) {
-        const colon = std.mem.indexOfScalar(u8, repo_part, ':') orelse return null;
-        host_slice = repo_part["git@".len..colon];
-        path_slice = repo_part[colon + 1 ..];
-        repo_owned = try allocator.dupe(u8, repo_part);
-    } else if (std.mem.indexOf(u8, repo_part, "://")) |_| {
-        const scheme_end = std.mem.indexOf(u8, repo_part, "://").? + "://".len;
-        const path_start = std.mem.indexOfScalarPos(u8, repo_part, scheme_end, '/') orelse return null;
-        host_slice = repo_part[scheme_end..path_start];
-        if (std.mem.indexOfScalar(u8, host_slice, '@')) |at| host_slice = host_slice[at + 1 ..];
-        path_slice = repo_part[path_start + 1 ..];
-        repo_owned = try allocator.dupe(u8, repo_part);
-    } else {
-        const slash = std.mem.indexOfScalar(u8, repo_part, '/') orelse return null;
-        host_slice = repo_part[0..slash];
-        path_slice = repo_part[slash + 1 ..];
-        if (std.mem.indexOfScalar(u8, host_slice, '.') == null and !std.mem.eql(u8, host_slice, "localhost")) return null;
-        repo_owned = try std.fmt.allocPrint(allocator, "https://{s}", .{repo_part});
-    }
-    errdefer allocator.free(repo_owned);
-
-    const normalized_path = trimGitSuffix(std.mem.trim(u8, path_slice, "/"));
-    if (host_slice.len == 0 or normalized_path.len == 0 or std.mem.indexOfScalar(u8, normalized_path, '/') == null) return null;
-
-    return .{
-        .repo = repo_owned,
-        .host = try allocator.dupe(u8, host_slice),
-        .path = try allocator.dupe(u8, normalized_path),
-        .ref = ref_owned,
-    };
-}
-
-fn commandPrefix(options: ExecuteOptions, kind: PackageTool) []const []const u8 {
-    return switch (kind) {
-        .npm => options.npm_command_override orelse &.{"npm"},
-        .git => options.git_command_override orelse &.{"git"},
-    };
-}
-
-fn runExternalCommand(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    prefix: []const []const u8,
-    args: []const []const u8,
-    cwd: ?[]const u8,
-    stderr: *std.Io.Writer,
-) !bool {
-    var argv = try allocator.alloc([]const u8, prefix.len + args.len);
-    defer allocator.free(argv);
-    @memcpy(argv[0..prefix.len], prefix);
-    @memcpy(argv[prefix.len..], args);
-
-    var display: std.ArrayList(u8) = .empty;
-    defer display.deinit(allocator);
-    for (argv, 0..) |arg, index| {
-        if (index > 0) try display.append(allocator, ' ');
-        try display.appendSlice(allocator, arg);
-    }
-
-    const result = (if (cwd) |path|
-        std.process.run(allocator, io, .{
-            .argv = argv,
-            .cwd = .{ .path = path },
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-        })
-    else
-        std.process.run(allocator, io, .{
-            .argv = argv,
-            .stdout_limit = .limited(1024 * 1024),
-            .stderr_limit = .limited(1024 * 1024),
-        })) catch |err| {
-        try stderr.print("Error: Failed to run {s}: {s}\n", .{ display.items, @errorName(err) });
-        return false;
-    };
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code == 0) return true;
-            try stderr.print("Error: {s} exited with code {d}\n", .{ display.items, code });
-            if (result.stderr.len > 0) try stderr.print("{s}", .{result.stderr});
-            return false;
-        },
-        .signal => |signal| {
-            try stderr.print("Error: {s} terminated by signal {d}\n", .{ display.items, signal });
-            return false;
-        },
-        else => {
-            try stderr.print("Error: {s} terminated abnormally\n", .{display.items});
-            return false;
-        },
-    }
-}
-
-fn ensureNpmProject(allocator: std.mem.Allocator, io: std.Io, install_root: []const u8) !void {
-    try std.Io.Dir.createDirPath(.cwd(), io, install_root);
-
-    const gitignore_path = try std.fs.path.join(allocator, &.{ install_root, ".gitignore" });
-    defer allocator.free(gitignore_path);
-    const gitignore_exists = blk: {
-        _ = std.Io.Dir.statFile(.cwd(), io, gitignore_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (!gitignore_exists) try common.writeFileAbsolute(io, gitignore_path, "*\n!.gitignore\n", true);
-
-    const package_json_path = try std.fs.path.join(allocator, &.{ install_root, "package.json" });
-    defer allocator.free(package_json_path);
-    const package_json_exists = blk: {
-        _ = std.Io.Dir.statFile(.cwd(), io, package_json_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (!package_json_exists) try common.writeFileAbsolute(io, package_json_path, "{\n  \"name\": \"pi-extensions\",\n  \"private\": true\n}\n", true);
-}
-
-fn npmInstallRoot(allocator: std.mem.Allocator, options: ExecuteOptions, is_project: bool) ![]u8 {
-    if (is_project) return std.fs.path.join(allocator, &.{ options.cwd, ".pi", "packages", "npm" });
-    return std.fs.path.join(allocator, &.{ options.agent_dir, "packages", "npm" });
-}
-
-fn executeNpmInstall(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-    stderr: *std.Io.Writer,
-) !bool {
-    const spec = std.mem.trim(u8, source["npm:".len..], " ");
-    const prefix = commandPrefix(options, .npm);
-    const install_root = try npmInstallRoot(allocator, options, is_project);
-    defer allocator.free(install_root);
-    try ensureNpmProject(allocator, io, install_root);
-    return runExternalCommand(allocator, io, prefix, &.{ "install", spec, "--prefix", install_root }, null, stderr);
-}
-
-fn executeNpmUpdate(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-    stderr: *std.Io.Writer,
-) !bool {
-    const spec = std.mem.trim(u8, source["npm:".len..], " ");
-    const pkg_name = npmPackageName(spec);
-    const latest_spec = try std.fmt.allocPrint(allocator, "{s}@latest", .{pkg_name});
-    defer allocator.free(latest_spec);
-    const prefix = commandPrefix(options, .npm);
-    const install_root = try npmInstallRoot(allocator, options, is_project);
-    defer allocator.free(install_root);
-    try ensureNpmProject(allocator, io, install_root);
-    return runExternalCommand(allocator, io, prefix, &.{ "install", latest_spec, "--prefix", install_root }, null, stderr);
-}
-
-fn gitInstallRoot(allocator: std.mem.Allocator, options: ExecuteOptions, is_project: bool) ![]u8 {
-    if (is_project) return std.fs.path.join(allocator, &.{ options.cwd, ".pi", "packages", "git" });
-    return std.fs.path.join(allocator, &.{ options.agent_dir, "packages", "git" });
-}
-
-fn gitInstallPath(allocator: std.mem.Allocator, options: ExecuteOptions, source: []const u8, is_project: bool) ![]u8 {
-    const root = try gitInstallRoot(allocator, options, is_project);
-    defer allocator.free(root);
-    const normalized = std.mem.trim(u8, normalizeGitSource(source), " ");
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
-    const digest_hex = std.fmt.bytesToHex(digest, .lower);
-    const hex = try std.fmt.allocPrint(allocator, "{s}", .{digest_hex[0..]});
-    defer allocator.free(hex);
-    return std.fs.path.join(allocator, &.{ root, hex });
-}
-
-fn executeGitInstall(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-    stderr: *std.Io.Writer,
-) !bool {
-    var info = (try parseGitSource(allocator, source)) orelse {
-        try stderr.print("Error: Unsupported git source: {s}\n", .{source});
-        return false;
-    };
-    defer info.deinit(allocator);
-
-    const target_dir = try gitInstallPath(allocator, options, source, is_project);
-    defer allocator.free(target_dir);
-    const target_exists = blk: {
-        _ = std.Io.Dir.statFile(.cwd(), io, target_dir, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (target_exists) return true;
-
-    const root = try gitInstallRoot(allocator, options, is_project);
-    defer allocator.free(root);
-    try std.Io.Dir.createDirPath(.cwd(), io, root);
-    const gitignore_path = try std.fs.path.join(allocator, &.{ root, ".gitignore" });
-    defer allocator.free(gitignore_path);
-    const gitignore_exists = blk: {
-        _ = std.Io.Dir.statFile(.cwd(), io, gitignore_path, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (!gitignore_exists) try common.writeFileAbsolute(io, gitignore_path, "*\n!.gitignore\n", true);
-
-    const parent = std.fs.path.dirname(target_dir) orelse root;
-    try std.Io.Dir.createDirPath(.cwd(), io, parent);
-    const prefix = commandPrefix(options, .git);
-    if (!try runExternalCommand(allocator, io, prefix, &.{ "clone", info.repo, target_dir }, null, stderr)) return false;
-    if (info.ref) |ref| {
-        if (!try runExternalCommand(allocator, io, prefix, &.{ "checkout", ref }, target_dir, stderr)) return false;
-    }
-    return true;
-}
-
-fn executeGitUpdate(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-    stderr: *std.Io.Writer,
-) !bool {
-    var info = (try parseGitSource(allocator, source)) orelse return true;
-    defer info.deinit(allocator);
-    if (info.ref != null) return true;
-
-    const target_dir = try gitInstallPath(allocator, options, source, is_project);
-    defer allocator.free(target_dir);
-    const target_exists = blk: {
-        _ = std.Io.Dir.statFile(.cwd(), io, target_dir, .{}) catch break :blk false;
-        break :blk true;
-    };
-    if (!target_exists) return executeGitInstall(allocator, io, source, is_project, options, stderr);
-
-    const prefix = commandPrefix(options, .git);
-    return runExternalCommand(allocator, io, prefix, &.{ "pull", "--ff-only" }, target_dir, stderr);
-}
-
 fn executeList(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2371,169 +2055,6 @@ fn writePackageCommandHelp(stdout: *std.Io.Writer, command: PackageCommand) !voi
             \\
         ),
     }
-}
-
-fn isLocalSource(source: []const u8) bool {
-    return !isNpmSource(source) and !isGitSource(source);
-}
-
-/// Strips the npm: prefix and version specifier to get the package name.
-/// e.g. "npm:@scope/pkg@1.0.0" → "@scope/pkg", "npm:my-pkg" → "my-pkg"
-fn npmPackageName(spec: []const u8) []const u8 {
-    if (spec.len == 0) return spec;
-    if (spec[0] == '@') {
-        const at_index = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return spec;
-        if (std.mem.indexOfScalar(u8, spec, '/')) |slash_index| {
-            if (at_index > slash_index) return spec[0..at_index];
-        }
-        return spec;
-    }
-    const at_index = std.mem.lastIndexOfScalar(u8, spec, '@') orelse return spec;
-    return spec[0..at_index];
-}
-
-/// Returns the normalized form of a git source for hashing (used by gitInstallPath).
-fn normalizeGitSource(source: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, source, "git:")) return source["git:".len..];
-    return source;
-}
-
-/// Computes the expected on-disk install path for a package source.
-/// For local sources, resolves relative paths from cwd.
-/// For npm sources, returns the node_modules directory path.
-/// For git sources, returns a SHA256-derived directory path.
-/// Caller owns the returned slice.
-fn computeInstalledPath(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    is_project: bool,
-    cwd: []const u8,
-    agent_dir: []const u8,
-) ![]u8 {
-    if (isLocalSource(source)) {
-        return resolveLocalPathFromScopeBase(allocator, source, is_project, cwd, agent_dir);
-    }
-    if (std.mem.startsWith(u8, source, "npm:")) {
-        const spec = std.mem.trim(u8, source["npm:".len..], " ");
-        const pkg_name = npmPackageName(spec);
-        const base = if (is_project)
-            try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "npm", "node_modules" })
-        else
-            try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "npm", "node_modules" });
-        defer allocator.free(base);
-        return std.fs.path.join(allocator, &[_][]const u8{ base, pkg_name });
-    }
-    if (try parseGitSource(allocator, source)) |info_value| {
-        var info = info_value;
-        defer info.deinit(allocator);
-        const base = if (is_project)
-            try std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi", "packages", "git" })
-        else
-            try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "packages", "git" });
-        defer allocator.free(base);
-        const normalized = std.mem.trim(u8, normalizeGitSource(source), " ");
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
-        const digest_hex = std.fmt.bytesToHex(digest, .lower);
-        const hex = try std.fmt.allocPrint(allocator, "{s}", .{digest_hex[0..]});
-        defer allocator.free(hex);
-        return std.fs.path.join(allocator, &[_][]const u8{ base, hex });
-    }
-    return allocator.dupe(u8, source);
-}
-
-fn localBaseDirForScope(
-    allocator: std.mem.Allocator,
-    is_project: bool,
-    cwd: []const u8,
-    agent_dir: []const u8,
-) ![]u8 {
-    if (is_project) return std.fs.path.join(allocator, &[_][]const u8{ cwd, ".pi" });
-    return allocator.dupe(u8, agent_dir);
-}
-
-fn expandHomePath(allocator: std.mem.Allocator, input: []const u8) !?[]u8 {
-    if (input.len == 0 or input[0] != '~') return null;
-    if (input.len > 1 and input[1] != '/') return null;
-    const home_ptr = std.c.getenv("HOME") orelse return null;
-    const home = std.mem.span(home_ptr);
-    if (input.len == 1) return try allocator.dupe(u8, home);
-    return try std.fs.path.join(allocator, &[_][]const u8{ home, input[2..] });
-}
-
-fn resolveLocalPathFromCwd(
-    allocator: std.mem.Allocator,
-    cwd: []const u8,
-    source: []const u8,
-) ![]u8 {
-    const trimmed = std.mem.trim(u8, source, " \t\r\n");
-    if (try expandHomePath(allocator, trimmed)) |expanded| return expanded;
-    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, trimmed });
-}
-
-fn resolveLocalPathFromScopeBase(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    is_project: bool,
-    cwd: []const u8,
-    agent_dir: []const u8,
-) ![]u8 {
-    const trimmed = std.mem.trim(u8, source, " \t\r\n");
-    if (try expandHomePath(allocator, trimmed)) |expanded| return expanded;
-    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
-    const base_dir = try localBaseDirForScope(allocator, is_project, cwd, agent_dir);
-    defer allocator.free(base_dir);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ base_dir, trimmed });
-}
-
-fn normalizePackageSourceForSettings(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    is_project: bool,
-    cwd: []const u8,
-    agent_dir: []const u8,
-) ![]u8 {
-    if (!isLocalSource(source)) return allocator.dupe(u8, source);
-
-    const base_dir = try localBaseDirForScope(allocator, is_project, cwd, agent_dir);
-    defer allocator.free(base_dir);
-    const resolved = try resolveLocalPathFromCwd(allocator, cwd, source);
-    defer allocator.free(resolved);
-    const relative = try std.fs.path.relative(allocator, cwd, null, base_dir, resolved);
-    if (relative.len == 0) {
-        allocator.free(relative);
-        return allocator.dupe(u8, ".");
-    }
-    return relative;
-}
-
-fn packageSourcesMatchForScope(
-    allocator: std.mem.Allocator,
-    configured_source: []const u8,
-    input_source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-) !bool {
-    if (std.mem.eql(u8, configured_source, input_source)) return true;
-    if (isLocalSource(configured_source) and isLocalSource(input_source)) {
-        const configured_path = try resolveLocalPathFromScopeBase(
-            allocator,
-            configured_source,
-            is_project,
-            options.cwd,
-            options.agent_dir,
-        );
-        defer allocator.free(configured_path);
-        const input_path = try resolveLocalPathFromCwd(allocator, options.cwd, input_source);
-        defer allocator.free(input_path);
-        const configured_identity = try realpathOrResolved(allocator, configured_path);
-        defer allocator.free(configured_identity);
-        const input_identity = try realpathOrResolved(allocator, input_path);
-        defer allocator.free(input_identity);
-        return std.mem.eql(u8, configured_identity, input_identity);
-    }
-    return false;
 }
 
 /// Returns true when the settings JSON object for a package has any
@@ -2830,34 +2351,6 @@ fn packageSourceFromItem(allocator: std.mem.Allocator, item: std.json.Value) ![]
         },
         else => error.InvalidPackageSource,
     };
-}
-
-fn realpathOrResolved(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (@import("builtin").os.tag == .windows) {
-        return std.fs.path.resolve(allocator, &.{path}) catch allocator.dupe(u8, path);
-    }
-    const z_path = try allocator.dupeZ(u8, path);
-    defer allocator.free(z_path);
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return allocator.dupe(u8, path);
-    return allocator.dupe(u8, std.mem.span(resolved));
-}
-
-fn localProvenanceKeyForSource(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-    mode: LocalPathMode,
-) ![]u8 {
-    const resolved = switch (mode) {
-        .input => try resolveLocalPathFromCwd(allocator, options.cwd, source),
-        .settings => try resolveLocalPathFromScopeBase(allocator, source, is_project, options.cwd, options.agent_dir),
-    };
-    defer allocator.free(resolved);
-    const identity = try realpathOrResolved(allocator, resolved);
-    defer allocator.free(identity);
-    return std.fmt.allocPrint(allocator, "local:{s}", .{identity});
 }
 
 fn computeLocalWasmLockEntryNoDiagnostics(
