@@ -3352,11 +3352,12 @@ pub fn visibleChatTextAlloc(
             0,
             snapshot.all_expanded,
         );
-        defer {
+        errdefer {
             for (lines) |line| allocator.free(line);
             allocator.free(lines);
         }
         try all_lines.appendSlice(allocator, lines);
+        allocator.free(lines);
     }
 
     const visible_rows = if (snapshot.chat_visible_rows == 0) all_lines.items.len else snapshot.chat_visible_rows;
