@@ -2140,194 +2140,41 @@ pub const ScreenComponent = struct {
 
         if (self.after_snapshot_hook) |hook| hook.run();
 
-        const width = @max(@as(usize, window.width), 1);
-        const footer_text = if (snapshot.extension_footer_lines.len > 0)
-            try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
-        else if (showExecutionPanel(&snapshot))
-            try formatFooterText(ctx.arena, &snapshot, width)
-        else
-            try formatFooterTextForDisplay(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
-        const extension_header_height = snapshot.extension_header_lines.len;
-        const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
-        const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
-        const extension_below_height = extensionWidgetLineCount(snapshot.extension_widgets, .below_editor);
-        const core_prompt_height = try measurePromptHeight(
+        const layout = try computeScreenLayout(
             ctx.arena,
-            self.theme,
-            self.editor,
-            snapshot.pending_editor_images,
-            width,
+            self,
+            &snapshot,
+            @max(@as(usize, window.width), 1),
+            @max(@as(usize, window.height), 1),
         );
-        const prompt_height = core_prompt_height + extension_above_height + extension_editor_height + extension_below_height;
-        const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
-        const execution_height = try measureExecutionPanelHeight(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
-        const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
-        const task_panel_height = taskPanelHeightForWidth(width);
-        const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
-        const reserved_lines: usize = task_panel_height + extension_header_height + prompt_height + queued_height + execution_height + 1 + autocomplete_height + scroll_indicator_height;
-        const window_height: usize = @max(@as(usize, window.height), 1);
-        const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
         var row: usize = 0;
-        if (task_panel_height > 0 and row < window.height) {
+        if (layout.task_panel_height > 0 and row < window.height) {
             const panel_window = window.child(.{
                 .y_off = @intCast(row),
-                .height = @intCast(@min(task_panel_height, @as(usize, window.height) - row)),
+                .height = @intCast(@min(layout.task_panel_height, @as(usize, window.height) - row)),
             });
             _ = try drawTaskPanel(panel_window, .{
                 .window = panel_window,
                 .arena = ctx.arena,
             }, self.keybindings, self.theme, &snapshot, self.now_ms);
         }
-        row += task_panel_height;
+        row += layout.task_panel_height;
 
-        if (extension_header_height > 0 and row < window.height) {
+        if (layout.extension_header_height > 0 and row < window.height) {
             row += drawExtensionHeaderLines(window, row, snapshot.extension_header_lines, self.theme);
         }
 
-        const sel_range: ?chat_rendering.SelectionRange = if (self.state.hasSelection()) blk: {
-            const sr = self.state.getSelectionRange().?;
-            break :blk .{
-                .start_row = sr.start_row,
-                .start_col = sr.start_col,
-                .end_row = sr.end_row,
-                .end_col = sr.end_col,
-            };
-        } else null;
-        var selected_text = std.ArrayList(u8).empty;
-        defer selected_text.deinit(ctx.arena);
-        const chat_metrics = try drawChatViewport(
-            ctx.arena,
-            self.keybindings,
-            self.theme,
-            snapshot.items,
-            window,
-            row,
-            chat_capacity,
-            snapshot.chat_scroll_offset,
-            self.now_ms,
-            snapshot.all_expanded,
-            sel_range,
-            if (self.state.hasSelection()) &selected_text else null,
-        );
-        if (!self.state.selection_active and self.state.hasSelection() and selected_text.items.len > 0) {
-            copySelectedText(ctx.arena, self.state.io, selected_text.items);
-            self.state.clearSelection();
-        }
-        self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, width);
-        row += chat_capacity;
-
-        if (snapshot.chat_scroll_offset > 0 and row < window.height) {
-            self.state.scroll_indicator_row = row;
-            const indicator_text = " \xe2\x86\x91 scrolled  \xe2\x86\x93 Jump to bottom (Ctrl+End) ";
-            const indicator_style = styleForToken(self.theme, .status);
-            const indicator_window = window.child(.{
-                .y_off = @intCast(row),
-                .height = 1,
-            });
-            indicator_window.fill(.{
-                .char = .{ .grapheme = " ", .width = 1 },
-                .style = indicator_style,
-            });
-            const text_width = std.unicode.utf8CountCodepoints(indicator_text) catch indicator_text.len;
-            const x_center: usize = if (width > text_width) (width - text_width) / 2 else 0;
-            _ = indicator_window.printSegment(.{
-                .text = indicator_text,
-                .style = indicator_style,
-            }, .{ .col_offset = @intCast(x_center), .wrap = .none });
-            row += 1;
-        } else {
-            self.state.scroll_indicator_row = null;
-        }
-
-        if (queued_height > 0 and row < window.height) {
-            const queued_window = window.child(.{
-                .y_off = @intCast(row),
-                .height = @intCast(@min(queued_height, @as(usize, window.height) - row)),
-            });
-            _ = try drawQueuedMessages(queued_window, .{
-                .window = queued_window,
-                .arena = ctx.arena,
-            }, self.keybindings, self.theme, &snapshot);
-        }
-        row += queued_height;
-
-        if (execution_height > 0 and row < window.height) {
-            const execution_window = window.child(.{
-                .y_off = @intCast(row),
-                .height = @intCast(@min(execution_height, @as(usize, window.height) - row)),
-            });
-            row += try drawExecutionPanel(
-                execution_window,
-                ctx.arena,
-                self.keybindings,
-                self.theme,
-                &snapshot,
-                self.now_ms,
-            );
-        }
-
-        const prompt_start_row = row + extension_above_height + extension_editor_height;
-        if (extension_above_height > 0 and row < window.height) {
-            row += drawExtensionWidgetLines(window, row, snapshot.extension_widgets, .above_editor, self.theme);
-        }
-        if (snapshot.extension_editor_label) |label| {
-            if (row < window.height) {
-                const editor_label = try std.fmt.allocPrint(ctx.arena, "Extension editor: {s}", .{label});
-                drawFittedLine(window, row, editor_label, styleForToken(self.theme, .status));
-            }
-            row += 1;
-        }
-        if (row < window.height) {
-            const prompt_window = window.child(.{
-                .y_off = @intCast(row),
-                .height = @intCast(@min(core_prompt_height, @as(usize, window.height) - row)),
-            });
-            _ = try drawPromptLines(
-                prompt_window,
-                .{ .window = prompt_window, .arena = ctx.arena },
-                self.theme,
-                self.editor,
-                snapshot.pending_editor_images,
-            );
-        }
-        row += core_prompt_height;
-        if (extension_below_height > 0 and row < window.height) {
-            row += drawExtensionWidgetLines(window, row, snapshot.extension_widgets, .below_editor, self.theme);
-        }
-
-        const editor_window_width = promptEditorWidth(width);
-        const editor_x = promptEditorOffsetX(width);
-        const editor_y = prompt_start_row + promptEditorOffsetY(width);
-        if (editor_y < window.height and @as(usize, window.width) > editor_x) {
-            const editor_window = window.child(.{
-                .x_off = @intCast(editor_x),
-                .y_off = @intCast(editor_y),
-                .width = @intCast(editor_window_width),
-                .height = 1,
-            });
-            _ = try self.editor.draw(editor_window, .{
-                .window = editor_window,
-                .arena = ctx.arena,
-            });
-        }
-
-        if (autocomplete_height > 0 and row < window.height) {
-            const autocomplete_window = window.child(.{
-                .x_off = @intCast(editor_x),
-                .y_off = @intCast(row),
-                .width = @intCast(editor_window_width),
-                .height = @intCast(@min(autocomplete_height, @as(usize, window.height) - row)),
-            });
-            _ = try self.editor.drawAutocomplete(autocomplete_window, .{
-                .window = autocomplete_window,
-                .arena = ctx.arena,
-            });
-        }
-        row += autocomplete_height;
+        row = try self.drawChatSection(window, ctx.arena, &snapshot, layout, row);
+        row = drawScrollIndicatorSection(self, window, layout.width, row, &snapshot);
+        row = try drawQueuedSection(window, ctx.arena, self.keybindings, self.theme, &snapshot, layout.queued_height, row);
+        row = try drawExecutionSection(window, ctx.arena, self.keybindings, self.theme, &snapshot, self.now_ms, layout.execution_height, row);
+        row = try self.drawPromptSection(window, ctx.arena, &snapshot, layout, row);
+        row = try self.drawAutocompleteSection(window, ctx.arena, layout, row);
+        row = try drawContextGaugeSection(window, ctx.arena, self.theme, &snapshot, layout.context_gauge_height, row);
 
         if (row < window.height) {
-            try drawFooterWithTerminal(window, row, footer_text, self.terminal_name, self.theme, ctx.arena);
+            try drawFooterWithTerminal(window, row, layout.footer_text, self.terminal_name, self.theme, ctx.arena);
         }
         row += 1;
 
@@ -2336,7 +2183,307 @@ pub const ScreenComponent = struct {
             .height = @intCast(@min(row, @as(usize, window.height))),
         };
     }
+
+    fn drawChatSection(
+        self: *const ScreenComponent,
+        window: tui.vaxis.Window,
+        allocator: std.mem.Allocator,
+        snapshot: *const RenderStateSnapshot,
+        layout: ScreenLayout,
+        row: usize,
+    ) !usize {
+        const sel_range = currentSelectionRange(self.state);
+        var selected_text = std.ArrayList(u8).empty;
+        defer selected_text.deinit(allocator);
+
+        const chat_metrics = try drawChatViewport(
+            allocator,
+            self.keybindings,
+            self.theme,
+            snapshot.items,
+            window,
+            row,
+            layout.chat_capacity,
+            snapshot.chat_scroll_offset,
+            self.now_ms,
+            snapshot.all_expanded,
+            sel_range,
+            if (sel_range != null) &selected_text else null,
+        );
+        if (!self.state.selection_active and self.state.hasSelection() and selected_text.items.len > 0) {
+            copySelectedText(allocator, self.state.io, selected_text.items);
+            self.state.clearSelection();
+        }
+        self.state.updateChatScrollLayout(chat_metrics.rendered_height, chat_metrics.visible_height, row, layout.width);
+        return row + layout.chat_capacity;
+    }
+
+    fn drawPromptSection(
+        self: *const ScreenComponent,
+        window: tui.vaxis.Window,
+        allocator: std.mem.Allocator,
+        snapshot: *const RenderStateSnapshot,
+        layout: ScreenLayout,
+        row: usize,
+    ) !usize {
+        var next_row = row;
+        const prompt_start_row = next_row + layout.extension_above_height + layout.extension_editor_height;
+
+        if (layout.extension_above_height > 0 and next_row < window.height) {
+            next_row += drawExtensionWidgetLines(window, next_row, snapshot.extension_widgets, .above_editor, self.theme);
+        }
+        if (snapshot.extension_editor_label) |label| {
+            if (next_row < window.height) {
+                const editor_label = try std.fmt.allocPrint(allocator, "Extension editor: {s}", .{label});
+                drawFittedLine(window, next_row, editor_label, styleForToken(self.theme, .status));
+            }
+            next_row += 1;
+        }
+        if (next_row < window.height) {
+            const prompt_window = window.child(.{
+                .y_off = @intCast(next_row),
+                .height = @intCast(@min(layout.core_prompt_height, @as(usize, window.height) - next_row)),
+            });
+            _ = try drawPromptLines(
+                prompt_window,
+                .{ .window = prompt_window, .arena = allocator },
+                self.theme,
+                self.editor,
+                snapshot.pending_editor_images,
+            );
+        }
+        next_row += layout.core_prompt_height;
+        if (layout.extension_below_height > 0 and next_row < window.height) {
+            next_row += drawExtensionWidgetLines(window, next_row, snapshot.extension_widgets, .below_editor, self.theme);
+        }
+
+        if (prompt_start_row + layout.editor_y < window.height and @as(usize, window.width) > layout.editor_x) {
+            const editor_window = window.child(.{
+                .x_off = @intCast(layout.editor_x),
+                .y_off = @intCast(prompt_start_row + layout.editor_y),
+                .width = @intCast(layout.editor_window_width),
+                .height = 1,
+            });
+            _ = try self.editor.draw(editor_window, .{
+                .window = editor_window,
+                .arena = allocator,
+            });
+        }
+        return next_row;
+    }
+
+    fn drawAutocompleteSection(
+        self: *const ScreenComponent,
+        window: tui.vaxis.Window,
+        allocator: std.mem.Allocator,
+        layout: ScreenLayout,
+        row: usize,
+    ) !usize {
+        if (layout.autocomplete_height == 0 or row >= window.height) return row;
+        const autocomplete_window = window.child(.{
+            .x_off = @intCast(layout.editor_x),
+            .y_off = @intCast(row),
+            .width = @intCast(layout.editor_window_width),
+            .height = @intCast(@min(layout.autocomplete_height, @as(usize, window.height) - row)),
+        });
+        _ = try self.editor.drawAutocomplete(autocomplete_window, .{
+            .window = autocomplete_window,
+            .arena = allocator,
+        });
+        return row + layout.autocomplete_height;
+    }
 };
+
+const ScreenLayout = struct {
+    width: usize,
+    footer_text: []u8,
+    extension_header_height: usize,
+    extension_above_height: usize,
+    extension_editor_height: usize,
+    extension_below_height: usize,
+    core_prompt_height: usize,
+    queued_height: usize,
+    execution_height: usize,
+    context_gauge_height: usize,
+    autocomplete_height: usize,
+    task_panel_height: usize,
+    chat_capacity: usize,
+    editor_window_width: usize,
+    editor_x: usize,
+    editor_y: usize,
+};
+
+fn computeScreenLayout(
+    allocator: std.mem.Allocator,
+    screen: *const ScreenComponent,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    window_height: usize,
+) !ScreenLayout {
+    const footer_text = if (snapshot.extension_footer_lines.len > 0)
+        try formatExtensionFooterLineWithTerminal(allocator, null, snapshot, screen.terminal_name, width)
+    else if (showExecutionPanel(snapshot))
+        try formatFooterText(allocator, snapshot, width)
+    else
+        try formatFooterTextForDisplay(allocator, screen.keybindings, snapshot, width, screen.now_ms);
+
+    const extension_header_height = snapshot.extension_header_lines.len;
+    const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
+    const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
+    const extension_below_height = extensionWidgetLineCount(snapshot.extension_widgets, .below_editor);
+    const core_prompt_height = try measurePromptHeight(
+        allocator,
+        screen.theme,
+        screen.editor,
+        snapshot.pending_editor_images,
+        width,
+    );
+    const prompt_height = core_prompt_height + extension_above_height + extension_editor_height + extension_below_height;
+    const queued_height = try measureQueuedMessagesHeight(allocator, screen.keybindings, screen.theme, snapshot, width);
+    const execution_height = try measureExecutionPanelHeight(allocator, screen.keybindings, snapshot, width, screen.now_ms);
+    const context_gauge_height = measureContextGaugeHeight(snapshot, width);
+    const autocomplete_height = try measureAutocompleteHeight(allocator, screen.theme, screen.editor, width);
+    const task_panel_height = taskPanelHeightForWidth(width);
+    const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
+    const reserved_lines: usize = task_panel_height +
+        extension_header_height +
+        prompt_height +
+        queued_height +
+        execution_height +
+        context_gauge_height +
+        1 +
+        autocomplete_height +
+        scroll_indicator_height;
+    const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
+    const editor_window_width = promptEditorWidth(width);
+    const editor_x = promptEditorOffsetX(width);
+
+    return .{
+        .width = width,
+        .footer_text = footer_text,
+        .extension_header_height = extension_header_height,
+        .extension_above_height = extension_above_height,
+        .extension_editor_height = extension_editor_height,
+        .extension_below_height = extension_below_height,
+        .core_prompt_height = core_prompt_height,
+        .queued_height = queued_height,
+        .execution_height = execution_height,
+        .context_gauge_height = context_gauge_height,
+        .autocomplete_height = autocomplete_height,
+        .task_panel_height = task_panel_height,
+        .chat_capacity = chat_capacity,
+        .editor_window_width = editor_window_width,
+        .editor_x = editor_x,
+        .editor_y = promptEditorOffsetY(width),
+    };
+}
+
+fn currentSelectionRange(state: *const AppState) ?chat_rendering.SelectionRange {
+    if (!state.hasSelection()) return null;
+    const selection_range = state.getSelectionRange() orelse return null;
+    return .{
+        .start_row = selection_range.start_row,
+        .start_col = selection_range.start_col,
+        .end_row = selection_range.end_row,
+        .end_col = selection_range.end_col,
+    };
+}
+
+fn drawScrollIndicatorSection(
+    screen: *const ScreenComponent,
+    window: tui.vaxis.Window,
+    width: usize,
+    row: usize,
+    snapshot: *const RenderStateSnapshot,
+) usize {
+    if (snapshot.chat_scroll_offset == 0 or row >= window.height) {
+        screen.state.scroll_indicator_row = null;
+        return row;
+    }
+
+    screen.state.scroll_indicator_row = row;
+    const indicator_text = " \xe2\x86\x91 scrolled  \xe2\x86\x93 Jump to bottom (Ctrl+End) ";
+    const indicator_style = styleForToken(screen.theme, .status);
+    const indicator_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = 1,
+    });
+    indicator_window.fill(.{
+        .char = .{ .grapheme = " ", .width = 1 },
+        .style = indicator_style,
+    });
+    const text_width = std.unicode.utf8CountCodepoints(indicator_text) catch indicator_text.len;
+    const x_center: usize = if (width > text_width) (width - text_width) / 2 else 0;
+    _ = indicator_window.printSegment(.{
+        .text = indicator_text,
+        .style = indicator_style,
+    }, .{ .col_offset = @intCast(x_center), .wrap = .none });
+    return row + 1;
+}
+
+fn drawQueuedSection(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    queued_height: usize,
+    row: usize,
+) !usize {
+    if (queued_height == 0 or row >= window.height) return row;
+    const queued_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = @intCast(@min(queued_height, @as(usize, window.height) - row)),
+    });
+    _ = try drawQueuedMessages(queued_window, .{
+        .window = queued_window,
+        .arena = allocator,
+    }, keybindings, theme, snapshot);
+    return row + queued_height;
+}
+
+fn drawExecutionSection(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    now_ms: i64,
+    execution_height: usize,
+    row: usize,
+) !usize {
+    if (execution_height == 0 or row >= window.height) return row;
+    const execution_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = @intCast(@min(execution_height, @as(usize, window.height) - row)),
+    });
+    const rendered = try drawExecutionPanel(
+        execution_window,
+        allocator,
+        keybindings,
+        theme,
+        snapshot,
+        now_ms,
+    );
+    return row + rendered;
+}
+
+fn drawContextGaugeSection(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    context_gauge_height: usize,
+    row: usize,
+) !usize {
+    if (context_gauge_height == 0 or row >= window.height) return row;
+    const gauge_window = window.child(.{
+        .y_off = @intCast(row),
+        .height = 1,
+    });
+    const rendered = try drawContextGauge(gauge_window, allocator, theme, snapshot);
+    return row + rendered;
+}
 
 pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenComponent, width: usize) ![]const []const u8 {
     var vscreen = try tui.vaxis.Screen.init(allocator, .{
@@ -2610,6 +2757,57 @@ fn executionPanelBadgeText(kind: ActiveOperationKind) []const u8 {
         .tool_execution => "TOOL",
         .agent_wait => "RUN",
     };
+}
+
+fn showContextGauge(snapshot: *const RenderStateSnapshot, width: usize) bool {
+    return width >= 120 and snapshot.context_window > 0 and snapshot.context_percent != null;
+}
+
+fn measureContextGaugeHeight(snapshot: *const RenderStateSnapshot, width: usize) usize {
+    return if (showContextGauge(snapshot, width)) 1 else 0;
+}
+
+fn drawContextGauge(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+) !usize {
+    if (!showContextGauge(snapshot, window.width) or window.height == 0 or window.width == 0) return 0;
+
+    const percent = std.math.clamp(snapshot.context_percent.?, 0.0, 100.0);
+    const ratio = percent / 100.0;
+    const used_tokens = @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(snapshot.context_window)) * ratio)));
+    const used_text = try formatCompactTokenCount(allocator, used_tokens);
+    const total_text = try formatCompactTokenCount(allocator, snapshot.context_window);
+    const label = try std.fmt.allocPrint(
+        allocator,
+        "Ctx {d:.1}% {s}/{s} ",
+        .{ percent, used_text, total_text },
+    );
+
+    var filled_style = styleForToken(theme, contextGaugeToken(percent));
+    filled_style.bold = true;
+    var unfilled_style = styleForToken(theme, .status);
+    unfilled_style.dim = true;
+
+    const gauge = tui.LineGauge{
+        .ratio = ratio,
+        .label = label,
+        .filled_style = filled_style,
+        .unfilled_style = unfilled_style,
+    };
+    const size = try gauge.draw(window, .{
+        .window = window,
+        .arena = allocator,
+    });
+    return @as(usize, size.height);
+}
+
+fn contextGaugeToken(percent: f64) resources_mod.ThemeToken {
+    if (percent >= 85.0) return .@"error";
+    if (percent >= 60.0) return .task_header_accent;
+    return .welcome;
 }
 
 fn drawTaskPanel(

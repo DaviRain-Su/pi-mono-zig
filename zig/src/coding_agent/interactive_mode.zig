@@ -1458,7 +1458,7 @@ test "interactive mode renders tool execution details through a mock backend" {
     defer freeLinesSlice(allocator, lines);
 
     try std.testing.expect(renderedLinesContain(lines, "Read README.md"));
-    try std.testing.expect(renderedLinesContain(lines, "Read result read:"));
+    try std.testing.expect(renderedLinesContain(lines, "completed"));
     try std.testing.expect(renderedLinesContain(lines, "project notes"));
 }
 

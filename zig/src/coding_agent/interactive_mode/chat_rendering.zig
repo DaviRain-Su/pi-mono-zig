@@ -372,6 +372,21 @@ const ToolVisualState = enum {
     @"error",
 };
 
+const ToolBodyKind = enum {
+    none,
+    text,
+    terminal,
+    diff,
+};
+
+const ParsedToolItem = struct {
+    label: []const u8,
+    title: []const u8,
+    body: []const u8,
+    details: []const u8,
+    body_kind: ToolBodyKind,
+};
+
 fn drawToolItem(
     window: tui.vaxis.Window,
     allocator: std.mem.Allocator,
@@ -380,13 +395,12 @@ fn drawToolItem(
     now_ms: i64,
     all_expanded: bool,
 ) !usize {
-    _ = allocator;
     _ = now_ms;
     if (window.height == 0 or window.width == 0) return 0;
 
     const item_text = displayText(item, all_expanded);
     const state = toolVisualState(item.kind, item_text);
-    const split = splitFirstLine(item_text);
+    const parsed = parseToolItem(item.kind, item_text);
 
     const marker = switch (item.kind) {
         .bash_execution => switch (state) {
@@ -401,29 +415,50 @@ fn drawToolItem(
 
     const title_style = toolTitleStyle(theme, item.kind, state);
     const body_style = toolBodyStyle(theme, item.kind, state);
+    const detail_style = toolDetailStyle(theme, state);
 
     var row: usize = 0;
-    if (split.title.len > 0 and window.width > 2) {
-        _ = window.printSegment(.{
-            .text = marker,
-            .style = title_style,
-        }, .{
-            .wrap = .none,
-            .row_offset = @intCast(row),
-        });
-        const title_window = window.child(.{
-            .x_off = 2,
-            .width = window.width - 2,
+    if (row < window.height) {
+        const header_window = window.child(.{
             .y_off = @intCast(row),
-            .height = window.height - @as(u16, @intCast(row)),
+            .height = 1,
         });
-        row += drawWrappedText(title_window, 0, split.title, title_style);
-    } else {
-        row += drawWrappedText(window, row, if (split.title.len > 0) split.title else marker, title_style);
+        const tags = [_]tui.Tag{
+            .{
+                .label = parsed.label,
+                .style = title_style,
+            },
+            .{
+                .label = toolStateLabel(item.kind, state),
+                .style = detail_style,
+            },
+        };
+        const tag_group = tui.TagGroup{ .tags = &tags };
+        const tag_size = try tag_group.draw(header_window, .{
+            .window = header_window,
+            .arena = allocator,
+        });
+
+        if (parsed.title.len > 0 and @as(usize, header_window.width) > @as(usize, tag_size.width) + 2) {
+            const title_window = header_window.child(.{
+                .x_off = @intCast(@as(usize, tag_size.width) + 1),
+                .width = header_window.width - tag_size.width - 1,
+            });
+            const title_text = try std.fmt.allocPrint(allocator, "{s} {s}", .{ marker, parsed.title });
+            row += drawWrappedText(title_window, 0, title_text, title_style);
+        } else {
+            row += 1;
+        }
     }
 
-    if (split.body.len > 0 and row < window.height) {
-        const body_window = if (window.width > 2)
+    if (parsed.body.len > 0 and row < window.height) {
+        const remaining = @as(usize, window.height) - row;
+        const body_height = if (parsed.details.len > 0 and remaining > 1) remaining - 1 else remaining;
+        row += try drawToolBody(window, allocator, theme, parsed, row, body_height, body_style);
+    }
+
+    if (parsed.details.len > 0 and row < window.height) {
+        const details_window = if (window.width > 4)
             window.child(.{
                 .x_off = 2,
                 .width = window.width - 2,
@@ -435,10 +470,276 @@ fn drawToolItem(
                 .y_off = @intCast(row),
                 .height = window.height - @as(u16, @intCast(row)),
             });
-        row += drawWrappedText(body_window, 0, split.body, body_style);
+        const details_text = try std.fmt.allocPrint(allocator, "Details: {s}", .{parsed.details});
+        row += drawWrappedText(details_window, 0, details_text, detail_style);
     }
 
     return @max(@as(usize, 1), row);
+}
+
+fn drawToolBody(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    parsed: ParsedToolItem,
+    start_row: usize,
+    max_height: usize,
+    style: tui.vaxis.Cell.Style,
+) !usize {
+    if (max_height == 0) return 0;
+    const body_window = if (window.width > 2)
+        window.child(.{
+            .x_off = 2,
+            .width = window.width - 2,
+            .y_off = @intCast(start_row),
+            .height = @intCast(@min(max_height, @as(usize, window.height) - start_row)),
+        })
+    else
+        window.child(.{
+            .y_off = @intCast(start_row),
+            .height = @intCast(@min(max_height, @as(usize, window.height) - start_row)),
+        });
+
+    return switch (parsed.body_kind) {
+        .none => 0,
+        .text => drawWrappedText(body_window, 0, parsed.body, style),
+        .terminal => try drawTerminalPanelBody(body_window, allocator, parsed.body, style),
+        .diff => try drawDiffViewerBody(body_window, allocator, theme, parsed.body),
+    };
+}
+
+fn drawTerminalPanelBody(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    style: tui.vaxis.Cell.Style,
+) !usize {
+    const lines = try buildTerminalLines(allocator, text, style);
+    const panel = tui.TerminalPanel{
+        .lines = lines,
+        .style = style,
+    };
+    const size = try panel.draw(window, .{
+        .window = window,
+        .arena = allocator,
+    });
+    return @as(usize, size.height);
+}
+
+fn buildTerminalLines(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    style: tui.vaxis.Cell.Style,
+) ![]tui.TerminalLine {
+    if (text.len == 0) return &.{};
+    const line_count = countLogicalLines(text);
+    const lines = try allocator.alloc(tui.TerminalLine, line_count);
+    var split = std.mem.splitScalar(u8, text, '\n');
+    var index: usize = 0;
+    while (split.next()) |line| : (index += 1) {
+        lines[index] = .{
+            .text = line,
+            .style = style,
+        };
+    }
+    return lines;
+}
+
+fn drawDiffViewerBody(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    text: []const u8,
+) !usize {
+    const lines = try buildDiffLines(allocator, text);
+    const viewer = tui.DiffViewer{
+        .lines = lines,
+        .show_line_numbers = false,
+        .line_number_width = 0,
+        .gutter_width = 1,
+        .header_style = diffHeaderStyle(theme),
+        .added_style = diffAddedStyle(theme),
+        .removed_style = diffRemovedStyle(theme),
+        .added_bg = diffAddedBackground(theme),
+        .removed_bg = diffRemovedBackground(theme),
+        .context_style = styleForToken(theme, .text),
+    };
+    const size = try viewer.draw(window, .{
+        .window = window,
+        .arena = allocator,
+    });
+    return @as(usize, size.height);
+}
+
+fn buildDiffLines(allocator: std.mem.Allocator, text: []const u8) ![]tui.DiffLine {
+    if (text.len == 0) return &.{};
+    const line_count = countLogicalLines(text);
+    const lines = try allocator.alloc(tui.DiffLine, line_count);
+    var split = std.mem.splitScalar(u8, text, '\n');
+    var index: usize = 0;
+    while (split.next()) |line| : (index += 1) {
+        if (std.mem.startsWith(u8, line, "+")) {
+            lines[index] = .{ .text = line[1..], .line_type = .added };
+        } else if (std.mem.startsWith(u8, line, "-")) {
+            lines[index] = .{ .text = line[1..], .line_type = .removed };
+        } else if (std.mem.startsWith(u8, line, "@@") or
+            std.mem.startsWith(u8, line, "+++ ") or
+            std.mem.startsWith(u8, line, "--- "))
+        {
+            lines[index] = .{ .text = line, .line_type = .header };
+        } else {
+            lines[index] = .{ .text = line, .line_type = .context };
+        }
+    }
+    return lines;
+}
+
+fn parseToolItem(kind: ChatKind, text: []const u8) ParsedToolItem {
+    const split = splitFirstLine(text);
+    return switch (kind) {
+        .bash_execution => parseBashExecutionItem(split),
+        .tool_call => parseToolCallItem(split),
+        .tool_result => parseToolResultItem(split),
+        else => .{
+            .label = "tool",
+            .title = split.title,
+            .body = split.body,
+            .details = "",
+            .body_kind = if (split.body.len > 0) .text else .none,
+        },
+    };
+}
+
+fn parseBashExecutionItem(split: LineSplit) ParsedToolItem {
+    const details = splitToolDetails(split.body);
+    return .{
+        .label = "bash",
+        .title = trimBashCommand(split.title),
+        .body = details.body,
+        .details = details.details,
+        .body_kind = if (details.body.len > 0) .terminal else .none,
+    };
+}
+
+fn parseToolCallItem(split: LineSplit) ParsedToolItem {
+    const body_kind: ToolBodyKind = if (looksLikeDiffBody(split.body))
+        .diff
+    else if (split.body.len > 0)
+        .text
+    else
+        .none;
+    if (std.mem.startsWith(u8, split.title, "$ ")) {
+        return .{
+            .label = "bash",
+            .title = trimBashCommand(split.title),
+            .body = split.body,
+            .details = "",
+            .body_kind = if (split.body.len > 0) .terminal else .none,
+        };
+    }
+    if (std.mem.startsWith(u8, split.title, "Read ")) {
+        return .{ .label = "read", .title = split.title, .body = split.body, .details = "", .body_kind = body_kind };
+    }
+    if (std.mem.startsWith(u8, split.title, "Write ")) {
+        return .{ .label = "write", .title = split.title, .body = split.body, .details = "", .body_kind = body_kind };
+    }
+    if (std.mem.startsWith(u8, split.title, "Edit ")) {
+        return .{ .label = "edit", .title = split.title, .body = split.body, .details = "", .body_kind = body_kind };
+    }
+    if (std.mem.startsWith(u8, split.title, "Gate ")) {
+        return .{ .label = "gate", .title = split.title, .body = split.body, .details = "", .body_kind = body_kind };
+    }
+    return .{ .label = "tool", .title = split.title, .body = split.body, .details = "", .body_kind = body_kind };
+}
+
+fn parseToolResultItem(split: LineSplit) ParsedToolItem {
+    const prefix_labels = [_]struct { prefix: []const u8, title: []const u8 }{
+        .{ .prefix = "Tool result ", .title = "completed" },
+        .{ .prefix = "Tool error ", .title = "failed" },
+        .{ .prefix = "Gate blocked ", .title = "blocked" },
+        .{ .prefix = "Read result ", .title = "completed" },
+        .{ .prefix = "Write result ", .title = "completed" },
+        .{ .prefix = "Edit result ", .title = "completed" },
+    };
+    for (prefix_labels) |entry| {
+        if (!std.mem.startsWith(u8, split.title, entry.prefix)) continue;
+        const remainder = split.title[entry.prefix.len..];
+        const tool_name, const inline_summary = splitToolNameAndSummary(remainder);
+        const details = splitToolDetails(split.body);
+        const body_kind: ToolBodyKind = if (std.mem.eql(u8, tool_name, "bash"))
+            if (details.body.len > 0) ToolBodyKind.terminal else .none
+        else if (details.body.len > 0)
+            ToolBodyKind.text
+        else
+            .none;
+        return .{
+            .label = if (tool_name.len > 0) tool_name else "result",
+            .title = if (inline_summary.len > 0) inline_summary else entry.title,
+            .body = details.body,
+            .details = details.details,
+            .body_kind = body_kind,
+        };
+    }
+    return .{
+        .label = "result",
+        .title = split.title,
+        .body = split.body,
+        .details = "",
+        .body_kind = if (split.body.len > 0) .text else .none,
+    };
+}
+
+const ToolDetailsSplit = struct {
+    body: []const u8,
+    details: []const u8,
+};
+
+fn splitToolDetails(text: []const u8) ToolDetailsSplit {
+    const marker = "\nDetails: ";
+    if (std.mem.indexOf(u8, text, marker)) |index| {
+        return .{
+            .body = text[0..index],
+            .details = text[index + marker.len ..],
+        };
+    }
+    if (std.mem.startsWith(u8, text, "Details: ")) {
+        return .{
+            .body = "",
+            .details = text["Details: ".len..],
+        };
+    }
+    return .{ .body = text, .details = "" };
+}
+
+fn trimBashCommand(title: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, title, "$ "))
+        title[2..]
+    else
+        title;
+}
+
+fn splitToolNameAndSummary(remainder: []const u8) struct { []const u8, []const u8 } {
+    if (std.mem.indexOfScalar(u8, remainder, ':')) |colon_index| {
+        const tool_name = std.mem.trim(u8, remainder[0..colon_index], " ");
+        const summary = std.mem.trim(u8, remainder[colon_index + 1 ..], " ");
+        return .{ tool_name, summary };
+    }
+    return .{ std.mem.trim(u8, remainder, " "), "" };
+}
+
+fn looksLikeDiffBody(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "+++ new") != null or
+        std.mem.indexOf(u8, text, "@@ edit") != null or
+        std.mem.indexOf(u8, text, "--- old") != null;
+}
+
+fn countLogicalLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var count: usize = 1;
+    for (text) |byte| {
+        if (byte == '\n') count += 1;
+    }
+    return count;
 }
 
 fn toolVisualState(kind: ChatKind, text: []const u8) ToolVisualState {
@@ -484,6 +785,55 @@ fn toolBodyStyle(
         .pending => styleForToken(theme, .role_tool_call),
         .success => styleForToken(theme, .role_tool_result),
         .@"error" => styleForToken(theme, .@"error"),
+    };
+}
+
+fn toolDetailStyle(theme: ?*const resources_mod.Theme, state: ToolVisualState) tui.vaxis.Cell.Style {
+    var style = switch (state) {
+        .pending => styleForToken(theme, .status),
+        .success => styleForToken(theme, .status),
+        .@"error" => styleForToken(theme, .@"error"),
+    };
+    style.dim = true;
+    return style;
+}
+
+fn diffHeaderStyle(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    var style = styleForToken(theme, .task_header_accent);
+    style.bold = true;
+    return style;
+}
+
+fn diffAddedStyle(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    return styleForToken(theme, .role_tool_result);
+}
+
+fn diffRemovedStyle(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    return styleForToken(theme, .@"error");
+}
+
+fn diffAddedBackground(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    return .{ .bg = diffAddedStyle(theme).bg };
+}
+
+fn diffRemovedBackground(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    return .{ .bg = diffRemovedStyle(theme).bg };
+}
+
+fn toolStateLabel(kind: ChatKind, state: ToolVisualState) []const u8 {
+    return switch (kind) {
+        .tool_call => "CALL",
+        .tool_result => switch (state) {
+            .pending => "waiting",
+            .success => "completed",
+            .@"error" => "failed",
+        },
+        .bash_execution => switch (state) {
+            .pending => "running",
+            .success => "completed",
+            .@"error" => "failed",
+        },
+        else => "OK",
     };
 }
 
@@ -629,17 +979,22 @@ fn estimateItemRowsFull(item: ChatItem, width: usize, all_expanded: bool) usize 
         .assistant => 1 + estimateWrappedRows(item_text, width),
         .markdown => estimateWrappedRows(item_text, width),
         .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item_text, width - 2)),
-        .tool_call, .tool_result, .bash_execution => estimateToolRows(item_text, width),
+        .tool_call, .tool_result, .bash_execution => estimateToolRows(item.kind, item_text, width),
         else => estimateWrappedRows(item_text, width),
     };
 }
 
-fn estimateToolRows(text: []const u8, width: usize) usize {
+fn estimateToolRows(kind: ChatKind, text: []const u8, width: usize) usize {
     if (width == 0) return 1;
-    const split = splitFirstLine(text);
-    var rows = estimateWrappedRows(split.title, @max(width -| 2, 1));
-    if (split.body.len > 0) {
-        rows += estimateWrappedRows(split.body, @max(width -| 2, 1));
+    const parsed = parseToolItem(kind, text);
+    var rows: usize = 1;
+    switch (parsed.body_kind) {
+        .none => {},
+        .text => rows += estimateWrappedRows(parsed.body, @max(width -| 2, 1)),
+        .terminal, .diff => rows += countLogicalLines(parsed.body),
+    }
+    if (parsed.details.len > 0) {
+        rows += estimateWrappedRows(parsed.details, @max(width -| 2, 1));
     }
     return @max(rows, 1);
 }
