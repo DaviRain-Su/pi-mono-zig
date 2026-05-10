@@ -6,6 +6,12 @@
 
 - Added `kimi-code-openai` default-model, API-key login, and display-name support for OpenAI-compatible Kimi Code.
 - Added Together AI to built-in provider setup, `/login` API-key auth, and default model resolution ([#3624](https://github.com/earendil-works/pi-mono/pull/3624) by [@Nutlope](https://github.com/Nutlope)).
+- Extracted TUI widgets into standalone `zig/vaxis-widgets` library with 26 components (Box, Text, Paragraph, List, Table, Tabs, Sparkline, Gauge, LineGauge, BarChart, Scrollbar, Chart, Canvas, Split, Placeholder, StatusBar, Calendar, Tree, Input, Popup, SelectList, Viewport, Image, Loader, Flex, Clear) and core drawing infrastructure.
+- Added Calendar, Tree, Input, and Popup widgets to the TUI component suite.
+
+### Changed
+
+- Decoupled theme system from `DrawContext` and all widgets; components now accept explicit `vaxis.Cell.Style` parameters instead of looking up styles via theme.
 
 ### Fixed
 
