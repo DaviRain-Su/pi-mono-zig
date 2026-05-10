@@ -20,6 +20,13 @@ pub const CornerStyle = enum {
     rounded,
 };
 
+pub const Borders = packed struct {
+    top: bool = true,
+    right: bool = true,
+    bottom: bool = true,
+    left: bool = true,
+};
+
 const BorderGlyphs = struct {
     top_left: []const u8,
     top_right: []const u8,
@@ -35,6 +42,7 @@ pub const Box = struct {
     theme: ?*const resources_mod.Theme = null,
     border_style: BorderStyle = .single,
     corner_style: CornerStyle = .square,
+    borders: Borders = .{},
     title: []const u8 = "",
     title_alignment: layout.AlignItems = .start,
     children: std.ArrayList(draw_mod.Component) = .empty,
@@ -124,15 +132,40 @@ pub const Box = struct {
 
     fn borderStyle(self: *const Box, theme: ?*const resources_mod.Theme) ?vaxis.Window.BorderOptions {
         if (self.border_style == .none) return null;
+        const style: vaxis.Cell.Style = if (theme) |active_theme| style_mod.styleFor(active_theme, .box_border) else .{};
+        const glyphs: vaxis.Window.BorderOptions.Glyphs = switch (self.border_style) {
+            .none => unreachable,
+            .single => if (self.corner_style == .rounded) .single_rounded else .single_square,
+            .double => .{ .custom = .{ "╔", "═", "╗", "║", "╝", "╚" } },
+            .thick => .{ .custom = .{ "┏", "━", "┓", "┃", "┛", "┗" } },
+        };
+        if (self.borders.top and self.borders.right and self.borders.bottom and self.borders.left) {
+            return .{ .where = .all, .style = style, .glyphs = glyphs };
+        }
+        if (!self.borders.top and !self.borders.right and !self.borders.bottom and !self.borders.left) {
+            return .{ .where = .none, .style = style, .glyphs = glyphs };
+        }
+        if (self.borders.top and !self.borders.right and !self.borders.bottom and !self.borders.left) {
+            return .{ .where = .top, .style = style, .glyphs = glyphs };
+        }
+        if (!self.borders.top and self.borders.right and !self.borders.bottom and !self.borders.left) {
+            return .{ .where = .right, .style = style, .glyphs = glyphs };
+        }
+        if (!self.borders.top and !self.borders.right and self.borders.bottom and !self.borders.left) {
+            return .{ .where = .bottom, .style = style, .glyphs = glyphs };
+        }
+        if (!self.borders.top and !self.borders.right and !self.borders.bottom and self.borders.left) {
+            return .{ .where = .left, .style = style, .glyphs = glyphs };
+        }
         return .{
-            .where = .all,
-            .style = if (theme) |active_theme| style_mod.styleFor(active_theme, .box_border) else .{},
-            .glyphs = switch (self.border_style) {
-                .none => unreachable,
-                .single => if (self.corner_style == .rounded) .single_rounded else .single_square,
-                .double => .{ .custom = .{ "╔", "═", "╗", "║", "╝", "╚" } },
-                .thick => .{ .custom = .{ "┏", "━", "┓", "┃", "┛", "┗" } },
-            },
+            .where = .{ .other = .{
+                .top = self.borders.top,
+                .right = self.borders.right,
+                .bottom = self.borders.bottom,
+                .left = self.borders.left,
+            } },
+            .style = style,
+            .glyphs = glyphs,
         };
     }
 
@@ -382,4 +415,24 @@ test "box supports centered and right-aligned title" {
     var right_screen = try test_helpers.renderToScreen(right.drawComponent(), 8, 3);
     defer right_screen.deinit(std.testing.allocator);
     try test_helpers.expectCell(&right_screen, 5, 0, "B", .{});
+}
+
+test "box supports per-side border control" {
+    const text = @import("text.zig").Text{
+        .text = "x",
+        .padding_x = 0,
+        .padding_y = 0,
+    };
+
+    var top_only = Box.init(0, 0);
+    defer top_only.deinit(std.testing.allocator);
+    top_only.borders = .{ .top = true, .right = false, .bottom = false, .left = false };
+    try top_only.addChild(std.testing.allocator, text.drawComponent());
+
+    var screen = try test_helpers.renderToScreen(top_only.drawComponent(), 6, 3);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "─", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "x", .{});
+    try test_helpers.expectCell(&screen, 0, 2, " ", .{});
 }
