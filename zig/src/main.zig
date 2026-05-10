@@ -17,6 +17,9 @@ const tools_common = @import("coding_agent/tools/common.zig");
 const extension_runtime = @import("coding_agent/extensions/extension_runtime.zig");
 const tool_adapters = @import("coding_agent/interactive_mode/tool_adapters.zig");
 const json_event_wire = @import("coding_agent/modes/json_event_wire.zig");
+const json_format = @import("coding_agent/shared/json_format.zig");
+
+const writeJsonStringValue = json_format.writeJsonString;
 const builtin = @import("builtin");
 const cli_test = if (builtin.is_test) @import("cli/test_harness.zig") else struct {};
 
@@ -876,12 +879,6 @@ fn settingsWithInstalledPackagePolicies(
         try root.object.put(allocator, try allocator.dupe(u8, "extensionPolicies"), .{ .object = policies });
     }
     return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 });
-}
-
-fn writeJsonStringValue(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
-    defer allocator.free(encoded);
-    try writer.writeAll(encoded);
 }
 
 fn temporaryTypeScriptPolicyKey(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

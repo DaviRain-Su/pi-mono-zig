@@ -2,10 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = @import("ai");
 const agent = @import("agent");
+const json_format = @import("../shared/json_format.zig");
 const json_event_wire = @import("json_event_wire.zig");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const tool_selection = @import("../tool_selection.zig");
+
+const writeJsonString = json_format.writeJsonString;
 
 pub const trusted_bundle_origin = "pi-webview://bundle";
 
@@ -815,15 +818,6 @@ fn writeUsizeField(
     try writer.print("\"{s}\":{d}", .{ name, value });
 }
 
-fn writeJsonString(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    value: []const u8,
-) !void {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
-    defer allocator.free(encoded);
-    try writer.writeAll(encoded);
-}
 
 fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "file://")) return false;

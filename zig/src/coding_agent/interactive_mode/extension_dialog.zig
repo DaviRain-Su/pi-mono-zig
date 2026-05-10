@@ -1,6 +1,9 @@
 const std = @import("std");
 const tui = @import("tui");
+const json_format = @import("../shared/json_format.zig");
 const keybindings_mod = @import("../shared/keybindings.zig");
+
+const writeJsonString = json_format.writeJsonString;
 
 pub const DialogKind = enum {
     select,
@@ -152,8 +155,3 @@ fn matchesEditorAction(
     return keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) == action;
 }
 
-fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
-    defer allocator.free(encoded);
-    try writer.writeAll(encoded);
-}

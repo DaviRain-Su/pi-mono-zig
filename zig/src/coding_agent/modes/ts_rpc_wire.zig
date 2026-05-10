@@ -1,4 +1,11 @@
 const std = @import("std");
+const json_format = @import("../shared/json_format.zig");
+
+/// Re-exported from coding_agent/shared/json_format.zig so the historical
+/// `ts_rpc_wire.writeJsonString` import path keeps working. Internal callers
+/// in this file just use `writeJsonString(...)` via the file-scope alias
+/// below; new code should prefer `json_format.writeJsonString` directly.
+pub const writeJsonString = json_format.writeJsonString;
 
 pub const command_types = [_][]const u8{
     "prompt",
@@ -301,12 +308,6 @@ pub fn writeIdField(allocator: std.mem.Allocator, writer: *std.Io.Writer, id: ?[
         try writeJsonString(allocator, writer, id_string);
         try writer.writeAll(",");
     }
-}
-
-pub fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
-    defer allocator.free(json);
-    try writer.writeAll(json);
 }
 
 fn objectParseErrorDetail(allocator: std.mem.Allocator, line: []const u8, object_start: usize) ![]u8 {

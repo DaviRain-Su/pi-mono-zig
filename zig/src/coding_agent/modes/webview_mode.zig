@@ -1,10 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ai = @import("ai");
+const json_format = @import("../shared/json_format.zig");
 const session_mod = @import("../sessions/session.zig");
 const tool_selection = @import("../tool_selection.zig");
 const webview_bridge = @import("webview_bridge.zig");
 const webview_platform = @import("webview_platform.zig");
+
+const writeJsonString = json_format.writeJsonString;
 
 const frontend_asset_relative_path = "share/pi/webview/index.html";
 const source_asset_relative_path = "assets/webview/index.html";
@@ -703,16 +706,6 @@ fn writeStringArrayField(
         try writeJsonString(allocator, writer, value);
     }
     try writer.writeAll("]");
-}
-
-fn writeJsonString(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    value: []const u8,
-) !void {
-    const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});
-    defer allocator.free(encoded);
-    try writer.writeAll(encoded);
 }
 
 fn isEnabledEnv(env_map: *const std.process.Environ.Map, key: []const u8) bool {
