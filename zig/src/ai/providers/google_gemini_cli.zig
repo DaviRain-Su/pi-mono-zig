@@ -35,7 +35,7 @@ pub const GoogleGeminiCliProvider = struct {
         errdefer stream_instance.deinit();
 
         const auth = resolveAuthCredentials(allocator, if (options) |stream_options| stream_options.api_key else null) catch |err| {
-            try emitAuthError(allocator, &stream_instance, model, authErrorMessage(err));
+            try provider_error.pushTerminalStreamError(allocator, &stream_instance, model, authErrorMessage(err));
             return stream_instance;
         };
         defer {
@@ -247,31 +247,6 @@ fn authErrorMessage(err: CredentialError) []const u8 {
         error.MissingTokenOrProjectId => "Missing token or projectId in Google Cloud credentials. Use /login to re-authenticate.",
         error.OutOfMemory => "Out of memory while preparing Google Cloud Code Assist credentials.",
     };
-}
-
-fn emitAuthError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    message_text: []const u8,
-) !void {
-    const error_message = try allocator.dupe(u8, message_text);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_ptr.end(message);
 }
 
 fn parseSseStreamLines(

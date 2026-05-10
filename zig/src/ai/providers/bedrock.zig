@@ -175,7 +175,7 @@ pub const BedrockProvider = struct {
         }
 
         const auth = resolveBedrockAuth(allocator, options) catch |err| {
-            try emitAuthError(allocator, stream_instance, model, authErrorMessage(err));
+            try provider_error.pushTerminalStreamError(allocator, stream_instance, model, authErrorMessage(err));
             return;
         };
         defer auth.deinit(allocator);
@@ -2435,27 +2435,6 @@ test "ISS-041 mapStopReason aligns Bedrock safety stops with terminal errors" {
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("guardrail_intervened"));
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("content_filtered"));
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("future_stop_reason"));
-}
-
-fn emitAuthError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    message_text: []const u8,
-) !void {
-    const error_message = try allocator.dupe(u8, message_text);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{ .event_type = .error_event, .error_message = error_message, .message = message });
-    stream_ptr.end(message);
 }
 
 fn authErrorMessage(err: anyerror) []const u8 {

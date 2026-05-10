@@ -30,7 +30,6 @@ pub const OpenAICodexResponsesProvider = struct {
     pub const stream = BaseProvider.stream;
     pub const streamSimple = BaseProvider.streamSimple;
 
-
     fn streamProduction(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -44,7 +43,8 @@ pub const OpenAICodexResponsesProvider = struct {
 
         if (resolved == null) {
             const error_message = try std.fmt.allocPrint(allocator, "No API key for provider: {s}", .{model.provider});
-            emitErrorMessage(stream_instance, model, error_message);
+            defer allocator.free(error_message);
+            try provider_error.pushTerminalStreamError(allocator, stream_instance, model, error_message);
             return;
         }
 
@@ -53,7 +53,8 @@ pub const OpenAICodexResponsesProvider = struct {
         const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key, " \t\r\n"));
         const account_id = extractAccountId(allocator, normalized_token) catch |err| {
             const error_message = try std.fmt.allocPrint(allocator, "Invalid Codex API key: {s}", .{@errorName(err)});
-            emitErrorMessage(stream_instance, model, error_message);
+            defer allocator.free(error_message);
+            try provider_error.pushTerminalStreamError(allocator, stream_instance, model, error_message);
             return;
         };
         defer allocator.free(account_id);
@@ -65,7 +66,8 @@ pub const OpenAICodexResponsesProvider = struct {
             if (stream_options.on_payload) |callback| {
                 const maybe_replacement = callback(allocator, payload, model) catch |err| {
                     const error_message = try std.fmt.allocPrint(allocator, "onPayload callback failed: {s}", .{@errorName(err)});
-                    emitErrorMessage(stream_instance, model, error_message);
+                    defer allocator.free(error_message);
+                    try provider_error.pushTerminalStreamError(allocator, stream_instance, model, error_message);
                     return;
                 };
                 if (maybe_replacement) |replacement| {
@@ -102,7 +104,8 @@ pub const OpenAICodexResponsesProvider = struct {
                 if (response.response_headers) |response_headers| {
                     callback(response.status, response_headers, model) catch |err| {
                         const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
-                        emitErrorMessage(stream_instance, model, error_message);
+                        defer allocator.free(error_message);
+                        try provider_error.pushTerminalStreamError(allocator, stream_instance, model, error_message);
                         return;
                     };
                 } else {
@@ -110,7 +113,8 @@ pub const OpenAICodexResponsesProvider = struct {
                     defer response_headers.deinit();
                     callback(response.status, response_headers, model) catch |err| {
                         const error_message = try std.fmt.allocPrint(allocator, "onResponse callback failed: {s}", .{@errorName(err)});
-                        emitErrorMessage(stream_instance, model, error_message);
+                        defer allocator.free(error_message);
+                        try provider_error.pushTerminalStreamError(allocator, stream_instance, model, error_message);
                         return;
                     };
                 }
@@ -127,29 +131,6 @@ pub const OpenAICodexResponsesProvider = struct {
         try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
 };
-
-fn emitErrorMessage(
-    stream_instance: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    error_message: []const u8,
-) void {
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_instance.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_instance.end(message);
-}
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,

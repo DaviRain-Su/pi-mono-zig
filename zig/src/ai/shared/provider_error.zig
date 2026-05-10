@@ -3,6 +3,31 @@ const abort_helper = @import("abort_signal.zig");
 const event_stream = @import("../event_stream.zig");
 const types = @import("../types.zig");
 
+pub fn pushTerminalStreamError(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    message_text: []const u8,
+) !void {
+    const error_message = try allocator.dupe(u8, message_text);
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+    stream_ptr.push(.{
+        .event_type = .error_event,
+        .error_message = error_message,
+        .message = message,
+    });
+    stream_ptr.end(message);
+}
+
 pub const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 512;
 pub const MAX_PROVIDER_ERROR_BODY_READ_BYTES: usize = MAX_PROVIDER_ERROR_BODY_BYTES + 1;
 

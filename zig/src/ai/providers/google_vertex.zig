@@ -121,7 +121,7 @@ pub const GoogleVertexProvider = struct {
         errdefer stream_instance.deinit();
 
         const auth_header = resolveVertexAuthHeader(allocator, io, options) catch |err| {
-            try emitAuthError(allocator, &stream_instance, model, authErrorMessage(err));
+            try provider_error.pushTerminalStreamError(allocator, &stream_instance, model, authErrorMessage(err));
             return stream_instance;
         };
         defer auth_header.deinit(allocator);
@@ -1119,31 +1119,6 @@ fn processVertexFunctionCallPart(
         .content_index = @intCast(content_index),
         .tool_call = state.content_blocks.items[content_index].tool_call,
     });
-}
-
-fn emitAuthError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    message_text: []const u8,
-) !void {
-    const error_message = try allocator.dupe(u8, message_text);
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_ptr.end(message);
 }
 
 fn authErrorMessage(err: anyerror) []const u8 {

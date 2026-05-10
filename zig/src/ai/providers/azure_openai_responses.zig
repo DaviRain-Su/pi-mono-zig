@@ -212,42 +212,6 @@ pub fn buildRequestSnapshotValueWithEnv(
     return .{ .object = snapshot };
 }
 
-fn emitProviderError(
-    allocator: std.mem.Allocator,
-    stream_instance: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    err: anyerror,
-) !event_stream.AssistantMessageEventStream {
-    const error_message = try allocator.dupe(u8, @errorName(err));
-    return emitErrorMessage(allocator, stream_instance, model, error_message);
-}
-
-fn emitErrorMessage(
-    allocator: std.mem.Allocator,
-    stream_instance: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-    error_message: []const u8,
-) !event_stream.AssistantMessageEventStream {
-    _ = allocator;
-    const message = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_instance.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_instance.end(message);
-    return stream_instance.*;
-}
-
 fn resolveDeploymentName(allocator: std.mem.Allocator, model_id: []const u8, options: ?types.StreamOptions) ![]const u8 {
     const env_value = try loadEnvOptional(allocator, AZURE_DEPLOYMENT_MAP_ENV);
     defer if (env_value) |value| allocator.free(value);
