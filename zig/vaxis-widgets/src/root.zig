@@ -98,6 +98,18 @@ pub const ResizableSplit = @import("components/resizable_split.zig").ResizableSp
 pub const Wizard = @import("components/wizard.zig").Wizard;
 pub const WizardStep = @import("components/wizard.zig").WizardStep;
 
+// Utility / display
+pub const Tag = @import("components/tag.zig").Tag;
+pub const TagGroup = @import("components/tag.zig").TagGroup;
+pub const Badge = @import("components/badge.zig").Badge;
+pub const Meter = @import("components/meter.zig").Meter;
+pub const IndeterminateProgress = @import("components/progress.zig").IndeterminateProgress;
+pub const Spinner = @import("components/progress.zig").Spinner;
+pub const TerminalPanel = @import("components/terminal_panel.zig").TerminalPanel;
+pub const TerminalLine = @import("components/terminal_panel.zig").TerminalLine;
+pub const MetricCard = @import("components/metric_card.zig").MetricCard;
+pub const TrendDirection = @import("components/metric_card.zig").TrendDirection;
+
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -146,6 +158,12 @@ pub const components = struct {
     pub const file_tree = @import("components/file_tree.zig");
     pub const resizable_split = @import("components/resizable_split.zig");
     pub const wizard = @import("components/wizard.zig");
+    pub const tag = @import("components/tag.zig");
+    pub const badge = @import("components/badge.zig");
+    pub const meter = @import("components/meter.zig");
+    pub const progress = @import("components/progress.zig");
+    pub const terminal_panel = @import("components/terminal_panel.zig");
+    pub const metric_card = @import("components/metric_card.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;

@@ -182,6 +182,18 @@ pub const ResizableSplit = vw.ResizableSplit;
 pub const Wizard = vw.Wizard;
 pub const WizardStep = vw.WizardStep;
 
+// Utility / display
+pub const Tag = vw.Tag;
+pub const TagGroup = vw.TagGroup;
+pub const Badge = vw.Badge;
+pub const Meter = vw.Meter;
+pub const IndeterminateProgress = vw.IndeterminateProgress;
+pub const Spinner = vw.Spinner;
+pub const TerminalPanel = vw.TerminalPanel;
+pub const TerminalLine = vw.TerminalLine;
+pub const MetricCard = vw.MetricCard;
+pub const TrendDirection = vw.TrendDirection;
+
 test {
     _ = @import("cell_rows.zig");
     _ = @import("style.zig");
