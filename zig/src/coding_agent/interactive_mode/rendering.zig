@@ -2930,6 +2930,7 @@ pub const OverlayPanelComponent = struct {
                         .select, .confirm => {
                             dialog.list.theme = self.theme;
                             dialog.list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
+                            dialog.list.show_scrollbar = true;
                             const list_window = content_window.child(.{
                                 .y_off = @intCast(row),
                                 .height = content_window.height - @as(u16, @intCast(row)),
