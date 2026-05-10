@@ -75,6 +75,8 @@ pub const Table = struct {
     show_scrollbar: bool = false,
     scrollbar_thumb: []const u8 = "█",
     scrollbar_track: []const u8 = "│",
+    sort_column: ?usize = null,
+    sort_order: SortOrder = .ascending,
 
     pub fn sortByColumn(
         self: *Table,
@@ -196,7 +198,11 @@ pub const Table = struct {
         // Render header
         if (self.header) |header_row| {
             if (y < area.height and header_height > 0) {
-                try renderRow(ctx.arena, window, header_row, column_rects, selection_width, y, false, null, self.highlight_symbol);
+                const indicator: ?[]const u8 = switch (self.sort_order) {
+                    .ascending => "↑",
+                    .descending => "↓",
+                };
+                try renderRow(ctx.arena, window, header_row, column_rects, selection_width, y, false, null, self.highlight_symbol, self.sort_column, indicator);
                 y += 1;
             }
 
@@ -214,7 +220,7 @@ pub const Table = struct {
             if (y >= area.height) break;
             const is_selected = state.selected_index == index;
             const hl = if (is_selected) self.row_highlight_style else null;
-            try renderRow(ctx.arena, window, row, column_rects, selection_width, y, is_selected, hl, self.highlight_symbol);
+            try renderRow(ctx.arena, window, row, column_rects, selection_width, y, is_selected, hl, self.highlight_symbol, null, null);
             y += 1;
         }
 
@@ -259,6 +265,8 @@ fn renderRow(
     is_selected: bool,
     highlight_style: ?vaxis.Cell.Style,
     highlight_symbol: []const u8,
+    sort_column: ?usize,
+    sort_indicator: ?[]const u8,
 ) std.mem.Allocator.Error!void {
     // Render highlight symbol
     if (is_selected and selection_width > 0) {
@@ -293,9 +301,22 @@ fn renderRow(
         };
 
         const max_width = col_rect.width;
+        const is_sort_col = sort_column != null and sort_column.? == cell_index and sort_indicator != null;
+        const indicator_text = if (is_sort_col) sort_indicator.? else "";
+        const indicator_width = ansi.visibleWidth(indicator_text);
+
+        // Truncate text to fit
+        const effective_max = if (max_width > indicator_width) max_width - indicator_width else 0;
+        const visible_text = if (ansi.visibleWidth(cell.text) <= effective_max)
+            cell.text
+        else blk: {
+            const truncated = try ansi.sliceVisibleAlloc(allocator, cell.text, 0, effective_max);
+            break :blk truncated;
+        };
+        defer if (visible_text.ptr != cell.text.ptr) allocator.free(visible_text);
 
         // Compute alignment padding
-        const text_width = @min(ansi.visibleWidth(cell.text), max_width);
+        const text_width = ansi.visibleWidth(visible_text) + indicator_width;
         const left_pad: u16 = if (text_width < max_width) switch (cell.alignment) {
             .start, .stretch => 0,
             .center => @intCast((max_width - text_width) / 2),
@@ -316,8 +337,8 @@ fn renderRow(
         // Write text
         var byte_idx: usize = 0;
         var written: u16 = 0;
-        while (byte_idx < cell.text.len and written < max_width - left_pad) {
-            const grapheme = extractGrapheme(cell.text[byte_idx..]);
+        while (byte_idx < visible_text.len and written < max_width - left_pad - indicator_width) {
+            const grapheme = extractGrapheme(visible_text[byte_idx..]);
             window.writeCell(x, row_y, .{
                 .char = .{ .grapheme = grapheme, .width = 1 },
                 .style = effective_style,
@@ -325,6 +346,15 @@ fn renderRow(
             x += 1;
             byte_idx += grapheme.len;
             written += 1;
+        }
+
+        // Write sort indicator
+        if (is_sort_col and indicator_width > 0 and x < col_rect.x + col_rect.width) {
+            window.writeCell(x, row_y, .{
+                .char = .{ .grapheme = indicator_text, .width = @intCast(indicator_width) },
+                .style = effective_style,
+            });
+            x += @intCast(indicator_width);
         }
 
         // Fill remaining column space
@@ -530,4 +560,43 @@ test "Table filter reduces rows by query" {
     try std.testing.expectEqual(@as(usize, 2), table.rows.len);
     try std.testing.expectEqualStrings("OpenAI", table.rows[0].cells[0].text);
     try std.testing.expectEqualStrings("OpenRouter", table.rows[1].cells[0].text);
+}
+
+test "Table renders sort indicator on header" {
+    const allocator = std.testing.allocator;
+
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 20,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const rows = &[_]Row{
+        .{ .cells = &.{ .{ .text = "Alpha" }, .{ .text = "1" } } },
+    };
+
+    var table = Table{
+        .rows = rows,
+        .header = .{ .cells = &.{ .{ .text = "Name" }, .{ .text = "Value" } } },
+        .widths = &.{ .{ .length = 8 }, .{ .length = 8 } },
+        .sort_column = 0,
+        .sort_order = .ascending,
+    };
+
+    var state = TableState{};
+    _ = try table.draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, &state);
+
+    const indicator = screen.readCell(4, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("↑", indicator.char.grapheme);
 }
