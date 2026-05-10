@@ -2938,35 +2938,44 @@ fn testHookHasCommand(ptr: *anyopaque, name: []const u8) bool {
     _ = name;
     return false;
 }
+/// Names of TestHookHost flag fields that map 1:1 to extension event names.
+/// Each entry must match both an `event_name` string and a `bool` field on
+/// TestHookHost; counter fields use the same name with a `_calls` suffix.
+const test_hook_event_flag_names = [_][]const u8{
+    "input",
+    "before_agent_start",
+    "context",
+    "agent_start",
+    "agent_end",
+    "turn_start",
+    "message_start",
+    "message_update",
+    "message_end",
+    "turn_end",
+    "tool_call",
+    "tool_result",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "model_select",
+    "thinking_level_select",
+    "session_start",
+    "session_shutdown",
+    "session_compact",
+    "session_tree",
+    "user_bash",
+    "resources_discover",
+    "session_before_compact",
+    "session_before_tree",
+    "before_provider_request",
+    "after_provider_response",
+};
+
 fn testHookHasHook(ptr: *anyopaque, event_name: []const u8) bool {
     const host = testHookHost(ptr);
-    if (std.mem.eql(u8, event_name, "input")) return host.input;
-    if (std.mem.eql(u8, event_name, "before_agent_start")) return host.before_agent_start;
-    if (std.mem.eql(u8, event_name, "context")) return host.context;
-    if (std.mem.eql(u8, event_name, "agent_start")) return host.agent_start;
-    if (std.mem.eql(u8, event_name, "agent_end")) return host.agent_end;
-    if (std.mem.eql(u8, event_name, "turn_start")) return host.turn_start;
-    if (std.mem.eql(u8, event_name, "message_start")) return host.message_start;
-    if (std.mem.eql(u8, event_name, "message_update")) return host.message_update;
-    if (std.mem.eql(u8, event_name, "message_end")) return host.message_end;
-    if (std.mem.eql(u8, event_name, "turn_end")) return host.turn_end;
-    if (std.mem.eql(u8, event_name, "tool_call")) return host.tool_call;
-    if (std.mem.eql(u8, event_name, "tool_result")) return host.tool_result;
-    if (std.mem.eql(u8, event_name, "tool_execution_start")) return host.tool_execution_start;
-    if (std.mem.eql(u8, event_name, "tool_execution_update")) return host.tool_execution_update;
-    if (std.mem.eql(u8, event_name, "tool_execution_end")) return host.tool_execution_end;
-    if (std.mem.eql(u8, event_name, "model_select")) return host.model_select;
-    if (std.mem.eql(u8, event_name, "thinking_level_select")) return host.thinking_level_select;
-    if (std.mem.eql(u8, event_name, "session_start")) return host.session_start;
-    if (std.mem.eql(u8, event_name, "session_shutdown")) return host.session_shutdown;
-    if (std.mem.eql(u8, event_name, "session_compact")) return host.session_compact;
-    if (std.mem.eql(u8, event_name, "session_tree")) return host.session_tree;
-    if (std.mem.eql(u8, event_name, "user_bash")) return host.user_bash;
-    if (std.mem.eql(u8, event_name, "resources_discover")) return host.resources_discover;
-    if (std.mem.eql(u8, event_name, "session_before_compact")) return host.session_before_compact;
-    if (std.mem.eql(u8, event_name, "session_before_tree")) return host.session_before_tree;
-    if (std.mem.eql(u8, event_name, "before_provider_request")) return host.before_provider_request;
-    if (std.mem.eql(u8, event_name, "after_provider_response")) return host.after_provider_response;
+    inline for (test_hook_event_flag_names) |name| {
+        if (std.mem.eql(u8, event_name, name)) return @field(host, name);
+    }
     return false;
 }
 fn testHookSnapshot(ptr: *anyopaque, allocator: std.mem.Allocator) ![]u8 {
@@ -3052,34 +3061,6 @@ fn testHookInvoke(
         try putValue(allocator, &result.object, "messages", .{ .array = messages });
         return result;
     }
-    if (std.mem.eql(u8, event_name, "agent_start")) {
-        host.agent_start_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "agent_end")) {
-        host.agent_end_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "turn_start")) {
-        host.turn_start_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "message_start")) {
-        host.message_start_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "message_update")) {
-        host.message_update_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "message_end")) {
-        host.message_end_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "turn_end")) {
-        host.turn_end_calls += 1;
-        return result;
-    }
     if (std.mem.eql(u8, event_name, "tool_call")) {
         host.tool_call_calls += 1;
         var input = try makeObject(allocator);
@@ -3093,50 +3074,6 @@ fn testHookInvoke(
         try putBool(allocator, &result.object, "isError", false);
         return result;
     }
-    if (std.mem.eql(u8, event_name, "tool_execution_start")) {
-        host.tool_execution_start_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "tool_execution_update")) {
-        host.tool_execution_update_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "tool_execution_end")) {
-        host.tool_execution_end_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "model_select")) {
-        host.model_select_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "thinking_level_select")) {
-        host.thinking_level_select_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "session_start")) {
-        host.session_start_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "session_shutdown")) {
-        host.session_shutdown_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "session_compact")) {
-        host.session_compact_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "session_tree")) {
-        host.session_tree_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "user_bash")) {
-        host.user_bash_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "resources_discover")) {
-        host.resources_discover_calls += 1;
-        return result;
-    }
     if (std.mem.eql(u8, event_name, "session_before_compact")) {
         host.session_before_compact_calls += 1;
         if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
@@ -3147,13 +3084,36 @@ fn testHookInvoke(
         if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
         return result;
     }
-    if (std.mem.eql(u8, event_name, "before_provider_request")) {
-        host.before_provider_request_calls += 1;
-        return result;
-    }
-    if (std.mem.eql(u8, event_name, "after_provider_response")) {
-        host.after_provider_response_calls += 1;
-        return result;
+    // Simple counter-only events: each fixture event name has a matching
+    // `<name>_calls` field on TestHookHost. Adding a new notification-only
+    // event only needs a single entry here plus the bool/counter pair on
+    // TestHookHost.
+    inline for ([_][]const u8{
+        "agent_start",
+        "agent_end",
+        "turn_start",
+        "message_start",
+        "message_update",
+        "message_end",
+        "turn_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "model_select",
+        "thinking_level_select",
+        "session_start",
+        "session_shutdown",
+        "session_compact",
+        "session_tree",
+        "user_bash",
+        "resources_discover",
+        "before_provider_request",
+        "after_provider_response",
+    }) |name| {
+        if (std.mem.eql(u8, event_name, name)) {
+            @field(host, name ++ "_calls") += 1;
+            return result;
+        }
     }
     return result;
 }
