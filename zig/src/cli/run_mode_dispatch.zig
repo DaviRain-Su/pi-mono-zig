@@ -283,6 +283,12 @@ fn dispatchWebViewMode(
     };
     defer session.deinit();
 
+    const available_models = try coding_agent.provider_config.listAvailableModels(allocator, env_map, provider_runtime.model, .{
+        .auth_tokens = &prepared.runtime_config.auth_tokens,
+        .provider_api_keys = &prepared.runtime_config.provider_api_keys,
+    });
+    defer allocator.free(available_models);
+
     return try coding_agent.runWebViewMode(
         allocator,
         env_map,
@@ -294,6 +300,7 @@ fn dispatchWebViewMode(
             .backend = webview_backend,
             .no_session = options.no_session,
             .api_key_present = options.api_key != null or provider_runtime.api_key != null,
+            .available_models = available_models,
             .selected_tools = construction_selected_tools,
             .active_tool_count = built_tools.items.len,
             .initial_prompt = initial_input.prompt,

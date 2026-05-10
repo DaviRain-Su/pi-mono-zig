@@ -4,6 +4,7 @@ const ai = @import("ai");
 const agent = @import("agent");
 const json_format = @import("../shared/json_format.zig");
 const json_event_wire = @import("json_event_wire.zig");
+const provider_config = @import("../providers/provider_config.zig");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const tool_selection = @import("../tool_selection.zig");
@@ -76,6 +77,7 @@ pub const BridgeContext = struct {
     model: ai.Model,
     no_session: bool,
     api_key_present: bool,
+    available_models: []const provider_config.AvailableModel = &.{},
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     session: *session_mod.AgentSession,
@@ -315,7 +317,8 @@ pub const BridgeHost = struct {
         try writeStringField(allocator, writer, "modelProvider", self.context.model.provider, true);
         try writeStringField(allocator, writer, "modelName", self.context.model.name, true);
         try writeStringField(allocator, writer, "modelApi", self.context.model.api, true);
-        try writer.writeAll(",\"modelSelection\":{\"status\":\"gated\",\"permissionRequired\":true}");
+        try writer.writeAll(",\"modelSelection\":");
+        try self.writeModelSelectionState(allocator, writer);
         try writeStringField(allocator, writer, "sessionId", self.context.session.session_manager.getSessionId(), true);
         try writeBoolField(writer, "noSession", self.context.no_session, true);
         try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
@@ -329,6 +332,52 @@ pub const BridgeHost = struct {
             try writeUsizeField(writer, "imagesCount", self.context.initial_images_count, true);
             try writer.writeAll("}");
         }
+        try writer.writeAll("}");
+    }
+
+    fn writeModelSelectionState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{\"status\":\"gated\",\"permissionRequired\":true,\"activeProvider\":");
+        try writeJsonString(allocator, writer, self.context.provider);
+        try writer.writeAll(",\"activeModel\":");
+        try writeJsonString(allocator, writer, self.context.model.id);
+        try writer.writeAll(",\"availableModels\":[");
+        for (self.context.available_models, 0..) |model, index| {
+            if (index > 0) try writer.writeAll(",");
+            try self.writeAvailableModelState(allocator, writer, model);
+        }
+        try writer.writeAll("]}");
+    }
+
+    fn writeAvailableModelState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        model: provider_config.AvailableModel,
+    ) !void {
+        try writer.writeAll("{");
+        try writeStringField(allocator, writer, "provider", model.provider, false);
+        try writeStringField(allocator, writer, "model", model.model_id, true);
+        try writeStringField(allocator, writer, "displayName", model.display_name, true);
+        try writeBoolField(writer, "available", model.available, true);
+        try writeStringField(allocator, writer, "authStatus", @tagName(model.auth_status), true);
+        try writeStringField(allocator, writer, "authStatusLabel", provider_config.providerAuthStatusLabel(model.auth_status), true);
+        try writeBoolField(
+            writer,
+            "current",
+            std.mem.eql(u8, model.provider, self.context.model.provider) and
+                std.mem.eql(u8, model.model_id, self.context.model.id),
+            true,
+        );
+        try writeBoolField(writer, "reasoning", model.reasoning, true);
+        try writeBoolField(writer, "toolCalling", model.tool_calling, true);
+        try writeBoolField(writer, "loaded", model.loaded, true);
+        try writeBoolField(writer, "supportsImages", model.supports_images, true);
+        try writeUsizeField(writer, "contextWindow", model.context_window, true);
+        try writeUsizeField(writer, "maxTokens", model.max_tokens, true);
         try writer.writeAll("}");
     }
 
@@ -818,7 +867,6 @@ fn writeUsizeField(
     try writer.print("\"{s}\":{d}", .{ name, value });
 }
 
-
 fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "file://")) return false;
     const path = url["file://".len..];
@@ -1190,6 +1238,54 @@ test "webview get_state exposes resolver model metadata without secrets" {
     try std.testing.expect(std.mem.indexOf(u8, response, "\"apiKeyPresent\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "base_url") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "baseUrl") == null);
+}
+
+test "webview get_state exposes configured model choices without credential values" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    const available_models = [_]provider_config.AvailableModel{
+        .{
+            .provider = "faux",
+            .model_id = "faux-model",
+            .display_name = "Faux Model",
+            .available = true,
+            .auth_status = .local,
+            .reasoning = false,
+            .tool_calling = true,
+            .loaded = false,
+            .supports_images = false,
+            .context_window = 128000,
+            .max_tokens = 4096,
+        },
+        .{
+            .provider = "openai",
+            .model_id = "gpt-5.4",
+            .display_name = "GPT-5.4",
+            .available = true,
+            .auth_status = .stored,
+            .reasoning = true,
+            .tool_calling = true,
+            .loaded = false,
+            .supports_images = true,
+            .context_window = 272000,
+            .max_tokens = 128000,
+        },
+    };
+    bridge.context.available_models = available_models[0..];
+
+    const response = try bridge.handleRequestJson(allocator, "{\"id\":\"state-models\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"modelSelection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"availableModels\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"model\":\"gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"authStatus\":\"stored\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"current\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "baseUrl") == null);
 }
 

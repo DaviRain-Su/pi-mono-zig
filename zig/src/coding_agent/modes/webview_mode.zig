@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = @import("ai");
 const json_format = @import("../shared/json_format.zig");
+const provider_config = @import("../providers/provider_config.zig");
 const session_mod = @import("../sessions/session.zig");
 const tool_selection = @import("../tool_selection.zig");
 const webview_bridge = @import("webview_bridge.zig");
@@ -32,6 +33,7 @@ pub const RunWebViewModeOptions = struct {
     backend: webview_platform.AvailableBackend,
     no_session: bool,
     api_key_present: bool,
+    available_models: []const provider_config.AvailableModel = &.{},
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     initial_prompt: ?[]const u8 = null,
@@ -153,6 +155,7 @@ pub fn runWebViewMode(
         .model = options.model,
         .no_session = options.no_session,
         .api_key_present = options.api_key_present,
+        .available_models = options.available_models,
         .selected_tools = options.selected_tools,
         .active_tool_count = options.active_tool_count,
         .session = session,
