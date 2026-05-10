@@ -38,6 +38,10 @@ pub const components = struct {
     pub const split = @import("components/split.zig");
     pub const placeholder = @import("components/placeholder.zig");
     pub const status_bar = @import("components/status_bar.zig");
+    pub const calendar = @import("components/calendar.zig");
+    pub const tree = @import("components/tree.zig");
+    pub const input = @import("components/input.zig");
+    pub const popup = @import("components/popup.zig");
     pub const sparkline = @import("components/sparkline.zig");
     pub const clear = @import("components/clear.zig");
     pub const bar_chart = @import("components/bar_chart.zig");
@@ -122,6 +126,12 @@ pub const SplitDirection = components.split.SplitDirection;
 pub const Placeholder = components.placeholder.Placeholder;
 pub const StatusBar = components.status_bar.StatusBar;
 pub const StatusBarSection = components.status_bar.Section;
+pub const Calendar = components.calendar.Calendar;
+pub const Tree = components.tree.Tree;
+pub const TreeNode = components.tree.TreeNode;
+pub const TreeState = components.tree.TreeState;
+pub const Input = components.input.Input;
+pub const Popup = components.popup.Popup;
 
 test {
     _ = @import("ansi.zig");
@@ -163,6 +173,10 @@ test {
     _ = @import("components/split.zig");
     _ = @import("components/placeholder.zig");
     _ = @import("components/status_bar.zig");
+    _ = @import("components/calendar.zig");
+    _ = @import("components/tree.zig");
+    _ = @import("components/input.zig");
+    _ = @import("components/popup.zig");
 }
 
 test "components export autocomplete module" {
