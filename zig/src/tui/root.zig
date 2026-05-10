@@ -136,6 +136,8 @@ pub const Canvas = vw.Canvas;
 pub const Point = vw.Point;
 pub const Line = vw.Line;
 pub const Label = vw.Label;
+pub const Circle = vw.Circle;
+pub const Rectangle = vw.Rectangle;
 pub const Split = vw.Split;
 pub const SplitDirection = vw.SplitDirection;
 pub const Placeholder = vw.Placeholder;
@@ -193,6 +195,8 @@ pub const TerminalPanel = vw.TerminalPanel;
 pub const TerminalLine = vw.TerminalLine;
 pub const MetricCard = vw.MetricCard;
 pub const TrendDirection = vw.TrendDirection;
+pub const Fill = vw.Fill;
+pub const BigText = vw.BigText;
 
 test {
     _ = @import("cell_rows.zig");

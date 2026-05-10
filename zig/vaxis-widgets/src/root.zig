@@ -37,6 +37,8 @@ pub const Canvas = @import("components/canvas.zig").Canvas;
 pub const Point = @import("components/canvas.zig").Point;
 pub const Line = @import("components/canvas.zig").Line;
 pub const Label = @import("components/canvas.zig").Label;
+pub const Circle = @import("components/canvas.zig").Circle;
+pub const Rectangle = @import("components/canvas.zig").Rectangle;
 pub const Split = @import("components/split.zig").Split;
 pub const SplitDirection = @import("components/split.zig").SplitDirection;
 pub const Placeholder = @import("components/placeholder.zig").Placeholder;
@@ -83,6 +85,10 @@ pub const Slider = @import("components/slider.zig").Slider;
 pub const Breadcrumbs = @import("components/breadcrumbs.zig").Breadcrumbs;
 pub const BreadcrumbItem = @import("components/breadcrumbs.zig").BreadcrumbItem;
 pub const Pagination = @import("components/pagination.zig").Pagination;
+
+// Drawing primitives
+pub const Fill = @import("components/fill.zig").Fill;
+pub const BigText = @import("components/big_text.zig").BigText;
 
 // Specialized viewers
 pub const DiffViewer = @import("components/diff_viewer.zig").DiffViewer;
@@ -164,6 +170,8 @@ pub const components = struct {
     pub const progress = @import("components/progress.zig");
     pub const terminal_panel = @import("components/terminal_panel.zig");
     pub const metric_card = @import("components/metric_card.zig");
+    pub const fill = @import("components/fill.zig");
+    pub const big_text = @import("components/big_text.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;

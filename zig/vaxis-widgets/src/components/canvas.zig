@@ -26,12 +26,32 @@ pub const Label = struct {
     style: vaxis.Cell.Style = .{},
 };
 
+pub const Circle = struct {
+    x: f64,
+    y: f64,
+    radius: f64,
+    style: vaxis.Cell.Style = .{},
+    symbol: []const u8 = "•",
+};
+
+pub const Rectangle = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    style: vaxis.Cell.Style = .{},
+    symbol: []const u8 = "█",
+    filled: bool = false,
+};
+
 pub const Canvas = struct {
     x_bounds: [2]f64 = .{ 0, 1 },
     y_bounds: [2]f64 = .{ 0, 1 },
     points: []const Point = &.{},
     lines: []const Line = &.{},
     labels: []const Label = &.{},
+    circles: []const Circle = &.{},
+    rectangles: []const Rectangle = &.{},
     background_style: vaxis.Cell.Style = .{},
     x_labels: []const []const u8 = &.{},
     y_labels: []const []const u8 = &.{},
@@ -99,6 +119,49 @@ pub const Canvas = struct {
                     });
                     c += 1;
                     idx += 1;
+                }
+            }
+        }
+
+        // Draw circles
+        for (self.circles) |circle| {
+            for (0..360) |angle| {
+                const radians = @as(f64, @floatFromInt(angle)) * std.math.pi / 180.0;
+                const circle_x = circle.x + circle.radius * @cos(radians);
+                const circle_y = circle.y + circle.radius * @sin(radians);
+                const col = mapXToCol(circle_x, self.x_bounds[0], eff_x_range, window.width);
+                const row = mapYToRow(circle_y, self.y_bounds[0], eff_y_range, window.height);
+                if (col < window.width and row < window.height) {
+                    window.writeCell(col, row, .{
+                        .char = .{ .grapheme = circle.symbol, .width = 1 },
+                        .style = circle.style,
+                    });
+                }
+            }
+        }
+
+        // Draw rectangles
+        for (self.rectangles) |rect| {
+            const x1 = mapXToCol(rect.x, self.x_bounds[0], eff_x_range, window.width);
+            const y1 = mapYToRow(rect.y, self.y_bounds[0], eff_y_range, window.height);
+            const x2 = mapXToCol(rect.x + rect.width, self.x_bounds[0], eff_x_range, window.width);
+            const y2 = mapYToRow(rect.y + rect.height, self.y_bounds[0], eff_y_range, window.height);
+
+            const left = @min(x1, x2);
+            const right = @max(x1, x2);
+            const top = @min(y1, y2);
+            const bottom = @max(y1, y2);
+
+            for (top..bottom + 1) |row| {
+                for (left..right + 1) |col| {
+                    if (col >= window.width or row >= window.height) continue;
+                    const is_border = row == top or row == bottom or col == left or col == right;
+                    if (rect.filled or is_border) {
+                        window.writeCell(@intCast(col), @intCast(row), .{
+                            .char = .{ .grapheme = rect.symbol, .width = 1 },
+                            .style = rect.style,
+                        });
+                    }
                 }
             }
         }
@@ -220,4 +283,57 @@ test "canvas draws labels at coordinates" {
 
     const label = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("A", label.char.grapheme);
+}
+
+test "canvas draws circle" {
+    const canvas = Canvas{
+        .x_bounds = .{ 0, 10 },
+        .y_bounds = .{ 0, 10 },
+        .circles = &[_]Circle{
+            .{ .x = 5, .y = 5, .radius = 3 },
+        },
+    };
+
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 10, 10);
+    defer screen.deinit(std.testing.allocator);
+
+    // Circle should have points in all quadrants
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "•") != null);
+}
+
+test "canvas draws rectangle" {
+    const canvas = Canvas{
+        .x_bounds = .{ 0, 10 },
+        .y_bounds = .{ 0, 10 },
+        .rectangles = &[_]Rectangle{
+            .{ .x = 2, .y = 2, .width = 5, .height = 4 },
+        },
+    };
+
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 10, 10);
+    defer screen.deinit(std.testing.allocator);
+
+    // Border corners
+    try test_helpers.expectCell(&screen, 2, 6, "█", .{});
+    try test_helpers.expectCell(&screen, 7, 6, "█", .{});
+    try test_helpers.expectCell(&screen, 2, 2, "█", .{});
+    try test_helpers.expectCell(&screen, 7, 2, "█", .{});
+}
+
+test "canvas draws filled rectangle" {
+    const canvas = Canvas{
+        .x_bounds = .{ 0, 10 },
+        .y_bounds = .{ 0, 10 },
+        .rectangles = &[_]Rectangle{
+            .{ .x = 2, .y = 2, .width = 3, .height = 3, .filled = true },
+        },
+    };
+
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 10, 10);
+    defer screen.deinit(std.testing.allocator);
+
+    // Interior should be filled
+    try test_helpers.expectCell(&screen, 4, 4, "█", .{});
 }
