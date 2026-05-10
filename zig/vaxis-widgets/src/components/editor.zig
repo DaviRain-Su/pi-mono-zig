@@ -522,10 +522,7 @@ pub const Editor = struct {
         }
 
         if (self.buffer.items.len > 0) {
-            _ = content_window.printSegment(.{
-                .text = self.buffer.items,
-                .style = base_style,
-            }, .{ .wrap = .grapheme });
+            _ = drawGraphemeWrappedText(self.buffer.items, content_window, base_style, true);
         }
 
         const cursor = measureCursor(self.buffer.items, self.cursor, content_window, base_style);
@@ -1197,15 +1194,90 @@ const MeasuredCursor = struct {
     row: u16,
 };
 
+const GraphemeWrapResult = struct {
+    col: u16,
+    row: u16,
+    overflow: bool = false,
+};
+
+fn drawGraphemeWrappedText(
+    text: []const u8,
+    window: vaxis.Window,
+    style: vaxis.Cell.Style,
+    commit: bool,
+) GraphemeWrapResult {
+    if (window.width == 0 or window.height == 0) return .{ .col = 0, .row = 0, .overflow = text.len > 0 };
+
+    var col: u16 = 0;
+    var row: u16 = 0;
+    var idx: usize = 0;
+    while (idx < text.len) {
+        if (text[idx] == '\n') {
+            row += 1;
+            col = 0;
+            idx += 1;
+            if (row >= window.height) return .{ .col = 0, .row = window.height - 1, .overflow = true };
+            continue;
+        }
+
+        const cluster = ansi.nextDisplayCluster(text, idx);
+        if (cluster.end <= idx) break;
+        const width: u16 = @intCast(cluster.width);
+        if (width == 0) {
+            idx = cluster.end;
+            continue;
+        }
+
+        if (width > window.width) {
+            if (col != 0) {
+                row += 1;
+                col = 0;
+            }
+            idx = cluster.end;
+            if (row >= window.height) return .{ .col = 0, .row = window.height - 1, .overflow = true };
+            continue;
+        }
+
+        if (col > 0 and col + width > window.width) {
+            row += 1;
+            col = 0;
+            if (row >= window.height) return .{ .col = 0, .row = window.height - 1, .overflow = true };
+        }
+
+        if (commit) {
+            window.writeCell(col, row, .{
+                .char = .{ .grapheme = text[idx..cluster.end], .width = @intCast(width) },
+                .style = style,
+            });
+        }
+        col += width;
+        idx = cluster.end;
+    }
+
+    return .{ .col = col, .row = row };
+}
+
+fn normalizeCursorPosition(result: GraphemeWrapResult, window: vaxis.Window) MeasuredCursor {
+    if (window.width == 0 or window.height == 0) return .{ .col = 0, .row = 0 };
+    var col = result.col;
+    var row = result.row;
+    if (col >= window.width) {
+        if (row + 1 < window.height) {
+            row += 1;
+            col = 0;
+        } else {
+            col = window.width - 1;
+        }
+    }
+    return .{
+        .col = col,
+        .row = @min(row, window.height - 1),
+    };
+}
+
 fn measureRenderedHeight(text: []const u8, window: vaxis.Window, style: vaxis.Cell.Style) usize {
     if (text.len == 0) return 1;
-    const result = window.printSegment(.{
-        .text = text,
-        .style = style,
-    }, .{
-        .wrap = .grapheme,
-        .commit = false,
-    });
+    const result = drawGraphemeWrappedText(text, window, style, false);
     if (result.overflow) return window.height;
     return @max(@as(usize, 1), @as(usize, result.row) + 1);
 }
@@ -1214,29 +1286,8 @@ fn measureCursor(text: []const u8, cursor_index: usize, window: vaxis.Window, st
     if (text.len == 0) return .{ .col = 0, .row = 0 };
     const clamped = @min(cursor_index, text.len);
     if (clamped == 0) return .{ .col = 0, .row = 0 };
-    const result = window.printSegment(.{
-        .text = text[0..clamped],
-        .style = style,
-    }, .{
-        .wrap = .grapheme,
-        .commit = false,
-    });
-    if (result.col >= window.width and window.width > 0) {
-        if (result.row + 1 < window.height) {
-            return .{
-                .col = 0,
-                .row = result.row + 1,
-            };
-        }
-        return .{
-            .col = window.width - 1,
-            .row = @min(result.row, window.height - 1),
-        };
-    }
-    return .{
-        .col = result.col,
-        .row = @min(result.row, if (window.height == 0) 0 else window.height - 1),
-    };
+    const result = drawGraphemeWrappedText(text[0..clamped], window, style, false);
+    return normalizeCursorPosition(result, window);
 }
 
 fn drawSingleRowViewport(text: []const u8, cursor_index: usize, window: vaxis.Window, style: vaxis.Cell.Style) u16 {
@@ -1250,7 +1301,7 @@ fn drawSingleRowViewport(text: []const u8, cursor_index: usize, window: vaxis.Wi
     var start = clamped_cursor;
     var used_width: usize = 0;
     while (start > current_start) {
-        const previous = prevCodepointStart(text, start);
+        const previous = prevGraphemeStart(text, start);
         const cluster = ansi.nextDisplayCluster(text, previous);
         if (used_width + cluster.width > max_left_width) break;
         used_width += cluster.width;
@@ -2019,6 +2070,38 @@ test "editor single-row viewport scrolls to keep overflowing cursor visible" {
     defer screen.deinit(std.testing.allocator);
     try test_helpers.expectCell(&screen, 0, 0, "e", .{});
     try test_helpers.expectCell(&screen, 4, 0, "i", .{});
+}
+
+test "editor single-row viewport does not split emoji modifier graphemes" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try editor.setText("a👍🏽b");
+
+    var screen = try test_helpers.renderToScreen(editor.drawComponent(), 4, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "👍🏽", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
+}
+
+test "editor grapheme wrap moves wide grapheme to next row before overflow" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    try editor.setText("a你b");
+
+    var screen = try test_helpers.renderToScreen(editor.drawComponent(), 2, 3);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "a", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "你", .{});
+    try test_helpers.expectCell(&screen, 0, 2, "b", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }
 
 test "editor applies theme colors to content and autocomplete without ansi parsing assertions" {

@@ -40,11 +40,17 @@ pub const RichText = struct {
             while (idx < span.text.len and col < window.width) {
                 const cluster = ansi.nextDisplayCluster(span.text, idx);
                 if (cluster.end <= idx) break;
+                const width: u16 = @intCast(cluster.width);
+                if (width == 0) {
+                    idx = cluster.end;
+                    continue;
+                }
+                if (col + width > window.width) break;
                 window.writeCell(col, 0, .{
-                    .char = .{ .grapheme = span.text[idx..cluster.end], .width = @intCast(cluster.width) },
+                    .char = .{ .grapheme = span.text[idx..cluster.end], .width = @intCast(width) },
                     .style = style,
                 });
-                col += @intCast(cluster.width);
+                col += width;
                 idx = cluster.end;
                 total_width += cluster.width;
             }
@@ -89,4 +95,18 @@ test "rich text falls back to default style" {
     defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "p", .{ .dim = true });
+}
+
+test "rich text clips wide grapheme that would overflow row" {
+    const spans = &[_]Span{
+        .{ .text = "a你b" },
+    };
+
+    const rich = RichText{ .spans = spans };
+    var screen = try test_helpers.renderToScreen(rich.drawComponent(), 2, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "a", .{});
+    try test_helpers.expectCell(&screen, 1, 0, " ", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

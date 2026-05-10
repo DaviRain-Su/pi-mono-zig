@@ -18,6 +18,7 @@ pub const Row = struct {
 
 pub const TableState = struct {
     selected_index: ?usize = null,
+    selected_indices: []const usize = &.{},
     offset: usize = 0,
 
     pub fn select(self: *TableState, index: ?usize, total_rows: usize) void {
@@ -56,6 +57,28 @@ pub const TableState = struct {
 
         const max_offset = if (total_rows > visible_rows) total_rows - visible_rows else 0;
         self.offset = @min(self.offset, max_offset);
+    }
+
+    pub fn clamp(self: *TableState, visible_rows: usize, total_rows: usize) void {
+        if (total_rows == 0) {
+            self.selected_index = null;
+            self.offset = 0;
+            return;
+        }
+        if (self.selected_index) |selected| {
+            self.selected_index = @min(selected, total_rows - 1);
+        }
+        const max_offset = if (visible_rows > 0 and total_rows > visible_rows) total_rows - visible_rows else 0;
+        self.offset = @min(self.offset, max_offset);
+    }
+
+    pub fn isSelected(self: TableState, index: usize, total_rows: usize) bool {
+        if (index >= total_rows) return false;
+        if (self.selected_index != null and self.selected_index.? == index) return true;
+        for (self.selected_indices) |selected| {
+            if (selected == index) return true;
+        }
+        return false;
     }
 };
 
@@ -152,11 +175,12 @@ pub const Table = struct {
         };
 
         const column_count = self.columnCount();
-        if (column_count == 0 or self.rows.len == 0) {
+        if (column_count == 0) {
             return .{ .width = window.width, .height = 0 };
         }
 
-        const has_selection = state.selected_index != null;
+        state.clamp(0, self.rows.len);
+        const has_selection = state.selected_index != null or state.selected_indices.len > 0;
         const selection_width: u16 = if (has_selection)
             @intCast(ansi.visibleWidth(self.highlight_symbol))
         else
@@ -198,6 +222,7 @@ pub const Table = struct {
         );
 
         state.scrollToSelected(visible_data_rows, self.rows.len);
+        state.clamp(visible_data_rows, self.rows.len);
 
         var y: u16 = 0;
 
@@ -224,7 +249,7 @@ pub const Table = struct {
 
         for (self.rows[start_index..end_index], start_index..) |row, index| {
             if (y >= area.height) break;
-            const is_selected = state.selected_index == index;
+            const is_selected = state.isSelected(index, self.rows.len);
             const hl = if (is_selected) self.row_highlight_style else null;
             try renderRow(ctx.arena, window, row, column_rects, selection_width, y, is_selected, hl, self.highlight_symbol, null, null);
             y += 1;
@@ -398,9 +423,14 @@ fn mergeStyle(base: vaxis.Cell.Style, overlay: vaxis.Cell.Style) vaxis.Cell.Styl
     return .{
         .fg = if (overlay.fg != .default) overlay.fg else base.fg,
         .bg = if (overlay.bg != .default) overlay.bg else base.bg,
+        .ul = if (overlay.ul != .default) overlay.ul else base.ul,
         .bold = overlay.bold or base.bold,
         .dim = overlay.dim or base.dim,
         .italic = overlay.italic or base.italic,
+        .blink = overlay.blink or base.blink,
+        .reverse = overlay.reverse or base.reverse,
+        .invisible = overlay.invisible or base.invisible,
+        .strikethrough = overlay.strikethrough or base.strikethrough,
         .ul_style = if (overlay.ul_style != .off) overlay.ul_style else base.ul_style,
     };
 }
@@ -651,4 +681,108 @@ test "Table row separators keep selected row visible" {
     try std.testing.expectEqual(@as(usize, 1), state.offset);
     const selected = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(">", selected.char.grapheme);
+}
+
+test "Table renders header when rows are empty" {
+    const allocator = std.testing.allocator;
+
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 2,
+        .cols = 16,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const table = Table{
+        .rows = &.{},
+        .header = .{ .cells = &.{.{ .text = "OnlyHeader" }} },
+        .widths = &.{.{ .length = 12 }},
+    };
+    var state = TableState{ .offset = 99, .selected_index = 3 };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try table.draw(draw_mod.rootWindow(&screen), .{
+        .window = draw_mod.rootWindow(&screen),
+        .arena = arena.allocator(),
+    }, &state);
+
+    try std.testing.expectEqual(@as(?usize, null), state.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), state.offset);
+    const header = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("O", header.char.grapheme);
+}
+
+test "Table clamps stale offset after rows shrink" {
+    const allocator = std.testing.allocator;
+
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 2,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const rows = &[_]Row{
+        .{ .cells = &.{.{ .text = "row0" }} },
+        .{ .cells = &.{.{ .text = "row1" }} },
+    };
+    const table = Table{
+        .rows = rows,
+        .widths = &.{.{ .length = 8 }},
+    };
+    var state = TableState{ .offset = 20 };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try table.draw(draw_mod.rootWindow(&screen), .{
+        .window = draw_mod.rootWindow(&screen),
+        .arena = arena.allocator(),
+    }, &state);
+
+    try std.testing.expectEqual(@as(usize, 0), state.offset);
+    const row0 = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("r", row0.char.grapheme);
+}
+
+test "Table renders multi-selected rows and full highlight style" {
+    const allocator = std.testing.allocator;
+
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const rows = &[_]Row{
+        .{ .cells = &.{.{ .text = "row0" }} },
+        .{ .cells = &.{.{ .text = "row1" }} },
+        .{ .cells = &.{.{ .text = "row2" }} },
+    };
+    const table = Table{
+        .rows = rows,
+        .widths = &.{.{ .length = 8 }},
+        .row_highlight_style = .{ .reverse = true, .strikethrough = true },
+    };
+    const selected = &[_]usize{ 0, 2, 999 };
+    var state = TableState{ .selected_indices = selected };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    _ = try table.draw(draw_mod.rootWindow(&screen), .{
+        .window = draw_mod.rootWindow(&screen),
+        .arena = arena.allocator(),
+    }, &state);
+
+    const first = screen.readCell(1, 0) orelse return error.TestUnexpectedResult;
+    const middle = screen.readCell(1, 1) orelse return error.TestUnexpectedResult;
+    const third = screen.readCell(1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.style.reverse);
+    try std.testing.expect(first.style.strikethrough);
+    try std.testing.expect(!middle.style.reverse);
+    try std.testing.expect(third.style.reverse);
 }

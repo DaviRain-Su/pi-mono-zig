@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const draw_mod = @import("../draw.zig");
+const scroll_mod = @import("../scroll.zig");
 
 pub const Orientation = enum {
     vertical_left,
@@ -193,30 +194,14 @@ pub const Scrollbar = struct {
 };
 
 fn computeParts(track_len: u16, content_len: usize, position: usize, viewport_len: usize) [3]u16 {
-    const track = @as(usize, track_len);
-    if (track == 0 or content_len == 0) return .{ 0, 0, 0 };
-    if (viewport_len >= content_len) return .{ 0, @intCast(track), 0 };
-
-    const max_pos = content_len - viewport_len;
-    const pos = @min(position, max_pos);
-
-    const thumb = @max(1, roundingDivide(viewport_len * track, content_len));
-    const clamped_thumb = @min(thumb, track);
-
-    const travel = track - clamped_thumb;
-    const thumb_start = if (max_pos == 0) 0 else @min(roundingDivide(pos * travel, max_pos), travel);
-    const track_end = track -| (thumb_start + clamped_thumb);
+    const parts = scroll_mod.thumb(track_len, content_len, viewport_len, position);
+    const track_end = @as(usize, track_len) -| (parts.start + parts.length);
 
     return .{
-        @intCast(thumb_start),
-        @intCast(clamped_thumb),
+        @intCast(parts.start),
+        @intCast(parts.length),
         @intCast(track_end),
     };
-}
-
-fn roundingDivide(numerator: usize, denominator: usize) usize {
-    if (denominator == 0) return 0;
-    return (numerator + denominator / 2) / denominator;
 }
 
 test "scrollbar renders thumb at correct position" {

@@ -69,6 +69,31 @@ pub fn expectCell(
     try std.testing.expectEqual(style, cell.style);
 }
 
+pub fn expectCellWithWidth(
+    screen: *vaxis.AllocatingScreen,
+    col: usize,
+    row: usize,
+    grapheme: []const u8,
+    width: u8,
+    style: vaxis.Cell.Style,
+) !void {
+    const cell = screen.readCell(@intCast(col), @intCast(row)) orelse return error.TestUnexpectedResult;
+    const actual = if (cell.char.grapheme.len == 0) " " else cell.char.grapheme;
+    try std.testing.expectEqualStrings(grapheme, actual);
+    try std.testing.expectEqual(width, cell.char.width);
+    try std.testing.expectEqual(style, cell.style);
+}
+
+pub fn expectNoWideCellOverflow(screen: *vaxis.AllocatingScreen) !void {
+    for (0..screen.height) |row| {
+        for (0..screen.width) |col| {
+            const cell = screen.readCell(@intCast(col), @intCast(row)) orelse continue;
+            if (cell.char.width == 0) continue;
+            try std.testing.expect(col + cell.char.width <= screen.width);
+        }
+    }
+}
+
 fn normalizeCell(cell: vaxis.Cell) vaxis.Cell {
     if (cell.char.grapheme.len != 0) return cell;
 

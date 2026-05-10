@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const layout = @import("../layout.zig");
+const scroll_mod = @import("../scroll.zig");
 const test_helpers = @import("../test_helpers.zig");
 
 pub const Viewport = struct {
@@ -62,15 +63,13 @@ pub const Viewport = struct {
         blitAllocatingScreen(rendered.screen, inner_window, slice.start);
 
         if (self.show_scrollbar and inner_height > 0 and rendered.line_count > inner_height) {
-            const thumb_height = @max(1, (inner_height * inner_height) / rendered.line_count);
-            const max_offset = rendered.line_count - inner_height;
             const scroll_offset = slice.start;
-            const thumb_start = if (max_offset == 0) 0 else (scroll_offset * (inner_height - thumb_height)) / max_offset;
+            const thumb = scroll_mod.thumb(inner_height, rendered.line_count, inner_height, scroll_offset);
             const scroll_col = inner_window.width -| 1;
             for (0..inner_height) |i| {
                 const row_y: u16 = @intCast(i);
                 if (row_y >= inner_window.height) break;
-                const is_thumb = i >= thumb_start and i < thumb_start + thumb_height;
+                const is_thumb = i >= thumb.start and i < thumb.start + thumb.length;
                 inner_window.writeCell(scroll_col, row_y, .{
                     .char = .{ .grapheme = if (is_thumb) self.scrollbar_thumb else self.scrollbar_track, .width = 1 },
                     .style = .{},
@@ -126,9 +125,9 @@ fn resolveVisibleSlice(
     if (height == 0 or line_count == 0) return .{ .start = 0, .end = 0 };
     if (line_count <= height) return .{ .start = 0, .end = line_count };
 
-    const max_start = line_count - height;
+    const max_start = scroll_mod.clampOffset(line_count, height, std.math.maxInt(usize));
     const start = switch (anchor) {
-        .top => @min(scroll_offset, max_start),
+        .top => scroll_mod.clampOffset(line_count, height, scroll_offset),
         .bottom => max_start -| @min(scroll_offset, max_start),
     };
     return .{

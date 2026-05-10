@@ -14,12 +14,18 @@ pub const FileTreeNode = struct {
     name: []const u8,
     file_type: FileType = .file,
     expanded: bool = false,
-    children: ?[]const FileTreeNode = null,
+    children: ?[]FileTreeNode = null,
+};
+
+const VisibleFileNode = struct {
+    node: *const FileTreeNode,
+    depth: usize,
 };
 
 pub const FileTree = struct {
-    nodes: []const FileTreeNode,
+    nodes: []FileTreeNode,
     selected_index: usize = 0,
+    offset: usize = 0,
     style: vaxis.Cell.Style = .{},
     selected_style: vaxis.Cell.Style = .{ .reverse = true },
     dir_style: vaxis.Cell.Style = .{ .bold = true, .fg = .{ .index = 39 } },
@@ -45,18 +51,99 @@ pub const FileTree = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
-        var row: u16 = 0;
-        var flat_index: usize = 0;
-
-        for (self.nodes) |node| {
-            if (row >= window.height) break;
-            row = try self.drawNode(&node, window, 0, &row, &flat_index);
+        if (window.width == 0 or window.height == 0 or self.nodes.len == 0) {
+            return .{ .width = window.width, .height = 0 };
         }
 
-        return .{ .width = window.width, .height = row };
+        var visible = std.ArrayList(VisibleFileNode).empty;
+        defer visible.deinit(ctx.arena);
+        try flattenFileNodes(ctx.arena, self.nodes, 0, &visible);
+
+        const total_rows = visible.items.len;
+        if (total_rows == 0) return .{ .width = window.width, .height = 0 };
+
+        const visible_rows = @min(total_rows, window.height);
+        const selected_index = @min(self.selected_index, total_rows - 1);
+        const max_offset = total_rows - visible_rows;
+        var offset = @min(self.offset, max_offset);
+        if (selected_index < offset) {
+            offset = selected_index;
+        } else if (selected_index >= offset + visible_rows) {
+            offset = selected_index - visible_rows + 1;
+        }
+
+        for (0..visible_rows) |row_idx| {
+            const visible_index = offset + row_idx;
+            const entry = visible.items[visible_index];
+            try self.drawVisibleNode(entry.node, window, entry.depth, @intCast(row_idx), visible_index == selected_index);
+        }
+
+        return .{ .width = window.width, .height = visible_rows };
+    }
+
+    fn drawVisibleNode(
+        self: *const FileTree,
+        node: *const FileTreeNode,
+        window: vaxis.Window,
+        depth: usize,
+        row: u16,
+        is_selected: bool,
+    ) std.mem.Allocator.Error!void {
+        const style = if (is_selected) self.selected_style else switch (node.file_type) {
+            .directory => self.dir_style,
+            .symlink => self.symlink_style,
+            .file => self.file_style,
+        };
+
+        const row_window = window.child(.{ .y_off = row, .height = 1 });
+        row_window.fill(.{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = style,
+        });
+
+        var col: u16 = @intCast(depth * self.indent);
+        const has_children = node.children != null and node.children.?.len > 0;
+        const icon = if (node.file_type == .directory and has_children)
+            if (node.expanded) self.expanded_symbol else self.collapsed_symbol
+        else
+            self.file_symbol;
+
+        var idx: usize = 0;
+        while (idx < icon.len and col < row_window.width) {
+            const cluster = ansi.nextDisplayCluster(icon, idx);
+            if (cluster.end <= idx) break;
+            const width: u16 = @intCast(cluster.width);
+            if (width == 0 or col + width > row_window.width) break;
+            row_window.writeCell(col, 0, .{
+                .char = .{ .grapheme = icon[idx..cluster.end], .width = @intCast(width) },
+                .style = style,
+            });
+            col += width;
+            idx = cluster.end;
+        }
+
+        if (col < row_window.width) {
+            col += 1;
+            var nidx: usize = 0;
+            while (nidx < node.name.len and col < row_window.width) {
+                const cluster = ansi.nextDisplayCluster(node.name, nidx);
+                if (cluster.end <= nidx) break;
+                const width: u16 = @intCast(cluster.width);
+                if (width == 0) {
+                    nidx = cluster.end;
+                    continue;
+                }
+                if (col + width > row_window.width) break;
+                row_window.writeCell(col, 0, .{
+                    .char = .{ .grapheme = node.name[nidx..cluster.end], .width = @intCast(width) },
+                    .style = style,
+                });
+                col += width;
+                nidx = cluster.end;
+            }
+        }
     }
 
     fn drawNode(
@@ -134,9 +221,18 @@ pub const FileTree = struct {
     }
 
     pub fn toggleNode(self: *FileTree, index: usize) void {
-        // Flat index lookup would require tracking state
-        _ = self;
-        _ = index;
+        const node = visibleFileNodeAtMutable(self.nodes, index) orelse return;
+        if (node.file_type != .directory) return;
+        if (node.children == null or node.children.?.len == 0) return;
+        node.expanded = !node.expanded;
+        const visible_count = self.visibleCount();
+        if (visible_count == 0) {
+            self.selected_index = 0;
+            self.offset = 0;
+        } else {
+            self.selected_index = @min(self.selected_index, visible_count - 1);
+            self.offset = @min(self.offset, visible_count - 1);
+        }
     }
 
     pub fn handleKey(self: *FileTree, key: @import("../keys.zig").Key) void {
@@ -151,7 +247,7 @@ pub const FileTree = struct {
                 }
             },
             .enter => {
-                // toggle expansion on selected
+                self.toggleNode(self.selected_index);
             },
             else => {},
         }
@@ -185,18 +281,54 @@ fn countVisibleNode(node: *const FileTreeNode) usize {
     return count;
 }
 
+fn flattenFileNodes(
+    allocator: std.mem.Allocator,
+    nodes: []const FileTreeNode,
+    depth: usize,
+    out: *std.ArrayList(VisibleFileNode),
+) std.mem.Allocator.Error!void {
+    for (nodes) |*node| {
+        try out.append(allocator, .{ .node = node, .depth = depth });
+        if (node.expanded and node.children != null) {
+            try flattenFileNodes(allocator, node.children.?, depth + 1, out);
+        }
+    }
+}
+
+fn visibleFileNodeAtMutable(nodes: []FileTreeNode, target_index: usize) ?*FileTreeNode {
+    var current_index: usize = 0;
+    return visibleFileNodeAtMutableInner(nodes, target_index, &current_index);
+}
+
+fn visibleFileNodeAtMutableInner(
+    nodes: []FileTreeNode,
+    target_index: usize,
+    current_index: *usize,
+) ?*FileTreeNode {
+    for (nodes) |*node| {
+        if (current_index.* == target_index) return node;
+        current_index.* += 1;
+        if (node.expanded and node.children != null) {
+            if (visibleFileNodeAtMutableInner(node.children.?, target_index, current_index)) |found| {
+                return found;
+            }
+        }
+    }
+    return null;
+}
+
 test "file tree renders directories and files" {
-    const children = &[_]FileTreeNode{
+    var children = [_]FileTreeNode{
         .{ .name = "main.zig", .file_type = .file },
         .{ .name = "utils.zig", .file_type = .file },
     };
 
-    const nodes = &[_]FileTreeNode{
-        .{ .name = "src", .file_type = .directory, .expanded = true, .children = children },
+    var nodes = [_]FileTreeNode{
+        .{ .name = "src", .file_type = .directory, .expanded = true, .children = &children },
         .{ .name = "README.md", .file_type = .file },
     };
 
-    var tree = FileTree{ .nodes = nodes, .selected_index = 1 };
+    var tree = FileTree{ .nodes = &nodes, .selected_index = 1 };
 
     var screen = try test_helpers.renderToScreen(tree.drawComponent(), 20, 4);
     defer screen.deinit(std.testing.allocator);
@@ -211,15 +343,15 @@ test "file tree renders directories and files" {
 }
 
 test "file tree down navigation clamps to visible nodes" {
-    const children = &[_]FileTreeNode{
+    var children = [_]FileTreeNode{
         .{ .name = "main.zig", .file_type = .file },
     };
-    const nodes = &[_]FileTreeNode{
-        .{ .name = "src", .file_type = .directory, .expanded = true, .children = children },
+    var nodes = [_]FileTreeNode{
+        .{ .name = "src", .file_type = .directory, .expanded = true, .children = &children },
         .{ .name = "README.md", .file_type = .file },
     };
 
-    var tree = FileTree{ .nodes = nodes };
+    var tree = FileTree{ .nodes = &nodes };
     tree.handleKey(.down);
     tree.handleKey(.down);
     tree.handleKey(.down);
@@ -227,4 +359,55 @@ test "file tree down navigation clamps to visible nodes" {
 
     try std.testing.expectEqual(@as(usize, 2), tree.selected_index);
     try std.testing.expectEqual(@as(usize, 3), tree.visibleCount());
+}
+
+test "file tree draw scrolls selected node into view" {
+    var nodes = [_]FileTreeNode{
+        .{ .name = "one", .file_type = .file },
+        .{ .name = "two", .file_type = .file },
+        .{ .name = "three", .file_type = .file },
+        .{ .name = "four", .file_type = .file },
+    };
+
+    var tree = FileTree{ .nodes = &nodes, .selected_index = 3 };
+
+    var screen = try test_helpers.renderToScreen(tree.drawComponent(), 16, 2);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 3, 1, "f", .{ .reverse = true });
+}
+
+test "file tree enter toggles selected directory" {
+    var children = [_]FileTreeNode{
+        .{ .name = "main.zig", .file_type = .file },
+    };
+    var nodes = [_]FileTreeNode{
+        .{ .name = "src", .file_type = .directory, .expanded = false, .children = &children },
+        .{ .name = "README.md", .file_type = .file },
+    };
+
+    var tree = FileTree{ .nodes = &nodes };
+    try std.testing.expectEqual(@as(usize, 2), tree.visibleCount());
+
+    tree.handleKey(.enter);
+
+    try std.testing.expect(nodes[0].expanded);
+    try std.testing.expectEqual(@as(usize, 3), tree.visibleCount());
+}
+
+test "file tree collapse clamps hidden selected child" {
+    var children = [_]FileTreeNode{
+        .{ .name = "main.zig", .file_type = .file },
+        .{ .name = "utils.zig", .file_type = .file },
+    };
+    var nodes = [_]FileTreeNode{
+        .{ .name = "src", .file_type = .directory, .expanded = true, .children = &children },
+    };
+
+    var tree = FileTree{ .nodes = &nodes, .selected_index = 2, .offset = 2 };
+    tree.toggleNode(0);
+
+    try std.testing.expect(!nodes[0].expanded);
+    try std.testing.expectEqual(@as(usize, 0), tree.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), tree.offset);
 }

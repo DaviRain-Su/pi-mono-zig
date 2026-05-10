@@ -117,6 +117,7 @@ pub const Table = vw.Table;
 pub const TableState = vw.TableState;
 pub const TableCell = vw.TableCell;
 pub const TableRow = vw.TableRow;
+pub const TableSortOrder = vw.TableSortOrder;
 pub const Tabs = vw.Tabs;
 pub const Gauge = vw.Gauge;
 pub const Scrollbar = vw.Scrollbar;
@@ -230,6 +231,7 @@ test "exports migrated widget aliases" {
     _ = TruncationMode;
     _ = ScrollbarOrientation;
     _ = BarChartBar;
+    _ = TableSortOrder;
     _ = List;
     _ = ListState;
     _ = Tree;

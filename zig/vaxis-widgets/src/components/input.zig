@@ -78,7 +78,13 @@ pub const Input = struct {
         // If text is too wide, scroll to keep cursor visible
         if (self.mask) |mask_char| {
             // Simple mask: all chars show as mask_char
-            const mask_width = ansi.visibleWidth(&[_]u8{mask_char});
+            const mask_bytes = [_]u8{mask_char};
+            const raw_mask_width = ansi.visibleWidth(&mask_bytes);
+            const mask_width = @max(raw_mask_width, 1);
+            const mask_grapheme = if (raw_mask_width == 0)
+                "*"
+            else
+                try std.fmt.allocPrint(ctx.arena, "{c}", .{mask_char});
             const start_grapheme = visibleStartForCursor(graphemes.items, cursor_grapheme_index, effective_width, mask_width);
 
             var col: u16 = 0;
@@ -88,9 +94,8 @@ pub const Input = struct {
                 if (i == cursor_grapheme_index and self.show_cursor and !use_placeholder) {
                     cursor_col = col;
                 }
-                const grapheme = try std.fmt.allocPrint(ctx.arena, "{c}", .{mask_char});
                 window.writeCell(col, row, .{
-                    .char = .{ .grapheme = grapheme, .width = @intCast(mask_width) },
+                    .char = .{ .grapheme = mask_grapheme, .width = @intCast(mask_width) },
                     .style = if (i == cursor_grapheme_index and self.show_cursor and !use_placeholder)
                         self.cursor_style
                     else
@@ -104,7 +109,7 @@ pub const Input = struct {
 
             if (self.show_cursor and !use_placeholder and cursor_col < effective_width) {
                 window.writeCell(cursor_col, row, .{
-                    .char = .{ .grapheme = if (cursor_grapheme_index < graphemes.items.len) &[_]u8{mask_char} else " ", .width = @intCast(mask_width) },
+                    .char = .{ .grapheme = if (cursor_grapheme_index < graphemes.items.len) mask_grapheme else " ", .width = @intCast(mask_width) },
                     .style = self.cursor_style,
                 });
             }
@@ -290,4 +295,19 @@ test "input does not draw wide grapheme past narrow window" {
     defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, " ", .{ .reverse = true });
+    try test_helpers.expectNoWideCellOverflow(&screen);
+}
+
+test "input masked rendering never writes zero-width mask cells" {
+    const input = Input{
+        .text = "secret",
+        .mask = 0,
+        .show_cursor = false,
+    };
+
+    var screen = try test_helpers.renderToScreen(input.drawComponent(), 4, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCellWithWidth(&screen, 0, 0, "*", 1, .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

@@ -781,8 +781,8 @@ fn drawSegments(
     if (fill_style) |style| fillRows(window, style, height);
 
     if (wrap == .grapheme) {
-        const result = window.print(segments, .{ .wrap = wrap });
-        return renderedLineCount(result, true, window.height);
+        const result = drawGraphemeSegments(window, segments, true);
+        return result.lineCount(window.height);
     }
 
     var rich_text = richTextForSegments(segments, wrap, fill_style);
@@ -825,6 +825,75 @@ fn drawSegmentsNoWrap(window: vaxis.Window, segments: []const vaxis.Segment) voi
     _ = window.print(segments, .{ .wrap = .none });
 }
 
+const GraphemeSegmentsResult = struct {
+    row: usize = 0,
+    col: usize = 0,
+    wrote: bool = false,
+    overflow: bool = false,
+
+    fn lineCount(self: GraphemeSegmentsResult, max_height: usize) usize {
+        if (!self.wrote) return 0;
+        if (self.overflow) return max_height;
+        return @min(max_height, self.row + 1);
+    }
+};
+
+fn drawGraphemeSegments(window: vaxis.Window, segments: []const vaxis.Segment, commit: bool) GraphemeSegmentsResult {
+    if (window.width == 0 or window.height == 0 or segments.len == 0) return .{};
+
+    var row: usize = 0;
+    var col: usize = 0;
+    var wrote = false;
+
+    for (segments) |segment| {
+        var idx: usize = 0;
+        while (idx < segment.text.len) {
+            if (segment.text[idx] == '\n') {
+                wrote = true;
+                row += 1;
+                col = 0;
+                idx += 1;
+                if (row >= window.height) return .{ .row = window.height - 1, .col = 0, .wrote = true, .overflow = true };
+                continue;
+            }
+
+            const cluster = ansi.nextDisplayCluster(segment.text, idx);
+            if (cluster.end <= idx) break;
+            const width = cluster.width;
+            if (width == 0) {
+                idx = cluster.end;
+                continue;
+            }
+            if (width > window.width) {
+                if (col != 0) {
+                    row += 1;
+                    col = 0;
+                    if (row >= window.height) return .{ .row = window.height - 1, .col = 0, .wrote = wrote, .overflow = true };
+                }
+                idx = cluster.end;
+                continue;
+            }
+            if (col > 0 and col + width > window.width) {
+                row += 1;
+                col = 0;
+                if (row >= window.height) return .{ .row = window.height - 1, .col = 0, .wrote = wrote, .overflow = true };
+            }
+            if (commit) {
+                window.writeCell(@intCast(col), @intCast(row), .{
+                    .char = .{ .grapheme = segment.text[idx..cluster.end], .width = @intCast(width) },
+                    .style = segment.style,
+                    .link = segment.link,
+                });
+            }
+            wrote = true;
+            col += width;
+            idx = cluster.end;
+        }
+    }
+
+    return .{ .row = row, .col = col, .wrote = wrote };
+}
+
 fn drawTextAtRow(window: vaxis.Window, row: usize, text: []const u8, style: vaxis.Cell.Style) void {
     if (row >= window.height) return;
     const row_window = window.child(.{
@@ -851,6 +920,10 @@ fn fillRows(window: vaxis.Window, style: vaxis.Cell.Style, row_count: usize) voi
 
 fn measureSegmentsHeight(window: vaxis.Window, segments: []const vaxis.Segment, wrap: WrapMode) usize {
     if (window.width == 0 or window.height == 0 or segments.len == 0) return 0;
+    if (wrap == .grapheme) {
+        const result = drawGraphemeSegments(window, segments, false);
+        return result.lineCount(window.height);
+    }
     const result = window.print(segments, .{ .wrap = wrap, .commit = false });
     return renderedLineCount(result, true, window.height);
 }
@@ -1575,4 +1648,22 @@ test "markdown table snapshot preserves three column alignment" {
     ,
         rendered,
     );
+}
+
+test "markdown fenced code wraps wide grapheme before right border" {
+    const markdown = Markdown{
+        .text =
+        \\```
+        \\a你b
+        \\```
+        ,
+    };
+
+    var screen = try test_helpers.renderToScreen(markdown.drawComponent(), 6, 5);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 2, 1, "a", CODE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 2, "你", CODE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 3, "b", CODE_FALLBACK_STYLE);
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

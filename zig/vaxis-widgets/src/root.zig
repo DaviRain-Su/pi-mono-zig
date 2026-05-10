@@ -6,6 +6,7 @@ pub const ansi = @import("ansi.zig");
 pub const layout = @import("layout.zig");
 pub const constraints = @import("constraints.zig");
 pub const keys = @import("keys.zig");
+pub const scroll = @import("scroll.zig");
 pub const test_helpers = @import("test_helpers.zig");
 
 pub const Spacer = @import("components/spacer.zig").Spacer;
@@ -21,6 +22,7 @@ pub const Table = @import("components/table.zig").Table;
 pub const TableState = @import("components/table.zig").TableState;
 pub const TableCell = @import("components/table.zig").Cell;
 pub const TableRow = @import("components/table.zig").Row;
+pub const TableSortOrder = @import("components/table.zig").SortOrder;
 pub const Row = @import("components/table.zig").Row;
 pub const Cell = @import("components/table.zig").Cell;
 pub const Tabs = @import("components/tabs.zig").Tabs;
