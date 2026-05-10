@@ -31,6 +31,9 @@ pub const SelectList = struct {
     padding_x: usize = 0,
     padding_y: usize = 0,
     theme: ?*const resources_mod.Theme = null,
+    show_scrollbar: bool = false,
+    scrollbar_thumb: []const u8 = "█",
+    scrollbar_track: []const u8 = "│",
 
     pub fn drawComponent(self: *const SelectList) draw_mod.Component {
         return .{
@@ -102,16 +105,36 @@ pub const SelectList = struct {
                 row += 1;
             }
         } else {
+            const visible_count = @max(self.max_visible, 1);
             const start_index = self.visibleStartIndex();
-            const end_index = @min(start_index + @max(self.max_visible, 1), self.items.len);
+            const end_index = @min(start_index + visible_count, self.items.len);
+            const scrollbar_width: u16 = if (self.show_scrollbar and self.items.len > visible_count and visible_count > 0) 1 else 0;
+            const content_width = if (window.width > scrollbar_width) window.width - scrollbar_width else 0;
+
             for (start_index..end_index) |index| {
                 if (row >= window.height) break;
-                const row_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
+                const row_window = window.child(.{ .y_off = @intCast(row), .height = 1, .width = content_width });
                 try self.drawItemRow(ctx.arena, row_window, active_theme, self.items[index], index == self.selectedIndex());
                 row += 1;
             }
 
-            if (self.items.len > @max(self.max_visible, 1) and row < window.height) {
+            if (self.show_scrollbar and scrollbar_width > 0 and visible_count > 0) {
+                const thumb_height = @max(1, (visible_count * visible_count) / self.items.len);
+                const max_offset = self.items.len - visible_count;
+                const thumb_start = if (max_offset == 0) 0 else (start_index * (visible_count - thumb_height)) / max_offset;
+                const scroll_col = window.width - 1;
+                for (0..visible_count) |i| {
+                    const row_y = top_padding + @as(u16, @intCast(i));
+                    if (row_y >= window.height) break;
+                    const is_thumb = i >= thumb_start and i < thumb_start + thumb_height;
+                    window.writeCell(scroll_col, row_y, .{
+                        .char = .{ .grapheme = if (is_thumb) self.scrollbar_thumb else self.scrollbar_track, .width = 1 },
+                        .style = .{},
+                    });
+                }
+            }
+
+            if (self.items.len > visible_count and row < window.height and !self.show_scrollbar) {
                 const info_style = if (active_theme) |theme|
                     style_mod.styleFor(theme, .select_scroll)
                 else
