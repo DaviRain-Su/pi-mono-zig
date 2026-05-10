@@ -1,11 +1,11 @@
 const std = @import("std");
-const config_selector = @import("config_selector.zig");
+const package_settings_store = @import("package_settings_store.zig");
 
 /// Focused parser for package-management subcommands. Execution, config IO,
 /// self-update, and package resource mutation stay in `package_manager.zig`.
 pub const PackageCommand = enum { install, remove, update, list, config };
 
-pub const ConfigKind = config_selector.ConfigKind;
+pub const ConfigKind = package_settings_store.ConfigKind;
 
 pub const ConfigToggleAction = enum { enable, disable };
 

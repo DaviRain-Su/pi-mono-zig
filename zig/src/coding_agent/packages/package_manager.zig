@@ -10,6 +10,7 @@ const resources_mod = @import("../resources/resources.zig");
 const config_selector = @import("config_selector.zig");
 const package_command_parser = @import("package_command_parser.zig");
 const package_process_runner = @import("package_process_runner.zig");
+const package_settings_store = @import("package_settings_store.zig");
 const package_sources = @import("package_sources.zig");
 const provenance_lockfile = @import("provenance_lockfile.zig");
 const self_update = @import("self_update.zig");
@@ -43,24 +44,30 @@ const self_update = @import("self_update.zig");
 /// settings paths for tests so deterministic fixture runs can compare
 /// stdout/stderr and JSON state without leaking machine paths.
 pub const PackageCommand = package_command_parser.PackageCommand;
-pub const ConfigKind = config_selector.ConfigKind;
+pub const ConfigKind = package_settings_store.ConfigKind;
 const ConfigSelectorState = config_selector.ConfigSelectorState;
 const loadSelectorState = config_selector.loadSelectorState;
 const saveSelectorState = config_selector.saveSelectorState;
 const ProvenanceScope = provenance_lockfile.Scope;
+const collectScopePackages = package_settings_store.collectScopePackages;
 const LocalPathMode = package_sources.LocalPathMode;
 const computeInstalledPath = package_sources.computeInstalledPath;
+const ensurePackagesArray = package_settings_store.ensurePackagesArray;
+const findPackageIndex = package_settings_store.findPackageIndex;
 const gitInstallPath = package_sources.gitInstallPath;
 const isGitSource = package_sources.isGitSource;
 const isLocalSource = package_sources.isLocalSource;
 const isNpmSource = package_sources.isNpmSource;
+const loadSettingsObject = package_settings_store.loadSettingsObject;
 const localProvenanceKeyForSource = package_sources.localProvenanceKeyForSource;
 const normalizePackageSourceForSettings = package_sources.normalizePackageSourceForSettings;
 const npmPackageName = package_sources.npmPackageName;
 const packageSourcesMatchForScope = package_sources.packageSourcesMatchForScope;
+const packageSourceFromItem = package_settings_store.packageSourceFromItem;
 const parseGitSource = package_sources.parseGitSource;
 const resolveLocalPathFromCwd = package_sources.resolveLocalPathFromCwd;
 const resolveLocalPathFromScopeBase = package_sources.resolveLocalPathFromScopeBase;
+const settingsPathForScope = package_settings_store.settingsPathForScope;
 const executeGitInstall = package_process_runner.executeGitInstall;
 const executeGitUpdate = package_process_runner.executeGitUpdate;
 const executeNpmInstall = package_process_runner.executeNpmInstall;
@@ -125,6 +132,10 @@ pub const ExecuteOptions = struct {
 pub const SelfUpdatePackageManager = self_update.SelfUpdatePackageManager;
 pub const LatestSelfUpdateRelease = self_update.LatestSelfUpdateRelease;
 pub const ExecuteResult = self_update.ExecuteResult;
+
+fn settingsWriteOptions(options: ExecuteOptions) package_settings_store.WriteOptions {
+    return .{ .fail_settings_write_for_testing = options.fail_settings_write_for_testing };
+}
 
 /// Execute the parsed package command using deterministic local
 /// settings/file IO. `stdout` receives success/list output; `stderr`
@@ -202,6 +213,7 @@ fn executeConfig(
     const kind = command.config_options.toggle_kind.?;
     const pattern = command.config_options.toggle_pattern.?;
     const action = command.config_options.toggle_action;
+    const enabled = action == .enable;
 
     const settings_path = try settingsPathForScope(allocator, options, command.local);
     defer allocator.free(settings_path);
@@ -212,62 +224,12 @@ fn executeConfig(
         common.deinitJsonValue(allocator, owner);
     }
 
-    const prefix: u8 = if (action == .enable) '+' else '-';
-    const new_entry = try std.fmt.allocPrint(allocator, "{c}{s}", .{ prefix, pattern });
-    errdefer allocator.free(new_entry);
-
-    const array_ptr = try ensureKindArray(allocator, &settings_object, kind);
-
-    // Filter out any previous +pattern/-pattern/!pattern/pattern entries
-    // matching this exact pattern string. Mirrors the TS config selector
-    // semantics where toggling replaces the previous decision.
-    var idx: usize = 0;
-    while (idx < array_ptr.items.len) {
-        const item = array_ptr.items[idx];
-        const matches = blk: {
-            if (item != .string) break :blk false;
-            const value = item.string;
-            const stripped = if (value.len > 0 and (value[0] == '+' or value[0] == '-' or value[0] == '!'))
-                value[1..]
-            else
-                value;
-            break :blk std.mem.eql(u8, stripped, pattern);
-        };
-        if (matches) {
-            const removed = array_ptr.orderedRemove(idx);
-            common.deinitJsonValue(allocator, removed);
-            continue;
-        }
-        idx += 1;
-    }
-
-    try array_ptr.append(.{ .string = new_entry });
-    try writeSettingsObject(allocator, io, settings_path, settings_object, options);
+    try package_settings_store.setConfigKindPattern(allocator, &settings_object, kind, pattern, enabled);
+    try package_settings_store.writeSettingsObject(allocator, io, settings_path, settings_object, settingsWriteOptions(options));
 
     const action_label: []const u8 = if (action == .enable) "Enabled" else "Disabled";
     try stdout.print("{s} {s}: {s}\n", .{ action_label, kind.settingsKey(), pattern });
     return .{ .exit_code = 0 };
-}
-
-fn ensureKindArray(
-    allocator: std.mem.Allocator,
-    settings_object: *std.json.ObjectMap,
-    kind: ConfigKind,
-) !*std.json.Array {
-    const key_str = kind.settingsKey();
-    if (settings_object.getPtr(key_str)) |existing| {
-        if (existing.* == .array) {
-            return &existing.array;
-        }
-        const cleanup = existing.*;
-        common.deinitJsonValue(allocator, cleanup);
-        existing.* = .{ .array = std.json.Array.init(allocator) };
-        return &existing.array;
-    }
-    const owned_key = try allocator.dupe(u8, key_str);
-    errdefer allocator.free(owned_key);
-    try settings_object.put(allocator, owned_key, .{ .array = std.json.Array.init(allocator) });
-    return &settings_object.getPtr(key_str).?.array;
 }
 
 fn executeInstall(
@@ -403,7 +365,7 @@ fn executeInstall(
         }
     }
 
-    try writeSettingsObject(allocator, io, settings_path, settings_object, options);
+    try package_settings_store.writeSettingsObject(allocator, io, settings_path, settings_object, settingsWriteOptions(options));
     wrote_lock = false;
     const redacted_source = try redactDiagnosticValue(allocator, source);
     defer allocator.free(redacted_source);
@@ -1554,7 +1516,7 @@ fn executeRemove(
     const removed = packages_value_ptr.?.array.orderedRemove(matched_index.?);
     common.deinitJsonValue(allocator, removed);
 
-    writeSettingsObject(allocator, io, settings_path, settings_object, options) catch |err| {
+    package_settings_store.writeSettingsObject(allocator, io, settings_path, settings_object, settingsWriteOptions(options)) catch |err| {
         try restoreFileSnapshot(allocator, io, settings_snapshot);
         return err;
     };
@@ -2247,112 +2209,6 @@ fn localWasmTrustStatusForList(
     };
 }
 
-fn settingsPathForScope(
-    allocator: std.mem.Allocator,
-    options: ExecuteOptions,
-    local: bool,
-) ![]u8 {
-    if (local) {
-        return std.fs.path.join(allocator, &[_][]const u8{ options.cwd, ".pi", "settings.json" });
-    }
-    return std.fs.path.join(allocator, &[_][]const u8{ options.agent_dir, "settings.json" });
-}
-
-fn loadSettingsObject(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    settings_path: []const u8,
-) !std.json.ObjectMap {
-    const content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return std.json.ObjectMap.init(allocator, &.{}, &.{}),
-        else => return err,
-    };
-    defer allocator.free(content);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-        // Treat malformed settings as empty to avoid wedging the CLI.
-        return std.json.ObjectMap.init(allocator, &.{}, &.{});
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return std.json.ObjectMap.init(allocator, &.{}, &.{});
-    }
-
-    var clone = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer {
-        const cleanup: std.json.Value = .{ .object = clone };
-        common.deinitJsonValue(allocator, cleanup);
-    }
-    var iterator = parsed.value.object.iterator();
-    while (iterator.next()) |entry| {
-        try clone.put(
-            allocator,
-            try allocator.dupe(u8, entry.key_ptr.*),
-            try common.cloneJsonValue(allocator, entry.value_ptr.*),
-        );
-    }
-    return clone;
-}
-
-fn ensurePackagesArray(
-    allocator: std.mem.Allocator,
-    settings_object: *std.json.ObjectMap,
-) !*std.json.Array {
-    if (settings_object.getPtr("packages")) |existing| {
-        if (existing.* == .array) {
-            return &existing.array;
-        }
-        // Replace non-array `packages` with a fresh array; legacy
-        // values are discarded silently, matching TS where an invalid
-        // setting cannot prevent a fresh install.
-        const cleanup = existing.*;
-        common.deinitJsonValue(allocator, cleanup);
-        existing.* = .{ .array = std.json.Array.init(allocator) };
-        return &existing.array;
-    }
-
-    const key = try allocator.dupe(u8, "packages");
-    errdefer allocator.free(key);
-    try settings_object.put(allocator, key, .{ .array = std.json.Array.init(allocator) });
-    return &settings_object.getPtr("packages").?.array;
-}
-
-fn findPackageIndex(
-    allocator: std.mem.Allocator,
-    array: std.json.Array,
-    source: []const u8,
-    is_project: bool,
-    options: ExecuteOptions,
-) !?usize {
-    for (array.items, 0..) |item, idx| {
-        switch (item) {
-            .string => |s| if (try packageSourcesMatchForScope(allocator, s, source, is_project, options)) return idx,
-            .object => |obj| {
-                if (obj.get("source")) |value| {
-                    if (value == .string) {
-                        if (try packageSourcesMatchForScope(allocator, value.string, source, is_project, options)) return idx;
-                    }
-                }
-            },
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn packageSourceFromItem(allocator: std.mem.Allocator, item: std.json.Value) ![]u8 {
-    return switch (item) {
-        .string => |source| allocator.dupe(u8, source),
-        .object => |object| blk: {
-            const value = object.get("source") orelse return error.InvalidPackageSource;
-            if (value != .string) return error.InvalidPackageSource;
-            break :blk allocator.dupe(u8, value.string);
-        },
-        else => error.InvalidPackageSource,
-    };
-}
-
 fn computeLocalWasmLockEntryNoDiagnostics(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2433,21 +2289,6 @@ fn removeLocalWasmProvenanceForSource(
     _ = try removeProvenanceEntry(allocator, io, provenanceScope(is_project), lockfile_path, key, options);
 }
 
-fn writeSettingsObject(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    settings_path: []const u8,
-    settings_object: std.json.ObjectMap,
-    options: ExecuteOptions,
-) !void {
-    if (options.fail_settings_write_for_testing) return error.InjectedSettingsWriteFailure;
-    try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
-    const value: std.json.Value = .{ .object = settings_object };
-    const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
-    defer allocator.free(serialized);
-    try common.writeFileAbsolute(io, settings_path, serialized, true);
-}
-
 fn writeProvenanceEntry(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -2470,41 +2311,6 @@ fn removeProvenanceEntry(
 ) !bool {
     if (options.fail_lockfile_write_for_testing) return error.InjectedLockfileWriteFailure;
     return try provenance_lockfile.removeEntry(allocator, io, scope, lockfile_path, key);
-}
-
-fn collectScopePackages(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    options: ExecuteOptions,
-    local: bool,
-) !std.ArrayList([]u8) {
-    var result: std.ArrayList([]u8) = .empty;
-    errdefer freeOwnedStrings(allocator, &result);
-
-    const settings_path = try settingsPathForScope(allocator, options, local);
-    defer allocator.free(settings_path);
-
-    var settings_object = try loadSettingsObject(allocator, io, settings_path);
-    defer {
-        const cleanup: std.json.Value = .{ .object = settings_object };
-        common.deinitJsonValue(allocator, cleanup);
-    }
-
-    const packages_value = settings_object.get("packages") orelse return result;
-    if (packages_value != .array) return result;
-
-    for (packages_value.array.items) |item| {
-        switch (item) {
-            .string => |s| try result.append(allocator, try allocator.dupe(u8, s)),
-            .object => |obj| {
-                if (obj.get("source")) |value| {
-                    if (value == .string) try result.append(allocator, try allocator.dupe(u8, value.string));
-                }
-            },
-            else => {},
-        }
-    }
-    return result;
 }
 
 fn findInstalledScope(
@@ -3374,7 +3180,7 @@ fn addPolicyToSettings(
         .{ .object = policy },
     );
 
-    try writeSettingsObject(allocator, std.testing.io, settings_path, settings_object, .{ .cwd = "", .agent_dir = "" });
+    try package_settings_store.writeSettingsObject(allocator, std.testing.io, settings_path, settings_object, .{});
 }
 
 fn nativePolicyKeyForPackage(

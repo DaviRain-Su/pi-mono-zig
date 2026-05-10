@@ -47,6 +47,7 @@ pub const native_manifest = @import("extensions/native/native_manifest.zig");
 pub const native_dynamic_loader = @import("extensions/native/native_loader.zig");
 pub const native_sdk_template_tests = @import("extensions/native/sdk_template_tests.zig");
 pub const package_manager = @import("packages/package_manager.zig");
+pub const package_settings_store = @import("packages/package_settings_store.zig");
 pub const provider_config = @import("providers/provider_config.zig");
 pub const oauth_callback_listener = @import("auth/oauth_callback_listener.zig");
 pub const interactive_mode = @import("interactive_mode.zig");
@@ -158,6 +159,7 @@ test {
     _ = @import("extensions/native/native_loader.zig");
     _ = @import("extensions/native/sdk_template_tests.zig");
     _ = @import("packages/package_manager.zig");
+    _ = @import("packages/package_settings_store.zig");
     _ = @import("tests/ts_rpc_fixture_tests.zig");
     _ = @import("providers/provider_config.zig");
     _ = @import("auth/oauth_callback_listener.zig");

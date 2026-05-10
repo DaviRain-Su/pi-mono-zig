@@ -1,102 +1,9 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
-const config_mod = @import("../config/config.zig");
+const package_settings_store = @import("package_settings_store.zig");
 const tui_mod = @import("tui");
 
-pub const ConfigKind = enum {
-    extensions,
-    skills,
-    prompts,
-    themes,
-
-    pub fn fromString(value: []const u8) ?ConfigKind {
-        if (std.mem.eql(u8, value, "extensions")) return .extensions;
-        if (std.mem.eql(u8, value, "skills")) return .skills;
-        if (std.mem.eql(u8, value, "prompts")) return .prompts;
-        if (std.mem.eql(u8, value, "themes")) return .themes;
-        return null;
-    }
-
-    pub fn settingsKey(self: ConfigKind) []const u8 {
-        return switch (self) {
-            .extensions => "extensions",
-            .skills => "skills",
-            .prompts => "prompts",
-            .themes => "themes",
-        };
-    }
-};
-
-fn loadSettingsObject(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    settings_path: []const u8,
-) !std.json.ObjectMap {
-    const content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return std.json.ObjectMap.init(allocator, &.{}, &.{}),
-        else => return err,
-    };
-    defer allocator.free(content);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-        // Treat malformed settings as empty to avoid wedging the CLI.
-        return std.json.ObjectMap.init(allocator, &.{}, &.{});
-    };
-    defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return std.json.ObjectMap.init(allocator, &.{}, &.{});
-    }
-
-    var clone = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer {
-        const cleanup: std.json.Value = .{ .object = clone };
-        common.deinitJsonValue(allocator, cleanup);
-    }
-    var iterator = parsed.value.object.iterator();
-    while (iterator.next()) |entry| {
-        try clone.put(
-            allocator,
-            try allocator.dupe(u8, entry.key_ptr.*),
-            try common.cloneJsonValue(allocator, entry.value_ptr.*),
-        );
-    }
-    return clone;
-}
-
-fn ensureKindArray(
-    allocator: std.mem.Allocator,
-    settings_object: *std.json.ObjectMap,
-    kind: ConfigKind,
-) !*std.json.Array {
-    const key_str = kind.settingsKey();
-    if (settings_object.getPtr(key_str)) |existing| {
-        if (existing.* == .array) {
-            return &existing.array;
-        }
-        const cleanup = existing.*;
-        common.deinitJsonValue(allocator, cleanup);
-        existing.* = .{ .array = std.json.Array.init(allocator) };
-        return &existing.array;
-    }
-    const owned_key = try allocator.dupe(u8, key_str);
-    errdefer allocator.free(owned_key);
-    try settings_object.put(allocator, owned_key, .{ .array = std.json.Array.init(allocator) });
-    return &settings_object.getPtr(key_str).?.array;
-}
-
-fn writeSettingsObject(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    settings_path: []const u8,
-    settings_object: std.json.ObjectMap,
-) !void {
-    try config_mod.validateExtensionPoliciesForSettingsWrite(allocator, settings_object, settings_path);
-    const value: std.json.Value = .{ .object = settings_object };
-    const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
-    defer allocator.free(serialized);
-    try common.writeFileAbsolute(io, settings_path, serialized, true);
-}
+pub const ConfigKind = package_settings_store.ConfigKind;
 
 // ---------------------------------------------------------------------
 // Config Selector: interactive TUI for bare `pi config` on a TTY.
@@ -178,7 +85,7 @@ pub fn loadSelectorState(
     var state = ConfigSelectorState{ .entries = .empty };
     errdefer state.deinit(allocator);
 
-    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    var settings_object = try package_settings_store.loadSettingsObject(allocator, io, settings_path);
     defer {
         const owner: std.json.Value = .{ .object = settings_object };
         common.deinitJsonValue(allocator, owner);
@@ -220,7 +127,7 @@ pub fn saveSelectorState(
     state: *const ConfigSelectorState,
 ) !void {
     if (!state.hasChanges()) return;
-    var settings_object = try loadSettingsObject(allocator, io, settings_path);
+    var settings_object = try package_settings_store.loadSettingsObject(allocator, io, settings_path);
     defer {
         const owner: std.json.Value = .{ .object = settings_object };
         common.deinitJsonValue(allocator, owner);
@@ -228,36 +135,10 @@ pub fn saveSelectorState(
 
     for (state.entries.items) |entry| {
         if (!entry.changed) continue;
-        const array_ptr = try ensureKindArray(allocator, &settings_object, entry.kind);
-
-        // Remove any previous +/-/! entry for this pattern.
-        var idx: usize = 0;
-        while (idx < array_ptr.items.len) {
-            const item = array_ptr.items[idx];
-            const matches = blk: {
-                if (item != .string) break :blk false;
-                const v = item.string;
-                const stripped = if (v.len > 0 and (v[0] == '+' or v[0] == '-' or v[0] == '!'))
-                    v[1..]
-                else
-                    v;
-                break :blk std.mem.eql(u8, stripped, entry.pattern);
-            };
-            if (matches) {
-                const removed = array_ptr.orderedRemove(idx);
-                common.deinitJsonValue(allocator, removed);
-                continue;
-            }
-            idx += 1;
-        }
-
-        const prefix: u8 = if (entry.enabled) '+' else '-';
-        const new_entry = try std.fmt.allocPrint(allocator, "{c}{s}", .{ prefix, entry.pattern });
-        errdefer allocator.free(new_entry);
-        try array_ptr.append(.{ .string = new_entry });
+        try package_settings_store.setConfigKindPattern(allocator, &settings_object, entry.kind, entry.pattern, entry.enabled);
     }
 
-    try writeSettingsObject(allocator, io, settings_path, settings_object);
+    try package_settings_store.writeSettingsObject(allocator, io, settings_path, settings_object, .{});
 }
 
 /// Options for the interactive config selector TUI runner.
