@@ -8,6 +8,8 @@ pub const abort_signal_load_order = .seq_cst;
 
 pub const Api = []const u8;
 pub const Provider = []const u8;
+pub const ImagesApi = []const u8;
+pub const ImagesProvider = []const u8;
 
 pub const ThinkingLevel = enum {
     minimal,
@@ -143,6 +145,16 @@ pub const TextContent = struct {
 pub const ImageContent = struct {
     data: []const u8, // base64
     mime_type: []const u8,
+};
+
+pub const ImagesInputContent = union(enum) {
+    text: TextContent,
+    image: ImageContent,
+};
+
+pub const ImagesOutputContent = union(enum) {
+    text: TextContent,
+    image: ImageContent,
 };
 
 pub const ThinkingContent = struct {
@@ -664,6 +676,70 @@ pub const AssistantMessageEvent = struct {
     }
 };
 
+pub const ImagesStopReason = enum {
+    stop,
+    @"error",
+    aborted,
+};
+
+pub const ImagesContext = struct {
+    input: []const ImagesInputContent,
+};
+
+pub const ImagesModel = struct {
+    id: []const u8,
+    name: []const u8,
+    api: ImagesApi,
+    provider: ImagesProvider,
+    base_url: []const u8,
+    input: []const []const u8,
+    output: []const []const u8,
+    cost: ModelCost = .{},
+    headers: ?std.StringHashMap([]const u8) = null,
+};
+
+pub const AssistantImages = struct {
+    api: ImagesApi,
+    provider: ImagesProvider,
+    model: []const u8,
+    output: []const ImagesOutputContent,
+    response_id: ?[]const u8 = null,
+    usage: ?Usage = null,
+    stop_reason: ImagesStopReason = .stop,
+    error_message: ?[]const u8 = null,
+    timestamp: i64,
+};
+
+pub const ImagesOptions = struct {
+    api_key: ?[]const u8 = null,
+    on_payload: ?*const fn (std.mem.Allocator, std.json.Value, ImagesModel) anyerror!?std.json.Value = null,
+    on_response: ?*const fn (u16, std.StringHashMap([]const u8), ImagesModel) anyerror!void = null,
+    headers: ?std.StringHashMap([]const u8) = null,
+    timeout_ms: ?u32 = null,
+    max_retries: ?u32 = null,
+    max_retry_delay_ms: u32 = 60000,
+    signal: ?*const std.atomic.Value(bool) = null,
+    metadata: ?std.json.Value = null,
+};
+
+pub fn freeImagesContent(allocator: std.mem.Allocator, content: ImagesOutputContent) void {
+    switch (content) {
+        .text => |text| allocator.free(text.text),
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    }
+}
+
+pub fn freeAssistantImages(allocator: std.mem.Allocator, images: AssistantImages) void {
+    if (images.usage != null) {}
+    for (images.output) |content| freeImagesContent(allocator, content);
+    allocator.free(images.output);
+    if (images.response_id) |response_id| allocator.free(response_id);
+    if (images.error_message) |error_message| allocator.free(error_message);
+}
+
 test "Usage defaults" {
     const usage = Usage.init();
     try std.testing.expectEqual(@as(u32, 0), usage.input);
@@ -811,6 +887,10 @@ test "StreamOptions parity timeout and retries" {
     };
     try std.testing.expectEqual(@as(u32, 30_000), options.timeout_ms.?);
     try std.testing.expectEqual(@as(u32, 4), options.max_retries.?);
+}
+
+test "ImagesStopReason preserves error tag" {
+    try std.testing.expectEqualStrings("error", @tagName(ImagesStopReason.@"error"));
 }
 
 test "Model with cost and compat" {
