@@ -36,6 +36,7 @@ pub const components = struct {
     pub const chart = @import("components/chart.zig");
     pub const canvas = @import("components/canvas.zig");
     pub const split = @import("components/split.zig");
+    pub const placeholder = @import("components/placeholder.zig");
     pub const sparkline = @import("components/sparkline.zig");
     pub const clear = @import("components/clear.zig");
     pub const bar_chart = @import("components/bar_chart.zig");
@@ -117,6 +118,7 @@ pub const Line = components.canvas.Line;
 pub const Label = components.canvas.Label;
 pub const Split = components.split.Split;
 pub const SplitDirection = components.split.SplitDirection;
+pub const Placeholder = components.placeholder.Placeholder;
 
 test {
     _ = @import("ansi.zig");
@@ -156,6 +158,7 @@ test {
     _ = @import("components/chart.zig");
     _ = @import("components/canvas.zig");
     _ = @import("components/split.zig");
+    _ = @import("components/placeholder.zig");
 }
 
 test "components export autocomplete module" {
