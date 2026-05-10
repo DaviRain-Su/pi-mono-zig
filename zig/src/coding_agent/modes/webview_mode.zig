@@ -2,7 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = @import("ai");
 const json_format = @import("../shared/json_format.zig");
+const config_mod = @import("../config/config.zig");
 const provider_config = @import("../providers/provider_config.zig");
+const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
 const tool_selection = @import("../tool_selection.zig");
 const webview_bridge = @import("webview_bridge.zig");
@@ -37,6 +39,9 @@ pub const RunWebViewModeOptions = struct {
     available_models: []const provider_config.AvailableModel = &.{},
     configured_credentials: provider_config.ConfiguredCredentials = .{},
     auth_path: ?[]const u8 = null,
+    runtime_config: ?*config_mod.RuntimeConfig = null,
+    themes: []const resources_mod.Theme = &.{},
+    active_theme_name: ?[]const u8 = null,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     initial_prompt: ?[]const u8 = null,
@@ -174,6 +179,9 @@ pub fn runWebViewMode(
         .env_map = env_map,
         .configured_credentials = options.configured_credentials,
         .auth_path = options.auth_path,
+        .runtime_config = options.runtime_config,
+        .themes = options.themes,
+        .active_theme_name = options.active_theme_name,
         .selected_tools = options.selected_tools,
         .active_tool_count = options.active_tool_count,
         .session = session,
@@ -182,6 +190,7 @@ pub fn runWebViewMode(
             .model_selection = true,
             .session_mutation = true,
             .auth_mutation = true,
+            .settings_mutation = true,
         },
         .initial_prompt = options.initial_prompt,
         .initial_messages = options.initial_messages,
@@ -204,6 +213,9 @@ pub fn runWebViewMode(
     }
     if (env_map.get("PI_WEBVIEW_SMOKE_STRUCTURED_PROMPT")) |prompt_text| {
         try runBridgeSmokePrompt(allocator, &bridge, prompt_text, stdout);
+    }
+    if (isEnabledEnv(env_map, "PI_WEBVIEW_SMOKE_SETTINGS_PANELS")) {
+        try runBridgeSmokeSettingsPanels(allocator, &bridge, stdout);
     }
 
     const exit_code = try runNativeWebView(allocator, env_map, asset.asset_path, &bridge, stderr);
@@ -476,6 +488,22 @@ fn runBridgeSmokeCloseFlow(
     const closed_events = try pollBridgeSmokeEvents(allocator, bridge, turn_id, "closed_prompt_events", stdout);
     defer allocator.free(closed_events);
     try stdout.print("PI_WEBVIEW_CLOSE_CLEANUP active_after_join={s}\n", .{boolText(bridge.active_generation.load(.seq_cst))});
+}
+
+fn runBridgeSmokeSettingsPanels(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    stdout: *std.Io.Writer,
+) !void {
+    try writeBridgeSmokeResponse(allocator, bridge, "settings_state", "{\"id\":\"smoke-settings-state\",\"command\":\"get_state\"}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "settings_get", "{\"id\":\"smoke-settings-get\",\"command\":\"settings_get\"}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "settings_set_hide_thinking", "{\"id\":\"smoke-settings-set\",\"command\":\"settings_set\",\"payload\":{\"id\":\"hide_thinking\",\"value\":\"true\"}}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "thinking_set_off", "{\"id\":\"smoke-thinking-set\",\"command\":\"thinking_set\",\"payload\":{\"level\":\"off\"}}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "theme_select_light", "{\"id\":\"smoke-theme-select\",\"command\":\"theme_select\",\"payload\":{\"theme\":\"light\"}}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "scoped_models_get", "{\"id\":\"smoke-scoped-get\",\"command\":\"scoped_models_get\"}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "scoped_models_clear", "{\"id\":\"smoke-scoped-clear\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"clear_all\"}}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "scoped_models_enable_all", "{\"id\":\"smoke-scoped-enable\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"enable_all\"}}", stdout);
+    try writeBridgeSmokeResponse(allocator, bridge, "scoped_models_save", "{\"id\":\"smoke-scoped-save\",\"command\":\"scoped_models_save\"}", stdout);
 }
 
 fn configureFauxWebViewSmokeFixtures(
@@ -1051,4 +1079,30 @@ test "webview frontend asset includes model auth and session panels" {
     try std.testing.expect(std.mem.indexOf(u8, html, "model_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "auth_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "session_panel_rendered") != null);
+}
+
+test "webview frontend asset includes settings theme thinking and scoped model panels" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "settings-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "thinking-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "theme-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "scoped-models-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "settings_set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "thinking_set") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "theme_select") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "scoped_models_update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "scoped_models_save") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "settings_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "thinking_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "theme_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "scoped_models_panel_rendered") != null);
 }

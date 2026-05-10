@@ -51,7 +51,7 @@
       }
       .panels {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
         gap: 12px;
       }
       .panel {
@@ -92,6 +92,26 @@
       }
       .panel-row.current {
         border-color: rgba(63, 185, 80, 0.75);
+      }
+      .panel-row.disabled,
+      .panel-row:disabled {
+        opacity: 0.58;
+      }
+      .settings-row,
+      .scoped-row {
+        grid-template-columns: 1fr auto;
+        align-items: start;
+      }
+      .settings-row .meta,
+      .scoped-row .meta {
+        grid-column: 1 / -1;
+      }
+      .theme-swatch {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: currentColor;
       }
       .panel-row .meta,
       .panel-status {
@@ -267,6 +287,33 @@
           <input id="session-search-input" placeholder="Search sessions" autocomplete="off" />
           <div class="panel-list" id="session-list"></div>
         </section>
+        <section id="settings-panel" class="panel" aria-label="Settings panel">
+          <h2>Settings</h2>
+          <input id="settings-search-input" placeholder="Search settings" autocomplete="off" />
+          <div class="panel-status" id="settings-panel-status">Loading settings…</div>
+          <div class="panel-list" id="settings-list"></div>
+        </section>
+        <section id="thinking-panel" class="panel" aria-label="Thinking level selector">
+          <h2>Thinking level</h2>
+          <div class="panel-status" id="thinking-panel-status">Loading thinking levels…</div>
+          <div class="panel-list" id="thinking-list"></div>
+        </section>
+        <section id="theme-panel" class="panel" aria-label="Theme selector">
+          <h2>Theme</h2>
+          <div class="panel-status" id="theme-panel-status">Loading themes…</div>
+          <div class="panel-list" id="theme-list"></div>
+        </section>
+        <section id="scoped-models-panel" class="panel" aria-label="Scoped models panel">
+          <h2>Scoped models</h2>
+          <div class="panel-controls">
+            <input id="scoped-search-input" placeholder="Search scoped models" autocomplete="off" />
+            <button id="scoped-enable-all-button" type="button">Enable all</button>
+            <button id="scoped-clear-all-button" type="button">Clear</button>
+            <button id="scoped-save-button" type="button">Save</button>
+          </div>
+          <div class="panel-status" id="scoped-panel-status">Loading scoped models…</div>
+          <div class="panel-list" id="scoped-list"></div>
+        </section>
       </section>
       <pre id="initial-input" hidden></pre>
       <section id="messages" aria-live="polite"></section>
@@ -308,6 +355,12 @@
           showPath: false,
           search: "",
         },
+        settingsUi: {
+          search: "",
+        },
+        scopedUi: {
+          search: "",
+        },
         statusBaseText: "bridge: initializing",
         promptEnabled: true,
         activeFrameMonitor: null,
@@ -333,6 +386,19 @@
       const sessionSearchInputEl = document.getElementById("session-search-input");
       const sessionNewButtonEl = document.getElementById("session-new-button");
       const sessionListEl = document.getElementById("session-list");
+      const settingsSearchInputEl = document.getElementById("settings-search-input");
+      const settingsPanelStatusEl = document.getElementById("settings-panel-status");
+      const settingsListEl = document.getElementById("settings-list");
+      const thinkingPanelStatusEl = document.getElementById("thinking-panel-status");
+      const thinkingListEl = document.getElementById("thinking-list");
+      const themePanelStatusEl = document.getElementById("theme-panel-status");
+      const themeListEl = document.getElementById("theme-list");
+      const scopedSearchInputEl = document.getElementById("scoped-search-input");
+      const scopedEnableAllButtonEl = document.getElementById("scoped-enable-all-button");
+      const scopedClearAllButtonEl = document.getElementById("scoped-clear-all-button");
+      const scopedSaveButtonEl = document.getElementById("scoped-save-button");
+      const scopedPanelStatusEl = document.getElementById("scoped-panel-status");
+      const scopedListEl = document.getElementById("scoped-list");
 
       function postNativeMessage(message) {
         if (window.webkit?.messageHandlers?.pi) {
@@ -506,6 +572,203 @@
         });
       }
 
+      function settingMatchesSearch(row) {
+        const query = state.settingsUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [row.label, row.description, row.value, row.id]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function nextSettingValue(row) {
+        if (Array.isArray(row.options) && row.options.length > 0) {
+          const index = row.options.indexOf(row.value);
+          return row.options[(index + 1) % row.options.length];
+        }
+        if (row.kind === "toggle") return row.value === "true" ? "false" : "true";
+        return row.value;
+      }
+
+      function renderSettingsPanel(bridgeState) {
+        const panel = bridgeState.settingsPanel || {};
+        const rows = (panel.rows || []).filter(settingMatchesSearch);
+        settingsPanelStatusEl.textContent = `${rows.length}/${(panel.rows || []).length} rows${panel.permissionRequired ? " · changes gated" : ""}`;
+        settingsListEl.textContent = "";
+        for (const row of rows) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "panel-row settings-row";
+          button.disabled = Boolean(state.activeTurnId) || !row.editable || panel.permissionRequired;
+          const title = document.createElement("strong");
+          title.textContent = row.label;
+          const value = document.createElement("code");
+          value.textContent = row.value;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = row.description;
+          button.append(title, value, meta);
+          button.addEventListener("click", async () => {
+            const nextValue = nextSettingValue(row);
+            markTelemetry("settings_panel_set", { id: row.id, valueLength: nextValue.length });
+            await sendBridge("settings_set", { id: row.id, value: nextValue });
+            await refreshStatePanels();
+          });
+          settingsListEl.append(button);
+        }
+        markTelemetry("settings_panel_rendered", {
+          childCount: settingsListEl.childElementCount,
+          valueLength: rows.length,
+          searchLength: state.settingsUi.search.length,
+        });
+      }
+
+      function renderThinkingPanel(bridgeState) {
+        const thinking = bridgeState.thinkingSelection || bridgeState.settingsPanel?.thinking || {};
+        const levels = thinking.levels || [];
+        thinkingPanelStatusEl.textContent = thinking.modelSupportsThinking
+          ? `Current: ${thinking.current}`
+          : "Current model does not support thinking beyond off";
+        thinkingListEl.textContent = "";
+        for (const level of levels) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = `panel-row${level.active ? " current" : ""}${level.available ? "" : " disabled"}`;
+          row.disabled = Boolean(state.activeTurnId) || !level.available;
+          const title = document.createElement("strong");
+          title.textContent = `${level.active ? "✓ " : ""}${level.name}`;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = level.available ? level.description : (level.unavailableReason || "Unavailable for this model");
+          row.append(title, meta);
+          row.addEventListener("click", async () => {
+            markTelemetry("thinking_panel_select", { level: level.name });
+            await sendBridge("thinking_set", { level: level.name });
+            await refreshStatePanels();
+          });
+          thinkingListEl.append(row);
+        }
+        markTelemetry("thinking_panel_rendered", {
+          childCount: thinkingListEl.childElementCount,
+          valueLength: levels.length,
+          modelSupportsThinking: Boolean(thinking.modelSupportsThinking),
+        });
+      }
+
+      function applyThemeClass(themeName) {
+        document.documentElement.dataset.piTheme = themeName || "dark";
+        document.body.dataset.piTheme = themeName || "dark";
+      }
+
+      function renderThemePanel(bridgeState) {
+        const theme = bridgeState.themeSelection || bridgeState.settingsPanel?.theme || {};
+        const themes = theme.themes || [];
+        themePanelStatusEl.textContent = `Active: ${theme.active || "dark"}`;
+        applyThemeClass(theme.active || "dark");
+        themeListEl.textContent = "";
+        for (const item of themes) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = `panel-row${item.active ? " current" : ""}`;
+          row.disabled = Boolean(state.activeTurnId);
+          const title = document.createElement("strong");
+          title.textContent = `${item.active ? "✓ " : ""}${item.name}`;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = item.active ? "active theme" : "available theme";
+          row.append(title, meta);
+          row.addEventListener("click", async () => {
+            markTelemetry("theme_panel_select", { theme: item.name });
+            await sendBridge("theme_select", { theme: item.name });
+            await refreshStatePanels();
+          });
+          themeListEl.append(row);
+        }
+        markTelemetry("theme_panel_rendered", {
+          childCount: themeListEl.childElementCount,
+          activeTheme: theme.active || "dark",
+        });
+      }
+
+      function scopedModelMatchesSearch(model) {
+        const query = state.scopedUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [model.fullId, model.provider, model.model, model.displayName, model.authStatusLabel]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function filteredScopedModels() {
+        const scoped = state.bridgeState?.scopedModels || {};
+        return (scoped.models || []).filter(scopedModelMatchesSearch);
+      }
+
+      function renderScopedModelsPanel(bridgeState) {
+        const scoped = bridgeState.scopedModels || {};
+        const models = (scoped.models || []).filter(scopedModelMatchesSearch);
+        scopedPanelStatusEl.textContent = `${scoped.enabledCount || 0}/${scoped.totalCount || 0} enabled${scoped.dirty ? " · unsaved" : ""}`;
+        scopedListEl.textContent = "";
+        for (const model of models) {
+          const row = document.createElement("div");
+          row.className = `panel-row scoped-row${model.enabled ? " current" : ""}`;
+          const title = document.createElement("strong");
+          title.textContent = `${model.enabled ? "✓ " : "✗ "}${model.displayName || model.model}`;
+          const providerButton = document.createElement("button");
+          providerButton.type = "button";
+          providerButton.textContent = model.provider;
+          providerButton.disabled = Boolean(state.activeTurnId);
+          providerButton.addEventListener("click", async () => {
+            markTelemetry("scoped_models_provider_toggle", { provider: model.provider });
+            await sendBridge("scoped_models_update", { action: "provider_toggle", provider: model.provider });
+            await refreshStatePanels();
+          });
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = `${model.fullId} · ${model.authStatusLabel || model.authStatus || ""}`;
+          const controls = document.createElement("span");
+          controls.className = "panel-controls";
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.textContent = model.enabled ? "Disable" : "Enable";
+          toggle.disabled = Boolean(state.activeTurnId);
+          toggle.addEventListener("click", async () => {
+            markTelemetry("scoped_models_toggle", { fullId: model.fullId });
+            await sendBridge("scoped_models_update", { action: "toggle", fullId: model.fullId });
+            await refreshStatePanels();
+          });
+          const up = document.createElement("button");
+          up.type = "button";
+          up.textContent = "↑";
+          up.disabled = Boolean(state.activeTurnId);
+          up.addEventListener("click", async () => {
+            markTelemetry("scoped_models_reorder", { direction: "up", fullId: model.fullId });
+            await sendBridge("scoped_models_update", { action: "reorder", fullId: model.fullId, direction: "up" });
+            await refreshStatePanels();
+          });
+          const down = document.createElement("button");
+          down.type = "button";
+          down.textContent = "↓";
+          down.disabled = Boolean(state.activeTurnId);
+          down.addEventListener("click", async () => {
+            markTelemetry("scoped_models_reorder", { direction: "down", fullId: model.fullId });
+            await sendBridge("scoped_models_update", { action: "reorder", fullId: model.fullId, direction: "down" });
+            await refreshStatePanels();
+          });
+          controls.append(toggle, up, down);
+          row.append(title, providerButton, meta, controls);
+          scopedListEl.append(row);
+        }
+        scopedEnableAllButtonEl.disabled = Boolean(state.activeTurnId);
+        scopedClearAllButtonEl.disabled = Boolean(state.activeTurnId);
+        scopedSaveButtonEl.disabled = Boolean(state.activeTurnId) || !scoped.dirty;
+        markTelemetry("scoped_models_panel_rendered", {
+          childCount: scopedListEl.childElementCount,
+          valueLength: models.length,
+          enabledCount: scoped.enabledCount || 0,
+          dirty: Boolean(scoped.dirty),
+          searchLength: state.scopedUi.search.length,
+        });
+      }
+
       async function refreshStatePanels() {
         const bridgeState = await sendBridge("get_state");
         state.bridgeState = bridgeState;
@@ -517,6 +780,10 @@
         renderModelPanel(bridgeState);
         renderAuthPanel(bridgeState);
         renderSessionPanel(bridgeState);
+        renderSettingsPanel(bridgeState);
+        renderThinkingPanel(bridgeState);
+        renderThemePanel(bridgeState);
+        renderScopedModelsPanel(bridgeState);
         return bridgeState;
       }
 
@@ -1240,6 +1507,36 @@
         await refreshStatePanels();
         const transcript = await sendBridge("get_messages");
         renderMessages(transcript.messages || []);
+      });
+
+      settingsSearchInputEl.addEventListener("input", () => {
+        state.settingsUi.search = settingsSearchInputEl.value;
+        renderSettingsPanel(state.bridgeState || {});
+      });
+
+      scopedSearchInputEl.addEventListener("input", () => {
+        state.scopedUi.search = scopedSearchInputEl.value;
+        renderScopedModelsPanel(state.bridgeState || {});
+      });
+
+      scopedEnableAllButtonEl.addEventListener("click", async () => {
+        const targets = filteredScopedModels().map((model) => model.fullId);
+        markTelemetry("scoped_models_enable_all", { valueLength: targets.length });
+        await sendBridge("scoped_models_update", { action: "enable_all", targets });
+        await refreshStatePanels();
+      });
+
+      scopedClearAllButtonEl.addEventListener("click", async () => {
+        const targets = filteredScopedModels().map((model) => model.fullId);
+        markTelemetry("scoped_models_clear_all", { valueLength: targets.length });
+        await sendBridge("scoped_models_update", { action: "clear_all", targets });
+        await refreshStatePanels();
+      });
+
+      scopedSaveButtonEl.addEventListener("click", async () => {
+        markTelemetry("scoped_models_save", {});
+        await sendBridge("scoped_models_save");
+        await refreshStatePanels();
       });
 
       promptInputEl.addEventListener("focus", () => {

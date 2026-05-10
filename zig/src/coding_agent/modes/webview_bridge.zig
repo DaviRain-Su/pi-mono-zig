@@ -6,7 +6,9 @@ const json_format = @import("../shared/json_format.zig");
 const json_event_wire = @import("json_event_wire.zig");
 const auth = @import("../auth/auth.zig");
 const common = @import("../tools/common.zig");
+const config_mod = @import("../config/config.zig");
 const provider_config = @import("../providers/provider_config.zig");
+const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const tool_selection = @import("../tool_selection.zig");
@@ -38,6 +40,13 @@ pub const Command = enum {
     start_auth,
     save_api_key,
     remove_auth,
+    settings_get,
+    settings_set,
+    thinking_set,
+    theme_select,
+    scoped_models_get,
+    scoped_models_update,
+    scoped_models_save,
 };
 
 pub const Permission = enum {
@@ -45,6 +54,7 @@ pub const Permission = enum {
     model_selection,
     session_mutation,
     auth_mutation,
+    settings_mutation,
 };
 
 pub const BridgePermissions = struct {
@@ -52,6 +62,7 @@ pub const BridgePermissions = struct {
     model_selection: bool = false,
     session_mutation: bool = false,
     auth_mutation: bool = false,
+    settings_mutation: bool = false,
 
     fn allows(self: BridgePermissions, permission: Permission) bool {
         return switch (permission) {
@@ -59,6 +70,7 @@ pub const BridgePermissions = struct {
             .model_selection => self.model_selection,
             .session_mutation => self.session_mutation,
             .auth_mutation => self.auth_mutation,
+            .settings_mutation => self.settings_mutation,
         };
     }
 };
@@ -83,6 +95,13 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "start_auth", .command = .start_auth, .permission = .auth_mutation },
     .{ .name = "save_api_key", .command = .save_api_key, .permission = .auth_mutation },
     .{ .name = "remove_auth", .command = .remove_auth, .permission = .auth_mutation },
+    .{ .name = "settings_get", .command = .settings_get, .permission = .skeleton_chat },
+    .{ .name = "settings_set", .command = .settings_set, .permission = .settings_mutation },
+    .{ .name = "thinking_set", .command = .thinking_set, .permission = .settings_mutation },
+    .{ .name = "theme_select", .command = .theme_select, .permission = .settings_mutation },
+    .{ .name = "scoped_models_get", .command = .scoped_models_get, .permission = .skeleton_chat },
+    .{ .name = "scoped_models_update", .command = .scoped_models_update, .permission = .settings_mutation },
+    .{ .name = "scoped_models_save", .command = .scoped_models_save, .permission = .settings_mutation },
 };
 
 pub const BridgeContext = struct {
@@ -97,6 +116,9 @@ pub const BridgeContext = struct {
     env_map: ?*const std.process.Environ.Map = null,
     configured_credentials: provider_config.ConfiguredCredentials = .{},
     auth_path: ?[]const u8 = null,
+    runtime_config: ?*config_mod.RuntimeConfig = null,
+    themes: []const resources_mod.Theme = &.{},
+    active_theme_name: ?[]const u8 = null,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     session: *session_mod.AgentSession,
@@ -120,6 +142,13 @@ pub const DispatchCounters = struct {
     start_auth: usize = 0,
     save_api_key: usize = 0,
     remove_auth: usize = 0,
+    settings_get: usize = 0,
+    settings_set: usize = 0,
+    thinking_set: usize = 0,
+    theme_select: usize = 0,
+    scoped_models_get: usize = 0,
+    scoped_models_update: usize = 0,
+    scoped_models_save: usize = 0,
 
     fn increment(self: *DispatchCounters, command: Command) void {
         switch (command) {
@@ -136,6 +165,13 @@ pub const DispatchCounters = struct {
             .start_auth => self.start_auth += 1,
             .save_api_key => self.save_api_key += 1,
             .remove_auth => self.remove_auth += 1,
+            .settings_get => self.settings_get += 1,
+            .settings_set => self.settings_set += 1,
+            .thinking_set => self.thinking_set += 1,
+            .theme_select => self.theme_select += 1,
+            .scoped_models_get => self.scoped_models_get += 1,
+            .scoped_models_update => self.scoped_models_update += 1,
+            .scoped_models_save => self.scoped_models_save += 1,
         }
     }
 
@@ -152,7 +188,14 @@ pub const DispatchCounters = struct {
             self.auth_status +
             self.start_auth +
             self.save_api_key +
-            self.remove_auth;
+            self.remove_auth +
+            self.settings_get +
+            self.settings_set +
+            self.thinking_set +
+            self.theme_select +
+            self.scoped_models_get +
+            self.scoped_models_update +
+            self.scoped_models_save;
     }
 };
 
@@ -195,6 +238,10 @@ pub const BridgeHost = struct {
     worker_allocator: std.mem.Allocator = std.heap.c_allocator,
     owned_selected_model: ?ai.Model = null,
     owned_selected_api_key: ?[]u8 = null,
+    owned_active_theme_name: ?[]u8 = null,
+    scoped_draft_initialized: bool = false,
+    scoped_draft_enabled_ids: ?[][]u8 = null,
+    scoped_draft_dirty: bool = false,
 
     pub fn init(context: BridgeContext) BridgeHost {
         return .{ .context = context };
@@ -204,6 +251,8 @@ pub const BridgeHost = struct {
         _ = self.closeAndAbortActiveWork();
         self.joinWorkerIfPresent();
         self.clearOwnedSelection();
+        self.clearOwnedTheme();
+        self.clearScopedDraft();
         self.event_mutex.lockUncancelable(self.context.session.io);
         defer self.event_mutex.unlock(self.context.session.io);
         self.clearPromptStateLocked();
@@ -218,6 +267,22 @@ pub const BridgeHost = struct {
             self.context.session.allocator.free(api_key);
             self.owned_selected_api_key = null;
         }
+    }
+
+    fn clearOwnedTheme(self: *BridgeHost) void {
+        if (self.owned_active_theme_name) |theme| {
+            self.context.session.allocator.free(theme);
+            self.owned_active_theme_name = null;
+        }
+    }
+
+    fn clearScopedDraft(self: *BridgeHost) void {
+        if (self.scoped_draft_enabled_ids) |ids| {
+            freeOwnedStringList(self.context.session.allocator, ids);
+            self.scoped_draft_enabled_ids = null;
+        }
+        self.scoped_draft_initialized = false;
+        self.scoped_draft_dirty = false;
     }
 
     fn joinCompletedWorker(self: *BridgeHost) void {
@@ -447,6 +512,13 @@ pub const BridgeHost = struct {
             .new_session, .resume_session, .switch_session => try self.writeSessionMutationGatedResult(allocator, &writer.writer, command, payload),
             .auth_status => try self.writeAuthStatusResult(allocator, &writer.writer),
             .start_auth, .save_api_key, .remove_auth => try self.writeAuthMutationGatedResult(allocator, &writer.writer, command, payload),
+            .settings_get => try self.writeSettingsPanelResult(allocator, &writer.writer),
+            .settings_set => try self.writeSettingsSetResult(allocator, &writer.writer, payload.?),
+            .thinking_set => try self.writeThinkingSetResult(allocator, &writer.writer, payload.?),
+            .theme_select => try self.writeThemeSelectResult(allocator, &writer.writer, payload.?),
+            .scoped_models_get => try self.writeScopedModelsResult(allocator, &writer.writer),
+            .scoped_models_update => try self.writeScopedModelsUpdateResult(allocator, &writer.writer, payload.?),
+            .scoped_models_save => try self.writeScopedModelsSaveResult(allocator, &writer.writer),
         }
 
         try writer.writer.writeAll("}");
@@ -454,7 +526,7 @@ pub const BridgeHost = struct {
     }
 
     fn writeStateResult(
-        self: *const BridgeHost,
+        self: *BridgeHost,
         allocator: std.mem.Allocator,
         writer: *std.Io.Writer,
     ) !void {
@@ -473,6 +545,14 @@ pub const BridgeHost = struct {
         try self.writeAuthStatusResult(allocator, writer);
         try writer.writeAll(",\"sessionSelection\":");
         try self.writeSessionSelectionState(allocator, writer);
+        try writer.writeAll(",\"settingsPanel\":");
+        try self.writeSettingsPanelResult(allocator, writer);
+        try writer.writeAll(",\"thinkingSelection\":");
+        try self.writeThinkingSelectionState(allocator, writer);
+        try writer.writeAll(",\"themeSelection\":");
+        try self.writeThemeSelectionState(allocator, writer);
+        try writer.writeAll(",\"scopedModels\":");
+        try self.writeScopedModelsResult(allocator, writer);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
         try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
@@ -512,6 +592,567 @@ pub const BridgeHost = struct {
         try writer.writeAll(if (self.context.permissions.auth_mutation) "false" else "true");
         try writer.writeAll("}");
         try writer.writeAll("}");
+    }
+
+    fn writeSettingsPanelResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        const runtime = self.context.runtime_config;
+        try writer.writeAll("{\"status\":");
+        try writeJsonString(allocator, writer, if (runtime == null) "unavailable" else "ready");
+        try writer.writeAll(",\"searchable\":true,\"permissionRequired\":");
+        try writer.writeAll(if (self.context.permissions.settings_mutation) "false" else "true");
+        try writer.writeAll(",\"rows\":[");
+        var wrote = false;
+        try self.writeSettingsRows(allocator, writer, &wrote);
+        try writer.writeAll("],\"thinking\":");
+        try self.writeThinkingSelectionState(allocator, writer);
+        try writer.writeAll(",\"theme\":");
+        try self.writeThemeSelectionState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeSettingsRows(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        wrote: *bool,
+    ) !void {
+        const runtime = self.context.runtime_config;
+        try self.writeSettingRow(allocator, writer, wrote, "autocompact", "Auto-compact", "Automatically compact context when it gets too large", boolName(if (runtime) |config| (config.settings.compaction orelse session_mod.CompactionSettings{}).enabled else self.context.session.compaction_settings.enabled), "toggle", true, &.{ "true", "false" });
+        if (modelSupportsImages(self.context.model)) {
+            try self.writeSettingRow(allocator, writer, wrote, "show_images", "Show images", "Render images inline in terminal", boolName(if (runtime) |config| config.showImages() else true), "toggle", true, &.{ "true", "false" });
+            var image_width_buf: [32]u8 = undefined;
+            const image_width = std.fmt.bufPrint(&image_width_buf, "{d}", .{if (runtime) |config| config.imageWidthCells() else 60}) catch "60";
+            try self.writeSettingRow(allocator, writer, wrote, "image_width_cells", "Image width", "Preferred inline image width in terminal cells", image_width, "choice", true, &.{ "60", "80", "120" });
+        }
+        try self.writeSettingRow(allocator, writer, wrote, "auto_resize_images", "Auto-resize images", "Resize large images to 2000x2000 max for better model compatibility", boolName(if (runtime) |config| config.imageAutoResize() else true), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "block_images", "Block images", "Prevent images from being sent to LLM providers", boolName(if (runtime) |config| config.blockImages() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "skill_commands", "Skill commands", "Register skills as /skill:name commands", boolName(if (runtime) |config| config.enableSkillCommands() else true), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "show_hardware_cursor", "Show hardware cursor", "Show the terminal cursor while still positioning it for IME support", boolName(if (runtime) |config| config.showHardwareCursor() else false), "toggle", true, &.{ "true", "false" });
+        var editor_padding_buf: [32]u8 = undefined;
+        const editor_padding = std.fmt.bufPrint(&editor_padding_buf, "{d}", .{if (runtime) |config| config.settings.editor_padding_x orelse 0 else 0}) catch "0";
+        try self.writeSettingRow(allocator, writer, wrote, "editor_padding", "Editor padding", "Horizontal padding for input editor (0-3)", editor_padding, "choice", true, &.{ "0", "1", "2", "3" });
+        var autocomplete_buf: [32]u8 = undefined;
+        const autocomplete = std.fmt.bufPrint(&autocomplete_buf, "{d}", .{if (runtime) |config| config.settings.autocomplete_max_visible orelse 5 else 5}) catch "5";
+        try self.writeSettingRow(allocator, writer, wrote, "autocomplete_max_visible", "Autocomplete max items", "Max visible items in autocomplete dropdown (3-20)", autocomplete, "choice", true, &.{ "3", "5", "7", "10", "15", "20" });
+        try self.writeSettingRow(allocator, writer, wrote, "clear_on_shrink", "Clear on shrink", "Clear empty rows when content shrinks (may cause flicker)", boolName(if (runtime) |config| config.clearOnShrink() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "terminal_progress", "Terminal progress", "Show OSC 9;4 progress indicators in the terminal tab bar", boolName(if (runtime) |config| config.showTerminalProgress() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "steering_mode", "Steering mode", "Enter while streaming queues steering messages", queueModeName(self.context.session.agent.steering_queue.mode), "choice", true, &.{ "one-at-a-time", "all" });
+        try self.writeSettingRow(allocator, writer, wrote, "follow_up_mode", "Follow-up mode", "Alt+Enter queues follow-up messages until agent stops", queueModeName(self.context.session.agent.follow_up_queue.mode), "choice", true, &.{ "one-at-a-time", "all" });
+        try self.writeSettingRow(allocator, writer, wrote, "transport", "Transport", "Preferred transport for providers that support multiple transports", transportName(if (runtime) |config| config.transport() else .auto), "choice", true, &.{ "sse", "websocket", "websocket-cached", "auto" });
+        try self.writeSettingRow(allocator, writer, wrote, "hide_thinking", "Hide thinking", "Hide thinking blocks in assistant responses", boolName(if (runtime) |config| config.hideThinkingBlock() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "collapse_changelog", "Collapse changelog", "Show condensed changelog after updates", boolName(if (runtime) |config| config.collapseChangelog() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "quiet_startup", "Quiet startup", "Disable verbose printing at startup", boolName(if (runtime) |config| config.quietStartup() else false), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "install_telemetry", "Install telemetry", "Send an anonymous version/update ping after changelog-detected updates", boolName(if (runtime) |config| config.enableInstallTelemetry() else true), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "double_escape_action", "Double-escape action", "Action when pressing Escape twice with empty editor", doubleEscapeName(if (runtime) |config| config.doubleEscapeAction() else .tree), "choice", true, &.{ "tree", "fork", "none" });
+        try self.writeSettingRow(allocator, writer, wrote, "tree_filter_mode", "Tree filter mode", "Default filter when opening /tree", treeFilterName(if (runtime) |config| config.treeFilterMode() else .default), "choice", true, &.{ "default", "no-tools", "user-only", "labeled-only", "all" });
+        try self.writeSettingRow(allocator, writer, wrote, "warnings", "Warnings", "Enable or disable individual warnings", boolName(if (runtime) |config| config.warningAnthropicExtraUsage() else true), "toggle", true, &.{ "true", "false" });
+        try self.writeSettingRow(allocator, writer, wrote, "thinking", "Thinking level", "Reasoning depth for thinking-capable models", thinkingName(self.context.session.agent.getThinkingLevel()), "submenu", false, null);
+        try self.writeSettingRow(allocator, writer, wrote, "theme", "Theme", "Color theme for the interface", self.activeThemeName(), "submenu", false, null);
+        try self.writeSettingRow(allocator, writer, wrote, "raw_json", "Advanced raw JSON", "Open the safe settings.json editor with validation and cancel-on-error", "open", "raw", false, null);
+    }
+
+    fn writeSettingRow(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        wrote: *bool,
+        id: []const u8,
+        label: []const u8,
+        description: []const u8,
+        value: []const u8,
+        kind: []const u8,
+        editable: bool,
+        options: ?[]const []const u8,
+    ) !void {
+        _ = self;
+        if (wrote.*) try writer.writeAll(",");
+        wrote.* = true;
+        try writer.writeAll("{");
+        try writeStringField(allocator, writer, "id", id, false);
+        try writeStringField(allocator, writer, "label", label, true);
+        try writeStringField(allocator, writer, "description", description, true);
+        try writeStringField(allocator, writer, "value", value, true);
+        try writeStringField(allocator, writer, "kind", kind, true);
+        try writeBoolField(writer, "editable", editable, true);
+        try writer.writeAll(",\"options\":");
+        if (options) |values| {
+            try writer.writeAll("[");
+            for (values, 0..) |option, index| {
+                if (index > 0) try writer.writeAll(",");
+                try writeJsonString(allocator, writer, option);
+            }
+            try writer.writeAll("]");
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll("}");
+    }
+
+    fn writeThinkingSelectionState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{\"current\":");
+        try writeJsonString(allocator, writer, thinkingName(self.context.session.agent.getThinkingLevel()));
+        try writer.writeAll(",\"modelSupportsThinking\":");
+        try writer.writeAll(if (self.context.model.reasoning) "true" else "false");
+        try writer.writeAll(",\"levels\":[");
+        inline for (.{ agent.ThinkingLevel.off, .minimal, .low, .medium, .high, .xhigh }, 0..) |level, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"name\":");
+            try writeJsonString(allocator, writer, thinkingName(level));
+            try writer.writeAll(",\"description\":");
+            try writeJsonString(allocator, writer, thinkingDescription(level));
+            try writer.writeAll(",\"available\":");
+            try writer.writeAll(if (thinkingLevelAvailable(self.context.model, level)) "true" else "false");
+            try writer.writeAll(",\"active\":");
+            try writer.writeAll(if (self.context.session.agent.getThinkingLevel() == level) "true" else "false");
+            if (!thinkingLevelAvailable(self.context.model, level)) {
+                try writer.writeAll(",\"unavailableReason\":\"Current model does not support this thinking level\"");
+            }
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("]}");
+    }
+
+    fn writeThemeSelectionState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        const active = self.activeThemeName();
+        try writer.writeAll("{\"active\":");
+        try writeJsonString(allocator, writer, active);
+        try writer.writeAll(",\"themes\":[");
+        if (self.context.themes.len > 0) {
+            for (self.context.themes, 0..) |theme, index| {
+                if (index > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"name\":");
+                try writeJsonString(allocator, writer, theme.name);
+                try writer.writeAll(",\"active\":");
+                try writer.writeAll(if (std.mem.eql(u8, active, theme.name)) "true" else "false");
+                try writer.writeAll("}");
+            }
+        } else {
+            const fallback = [_][]const u8{ "dark", "light", "codex" };
+            for (fallback, 0..) |theme, index| {
+                if (index > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"name\":");
+                try writeJsonString(allocator, writer, theme);
+                try writer.writeAll(",\"active\":");
+                try writer.writeAll(if (std.mem.eql(u8, active, theme)) "true" else "false");
+                try writer.writeAll("}");
+            }
+        }
+        try writer.writeAll("]}");
+    }
+
+    fn activeThemeName(self: *const BridgeHost) []const u8 {
+        if (self.owned_active_theme_name) |theme| return theme;
+        if (self.context.active_theme_name) |theme| return theme;
+        if (self.context.runtime_config) |config| {
+            if (config.settings.theme) |theme| return theme;
+        }
+        return "dark";
+    }
+
+    fn writeSettingsSetResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const id = payload.object.get("id").?.string;
+        const value = payload.object.get("value").?.string;
+        if (self.context.runtime_config == null) {
+            try writer.writeAll("{\"status\":\"unavailable\",\"accepted\":false,\"message\":\"Settings are unavailable in this WebView session\"}");
+            return;
+        }
+        if (!settingValueAllowed(id, value)) {
+            try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"Setting value is not supported\"}");
+            return;
+        }
+        try self.persistSettingValue(allocator, id, value);
+        try self.applySettingSideEffect(id, value);
+        try writer.writeAll("{\"status\":\"saved\",\"accepted\":true,\"id\":");
+        try writeJsonString(allocator, writer, id);
+        try writer.writeAll(",\"value\":");
+        try writeJsonString(allocator, writer, value);
+        try writer.writeAll(",\"settings\":");
+        try self.writeSettingsPanelResult(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeThinkingSetResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const level_name = payload.object.get("level").?.string;
+        const level = parseThinkingLevelName(level_name) orelse {
+            try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"Unknown thinking level\"}");
+            return;
+        };
+        if (!thinkingLevelAvailable(self.context.model, level)) {
+            try writer.writeAll("{\"status\":\"unsupported\",\"accepted\":false,\"level\":");
+            try writeJsonString(allocator, writer, level_name);
+            try writer.writeAll(",\"message\":\"Current model does not support this thinking level\",\"thinking\":");
+            try self.writeThinkingSelectionState(allocator, writer);
+            try writer.writeAll("}");
+            return;
+        }
+        try self.context.session.setThinkingLevel(level);
+        try writer.writeAll("{\"status\":\"selected\",\"accepted\":true,\"level\":");
+        try writeJsonString(allocator, writer, thinkingName(level));
+        try writer.writeAll(",\"thinking\":");
+        try self.writeThinkingSelectionState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeThemeSelectResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const requested = canonicalThemeName(payload.object.get("theme").?.string);
+        if (!self.themeExists(requested)) {
+            try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"Unknown theme\"}");
+            return;
+        }
+        try self.persistSettingValue(allocator, "theme", requested);
+        const owned = try self.context.session.allocator.dupe(u8, requested);
+        self.clearOwnedTheme();
+        self.owned_active_theme_name = owned;
+        try writer.writeAll("{\"status\":\"selected\",\"accepted\":true,\"theme\":");
+        try writeJsonString(allocator, writer, requested);
+        try writer.writeAll(",\"themeSelection\":");
+        try self.writeThemeSelectionState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn themeExists(self: *const BridgeHost, name: []const u8) bool {
+        if (self.context.themes.len == 0) {
+            return std.mem.eql(u8, name, "dark") or std.mem.eql(u8, name, "light") or std.mem.eql(u8, name, "codex");
+        }
+        for (self.context.themes) |theme| {
+            if (std.mem.eql(u8, theme.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn writeScopedModelsResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try self.ensureScopedDraft();
+        const enabled_count = if (self.scoped_draft_enabled_ids) |ids| ids.len else self.context.available_models.len;
+        try writer.writeAll("{\"status\":\"ready\",\"permissionRequired\":");
+        try writer.writeAll(if (self.context.permissions.settings_mutation) "false" else "true");
+        try writer.writeAll(",\"dirty\":");
+        try writer.writeAll(if (self.scoped_draft_dirty) "true" else "false");
+        try writer.writeAll(",\"allEnabled\":");
+        try writer.writeAll(if (self.scoped_draft_enabled_ids == null) "true" else "false");
+        try writeUsizeField(writer, "enabledCount", enabled_count, true);
+        try writeUsizeField(writer, "totalCount", self.context.available_models.len, true);
+        try writer.writeAll(",\"controls\":{\"toggle\":true,\"enableAll\":true,\"clearAll\":true,\"providerToggle\":true,\"reorder\":true,\"save\":true,\"search\":true},\"models\":[");
+        try self.writeScopedModelRows(allocator, writer);
+        try writer.writeAll("]}");
+    }
+
+    fn writeScopedModelRows(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        if (self.context.available_models.len == 0) return;
+        const emitted = try allocator.alloc(bool, self.context.available_models.len);
+        defer allocator.free(emitted);
+        @memset(emitted, false);
+        var wrote = false;
+        var order_index: usize = 0;
+        if (self.scoped_draft_enabled_ids) |ids| {
+            for (ids) |id| {
+                const model_index = self.availableModelIndexByFullId(id) orelse continue;
+                if (emitted[model_index]) continue;
+                if (wrote) try writer.writeAll(",");
+                wrote = true;
+                try self.writeScopedModelRow(allocator, writer, self.context.available_models[model_index], true, order_index);
+                emitted[model_index] = true;
+                order_index += 1;
+            }
+        }
+        for (self.context.available_models, 0..) |model, index| {
+            if (emitted[index]) continue;
+            if (wrote) try writer.writeAll(",");
+            wrote = true;
+            const enabled = if (self.scoped_draft_enabled_ids == null) true else false;
+            try self.writeScopedModelRow(allocator, writer, model, enabled, order_index);
+            order_index += 1;
+        }
+    }
+
+    fn writeScopedModelRow(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        model: provider_config.AvailableModel,
+        enabled: bool,
+        order_index: usize,
+    ) !void {
+        const full_id = try scopedModelFullId(allocator, model);
+        defer allocator.free(full_id);
+        _ = self;
+        try writer.writeAll("{");
+        try writeStringField(allocator, writer, "fullId", full_id, false);
+        try writeStringField(allocator, writer, "provider", model.provider, true);
+        try writeStringField(allocator, writer, "model", model.model_id, true);
+        try writeStringField(allocator, writer, "displayName", model.display_name, true);
+        try writeBoolField(writer, "enabled", enabled, true);
+        try writeStringField(allocator, writer, "authStatus", @tagName(model.auth_status), true);
+        try writeStringField(allocator, writer, "authStatusLabel", provider_config.providerAuthStatusLabel(model.auth_status), true);
+        try writeBoolField(writer, "reasoning", model.reasoning, true);
+        try writeUsizeField(writer, "order", order_index, true);
+        try writer.writeAll("}");
+    }
+
+    fn writeScopedModelsUpdateResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        try self.ensureScopedDraft();
+        const action = payload.object.get("action").?.string;
+        if (std.mem.eql(u8, action, "toggle")) {
+            const full_id = payload.object.get("fullId") orelse {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"toggle requires fullId\"}");
+                return;
+            };
+            if (full_id != .string or self.availableModelIndexByFullId(full_id.string) == null) {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"unknown model\"}");
+                return;
+            }
+            try self.toggleScopedId(full_id.string);
+        } else if (std.mem.eql(u8, action, "enable_all")) {
+            const targets = try self.scopedTargetsFromPayload(allocator, payload);
+            defer freeOwnedStringList(allocator, targets);
+            try self.enableScopedTargets(targets);
+        } else if (std.mem.eql(u8, action, "clear_all")) {
+            const targets = try self.scopedTargetsFromPayload(allocator, payload);
+            defer freeOwnedStringList(allocator, targets);
+            try self.clearScopedTargets(targets);
+        } else if (std.mem.eql(u8, action, "provider_toggle")) {
+            const provider = payload.object.get("provider") orelse {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"provider_toggle requires provider\"}");
+                return;
+            };
+            if (provider != .string) {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"provider must be a string\"}");
+                return;
+            }
+            const targets = try self.scopedTargetsForProvider(allocator, provider.string);
+            defer freeOwnedStringList(allocator, targets);
+            if (self.allScopedTargetsEnabled(targets)) {
+                try self.clearScopedTargets(targets);
+            } else {
+                try self.enableScopedTargets(targets);
+            }
+        } else if (std.mem.eql(u8, action, "reorder")) {
+            const full_id = payload.object.get("fullId") orelse {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"reorder requires fullId\"}");
+                return;
+            };
+            const direction = payload.object.get("direction") orelse {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"reorder requires direction\"}");
+                return;
+            };
+            if (full_id != .string or direction != .string) {
+                try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"reorder fields must be strings\"}");
+                return;
+            }
+            try self.reorderScopedId(full_id.string, if (std.mem.eql(u8, direction.string, "up")) -1 else 1);
+        } else {
+            try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"unknown scoped model action\"}");
+            return;
+        }
+        try writer.writeAll("{\"status\":\"updated\",\"accepted\":true,\"scopedModels\":");
+        try self.writeScopedModelsResult(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeScopedModelsSaveResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try self.ensureScopedDraft();
+        if (self.context.runtime_config == null) {
+            try writer.writeAll("{\"status\":\"unavailable\",\"accepted\":false,\"message\":\"Settings are unavailable in this WebView session\"}");
+            return;
+        }
+        try persistEnabledModels(allocator, self.context.session.io, self.context.runtime_config.?, self.scoped_draft_enabled_ids);
+        try self.replaceRuntimeEnabledModelsFromDraft();
+        self.scoped_draft_dirty = false;
+        try writer.writeAll("{\"status\":\"saved\",\"accepted\":true,\"scopedModels\":");
+        try self.writeScopedModelsResult(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn ensureScopedDraft(self: *BridgeHost) !void {
+        if (self.scoped_draft_initialized) return;
+        self.scoped_draft_initialized = true;
+        if (self.context.runtime_config) |config| {
+            if (config.settings.enabled_models) |ids| {
+                self.scoped_draft_enabled_ids = try cloneStringListAsMutable(self.context.session.allocator, ids);
+            }
+        }
+    }
+
+    fn setScopedDraft(self: *BridgeHost, next_ids: ?[][]u8) void {
+        if (self.scoped_draft_enabled_ids) |ids| freeOwnedStringList(self.context.session.allocator, ids);
+        self.scoped_draft_enabled_ids = next_ids;
+        self.scoped_draft_dirty = true;
+    }
+
+    fn toggleScopedId(self: *BridgeHost, id: []const u8) !void {
+        const allocator = self.context.session.allocator;
+        if (self.scoped_draft_enabled_ids == null) {
+            const all_ids = try self.allScopedModelIds(allocator);
+            defer freeOwnedStringList(allocator, all_ids);
+            const next = try clonedExcludingIds(allocator, all_ids, &.{id});
+            self.setScopedDraft(next);
+            return;
+        }
+        const ids = self.scoped_draft_enabled_ids.?;
+        if (indexOfString(ids, id) != null) {
+            const next = try clonedExcludingIds(allocator, ids, &.{id});
+            self.setScopedDraft(next);
+        } else {
+            var next = try cloneStringListAsMutable(allocator, ids);
+            errdefer freeOwnedStringList(allocator, next);
+            try appendUniqueOwned(allocator, &next, id);
+            if (next.len == self.context.available_models.len) {
+                freeOwnedStringList(allocator, next);
+                self.setScopedDraft(null);
+            } else {
+                self.setScopedDraft(next);
+            }
+        }
+    }
+
+    fn enableScopedTargets(self: *BridgeHost, targets: []const []const u8) !void {
+        if (targets.len == 0 or self.scoped_draft_enabled_ids == null) return;
+        const allocator = self.context.session.allocator;
+        var next = try cloneStringListAsMutable(allocator, self.scoped_draft_enabled_ids.?);
+        errdefer freeOwnedStringList(allocator, next);
+        for (targets) |target| try appendUniqueOwned(allocator, &next, target);
+        if (next.len == self.context.available_models.len) {
+            freeOwnedStringList(allocator, next);
+            self.setScopedDraft(null);
+        } else {
+            self.setScopedDraft(next);
+        }
+    }
+
+    fn clearScopedTargets(self: *BridgeHost, targets: []const []const u8) !void {
+        const allocator = self.context.session.allocator;
+        if (self.scoped_draft_enabled_ids == null) {
+            const all_ids = try self.allScopedModelIds(allocator);
+            defer freeOwnedStringList(allocator, all_ids);
+            const next = try clonedExcludingIds(allocator, all_ids, targets);
+            self.setScopedDraft(next);
+        } else {
+            const next = try clonedExcludingIds(allocator, self.scoped_draft_enabled_ids.?, targets);
+            self.setScopedDraft(next);
+        }
+    }
+
+    fn reorderScopedId(self: *BridgeHost, id: []const u8, delta: isize) !void {
+        const allocator = self.context.session.allocator;
+        if (self.scoped_draft_enabled_ids == null) {
+            self.scoped_draft_enabled_ids = try self.allScopedModelIds(allocator);
+        }
+        const ids = self.scoped_draft_enabled_ids.?;
+        const index = indexOfString(ids, id) orelse return;
+        if (delta < 0 and index == 0) return;
+        if (delta > 0 and index + 1 >= ids.len) return;
+        const swap_index: usize = if (delta < 0) index - 1 else index + 1;
+        std.mem.swap([]u8, &ids[index], &ids[swap_index]);
+        self.scoped_draft_dirty = true;
+    }
+
+    fn scopedTargetsFromPayload(self: *BridgeHost, allocator: std.mem.Allocator, payload: std.json.Value) ![][]u8 {
+        if (payload.object.get("targets")) |targets| {
+            if (targets == .array) {
+                var list = std.ArrayList([]u8).empty;
+                errdefer freeOwnedStringList(allocator, list.items);
+                for (targets.array.items) |target| {
+                    if (target != .string) continue;
+                    if (self.availableModelIndexByFullId(target.string) != null) {
+                        try list.append(allocator, try allocator.dupe(u8, target.string));
+                    }
+                }
+                return try list.toOwnedSlice(allocator);
+            }
+        }
+        return try self.allScopedModelIds(allocator);
+    }
+
+    fn scopedTargetsForProvider(self: *BridgeHost, allocator: std.mem.Allocator, provider: []const u8) ![][]u8 {
+        var list = std.ArrayList([]u8).empty;
+        errdefer freeOwnedStringList(allocator, list.items);
+        for (self.context.available_models) |model| {
+            if (!std.mem.eql(u8, model.provider, provider)) continue;
+            try list.append(allocator, try scopedModelFullId(allocator, model));
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
+    fn allScopedTargetsEnabled(self: *BridgeHost, targets: []const []const u8) bool {
+        for (targets) |target| {
+            if (!scopedIdEnabled(self.scoped_draft_enabled_ids, target)) return false;
+        }
+        return targets.len > 0;
+    }
+
+    fn allScopedModelIds(self: *BridgeHost, allocator: std.mem.Allocator) ![][]u8 {
+        var ids = try allocator.alloc([]u8, self.context.available_models.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (ids[0..initialized]) |id| allocator.free(id);
+            allocator.free(ids);
+        }
+        for (self.context.available_models, 0..) |model, index| {
+            ids[index] = try scopedModelFullId(allocator, model);
+            initialized += 1;
+        }
+        return ids;
+    }
+
+    fn availableModelIndexByFullId(self: *const BridgeHost, full_id: []const u8) ?usize {
+        for (self.context.available_models, 0..) |model, index| {
+            var buffer: [1024]u8 = undefined;
+            const candidate = std.fmt.bufPrint(&buffer, "{s}/{s}", .{ model.provider, model.model_id }) catch continue;
+            if (std.mem.eql(u8, candidate, full_id)) return index;
+        }
+        return null;
+    }
+
+    fn replaceRuntimeEnabledModelsFromDraft(self: *BridgeHost) !void {
+        const runtime = self.context.runtime_config orelse return;
+        const allocator = runtime.allocator;
+        freeConstStringList(allocator, runtime.settings.enabled_models);
+        runtime.settings.enabled_models = try cloneStringListConst(allocator, self.scoped_draft_enabled_ids);
+        freeConstStringList(allocator, runtime.global_settings.enabled_models);
+        runtime.global_settings.enabled_models = try cloneStringListConst(allocator, self.scoped_draft_enabled_ids);
     }
 
     fn writeModelSelectionState(
@@ -1109,6 +1750,11 @@ pub const BridgeHost = struct {
                     }
                 }
             },
+            .settings_get, .scoped_models_get, .scoped_models_save => {},
+            .settings_set => {},
+            .thinking_set => {},
+            .theme_select => {},
+            .scoped_models_update => {},
         }
     }
 
@@ -1123,6 +1769,39 @@ pub const BridgeHost = struct {
     fn authRequired(self: *const BridgeHost) bool {
         return self.context.auth_status == .missing;
     }
+
+    fn persistSettingValue(self: *BridgeHost, allocator: std.mem.Allocator, id: []const u8, value: []const u8) !void {
+        const runtime = self.context.runtime_config orelse return;
+        var settings_json = try loadSettingsJsonValue(allocator, self.context.session.io, runtime.agent_dir);
+        defer common.deinitJsonValue(allocator, settings_json);
+        if (settings_json != .object) {
+            common.deinitJsonValue(allocator, settings_json);
+            settings_json = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+        }
+        try updateSettingsJsonValue(allocator, &settings_json.object, id, value);
+        const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime.agent_dir, "settings.json" });
+        defer allocator.free(settings_path);
+        const serialized = try std.json.Stringify.valueAlloc(allocator, settings_json, .{ .whitespace = .indent_2 });
+        defer allocator.free(serialized);
+        try common.writeFileAbsolute(self.context.session.io, settings_path, serialized, true);
+        try self.replaceRuntimeSetting(id, value);
+    }
+
+    fn replaceRuntimeSetting(self: *BridgeHost, id: []const u8, value: []const u8) !void {
+        const runtime = self.context.runtime_config orelse return;
+        try applyRuntimeSetting(&runtime.settings, runtime.allocator, id, value);
+        try applyRuntimeSetting(&runtime.global_settings, runtime.allocator, id, value);
+    }
+
+    fn applySettingSideEffect(self: *BridgeHost, id: []const u8, value: []const u8) !void {
+        if (std.mem.eql(u8, id, "autocompact")) {
+            self.context.session.compaction_settings.enabled = parseBoolText(value);
+        } else if (std.mem.eql(u8, id, "steering_mode")) {
+            self.context.session.agent.steering_queue.mode = parseQueueMode(value);
+        } else if (std.mem.eql(u8, id, "follow_up_mode")) {
+            self.context.session.agent.follow_up_queue.mode = parseQueueMode(value);
+        }
+    }
 };
 
 fn permissionDeniedMessage(permission: Permission) []const u8 {
@@ -1131,6 +1810,7 @@ fn permissionDeniedMessage(permission: Permission) []const u8 {
         .model_selection => "WebView model selection requires explicit model selection permission",
         .session_mutation => "WebView session mutation requires explicit session mutation permission",
         .auth_mutation => "WebView auth mutation requires explicit auth mutation permission",
+        .settings_mutation => "WebView settings/theme/scoped-model mutation requires explicit settings mutation permission",
     };
 }
 
@@ -1141,6 +1821,144 @@ fn statusForTerminalOutcome(outcome: []const u8) []const u8 {
     if (std.mem.eql(u8, outcome, "setup_failure")) return "failed";
     if (std.mem.eql(u8, outcome, "window_closed")) return "aborted";
     return "failed";
+}
+
+fn boolName(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+fn queueModeName(mode: agent.QueueMode) []const u8 {
+    return switch (mode) {
+        .all => "all",
+        .one_at_a_time => "one-at-a-time",
+    };
+}
+
+fn transportName(value: ai.types.Transport) []const u8 {
+    return switch (value) {
+        .sse => "sse",
+        .websocket => "websocket",
+        .websocket_cached => "websocket-cached",
+        .auto => "auto",
+    };
+}
+
+fn doubleEscapeName(action: config_mod.DoubleEscapeAction) []const u8 {
+    return switch (action) {
+        .fork => "fork",
+        .tree => "tree",
+        .none => "none",
+    };
+}
+
+fn treeFilterName(mode: config_mod.TreeFilterMode) []const u8 {
+    return switch (mode) {
+        .default => "default",
+        .no_tools => "no-tools",
+        .user_only => "user-only",
+        .labeled_only => "labeled-only",
+        .all => "all",
+    };
+}
+
+fn thinkingName(level: agent.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "off",
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
+fn thinkingDescription(level: agent.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "No reasoning",
+        .minimal => "Very brief reasoning (~1k tokens)",
+        .low => "Light reasoning (~2k tokens)",
+        .medium => "Moderate reasoning (~8k tokens)",
+        .high => "Deep reasoning (~16k tokens)",
+        .xhigh => "Maximum reasoning (~32k tokens)",
+    };
+}
+
+fn parseThinkingLevelName(value: []const u8) ?agent.ThinkingLevel {
+    if (std.mem.eql(u8, value, "off")) return .off;
+    if (std.mem.eql(u8, value, "minimal")) return .minimal;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh")) return .xhigh;
+    return null;
+}
+
+fn thinkingLevelAvailable(model: ai.Model, level: agent.ThinkingLevel) bool {
+    const mapped: ai.ModelThinkingLevel = switch (level) {
+        .off => .off,
+        .minimal => .minimal,
+        .low => .low,
+        .medium => .medium,
+        .high => .high,
+        .xhigh => .xhigh,
+    };
+    return ai.model_registry.isThinkingLevelSupported(model, mapped);
+}
+
+fn modelSupportsImages(model: ai.Model) bool {
+    for (model.input_types) |input_type| {
+        if (std.mem.eql(u8, input_type, "image")) return true;
+    }
+    return false;
+}
+
+fn canonicalThemeName(theme_name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(theme_name, "night")) return "dark";
+    if (std.ascii.eqlIgnoreCase(theme_name, "day")) return "light";
+    return theme_name;
+}
+
+fn parseBoolText(value: []const u8) bool {
+    return std.mem.eql(u8, value, "true");
+}
+
+fn parseQueueMode(value: []const u8) agent.QueueMode {
+    return if (std.mem.eql(u8, value, "all")) .all else .one_at_a_time;
+}
+
+fn settingValueAllowed(id: []const u8, value: []const u8) bool {
+    if (std.mem.eql(u8, id, "autocompact") or
+        std.mem.eql(u8, id, "show_images") or
+        std.mem.eql(u8, id, "auto_resize_images") or
+        std.mem.eql(u8, id, "block_images") or
+        std.mem.eql(u8, id, "skill_commands") or
+        std.mem.eql(u8, id, "show_hardware_cursor") or
+        std.mem.eql(u8, id, "clear_on_shrink") or
+        std.mem.eql(u8, id, "terminal_progress") or
+        std.mem.eql(u8, id, "hide_thinking") or
+        std.mem.eql(u8, id, "collapse_changelog") or
+        std.mem.eql(u8, id, "quiet_startup") or
+        std.mem.eql(u8, id, "install_telemetry") or
+        std.mem.eql(u8, id, "warnings"))
+    {
+        return std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false");
+    }
+    if (std.mem.eql(u8, id, "image_width_cells")) return oneOf(value, &.{ "60", "80", "120" });
+    if (std.mem.eql(u8, id, "editor_padding")) return oneOf(value, &.{ "0", "1", "2", "3" });
+    if (std.mem.eql(u8, id, "autocomplete_max_visible")) return oneOf(value, &.{ "3", "5", "7", "10", "15", "20" });
+    if (std.mem.eql(u8, id, "steering_mode") or std.mem.eql(u8, id, "follow_up_mode")) return oneOf(value, &.{ "one-at-a-time", "all" });
+    if (std.mem.eql(u8, id, "transport")) return oneOf(value, &.{ "sse", "websocket", "websocket-cached", "auto" });
+    if (std.mem.eql(u8, id, "double_escape_action")) return oneOf(value, &.{ "tree", "fork", "none" });
+    if (std.mem.eql(u8, id, "tree_filter_mode")) return oneOf(value, &.{ "default", "no-tools", "user-only", "labeled-only", "all" });
+    if (std.mem.eql(u8, id, "theme")) return value.len > 0;
+    return false;
+}
+
+fn oneOf(value: []const u8, options: []const []const u8) bool {
+    for (options) |option| {
+        if (std.mem.eql(u8, value, option)) return true;
+    }
+    return false;
 }
 
 pub const NavigationKind = enum {
@@ -1206,7 +2024,7 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     if (value == .null) return command != .prompt;
     if (value != .object) return false;
     return switch (command) {
-        .get_state, .get_messages, .abort, .get_events => true,
+        .get_state, .get_messages, .abort, .get_events, .settings_get, .scoped_models_get, .scoped_models_save => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
         .model_select => value.object.get("provider") != null and
             value.object.get("provider").? == .string and
@@ -1221,6 +2039,13 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
             value.object.get("apiKey") != null and
             value.object.get("apiKey").? == .string,
         .remove_auth => value.object.get("provider") != null and value.object.get("provider").? == .string,
+        .settings_set => value.object.get("id") != null and
+            value.object.get("id").? == .string and
+            value.object.get("value") != null and
+            value.object.get("value").? == .string,
+        .thinking_set => value.object.get("level") != null and value.object.get("level").? == .string,
+        .theme_select => value.object.get("theme") != null and value.object.get("theme").? == .string,
+        .scoped_models_update => value.object.get("action") != null and value.object.get("action").? == .string,
     };
 }
 
@@ -1519,6 +2344,263 @@ fn writeUsizeField(
 ) !void {
     if (comma) try writer.writeAll(",");
     try writer.print("\"{s}\":{d}", .{ name, value });
+}
+
+fn loadSettingsJsonValue(allocator: std.mem.Allocator, io: std.Io, agent_dir: []const u8) !std.json.Value {
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const content = std.Io.Dir.readFileAlloc(.cwd(), io, settings_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) },
+        else => return err,
+    };
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch
+        return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    defer parsed.deinit();
+    return common.cloneJsonValue(allocator, parsed.value);
+}
+
+fn updateSettingsJsonValue(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    id: []const u8,
+    value: []const u8,
+) !void {
+    if (std.mem.eql(u8, id, "autocompact")) return putNestedBool(allocator, object, "compaction", "enabled", parseBoolText(value));
+    if (std.mem.eql(u8, id, "show_images")) return putNestedBool(allocator, object, "terminal", "showImages", parseBoolText(value));
+    if (std.mem.eql(u8, id, "image_width_cells")) return putNestedInteger(allocator, object, "terminal", "imageWidthCells", try parseUsizeText(value));
+    if (std.mem.eql(u8, id, "auto_resize_images")) return putNestedBool(allocator, object, "images", "autoResize", parseBoolText(value));
+    if (std.mem.eql(u8, id, "block_images")) return putNestedBool(allocator, object, "images", "blockImages", parseBoolText(value));
+    if (std.mem.eql(u8, id, "skill_commands")) return putStringValue(allocator, object, "enableSkillCommands", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "show_hardware_cursor")) return putStringValue(allocator, object, "showHardwareCursor", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "editor_padding")) return putStringValue(allocator, object, "editorPaddingX", .{ .integer = @intCast(try parseUsizeText(value)) });
+    if (std.mem.eql(u8, id, "autocomplete_max_visible")) return putStringValue(allocator, object, "autocompleteMaxVisible", .{ .integer = @intCast(try parseUsizeText(value)) });
+    if (std.mem.eql(u8, id, "clear_on_shrink")) return putNestedBool(allocator, object, "terminal", "clearOnShrink", parseBoolText(value));
+    if (std.mem.eql(u8, id, "terminal_progress")) return putNestedBool(allocator, object, "terminal", "showTerminalProgress", parseBoolText(value));
+    if (std.mem.eql(u8, id, "steering_mode")) return putOwnedString(allocator, object, "steeringMode", value);
+    if (std.mem.eql(u8, id, "follow_up_mode")) return putOwnedString(allocator, object, "followUpMode", value);
+    if (std.mem.eql(u8, id, "transport")) return putOwnedString(allocator, object, "transport", value);
+    if (std.mem.eql(u8, id, "hide_thinking")) return putStringValue(allocator, object, "hideThinkingBlock", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "collapse_changelog")) return putStringValue(allocator, object, "collapseChangelog", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "quiet_startup")) return putStringValue(allocator, object, "quietStartup", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "install_telemetry")) return putStringValue(allocator, object, "enableInstallTelemetry", .{ .bool = parseBoolText(value) });
+    if (std.mem.eql(u8, id, "double_escape_action")) return putOwnedString(allocator, object, "doubleEscapeAction", value);
+    if (std.mem.eql(u8, id, "tree_filter_mode")) return putOwnedString(allocator, object, "treeFilterMode", value);
+    if (std.mem.eql(u8, id, "theme")) return putOwnedString(allocator, object, "theme", value);
+    if (std.mem.eql(u8, id, "warnings")) return putNestedBool(allocator, object, "warnings", "anthropicExtraUsage", parseBoolText(value));
+}
+
+fn putOwnedString(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
+    try putStringValue(allocator, object, key, .{ .string = try allocator.dupe(u8, value) });
+}
+
+fn putNestedBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, nested_key: []const u8, value: bool) !void {
+    const nested = try ensureNestedObject(allocator, object, key);
+    try putStringValue(allocator, nested, nested_key, .{ .bool = value });
+}
+
+fn putNestedInteger(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, nested_key: []const u8, value: usize) !void {
+    const nested = try ensureNestedObject(allocator, object, key);
+    try putStringValue(allocator, nested, nested_key, .{ .integer = @intCast(value) });
+}
+
+fn ensureNestedObject(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    if (object.getPtr(key)) |existing| {
+        if (existing.* != .object) {
+            common.deinitJsonValue(allocator, existing.*);
+            existing.* = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+        }
+        return &existing.object;
+    }
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
+    return &object.getPtr(key).?.object;
+}
+
+fn putStringValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
+    if (object.getPtr(key)) |existing| {
+        common.deinitJsonValue(allocator, existing.*);
+        existing.* = value;
+        return;
+    }
+    try object.put(allocator, try allocator.dupe(u8, key), value);
+}
+
+fn parseUsizeText(value: []const u8) !usize {
+    return try std.fmt.parseInt(usize, value, 10);
+}
+
+fn applyRuntimeSetting(settings: *config_mod.Settings, allocator: std.mem.Allocator, id: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, id, "autocompact")) {
+        var compaction = settings.compaction orelse session_mod.CompactionSettings{};
+        compaction.enabled = parseBoolText(value);
+        settings.compaction = compaction;
+    } else if (std.mem.eql(u8, id, "show_images")) {
+        settings.terminal_show_images = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "image_width_cells")) {
+        settings.terminal_image_width_cells = try parseUsizeText(value);
+    } else if (std.mem.eql(u8, id, "auto_resize_images")) {
+        settings.image_auto_resize = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "block_images")) {
+        settings.image_block_images = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "skill_commands")) {
+        settings.enable_skill_commands = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "show_hardware_cursor")) {
+        settings.show_hardware_cursor = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "editor_padding")) {
+        settings.editor_padding_x = try parseUsizeText(value);
+    } else if (std.mem.eql(u8, id, "autocomplete_max_visible")) {
+        settings.autocomplete_max_visible = try parseUsizeText(value);
+    } else if (std.mem.eql(u8, id, "clear_on_shrink")) {
+        settings.terminal_clear_on_shrink = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "terminal_progress")) {
+        settings.terminal_show_progress = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "steering_mode")) {
+        settings.steering_mode = if (std.mem.eql(u8, value, "all")) .all else .one_at_a_time;
+    } else if (std.mem.eql(u8, id, "follow_up_mode")) {
+        settings.follow_up_mode = if (std.mem.eql(u8, value, "all")) .all else .one_at_a_time;
+    } else if (std.mem.eql(u8, id, "transport")) {
+        settings.transport = parseTransport(value);
+    } else if (std.mem.eql(u8, id, "hide_thinking")) {
+        settings.hide_thinking_block = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "collapse_changelog")) {
+        settings.collapse_changelog = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "quiet_startup")) {
+        settings.quiet_startup = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "install_telemetry")) {
+        settings.enable_install_telemetry = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "double_escape_action")) {
+        settings.double_escape_action = parseDoubleEscape(value);
+    } else if (std.mem.eql(u8, id, "tree_filter_mode")) {
+        settings.tree_filter_mode = parseTreeFilter(value);
+    } else if (std.mem.eql(u8, id, "warnings")) {
+        settings.warning_anthropic_extra_usage = parseBoolText(value);
+    } else if (std.mem.eql(u8, id, "theme")) {
+        if (settings.theme) |old| allocator.free(old);
+        settings.theme = try allocator.dupe(u8, value);
+    }
+}
+
+fn parseTransport(value: []const u8) ai.types.Transport {
+    if (std.mem.eql(u8, value, "sse")) return .sse;
+    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    if (std.mem.eql(u8, value, "websocket-cached")) return .websocket_cached;
+    return .auto;
+}
+
+fn parseDoubleEscape(value: []const u8) config_mod.DoubleEscapeAction {
+    if (std.mem.eql(u8, value, "fork")) return .fork;
+    if (std.mem.eql(u8, value, "none")) return .none;
+    return .tree;
+}
+
+fn parseTreeFilter(value: []const u8) config_mod.TreeFilterMode {
+    if (std.mem.eql(u8, value, "no-tools")) return .no_tools;
+    if (std.mem.eql(u8, value, "user-only")) return .user_only;
+    if (std.mem.eql(u8, value, "labeled-only")) return .labeled_only;
+    if (std.mem.eql(u8, value, "all")) return .all;
+    return .default;
+}
+
+fn persistEnabledModels(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_config: *config_mod.RuntimeConfig,
+    enabled_ids: ?[]const []const u8,
+) !void {
+    var settings_json = try loadSettingsJsonValue(allocator, io, runtime_config.agent_dir);
+    defer common.deinitJsonValue(allocator, settings_json);
+    if (settings_json != .object) {
+        common.deinitJsonValue(allocator, settings_json);
+        settings_json = .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
+    }
+    if (enabled_ids) |ids| {
+        var array = std.json.Array.init(allocator);
+        errdefer array.deinit();
+        for (ids) |id| {
+            try array.append(.{ .string = try allocator.dupe(u8, id) });
+        }
+        try putStringValue(allocator, &settings_json.object, "enabledModels", .{ .array = array });
+    } else {
+        try putStringValue(allocator, &settings_json.object, "enabledModels", .null);
+    }
+    const settings_path = try std.fs.path.join(allocator, &[_][]const u8{ runtime_config.agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const serialized = try std.json.Stringify.valueAlloc(allocator, settings_json, .{ .whitespace = .indent_2 });
+    defer allocator.free(serialized);
+    try common.writeFileAbsolute(io, settings_path, serialized, true);
+}
+
+fn scopedModelFullId(allocator: std.mem.Allocator, model: provider_config.AvailableModel) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ model.provider, model.model_id });
+}
+
+fn indexOfString(items: []const []const u8, needle: []const u8) ?usize {
+    for (items, 0..) |item, index| {
+        if (std.mem.eql(u8, item, needle)) return index;
+    }
+    return null;
+}
+
+fn scopedIdEnabled(enabled_ids: ?[][]u8, id: []const u8) bool {
+    const ids = enabled_ids orelse return true;
+    return indexOfString(ids, id) != null;
+}
+
+fn appendUniqueOwned(allocator: std.mem.Allocator, items: *[][]u8, value: []const u8) !void {
+    if (indexOfString(items.*, value) != null) return;
+    const next = try allocator.realloc(items.*, items.*.len + 1);
+    next[next.len - 1] = try allocator.dupe(u8, value);
+    items.* = next;
+}
+
+fn clonedExcludingIds(allocator: std.mem.Allocator, source: []const []const u8, excluded: []const []const u8) ![][]u8 {
+    var result = std.ArrayList([]u8).empty;
+    errdefer freeOwnedStringList(allocator, result.items);
+    for (source) |item| {
+        if (indexOfString(excluded, item) == null) try result.append(allocator, try allocator.dupe(u8, item));
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+fn cloneStringListAsMutable(allocator: std.mem.Allocator, source: []const []const u8) ![][]u8 {
+    var result = try allocator.alloc([]u8, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |item| allocator.free(item);
+        allocator.free(result);
+    }
+    for (source, 0..) |item, index| {
+        result[index] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn cloneStringListConst(allocator: std.mem.Allocator, source: ?[][]u8) !?[]const []const u8 {
+    const ids = source orelse return null;
+    const result = try allocator.alloc([]const u8, ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |item| allocator.free(@constCast(item));
+        allocator.free(result);
+    }
+    for (ids, 0..) |item, index| {
+        result[index] = try allocator.dupe(u8, item);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn freeOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn freeConstStringList(allocator: std.mem.Allocator, items: ?[]const []const u8) void {
+    const list = items orelse return;
+    for (list) |item| allocator.free(@constCast(item));
+    allocator.free(list);
 }
 
 fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
@@ -1838,7 +2920,7 @@ test "bridge command table exposes approved skeleton commands first" {
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 13), command_table.len);
+    try std.testing.expectEqual(@as(usize, 20), command_table.len);
     try std.testing.expectEqualStrings("new_session", command_table[6].name);
     try std.testing.expectEqual(Command.new_session, command_table[6].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
@@ -1869,6 +2951,25 @@ test "bridge command table exposes auth status and gates auth mutations" {
     try std.testing.expectEqualStrings("remove_auth", command_table[12].name);
     try std.testing.expectEqual(Command.remove_auth, command_table[12].command);
     try std.testing.expectEqual(Permission.auth_mutation, command_table[12].permission);
+}
+
+test "bridge command table exposes settings theme thinking and scoped model commands" {
+    try std.testing.expectEqual(@as(usize, 20), command_table.len);
+    try std.testing.expectEqualStrings("settings_get", command_table[13].name);
+    try std.testing.expectEqual(Command.settings_get, command_table[13].command);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[13].permission);
+    try std.testing.expectEqualStrings("settings_set", command_table[14].name);
+    try std.testing.expectEqual(Permission.settings_mutation, command_table[14].permission);
+    try std.testing.expectEqualStrings("thinking_set", command_table[15].name);
+    try std.testing.expectEqual(Permission.settings_mutation, command_table[15].permission);
+    try std.testing.expectEqualStrings("theme_select", command_table[16].name);
+    try std.testing.expectEqual(Permission.settings_mutation, command_table[16].permission);
+    try std.testing.expectEqualStrings("scoped_models_get", command_table[17].name);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[17].permission);
+    try std.testing.expectEqualStrings("scoped_models_update", command_table[18].name);
+    try std.testing.expectEqual(Permission.settings_mutation, command_table[18].permission);
+    try std.testing.expectEqualStrings("scoped_models_save", command_table[19].name);
+    try std.testing.expectEqual(Permission.settings_mutation, command_table[19].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -2194,6 +3295,223 @@ test "webview get_state exposes configured model choices without credential valu
     try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, response, "baseUrl") == null);
+}
+
+test "webview get_state exposes structured settings thinking theme and scoped model state" {
+    const allocator = std.testing.allocator;
+    var thinking_model = testModel();
+    thinking_model.reasoning = true;
+    thinking_model.input_types = &.{ "text", "image" };
+
+    var session = try testSessionWithModel(allocator, thinking_model);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.model = thinking_model;
+    bridge.context.permissions.settings_mutation = true;
+    const available_models = [_]provider_config.AvailableModel{
+        .{
+            .provider = "faux",
+            .model_id = "faux-model",
+            .display_name = "Faux Model",
+            .available = true,
+            .auth_status = .local,
+            .reasoning = true,
+            .tool_calling = true,
+            .loaded = false,
+            .supports_images = true,
+            .context_window = 128000,
+            .max_tokens = 4096,
+        },
+    };
+    bridge.context.available_models = available_models[0..];
+
+    const response = try bridge.handleRequestJson(allocator, "{\"id\":\"state-panels\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"settingsPanel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"label\":\"Auto-compact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"label\":\"Show images\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"label\":\"Theme\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"thinkingSelection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"name\":\"xhigh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"themeSelection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"name\":\"dark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"scopedModels\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"toggle\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"fullId\":\"faux/faux-model\"") != null);
+}
+
+test "webview settings mutations are permission gated and persist theme and rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const agent_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "agent", allocator);
+    defer allocator.free(agent_dir);
+    const project_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "project", allocator);
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime.deinit();
+
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.runtime_config = &runtime;
+
+    const denied = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"settings-denied\",\"command\":\"settings_set\",\"payload\":{\"id\":\"hide_thinking\",\"value\":\"true\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(denied);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "\"code\":\"permission_denied\"") != null);
+
+    bridge.context.permissions.settings_mutation = true;
+    const saved = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"settings-save\",\"command\":\"settings_set\",\"payload\":{\"id\":\"hide_thinking\",\"value\":\"true\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"status\":\"saved\"") != null);
+    try std.testing.expect(runtime.hideThinkingBlock());
+
+    const theme = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"theme-save\",\"command\":\"theme_select\",\"payload\":{\"theme\":\"light\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(theme);
+    try std.testing.expect(std.mem.indexOf(u8, theme, "\"status\":\"selected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, theme, "\"theme\":\"light\"") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .unlimited);
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"hideThinkingBlock\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"theme\": \"light\"") != null);
+}
+
+test "webview thinking levels respect model capability awareness" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.permissions.settings_mutation = true;
+
+    const unsupported = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"thinking-high\",\"command\":\"thinking_set\",\"payload\":{\"level\":\"high\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(unsupported);
+    try std.testing.expect(std.mem.indexOf(u8, unsupported, "\"status\":\"unsupported\"") != null);
+    try std.testing.expectEqual(agent.ThinkingLevel.off, session.agent.getThinkingLevel());
+
+    var thinking_model = testModel();
+    thinking_model.reasoning = true;
+    bridge.context.model = thinking_model;
+    try session.setModel(thinking_model);
+    const selected = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"thinking-high\",\"command\":\"thinking_set\",\"payload\":{\"level\":\"high\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(selected);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "\"status\":\"selected\"") != null);
+    try std.testing.expectEqual(agent.ThinkingLevel.high, session.agent.getThinkingLevel());
+}
+
+test "webview scoped model controls toggle bulk provider reorder and save" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "agent");
+    try tmp.dir.createDirPath(std.testing.io, "project");
+    const agent_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "agent", allocator);
+    defer allocator.free(agent_dir);
+    const project_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "project", allocator);
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+    var runtime = try config_mod.loadRuntimeConfigWithOptions(allocator, std.testing.io, &env_map, project_dir, .{ .discover_models = false });
+    defer runtime.deinit();
+
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.runtime_config = &runtime;
+    bridge.context.permissions.settings_mutation = true;
+    const available_models = [_]provider_config.AvailableModel{
+        .{ .provider = "faux", .model_id = "faux-model", .display_name = "Faux Model", .available = true, .auth_status = .local, .reasoning = false, .tool_calling = true, .loaded = false, .supports_images = false, .context_window = 128000, .max_tokens = 4096 },
+        .{ .provider = "faux", .model_id = "faux-alt", .display_name = "Faux Alt", .available = true, .auth_status = .local, .reasoning = false, .tool_calling = true, .loaded = false, .supports_images = false, .context_window = 128000, .max_tokens = 4096 },
+        .{ .provider = "local", .model_id = "local-one", .display_name = "Local One", .available = true, .auth_status = .local, .reasoning = true, .tool_calling = false, .loaded = true, .supports_images = false, .context_window = 8192, .max_tokens = 1024 },
+    };
+    bridge.context.available_models = available_models[0..];
+
+    const toggled = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"scoped-toggle\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"toggle\",\"fullId\":\"faux/faux-model\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(toggled);
+    try std.testing.expect(std.mem.indexOf(u8, toggled, "\"dirty\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toggled, "\"fullId\":\"faux/faux-model\",\"provider\":\"faux\"") != null);
+
+    const provider_toggle = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"scoped-provider\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"provider_toggle\",\"provider\":\"faux\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(provider_toggle);
+    try std.testing.expect(std.mem.indexOf(u8, provider_toggle, "\"status\":\"updated\"") != null);
+
+    const reorder = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"scoped-reorder\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"reorder\",\"fullId\":\"local/local-one\",\"direction\":\"up\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(reorder);
+    try std.testing.expect(std.mem.indexOf(u8, reorder, "\"status\":\"updated\"") != null);
+
+    const enable = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"scoped-enable\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"enable_all\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(enable);
+    try std.testing.expect(std.mem.indexOf(u8, enable, "\"allEnabled\":true") != null);
+
+    const clear = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"scoped-clear\",\"command\":\"scoped_models_update\",\"payload\":{\"action\":\"clear_all\",\"targets\":[\"faux/faux-model\"]}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "\"allEnabled\":false") != null);
+
+    const saved = try bridge.handleRequestJson(allocator, "{\"id\":\"scoped-save\",\"command\":\"scoped_models_save\"}", trusted_bundle_origin);
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"status\":\"saved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"dirty\":false") != null);
+
+    const settings_path = try std.fs.path.join(allocator, &.{ agent_dir, "settings.json" });
+    defer allocator.free(settings_path);
+    const written = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, settings_path, allocator, .unlimited);
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"enabledModels\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "local/local-one") != null);
 }
 
 test "webview auth status exposes minimal storage-derived state without secrets" {
