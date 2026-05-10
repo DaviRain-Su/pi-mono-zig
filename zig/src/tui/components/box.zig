@@ -34,6 +34,7 @@ pub const Box = struct {
     theme: ?*const resources_mod.Theme = null,
     border_style: BorderStyle = .single,
     corner_style: CornerStyle = .square,
+    title: []const u8 = "",
     children: std.ArrayList(draw_mod.Component) = .empty,
 
     pub fn init(padding_x: usize, padding_y: usize) Box {
@@ -75,6 +76,31 @@ pub const Box = struct {
         else
             window;
         bordered.clear();
+
+        if (self.title.len > 0 and self.border_style != .none and window.width >= 4) {
+            const title_style: vaxis.Cell.Style = if (active_theme) |t| style_mod.styleFor(t, .box_border) else .{};
+            const start_col: u16 = 2;
+            var col = start_col;
+            var index: usize = 0;
+            while (index < self.title.len and col < window.width -| 2) {
+                const cluster = ansi.nextDisplayCluster(self.title, index);
+                if (cluster.end <= index) break;
+                if (cluster.width == 0) {
+                    index = cluster.end;
+                    continue;
+                }
+                if (@as(usize, col) + cluster.width > window.width - 2) break;
+                window.writeCell(col, 0, .{
+                    .char = .{
+                        .grapheme = self.title[index..cluster.end],
+                        .width = @intCast(cluster.width),
+                    },
+                    .style = title_style,
+                });
+                col += @intCast(cluster.width);
+                index = cluster.end;
+            }
+        }
 
         const content_window = innerWindow(bordered, self.padding_x, self.padding_y) orelse {
             return .{ .width = window.width, .height = window.height };
@@ -298,4 +324,25 @@ test "box supports rounded, double, and thick border styles" {
     defer thick_screen.deinit(std.testing.allocator);
     try test_helpers.expectCell(&thick_screen, 0, 0, "┏", .{});
     try test_helpers.expectCell(&thick_screen, 0, 1, "┃", .{});
+}
+
+test "box renders title on top border" {
+    const text = @import("text.zig").Text{
+        .text = "content",
+        .padding_x = 0,
+        .padding_y = 0,
+    };
+
+    var box = Box.init(1, 0);
+    defer box.deinit(std.testing.allocator);
+    box.title = "Test";
+    try box.addChild(std.testing.allocator, text.drawComponent());
+
+    var screen = try test_helpers.renderToScreen(box.drawComponent(), 14, 3);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "┌", .{});
+    try test_helpers.expectCell(&screen, 2, 0, "T", .{});
+    try test_helpers.expectCell(&screen, 5, 0, "t", .{});
+    try test_helpers.expectCell(&screen, 13, 0, "┐", .{});
 }
