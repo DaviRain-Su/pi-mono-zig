@@ -2612,7 +2612,8 @@ test "extension startup loads approved explicit project and global extensions in
     defer bundle.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     for (bundle.extensions) |extension| {
         const key = try extension_runtime.typeScriptPolicyLookupKey(allocator, .{
             .configured_path = extension.source_info.path,
@@ -2624,6 +2625,7 @@ test "extension startup loads approved explicit project and global extensions in
     }
 
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, agent_dir, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2685,10 +2687,12 @@ test "extension startup resolves manifest graph before activation" {
     defer consumer.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, provider, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, consumer, .{ .grants = &.{"tool.use"} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2754,10 +2758,12 @@ test "package-origin extension startup resolves package-root manifest graph befo
     defer consumer.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, provider, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, consumer, .{ .grants = &.{"tool.use"} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2819,10 +2825,12 @@ test "extension startup rejects invalid manifest graphs before activation" {
     defer cycle_b.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, cycle_a, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, cycle_b, .{ .grants = &.{"tool.use"} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2887,10 +2895,12 @@ test "package-origin extension startup rejects invalid package-root manifest gra
     defer cycle_b.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, cycle_a, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, cycle_b, .{ .grants = &.{"tool.use"} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2943,11 +2953,13 @@ test "extension startup diagnoses optional required and denied policy outcomes" 
     defer denied.deinit(allocator);
 
     var optional_policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &optional_policy_map);
+    var optional_policy_map_owned = true;
+    errdefer if (optional_policy_map_owned) deinitToolAdapterPolicyMap(allocator, &optional_policy_map);
     try putLoadedExtensionPolicy(allocator, &optional_policy_map, good, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &optional_policy_map, hang, .{ .grants = &.{"tool.use"}, .startup_timeout_ms = 50 });
     try putLoadedExtensionPolicy(allocator, &optional_policy_map, denied, .{ .grants = &.{} });
     var optional_runtime = try makeToolAdapterRuntimeConfig(allocator, cwd, optional_policy_map);
+    optional_policy_map_owned = false;
     defer optional_runtime.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -2974,9 +2986,11 @@ test "extension startup diagnoses optional required and denied policy outcomes" 
     try std.testing.expect(!optional_tools.required_startup_failed);
 
     var required_policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &required_policy_map);
+    var required_policy_map_owned = true;
+    errdefer if (required_policy_map_owned) deinitToolAdapterPolicyMap(allocator, &required_policy_map);
     try putLoadedExtensionPolicy(allocator, &required_policy_map, hang, .{ .grants = &.{"tool.use"}, .required = true, .startup_timeout_ms = 50 });
     var required_runtime = try makeToolAdapterRuntimeConfig(allocator, cwd, required_policy_map);
+    required_policy_map_owned = false;
     defer required_runtime.deinit();
 
     var required_tools = try buildAgentToolsWithExtensionsSelection(allocator, &app_context, .{}, .{
@@ -3041,10 +3055,12 @@ test "extension reload swaps tool registry and shuts down removed hosts" {
     defer new_extension.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, old_extension, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, new_extension, .{ .grants = &.{"tool.use"} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -3128,11 +3144,13 @@ test "extension reload diagnostics distinguish parse policy and runtime failures
     defer denied_extension.deinit(allocator);
 
     var policy_map = config_mod.ExtensionPolicyMap.init(allocator);
-    errdefer deinitToolAdapterPolicyMap(allocator, &policy_map);
+    var policy_map_owned = true;
+    errdefer if (policy_map_owned) deinitToolAdapterPolicyMap(allocator, &policy_map);
     try putLoadedExtensionPolicy(allocator, &policy_map, parse_extension, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, runtime_extension, .{ .grants = &.{"tool.use"} });
     try putLoadedExtensionPolicy(allocator, &policy_map, denied_extension, .{ .grants = &.{} });
     var runtime_config = try makeToolAdapterRuntimeConfig(allocator, cwd, policy_map);
+    policy_map_owned = false;
     defer runtime_config.deinit();
 
     var app_context = AppContext.init(cwd, std.testing.io);

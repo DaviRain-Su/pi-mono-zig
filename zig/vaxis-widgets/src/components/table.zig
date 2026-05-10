@@ -327,7 +327,6 @@ fn renderRow(
             const truncated = try ansi.sliceVisibleAlloc(allocator, cell.text, 0, effective_max);
             break :blk truncated;
         };
-        defer if (visible_text.ptr != cell.text.ptr) allocator.free(visible_text);
 
         // Compute alignment padding
         const text_width = ansi.visibleWidth(visible_text) + indicator_width;
