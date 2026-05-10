@@ -267,7 +267,7 @@ pub const Table = struct {
 };
 
 fn renderRow(
-    _: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     window: vaxis.Window,
     row: Row,
     column_rects: []const constraints_mod.Rect,
