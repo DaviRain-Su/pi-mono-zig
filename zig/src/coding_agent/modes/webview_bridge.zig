@@ -605,17 +605,21 @@ pub const BridgeHost = struct {
 
         const selected = try self.resolveSelectedModel(allocator, provider, model);
         defer selected.deinit(allocator);
-        var next_owned_model = try ai.model_registry.cloneOwnedModel(self.context.session.allocator, selected.model);
-        errdefer ai.model_registry.deinitOwnedModel(self.context.session.allocator, &next_owned_model);
-        const next_owned_api_key = if (selected.api_key) |api_key|
+        var next_owned_model: ?ai.Model = try ai.model_registry.cloneOwnedModel(self.context.session.allocator, selected.model);
+        errdefer if (next_owned_model) |*owned_model| {
+            ai.model_registry.deinitOwnedModel(self.context.session.allocator, owned_model);
+        };
+        var next_owned_api_key: ?[]u8 = if (selected.api_key) |api_key|
             try self.context.session.allocator.dupe(u8, api_key)
         else
             null;
         errdefer if (next_owned_api_key) |api_key| self.context.session.allocator.free(api_key);
 
         self.clearOwnedSelection();
-        self.owned_selected_model = next_owned_model;
+        self.owned_selected_model = next_owned_model.?;
         self.owned_selected_api_key = next_owned_api_key;
+        next_owned_model = null;
+        next_owned_api_key = null;
         const stable_model = self.owned_selected_model.?;
         self.context.provider = stable_model.provider;
         self.context.model = stable_model;
@@ -1017,8 +1021,9 @@ pub const BridgeHost = struct {
         defer credential.deinit(allocator);
         try auth.upsertStoredCredential(allocator, self.context.session.io, auth_path, provider, &credential);
         if (std.mem.eql(u8, provider, self.context.provider)) {
+            const next_api_key = try self.context.session.allocator.dupe(u8, api_key);
             if (self.owned_selected_api_key) |old| self.context.session.allocator.free(old);
-            self.owned_selected_api_key = try self.context.session.allocator.dupe(u8, api_key);
+            self.owned_selected_api_key = next_api_key;
             self.context.session.setApiKey(self.owned_selected_api_key);
             self.context.auth_status = .stored;
             self.context.api_key_present = true;
@@ -2417,6 +2422,67 @@ test "webview model selection permission updates active session model safely" {
     defer allocator.free(written);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"model_change\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "webview-local-model") != null);
+}
+
+test "webview model selection owns selected clone after response allocation failure" {
+    const allocator = std.testing.allocator;
+    defer ai.model_registry.resetForTesting();
+    try ai.model_registry.registerProvider(.{
+        .provider = "webview-owned-model-provider",
+        .api = "openai-completions",
+        .base_url = "http://localhost:4322/v1",
+        .default_model_id = "webview-owned-model",
+    });
+    try ai.model_registry.registerModel(.{
+        .id = "webview-owned-model",
+        .name = "WebView Owned Model",
+        .api = "openai-completions",
+        .provider = "webview-owned-model-provider",
+        .base_url = "http://localhost:4322/v1",
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 8192,
+        .max_tokens = 1024,
+        .reasoning = true,
+    });
+
+    const available_models = [_]provider_config.AvailableModel{.{
+        .provider = "webview-owned-model-provider",
+        .model_id = "webview-owned-model",
+        .display_name = "WebView Owned Model",
+        .available = true,
+        .auth_status = .local,
+        .reasoning = true,
+        .tool_calling = false,
+        .loaded = false,
+        .supports_images = true,
+        .context_window = 8192,
+        .max_tokens = 1024,
+    }};
+
+    var saw_post_transfer_oom = false;
+    var fail_index: usize = 0;
+    while (fail_index < 128 and !saw_post_transfer_oom) : (fail_index += 1) {
+        var session = try testSession(allocator);
+        defer session.deinit();
+        var bridge = testBridge(&session);
+        defer bridge.deinit();
+        bridge.context.permissions.model_selection = true;
+        bridge.context.available_models = available_models[0..];
+
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        const failing_allocator = failing_state.allocator();
+        if (bridge.handleRequestJson(
+            failing_allocator,
+            "{\"id\":\"select-owned\",\"command\":\"model_select\",\"payload\":{\"provider\":\"webview-owned-model-provider\",\"model\":\"webview-owned-model\"}}",
+            trusted_bundle_origin,
+        )) |response| {
+            failing_allocator.free(response);
+        } else |_| {
+            saw_post_transfer_oom = std.mem.eql(u8, bridge.context.model.id, "webview-owned-model");
+        }
+    }
+
+    try std.testing.expect(saw_post_transfer_oom);
 }
 
 test "webview permitted model selection gates missing auth visibly" {
