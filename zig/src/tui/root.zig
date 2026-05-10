@@ -33,6 +33,7 @@ pub const components = struct {
     pub const scrollbar = @import("components/scrollbar.zig");
     pub const paragraph = @import("components/paragraph.zig");
     pub const list = @import("components/list.zig");
+    pub const chart = @import("components/chart.zig");
     pub const sparkline = @import("components/sparkline.zig");
     pub const clear = @import("components/clear.zig");
     pub const bar_chart = @import("components/bar_chart.zig");
