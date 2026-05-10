@@ -191,6 +191,9 @@ pub fn runWebViewMode(
     if (env_map.get("PI_WEBVIEW_SMOKE_CLOSE_PROMPT")) |prompt_text| {
         try runBridgeSmokeCloseFlow(allocator, &bridge, prompt_text, stdout);
     }
+    if (env_map.get("PI_WEBVIEW_SMOKE_STRUCTURED_PROMPT")) |prompt_text| {
+        try runBridgeSmokePrompt(allocator, &bridge, prompt_text, stdout);
+    }
 
     const exit_code = try runNativeWebView(allocator, env_map, asset.asset_path, &bridge, stderr);
     if (exit_code != 0) {
@@ -471,6 +474,17 @@ fn configureFauxWebViewSmokeFixtures(
     registration_out: *?ai.providers.faux.FauxProviderRegistration,
 ) !void {
     if (!std.mem.eql(u8, provider, "faux")) return;
+    if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_STRUCTURED_PROMPT") != null or
+        env_map.get("PI_WEBVIEW_SMOKE_STRUCTURED_PROMPT") != null)
+    {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewStructuredSmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
     if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_PROVIDER_ERROR_PROMPT") != null) {
         const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
         errdefer registration.unregister();
@@ -599,6 +613,26 @@ fn webViewProviderErrorSmokeFactory(
         .stop_reason = .error_reason,
         .error_message = "faux provider error for WebView smoke",
     });
+}
+
+fn webViewStructuredSmokeFactory(
+    allocator: std.mem.Allocator,
+    _: ai.Context,
+    _: ?ai.types.StreamOptions,
+    _: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try arguments.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "printf 'structured smoke'") });
+    const arguments_value = std.json.Value{ .object = arguments };
+    defer ai.provider_json.freeValue(allocator, arguments_value);
+
+    const tool_call = try ai.providers.faux.fauxToolCall(allocator, "bash", arguments_value, .{ .id = "tool-webview-structured" });
+    const blocks = try allocator.alloc(ai.providers.faux.FauxContentBlock, 3);
+    blocks[0] = ai.providers.faux.fauxThinking("internal hidden reasoning for structured smoke");
+    blocks[1] = ai.providers.faux.fauxText("visible structured smoke answer");
+    blocks[2] = tool_call;
+    return ai.providers.faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use });
 }
 
 fn writeBridgeSmokeResponse(
@@ -960,4 +994,26 @@ test "webview frontend asset includes abort and provider-error responsiveness ho
     try std.testing.expect(std.mem.indexOf(u8, html, "late_assistant_delta_suppressed") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "provider_error_retry_ready") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "errorToRetryReadyMs") != null);
+}
+
+test "webview frontend asset renders structured chat surfaces separately" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "renderAssistantEvent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "text_delta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "thinking_delta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "toolcall_delta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "createThinkingBlock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "thinking_block_collapsed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "createToolCallBlock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "createTerminalCard") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "structured_surface_rendered") != null);
 }

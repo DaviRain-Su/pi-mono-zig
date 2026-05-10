@@ -83,6 +83,57 @@
         color: #c9d1d9;
         font-size: 13px;
       }
+      .structured-card {
+        display: grid;
+        gap: 8px;
+        border-left: 4px solid rgba(201, 209, 217, 0.35);
+      }
+      .structured-card .card-title {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        font-weight: 700;
+      }
+      .structured-card .card-kind {
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-size: 11px;
+        opacity: 0.8;
+      }
+      .structured-card pre,
+      .structured-card code {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .thinking-card {
+        background: rgba(187, 128, 255, 0.12);
+        border-left-color: rgba(187, 128, 255, 0.75);
+      }
+      .thinking-card details:not([open]) .thinking-body {
+        display: none;
+      }
+      .thinking-card summary {
+        cursor: pointer;
+        font-weight: 700;
+      }
+      .tool-call-card {
+        background: rgba(255, 171, 0, 0.12);
+        border-left-color: rgba(255, 171, 0, 0.75);
+      }
+      .tool-result-card {
+        background: rgba(63, 185, 80, 0.1);
+        border-left-color: rgba(63, 185, 80, 0.75);
+      }
+      .tool-result-card.error,
+      .terminal-card.error,
+      .error-card {
+        background: rgba(248, 81, 73, 0.12);
+        border-left-color: rgba(248, 81, 73, 0.8);
+      }
+      .terminal-card.abort {
+        background: rgba(255, 171, 0, 0.12);
+        border-left-color: rgba(255, 171, 0, 0.75);
+      }
       form {
         display: grid;
         grid-template-columns: 1fr auto auto;
@@ -148,6 +199,8 @@
         firstDeltaSeenByTurn: new Set(),
         locallyAbortedTurns: new Set(),
         liveAssistantByTurn: new Map(),
+        thinkingByTurn: new Map(),
+        toolCallByTurn: new Map(),
         statusBaseText: "bridge: initializing",
         promptEnabled: true,
         activeFrameMonitor: null,
@@ -213,11 +266,215 @@
         return surface.block;
       }
 
+      function structuredKey(turnId, contentIndex, fallback) {
+        return `${turnId}:${contentIndex ?? fallback}`;
+      }
+
+      function perTurnSurface(map, turnId) {
+        let surfaces = map.get(turnId);
+        if (!surfaces) {
+          surfaces = new Map();
+          map.set(turnId, surfaces);
+        }
+        return surfaces;
+      }
+
+      function jsonSummary(value) {
+        if (value === undefined || value === null) return "";
+        try {
+          return JSON.stringify(value, null, 2);
+        } catch (_) {
+          return String(value);
+        }
+      }
+
+      function contentBlockText(block) {
+        if (!block || typeof block !== "object") return "";
+        if (block.type === "text") return block.text || "";
+        if (block.type === "thinking") return block.thinking || "";
+        if (block.type === "image") return `[Image: ${block.mimeType || "image"}]`;
+        if (block.type === "toolCall") return `${block.name || "tool"} ${jsonSummary(block.arguments)}`;
+        return "";
+      }
+
+      function contentBlocksText(blocks, wantedType) {
+        if (!Array.isArray(blocks)) return "";
+        const parts = [];
+        for (const block of blocks) {
+          if (wantedType && block?.type !== wantedType) continue;
+          const text = contentBlockText(block);
+          if (text.length > 0) parts.push(text);
+        }
+        return parts.join("\n");
+      }
+
+      function createStructuredCard(className, kind, title, text = "") {
+        const block = document.createElement("article");
+        block.className = `event structured-card ${className}`;
+        const header = document.createElement("div");
+        header.className = "card-title";
+        const kindEl = document.createElement("span");
+        kindEl.className = "card-kind";
+        kindEl.textContent = kind;
+        const titleEl = document.createElement("span");
+        titleEl.textContent = title;
+        const body = document.createElement("pre");
+        body.textContent = text;
+        header.append(kindEl, titleEl);
+        block.append(header, body);
+        messagesEl.append(block);
+        scrollMessagesToLatest();
+        markTelemetry("structured_surface_rendered", {
+          kind,
+          title,
+          terminalOutcome: kind === "terminal" ? title : "none",
+          valueLength: text.length,
+          childCount: messagesEl.childElementCount,
+        });
+        return { block, body, title: titleEl };
+      }
+
+      function createThinkingBlock(turnId, contentIndex) {
+        const key = structuredKey(turnId, contentIndex, "thinking");
+        const surfaces = perTurnSurface(state.thinkingByTurn, turnId);
+        const existing = surfaces.get(key);
+        if (existing) return existing;
+
+        const block = document.createElement("article");
+        block.className = "event structured-card thinking-card";
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = "Thinking";
+        const body = document.createElement("pre");
+        body.className = "thinking-body";
+        details.append(summary, body);
+        block.append(details);
+        messagesEl.append(block);
+        scrollMessagesToLatest();
+        const surface = { block, details, summary, body, text: "" };
+        surfaces.set(key, surface);
+        markTelemetry("thinking_block_collapsed", {
+          turnId,
+          contentIndex: contentIndex ?? null,
+          expanded: details.open,
+          childCount: messagesEl.childElementCount,
+        });
+        details.addEventListener("toggle", () => {
+          const answer = state.liveAssistantByTurn.get(turnId);
+          markTelemetry("thinking_block_toggled", {
+            turnId,
+            contentIndex: contentIndex ?? null,
+            expanded: details.open,
+            answerTextLength: answer ? answer.text.length + answer.pendingText.length : 0,
+          });
+        });
+        return surface;
+      }
+
+      function appendThinkingDelta(turnId, contentIndex, delta, frame) {
+        const surface = createThinkingBlock(turnId, contentIndex);
+        surface.text += delta || "";
+        surface.body.textContent = surface.text;
+        markTelemetry("thinking_delta_rendered", {
+          turnId,
+          sequence: frame.sequence,
+          valueLength: (delta || "").length,
+          visibleInAnswer: false,
+        });
+      }
+
+      function createToolCallBlock(turnId, contentIndex, toolCall) {
+        const key = structuredKey(turnId, contentIndex, toolCall?.id || "toolcall");
+        const surfaces = perTurnSurface(state.toolCallByTurn, turnId);
+        const existing = surfaces.get(key);
+        if (existing) return existing;
+        const title = toolCall?.name ? `${toolCall.name}` : "streaming tool call";
+        const surface = createStructuredCard("tool-call-card", "tool call", title, "");
+        surface.text = "";
+        surfaces.set(key, surface);
+        return surface;
+      }
+
+      function updateToolCallBlock(turnId, contentIndex, toolCall, delta, frame) {
+        const surface = createToolCallBlock(turnId, contentIndex, toolCall);
+        if (toolCall?.name) surface.title.textContent = toolCall.name;
+        if (toolCall?.arguments) {
+          surface.text = jsonSummary(toolCall.arguments);
+        } else {
+          surface.text = `${surface.text || ""}${delta || ""}`;
+        }
+        surface.body.textContent = surface.text;
+        markTelemetry("tool_call_card_rendered", {
+          turnId,
+          sequence: frame.sequence,
+          toolName: toolCall?.name || "unknown",
+          valueLength: surface.text.length,
+        });
+      }
+
+      function createToolResultBlock(toolName, result, isError, frame) {
+        const text = result?.content ? contentBlocksText(result.content) : jsonSummary(result);
+        const surface = createStructuredCard(
+          `tool-result-card${isError ? " error" : ""}`,
+          "tool result",
+          toolName || "tool",
+          text,
+        );
+        markTelemetry("tool_result_card_rendered", {
+          turnId: frame.turnId,
+          sequence: frame.sequence,
+          toolName: toolName || "unknown",
+          isError: Boolean(isError),
+          valueLength: text.length,
+        });
+        return surface;
+      }
+
+      function createTerminalCard(frame, label, text) {
+        const outcome = frame.terminalOutcome || label || "done";
+        const className = outcome === "abort" || outcome === "window_closed"
+          ? "terminal-card abort"
+          : outcome === "success"
+            ? "terminal-card"
+            : "terminal-card error";
+        return createStructuredCard(className, "terminal", outcome, text || outcome);
+      }
+
       function renderMessages(messages) {
         messagesEl.textContent = "";
         state.liveAssistantByTurn.clear();
+        state.thinkingByTurn.clear();
+        state.toolCallByTurn.clear();
         for (const message of messages) {
-          appendBlock(`message ${message.role}`, message.role, message.text || "");
+          if (message.role === "assistant" && Array.isArray(message.content)) {
+            const transcriptTurnId = `transcript-${message.timestamp || messagesEl.childElementCount}`;
+            for (const block of message.content) {
+              if (block.type === "thinking") {
+                const thinking = createThinkingBlock(transcriptTurnId, block.contentIndex ?? "history");
+                thinking.text = block.thinking || "";
+                thinking.body.textContent = thinking.text;
+              }
+            }
+            const answer = contentBlocksText(message.content, "text");
+            if (answer.length > 0) appendBlock("message assistant", "assistant", answer);
+            for (const block of message.content) {
+              if (block.type === "toolCall") {
+                updateToolCallBlock(transcriptTurnId, block.contentIndex ?? block.id, block, "", {
+                  turnId: transcriptTurnId,
+                  sequence: 0,
+                });
+              }
+            }
+          } else if (message.role === "toolResult") {
+            createToolResultBlock(
+              message.toolName || "tool",
+              { content: message.content || [{ type: "text", text: message.text || "" }] },
+              Boolean(message.isError),
+              { turnId: "transcript", sequence: 0 },
+            );
+          } else {
+            appendBlock(`message ${message.role}`, message.role, message.text || "");
+          }
         }
         markTelemetry("transcript_render", {
           messageCount: messages.length,
@@ -356,6 +613,90 @@
           type === "after_provider_response";
       }
 
+      function renderAssistantEvent(frame, assistant) {
+        const type = assistant.type;
+        switch (type) {
+          case "start":
+          case "text_start":
+            ensureLiveAssistant(frame.turnId);
+            return true;
+          case "text_delta":
+            if (state.locallyAbortedTurns.has(frame.turnId)) {
+              markTelemetry("late_assistant_delta_suppressed", {
+                turnId: frame.turnId,
+                sequence: frame.sequence,
+                valueLength: (assistant.delta || "").length,
+              });
+              return true;
+            }
+            scheduleAssistantFlush(frame.turnId, frame, assistant.delta || "");
+            markTelemetry("answer_text_delta", {
+              turnId: frame.turnId,
+              sequence: frame.sequence,
+              valueLength: (assistant.delta || "").length,
+            });
+            return true;
+          case "text_end":
+            flushAssistantSurface(frame.turnId, frame);
+            return true;
+          case "thinking_start":
+            createThinkingBlock(frame.turnId, assistant.contentIndex);
+            return true;
+          case "thinking_delta":
+            appendThinkingDelta(frame.turnId, assistant.contentIndex, assistant.delta || "", frame);
+            return true;
+          case "thinking_end": {
+            const surface = createThinkingBlock(frame.turnId, assistant.contentIndex);
+            if (assistant.content && surface.text.length === 0) {
+              surface.text = assistant.content;
+              surface.body.textContent = surface.text;
+            }
+            return true;
+          }
+          case "toolcall_start":
+            createToolCallBlock(frame.turnId, assistant.contentIndex, assistant.toolCall);
+            return true;
+          case "toolcall_delta":
+            updateToolCallBlock(frame.turnId, assistant.contentIndex, assistant.toolCall, assistant.delta || "", frame);
+            return true;
+          case "toolcall_end":
+            updateToolCallBlock(frame.turnId, assistant.contentIndex, assistant.toolCall, "", frame);
+            return true;
+          case "error": {
+            const reason = assistant.reason || "provider error";
+            const text = assistant.error?.errorMessage || assistant.error?.text || reason;
+            createStructuredCard("error-card", "error", reason, text);
+            return true;
+          }
+          case "done":
+            flushAssistantSurface(frame.turnId, frame);
+            markTelemetry("assistant_done_structured", {
+              turnId: frame.turnId,
+              sequence: frame.sequence,
+            });
+            return true;
+          default:
+            return false;
+        }
+      }
+
+      function renderToolExecutionEvent(frame, event) {
+        const toolName = event.toolName || "tool";
+        if (frame.type === "tool_execution_start") {
+          createStructuredCard("tool-call-card", "tool call", toolName, jsonSummary(event.args));
+          return true;
+        }
+        if (frame.type === "tool_execution_update") {
+          createToolResultBlock(toolName, event.partialResult, false, frame);
+          return true;
+        }
+        if (frame.type === "tool_execution_end") {
+          createToolResultBlock(toolName, event.result, Boolean(event.isError), frame);
+          return true;
+        }
+        return false;
+      }
+
       function renderEvent(frame) {
         if (!frame || !frame.turnId) return;
         if (state.activeTurnId && frame.turnId !== state.activeTurnId) return;
@@ -367,19 +708,9 @@
         state.lastSequenceByTurn.set(frame.turnId, frame.sequence);
         const event = frame.event || {};
         const assistant = event.assistantMessageEvent || {};
-        if (assistant.delta) {
-          if (state.locallyAbortedTurns.has(frame.turnId)) {
-            markTelemetry("late_assistant_delta_suppressed", {
-              turnId: frame.turnId,
-              sequence: frame.sequence,
-              valueLength: assistant.delta.length,
-            });
-            return;
-          }
-          scheduleAssistantFlush(frame.turnId, frame, assistant.delta);
-        } else if (assistant.type) {
-          if (assistant.type === "start" || assistant.type.endsWith("_start")) {
-            ensureLiveAssistant(frame.turnId);
+        if (assistant.type) {
+          if (!renderAssistantEvent(frame, assistant)) {
+            appendBlock("event", `${frame.sequence} assistant`, assistant.type);
           }
         } else if (frame.terminal) {
           flushAssistantSurface(frame.turnId, frame);
@@ -389,7 +720,7 @@
             ? `${frame.terminalOutcome || "done"}: ${frame.error}`
             : frame.terminalOutcome || "done";
           if (frame.terminalOutcome && frame.terminalOutcome !== "success") {
-            appendBlock("event", `${frame.sequence} terminal`, terminalText);
+            createTerminalCard(frame, `${frame.sequence} terminal`, terminalText);
           }
           stopActiveFrameMonitor(frame.turnId, frame.terminalOutcome || "done");
           if (frame.terminalOutcome === "provider_error") {
@@ -406,6 +737,8 @@
             sequence: frame.sequence,
             childCount: messagesEl.childElementCount,
           });
+        } else if (renderToolExecutionEvent(frame, event)) {
+          // Rendered as a structured tool card.
         } else {
           appendBlock("event", `${frame.sequence} ${frame.type}`, event.type || "");
         }
@@ -425,7 +758,7 @@
       }
 
       function isAssistantDeltaFrame(frame) {
-        return Boolean(frame?.event?.assistantMessageEvent?.delta);
+        return frame?.event?.assistantMessageEvent?.type === "text_delta";
       }
 
       async function pollTurnEvents(turnId) {
@@ -580,7 +913,7 @@
           });
           promptInputEl.value = "";
         } catch (error) {
-          appendBlock("event", "error", String(error.message || error));
+          createStructuredCard("terminal-card error", "terminal", "error", String(error.message || error));
         } finally {
           state.activeTurnId = null;
           promptInputEl.disabled = false;
@@ -602,13 +935,13 @@
             });
           }
           const result = await sendBridge("abort");
-          appendBlock("event", "abort", result.status);
+          createStructuredCard("terminal-card abort", "terminal", "abort", result.status);
           markTelemetry("abort_response", {
             turnId: turnId || "none",
             abortToVisibleMs: performance.now() - abortPerfMs,
           });
         } catch (error) {
-          appendBlock("event", "abort error", String(error.message || error));
+          createStructuredCard("terminal-card error", "terminal", "abort error", String(error.message || error));
         }
       });
 

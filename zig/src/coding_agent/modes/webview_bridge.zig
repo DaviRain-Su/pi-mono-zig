@@ -1006,6 +1006,8 @@ fn writeMessageSummary(
             try writer.print("{d}", .{assistant.timestamp});
             try writer.writeAll(",\"text\":");
             try writeJsonString(allocator, writer, firstTextContent(assistant.content) orelse "");
+            try writer.writeAll(",\"content\":");
+            try writeContentBlocksSummary(allocator, writer, assistant.content);
             try writer.writeAll(",\"stopReason\":");
             try writeJsonString(allocator, writer, @tagName(assistant.stop_reason));
         },
@@ -1013,13 +1015,64 @@ fn writeMessageSummary(
             try writeJsonString(allocator, writer, "toolResult");
             try writer.writeAll(",\"timestamp\":");
             try writer.print("{d}", .{tool_result.timestamp});
+            try writer.writeAll(",\"toolCallId\":");
+            try writeJsonString(allocator, writer, tool_result.tool_call_id);
+            try writer.writeAll(",\"toolName\":");
+            try writeJsonString(allocator, writer, tool_result.tool_name);
             try writer.writeAll(",\"text\":");
             try writeJsonString(allocator, writer, firstTextContent(tool_result.content) orelse "");
+            try writer.writeAll(",\"content\":");
+            try writeContentBlocksSummary(allocator, writer, tool_result.content);
             try writer.writeAll(",\"isError\":");
             try writer.writeAll(if (tool_result.is_error) "true" else "false");
         },
     }
     try writer.writeAll("}");
+}
+
+fn writeContentBlocksSummary(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    blocks: []const ai.ContentBlock,
+) !void {
+    try writer.writeAll("[");
+    for (blocks, 0..) |block, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"type\":");
+        switch (block) {
+            .text => |text| {
+                try writeJsonString(allocator, writer, "text");
+                try writer.writeAll(",\"text\":");
+                try writeJsonString(allocator, writer, text.text);
+            },
+            .thinking => |thinking| {
+                try writeJsonString(allocator, writer, "thinking");
+                try writer.writeAll(",\"thinking\":");
+                try writeJsonString(allocator, writer, thinking.thinking);
+                if (thinking.redacted) {
+                    try writer.writeAll(",\"redacted\":true");
+                }
+            },
+            .image => |image| {
+                try writeJsonString(allocator, writer, "image");
+                try writer.writeAll(",\"mimeType\":");
+                try writeJsonString(allocator, writer, image.mime_type);
+                try writer.writeAll(",\"dataLength\":");
+                try writer.print("{d}", .{image.data.len});
+            },
+            .tool_call => |tool_call| {
+                try writeJsonString(allocator, writer, "toolCall");
+                try writer.writeAll(",\"id\":");
+                try writeJsonString(allocator, writer, tool_call.id);
+                try writer.writeAll(",\"name\":");
+                try writeJsonString(allocator, writer, tool_call.name);
+                try writer.writeAll(",\"arguments\":");
+                try std.json.Stringify.value(tool_call.arguments, .{}, writer);
+            },
+        }
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
 }
 
 fn firstTextContent(blocks: []const ai.ContentBlock) ?[]const u8 {
@@ -1544,6 +1597,63 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     try std.testing.expect(std.mem.indexOf(u8, after, "webview answer") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "webview-turn-0") == null);
     try std.testing.expect(std.mem.indexOf(u8, after, "\"sequence\"") == null);
+}
+
+test "webview message summaries preserve structured assistant content separately" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+
+    var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    try arguments.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "printf structured") });
+    const arguments_value = std.json.Value{ .object = arguments };
+    defer ai.provider_json.freeValue(allocator, arguments_value);
+
+    const tool_call = try faux.fauxToolCall(allocator, "bash", arguments_value, .{ .id = "tool-structured" });
+    defer switch (tool_call) {
+        .tool_call => |value| {
+            allocator.free(value.id);
+            allocator.free(value.name);
+            ai.provider_json.freeValue(allocator, value.arguments);
+        },
+        else => unreachable,
+    };
+    const blocks = [_]faux.FauxContentBlock{
+        faux.fauxThinking("internal hidden reasoning"),
+        faux.fauxText("visible structured answer"),
+        tool_call,
+    };
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{ .stop_reason = .tool_use }) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.model = registration.getModel();
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"structured\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"type\":\"thinking_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"type\":\"text_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"type\":\"toolcall_delta\"") != null);
+
+    const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "\"text\":\"visible structured answer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "\"thinking\":\"internal hidden reasoning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "\"type\":\"toolCall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "\"text\":\"internal hidden reasoning\"") == null);
 }
 
 test "webview prompt accepts asynchronously and polls ordered incremental events" {

@@ -127,9 +127,11 @@ static NSDictionary *pi_webview_json_object_from_string(NSString *json) {
 static void pi_webview_log_telemetry(NSDictionary *payload) {
     NSString *name = pi_webview_safe_telemetry_string(payload[@"name"]);
     NSString *provider = pi_webview_safe_telemetry_string(payload[@"provider"]);
+    NSString *toolName = pi_webview_safe_telemetry_string(payload[@"toolName"]);
+    NSString *terminalOutcome = pi_webview_safe_telemetry_string(payload[@"terminalOutcome"]);
     fprintf(
         stderr,
-        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f abort_to_visible_ms=%.3f error_to_retry_ready_ms=%.3f sequence=%.0f visible_delta_index=%.0f child_count=%.0f reused_surface=%s max_active_frame_gap_ms=%.3f stall_over_100=%s\n",
+        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f abort_to_visible_ms=%.3f error_to_retry_ready_ms=%.3f sequence=%.0f visible_delta_index=%.0f child_count=%.0f reused_surface=%s expanded=%s visible_in_answer=%s tool_name=%s terminal_outcome=%s max_active_frame_gap_ms=%.3f stall_over_100=%s\n",
         [name UTF8String],
         getpid(),
         pi_webview_monotonic_ms(),
@@ -157,6 +159,10 @@ static void pi_webview_log_telemetry(NSDictionary *payload) {
         pi_webview_telemetry_number(payload, @"visibleDeltaIndex"),
         pi_webview_telemetry_number(payload, @"childCount"),
         pi_webview_telemetry_bool(payload, @"reusedSurface"),
+        pi_webview_telemetry_bool(payload, @"expanded"),
+        pi_webview_telemetry_bool(payload, @"visibleInAnswer"),
+        [toolName UTF8String],
+        [terminalOutcome UTF8String],
         pi_webview_telemetry_number(payload, @"maxActiveFrameGapMs"),
         pi_webview_telemetry_bool(payload, @"stallOver100")
     );
@@ -431,12 +437,16 @@ int pi_webview_macos_run(
         const char *autoSubmitUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT");
         const char *autoAbortUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_ABORT_PROMPT");
         const char *autoProviderErrorUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_PROVIDER_ERROR_PROMPT");
+        const char *autoStructuredUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_STRUCTURED_PROMPT");
         const char *selectedAutoSubmitUtf8 = autoSubmitUtf8;
         if (selectedAutoSubmitUtf8 == NULL || selectedAutoSubmitUtf8[0] == '\0') {
             selectedAutoSubmitUtf8 = autoAbortUtf8;
         }
         if (selectedAutoSubmitUtf8 == NULL || selectedAutoSubmitUtf8[0] == '\0') {
             selectedAutoSubmitUtf8 = autoProviderErrorUtf8;
+        }
+        if (selectedAutoSubmitUtf8 == NULL || selectedAutoSubmitUtf8[0] == '\0') {
+            selectedAutoSubmitUtf8 = autoStructuredUtf8;
         }
         NSString *autoSubmitPrompt = selectedAutoSubmitUtf8 != NULL ? [NSString stringWithUTF8String:selectedAutoSubmitUtf8] : @"";
         if (autoSubmitPrompt == nil) {
