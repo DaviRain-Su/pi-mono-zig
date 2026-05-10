@@ -111,6 +111,31 @@ npm run check        # Lint, format, and type check
 
 > **Note:** `npm run check` requires `npm run build` to be run first. The web-ui package uses `tsc` which needs compiled `.d.ts` files from dependencies.
 
+### Zig WebView mode
+
+The Zig implementation includes a macOS desktop WebView mode backed by the Zig runtime:
+
+```bash
+cd zig
+zig build
+./zig-out/bin/pi --webview --provider faux --no-session
+```
+
+For safe local smoke testing, use the Zig faux provider and auto-close the window; this exercises the WebView bridge without real provider credentials:
+
+```bash
+cd zig
+PI_WEBVIEW_SMOKE_PROMPT="hello" PI_WEBVIEW_AUTO_CLOSE_MS=1000 ./zig-out/bin/pi --webview --provider faux --no-session
+```
+
+Relevant validation commands:
+
+```bash
+cd zig && zig build test-coding-agent
+cd zig && zig build test-tidy
+npm run check
+```
+
 ### Zig implementation external tools
 
 The native Zig CLI under `zig/` shells out to a few external executables:
