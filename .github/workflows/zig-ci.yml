@@ -44,7 +44,15 @@ jobs:
 
       - name: Install Node dependencies
         working-directory: .
-        run: npm ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci || {
+            status=$?
+            echo "npm ci failed with status ${status}; clearing npm cache and retrying once" >&2
+            npm cache clean --force
+            npm ci
+          }
 
       - name: Resolve Zig 0.16.0 package
         id: zig-package
