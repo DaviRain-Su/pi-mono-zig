@@ -91,23 +91,21 @@ pub const Image = struct {
         const effective_width = @max(@as(usize, window.width), 1);
         const content_width = @max(effective_width, self.padding_x * 2 + 1) - self.padding_x * 2;
 
-        var lines = component_mod.LineList.empty;
+        var lines = std.ArrayList([]const u8).empty;
 
         const blank_line = try allocator.alloc(u8, effective_width);
         @memset(blank_line, ' ');
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(&lines, allocator, blank_line);
+            try lines.append(allocator, try allocator.dupe(u8, blank_line));
         }
 
-        var rendered = component_mod.LineList.empty;
+        const rendered = switch (self.mode) {
+            .placeholder => try self.renderPlaceholderInto(allocator, content_width),
+            .ascii => try self.renderAsciiInto(allocator, content_width),
+        };
 
-        switch (self.mode) {
-            .placeholder => try self.renderPlaceholderInto(allocator, content_width, &rendered),
-            .ascii => try self.renderAsciiInto(allocator, content_width, &rendered),
-        }
-
-        for (rendered.items) |line| {
+        for (rendered) |line| {
             var builder = std.ArrayList(u8).empty;
             errdefer builder.deinit(allocator);
 
@@ -115,12 +113,12 @@ pub const Image = struct {
             try builder.appendSlice(allocator, line);
 
             const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, effective_width);
-            try component_mod.appendOwnedLine(&lines, allocator, padded);
+            try lines.append(allocator, padded);
             builder.deinit(allocator);
         }
 
         for (0..self.padding_y) |_| {
-            try component_mod.appendOwnedLine(&lines, allocator, blank_line);
+            try lines.append(allocator, try allocator.dupe(u8, blank_line));
         }
 
         drawLinesToWindow(window, lines.items);
@@ -143,11 +141,9 @@ pub const Image = struct {
         self: *const Image,
         allocator: std.mem.Allocator,
         width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
+    ) std.mem.Allocator.Error![]const []const u8 {
         const art = self.ascii_art orelse {
-            try self.renderPlaceholderInto(allocator, width, lines);
-            return;
+            return self.renderPlaceholderInto(allocator, width);
         };
 
         const render_width = resolveRenderWidth(self, width);
@@ -166,8 +162,13 @@ pub const Image = struct {
 
         const source_width = measureSourceWidth(source_lines.items);
         if (source_lines.items.len == 0 or source_width == 0) {
-            try self.renderPlaceholderInto(allocator, width, lines);
-            return;
+            return self.renderPlaceholderInto(allocator, width);
+        }
+
+        var lines = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (lines.items) |line| allocator.free(line);
+            lines.deinit(allocator);
         }
 
         const size = resolveAsciiRenderSize(self, render_width, max_height, source_width, source_lines.items.len);
@@ -176,19 +177,24 @@ pub const Image = struct {
             const sampled = try sampleAsciiRowAlloc(allocator, source_lines.items[source_row], source_width, size.width);
             defer allocator.free(sampled);
             const padded = try ansi.padRightVisibleAlloc(allocator, sampled, render_width);
-            defer allocator.free(padded);
-            try component_mod.appendOwnedLine(lines, allocator, padded);
+            try lines.append(allocator, padded);
         }
+        return lines.toOwnedSlice(allocator);
     }
 
     fn renderPlaceholderInto(
         self: *const Image,
         allocator: std.mem.Allocator,
         width: usize,
-        lines: *component_mod.LineList,
-    ) std.mem.Allocator.Error!void {
+    ) std.mem.Allocator.Error![]const []const u8 {
         const render_width = resolveRenderWidth(self, width);
         const render_height = resolvePlaceholderHeight(self, render_width);
+
+        var lines = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (lines.items) |line| allocator.free(line);
+            lines.deinit(allocator);
+        }
 
         if (render_width < 6 or render_height < 3) {
             const fallback = try buildFallbackLabel(allocator, self);
@@ -198,14 +204,12 @@ pub const Image = struct {
             defer allocator.free(truncated);
 
             const padded = try ansi.padRightVisibleAlloc(allocator, truncated, render_width);
-            defer allocator.free(padded);
-            try component_mod.appendOwnedLine(lines, allocator, padded);
-            return;
+            try lines.append(allocator, padded);
+            return lines.toOwnedSlice(allocator);
         }
 
         const top = try buildBorderLine(allocator, render_width, true);
-        defer allocator.free(top);
-        try component_mod.appendOwnedLine(lines, allocator, top);
+        try lines.append(allocator, top);
 
         var labels: [4]?[]u8 = .{ null, null, null, null };
         var label_count: usize = 0;
@@ -248,13 +252,12 @@ pub const Image = struct {
                 null;
 
             const line = try buildInteriorLine(allocator, render_width, maybe_label);
-            defer allocator.free(line);
-            try component_mod.appendOwnedLine(lines, allocator, line);
+            try lines.append(allocator, line);
         }
 
         const bottom = try buildBorderLine(allocator, render_width, false);
-        defer allocator.free(bottom);
-        try component_mod.appendOwnedLine(lines, allocator, bottom);
+        try lines.append(allocator, bottom);
+        return lines.toOwnedSlice(allocator);
     }
 };
 
