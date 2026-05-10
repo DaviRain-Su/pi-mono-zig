@@ -3,7 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
-const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const model_registry = @import("../model_registry.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
@@ -111,36 +111,15 @@ pub const OpenAIResponsesProvider = struct {
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        var env_api_key: ?[]u8 = null;
-        defer if (env_api_key) |key| allocator.free(key);
+        const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
+        defer if (resolved) |r| r.deinit(allocator);
 
-        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
-        const api_key = blk: {
-            if (provided_api_key) |key| break :blk key;
-            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
-            break :blk env_api_key;
-        };
-
-        if (api_key == null or api_key.?.len == 0) {
-            const error_message = try std.fmt.allocPrint(allocator, "No API key for provider: {s}", .{model.provider});
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+        if (resolved == null) {
+            try resolve_api_key.pushMissingApiKeyError(allocator, stream_instance, model);
             return;
         }
+
+        const api_key = resolved.?.key;
 
         const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
             try cloudflare.resolveCloudflareBaseUrl(allocator, model)
@@ -152,7 +131,7 @@ pub const OpenAIResponsesProvider = struct {
         defer allocator.free(url);
 
         var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
-        resolved_options.api_key = api_key.?;
+        resolved_options.api_key = api_key;
 
         var headers = try buildRequestHeaders(allocator, model, context, resolved_options);
         defer provider_stream.deinitOwnedHeaders(allocator, &headers);

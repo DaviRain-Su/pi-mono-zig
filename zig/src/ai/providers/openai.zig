@@ -5,7 +5,7 @@ const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
-const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 const chat_payload = @import("openai_chat_payload.zig");
@@ -41,27 +41,17 @@ pub const OpenAIProvider = struct {
 
         try std.json.Stringify.value(payload, .{}, json_writer);
 
-        // Resolve provider authentication. Mirrors the TypeScript
-        // `apiKey || getEnvApiKey(model.provider)` precedence and emits a
-        // sanitized terminal stream error when both are missing instead of
-        // sending an unauthenticated request.
-        var env_api_key: ?[]u8 = null;
-        defer if (env_api_key) |key| allocator.free(key);
+        // Resolve provider authentication.
+        const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
+        defer if (resolved) |r| r.deinit(allocator);
 
-        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
-        const has_provided_api_key = if (provided_api_key) |key| key.len > 0 else false;
-        if (!has_provided_api_key) {
-            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
-        }
-
-        const resolved_api_key: ?[]const u8 = if (has_provided_api_key) provided_api_key else env_api_key;
-        if (resolved_api_key == null or resolved_api_key.?.len == 0) {
-            try pushMissingApiKeyError(allocator, event_stream_instance, model);
+        if (resolved == null) {
+            try resolve_api_key.pushMissingApiKeyError(allocator, event_stream_instance, model);
             return;
         }
 
         var resolved_options = if (options) |stream_options| stream_options else types.StreamOptions{};
-        resolved_options.api_key = resolved_api_key.?;
+        resolved_options.api_key = resolved.?.key;
 
         // Build HTTP request
         var headers = try buildRequestHeaders(allocator, model, resolved_options);
@@ -129,39 +119,6 @@ fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) v
     }
     // Do NOT free event.content or event.message - they are shared with content_blocks
     if (event.error_message) |em| allocator.free(em);
-}
-
-/// Emit a deterministic sanitized terminal stream error when no API key is
-/// available. Mirrors the TypeScript `No API key for provider:` diagnostic and
-/// must not leak environment values, credential-store paths, bearer tokens, or
-/// local auth paths.
-fn pushMissingApiKeyError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-) !void {
-    const error_message = try std.fmt.allocPrint(
-        allocator,
-        "No API key for provider: {s}",
-        .{model.provider},
-    );
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_ptr.end(message);
 }
 
 /// Removes unpaired Unicode surrogate characters from text.

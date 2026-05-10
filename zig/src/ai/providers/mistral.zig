@@ -3,7 +3,7 @@ const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
-const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const finalize = @import("../shared/finalize.zig");
@@ -107,36 +107,15 @@ pub const MistralProvider = struct {
         options: ?types.StreamOptions,
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
-        var env_api_key: ?[]u8 = null;
-        defer if (env_api_key) |key| allocator.free(key);
+        const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
+        defer if (resolved) |r| r.deinit(allocator);
 
-        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
-        const api_key = blk: {
-            if (provided_api_key) |key| break :blk key;
-            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
-            break :blk env_api_key;
-        };
-
-        if (api_key == null or api_key.?.len == 0) {
-            const error_message = try allocator.dupe(u8, "No API key for provider: mistral");
-            const message = types.AssistantMessage{
-                .content = &[_]types.ContentBlock{},
-                .api = model.api,
-                .provider = model.provider,
-                .model = model.id,
-                .usage = types.Usage.init(),
-                .stop_reason = .error_reason,
-                .error_message = error_message,
-                .timestamp = 0,
-            };
-            stream_instance.push(.{
-                .event_type = .error_event,
-                .error_message = error_message,
-                .message = message,
-            });
-            stream_instance.end(message);
+        if (resolved == null) {
+            try resolve_api_key.pushMissingApiKeyError(allocator, stream_instance, model);
             return;
         }
+
+        const api_key = resolved.?.key;
 
         var payload = try buildRequestPayload(allocator, model, context, options);
         defer provider_json.freeValue(allocator, payload);
@@ -160,7 +139,7 @@ pub const MistralProvider = struct {
         defer provider_stream.deinitOwnedHeaders(allocator, &headers);
         try provider_stream.putOwnedHeader(allocator, &headers, "Content-Type", "application/json");
         try provider_stream.putOwnedHeader(allocator, &headers, "Accept", "text/event-stream");
-        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(auth_header);
         try provider_stream.putOwnedHeader(allocator, &headers, "Authorization", auth_header);
         try provider_stream.mergeHeaders(allocator, &headers, model.headers);

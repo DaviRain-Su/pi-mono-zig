@@ -2,7 +2,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const event_stream = @import("../event_stream.zig");
-const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
@@ -39,23 +39,18 @@ pub const OpenAICodexResponsesProvider = struct {
         options: ?types.StreamOptions,
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
-        var env_api_key: ?[]u8 = null;
-        defer if (env_api_key) |key| allocator.free(key);
+        const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
+        defer if (resolved) |r| r.deinit(allocator);
 
-        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
-        const api_key = blk: {
-            if (provided_api_key) |key| break :blk key;
-            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
-            break :blk env_api_key;
-        };
-
-        if (api_key == null or std.mem.trim(u8, api_key.?, " \t\r\n").len == 0) {
+        if (resolved == null) {
             const error_message = try std.fmt.allocPrint(allocator, "No API key for provider: {s}", .{model.provider});
             emitErrorMessage(stream_instance, model, error_message);
             return;
         }
 
-        const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key.?, " \t\r\n"));
+        const api_key = resolved.?.key;
+
+        const normalized_token = stripBearerPrefix(std.mem.trim(u8, api_key, " \t\r\n"));
         const account_id = extractAccountId(allocator, normalized_token) catch |err| {
             const error_message = try std.fmt.allocPrint(allocator, "Invalid Codex API key: {s}", .{@errorName(err)});
             emitErrorMessage(stream_instance, model, error_message);

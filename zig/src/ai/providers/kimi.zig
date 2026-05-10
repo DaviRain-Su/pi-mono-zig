@@ -10,7 +10,7 @@ const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
-const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const openai = @import("openai.zig");
 const test_stream_server = @import("test_stream_server.zig");
 
@@ -29,20 +29,15 @@ pub const KimiProvider = struct {
         options: ?types.StreamOptions,
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
-        var env_api_key: ?[]u8 = null;
-        defer if (env_api_key) |key| allocator.free(key);
+        const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
+        defer if (resolved) |r| r.deinit(allocator);
 
-        const provided_api_key = if (options) |stream_options| stream_options.api_key else null;
-        const api_key = blk: {
-            if (provided_api_key) |key| break :blk key;
-            env_api_key = try env_api_keys.getEnvApiKey(allocator, model.provider);
-            break :blk env_api_key;
-        };
-
-        if (api_key == null or api_key.?.len == 0) {
-            try pushMissingApiKeyError(allocator, stream_instance, model);
+        if (resolved == null) {
+            try resolve_api_key.pushMissingApiKeyError(allocator, stream_instance, model);
             return;
         }
+
+        const api_key = resolved.?.key;
 
         const payload = try buildRequestPayload(allocator, model, context, options);
         defer provider_json.freeValue(allocator, payload);
@@ -64,7 +59,7 @@ pub const KimiProvider = struct {
         try headers.put("Content-Type", "application/json");
         try headers.put("Accept", "text/event-stream");
 
-        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key.?});
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
         defer allocator.free(auth_header);
         try headers.put("Authorization", auth_header);
 
@@ -112,35 +107,6 @@ pub const KimiProvider = struct {
     }
 
 };
-
-fn pushMissingApiKeyError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-) !void {
-    const error_message = try std.fmt.allocPrint(
-        allocator,
-        "No API key for provider: {s}",
-        .{model.provider},
-    );
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_ptr.end(message);
-}
 
 const CurrentBlock = union(enum) {
     text: struct {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const env_api_keys = @import("../env_api_keys.zig");
+const resolve_api_key_mod = @import("../shared/resolve_api_key.zig");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const json_parse = @import("../json_parse.zig");
@@ -86,7 +87,7 @@ pub const AnthropicProvider = struct {
         else
             "";
         if (resolved_api_key.len == 0) {
-            try pushMissingApiKeyError(allocator, stream_instance, model);
+            try resolve_api_key_mod.pushMissingApiKeyError(allocator, stream_instance, model);
             return;
         }
 
@@ -166,39 +167,6 @@ pub const AnthropicProvider = struct {
     }
 
 };
-
-/// Emit a deterministic sanitized terminal stream error when no API key is
-/// available. Mirrors the TypeScript `No API key for provider:` diagnostic and
-/// must not leak environment values, credential-store paths, bearer tokens, or
-/// local auth paths.
-fn pushMissingApiKeyError(
-    allocator: std.mem.Allocator,
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-    model: types.Model,
-) !void {
-    const error_message = try std.fmt.allocPrint(
-        allocator,
-        "No API key for provider: {s}",
-        .{model.provider},
-    );
-    const message = types.AssistantMessage{
-        .role = "assistant",
-        .content = &[_]types.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = types.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = error_message,
-        .timestamp = 0,
-    };
-    stream_ptr.push(.{
-        .event_type = .error_event,
-        .error_message = error_message,
-        .message = message,
-    });
-    stream_ptr.end(message);
-}
 
 fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, base_url, "/");
