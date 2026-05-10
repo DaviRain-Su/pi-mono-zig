@@ -280,10 +280,7 @@ fn parseStringArray(allocator: std.mem.Allocator, value: ?std.json.Value) ![]con
     return try items.toOwnedSlice(allocator);
 }
 
-fn freeStringArray(allocator: std.mem.Allocator, items: []const []u8) void {
-    for (items) |item| allocator.free(item);
-    allocator.free(items);
-}
+const freeStringArray = @import("../slice_utils.zig").freeStringSlice;
 
 fn parseEnvObject(allocator: std.mem.Allocator, value: ?std.json.Value) ![]const EnvEntry {
     const object_value = value orelse return try allocator.alloc(EnvEntry, 0);

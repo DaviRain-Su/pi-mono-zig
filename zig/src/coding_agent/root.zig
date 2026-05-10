@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const tools = @import("tools/root.zig");
 pub const json_utils = @import("json_utils.zig");
+pub const slice_utils = @import("slice_utils.zig");
 pub const session_jsonl = @import("sessions/session_jsonl.zig");
 pub const session_manager = @import("sessions/session_manager.zig");
 pub const session = @import("sessions/session.zig");
@@ -112,6 +113,7 @@ pub const runInteractiveMode = interactive_mode.runInteractiveMode;
 test {
     _ = @import("tools/root.zig");
     _ = @import("json_utils.zig");
+    _ = @import("slice_utils.zig");
     _ = @import("sessions/session_jsonl.zig");
     _ = @import("sessions/session_manager.zig");
     _ = @import("sessions/session_search.zig");

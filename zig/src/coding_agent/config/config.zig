@@ -1696,11 +1696,7 @@ fn cloneStringList(allocator: std.mem.Allocator, value: ?[]const []const u8) !?[
     return try cloned.toOwnedSlice(allocator);
 }
 
-fn freeStringList(allocator: std.mem.Allocator, value: ?[]const []const u8) void {
-    const items = value orelse return;
-    for (items) |item| allocator.free(item);
-    allocator.free(items);
-}
+const freeStringList = @import("../slice_utils.zig").freeOptionalStringSlice;
 
 pub fn resolveAgentDir(allocator: std.mem.Allocator, env_map: *const std.process.Environ.Map) ![]u8 {
     if (env_map.get("PI_CODING_AGENT_DIR")) |value| {

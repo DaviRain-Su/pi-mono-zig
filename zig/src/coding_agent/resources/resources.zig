@@ -801,10 +801,7 @@ pub fn parseCommandArgs(allocator: std.mem.Allocator, args_string: []const u8) !
     return try args.toOwnedSlice(allocator);
 }
 
-pub fn freeParsedArgs(allocator: std.mem.Allocator, args: []const []const u8) void {
-    for (args) |item| allocator.free(item);
-    allocator.free(args);
-}
+pub const freeParsedArgs = @import("../slice_utils.zig").freeStringSlice;
 
 pub fn substituteArgs(allocator: std.mem.Allocator, content: []const u8, args: []const []const u8) ![]u8 {
     var builder = std.ArrayList(u8).empty;
@@ -2939,16 +2936,9 @@ fn cloneStringList(allocator: std.mem.Allocator, input: ?[]const []const u8) !?[
     return try list.toOwnedSlice(allocator);
 }
 
-fn freeStringList(allocator: std.mem.Allocator, input: ?[]const []const u8) void {
-    const items = input orelse return;
-    for (items) |item| allocator.free(item);
-    allocator.free(items);
-}
+const freeStringList = @import("../slice_utils.zig").freeOptionalStringSlice;
 
-fn freeOwnedStringArray(allocator: std.mem.Allocator, input: [][]u8) void {
-    for (input) |item| allocator.free(item);
-    allocator.free(input);
-}
+const freeOwnedStringArray = @import("../slice_utils.zig").freeStringSlice;
 
 fn freeOwnedStringArrayList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
     for (list.items) |item| allocator.free(item);

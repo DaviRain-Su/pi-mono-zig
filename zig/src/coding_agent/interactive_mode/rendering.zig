@@ -3418,10 +3418,7 @@ pub fn parseEnvSize(value: ?[]const u8) ?usize {
     return std.fmt.parseInt(usize, text, 10) catch null;
 }
 
-pub fn freeLinesSlice(allocator: std.mem.Allocator, lines: []const []const u8) void {
-    for (lines) |line| allocator.free(line);
-    allocator.free(lines);
-}
+pub const freeLinesSlice = @import("../slice_utils.zig").freeStringSlice;
 
 pub const INPUT_PROMPT_PREFIX = render_text.INPUT_PROMPT_PREFIX;
 const TOP_PANEL_HEIGHT = render_text.TOP_PANEL_HEIGHT;
@@ -3817,10 +3814,7 @@ fn cloneConstStringList(allocator: std.mem.Allocator, items: []const []const u8)
     return cloned;
 }
 
-fn deinitOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
-    for (items) |item| allocator.free(item);
-    if (items.len > 0) allocator.free(items);
-}
+const deinitOwnedStringList = @import("../slice_utils.zig").freeStringSlice;
 
 test "screen draw renders top task panel and shifts chat below it" {
     const allocator = std.testing.allocator;

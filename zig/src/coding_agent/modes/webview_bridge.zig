@@ -3511,10 +3511,7 @@ fn cloneStringListConst(allocator: std.mem.Allocator, source: ?[][]u8) !?[]const
     return result;
 }
 
-fn freeOwnedStringList(allocator: std.mem.Allocator, items: [][]u8) void {
-    for (items) |item| allocator.free(item);
-    allocator.free(items);
-}
+const freeOwnedStringList = @import("../slice_utils.zig").freeStringSlice;
 
 fn freeConstStringList(allocator: std.mem.Allocator, items: ?[]const []const u8) void {
     const list = items orelse return;

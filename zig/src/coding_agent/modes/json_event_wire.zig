@@ -16,74 +16,74 @@ pub fn stringifyAgentEventLineWithConfigErrors(
     var value = try agentEventToJsonValue(allocator, event);
     defer common.deinitJsonValue(allocator, value);
     if (event.event_type == .agent_start) {
-        try putField(&value.object, allocator, "configErrors", try configErrorsToJsonValue(allocator, errors));
+        try common.putValue(allocator, &value.object, "configErrors", try configErrorsToJsonValue(allocator, errors));
     }
     try validateAgentEventJson(allocator, value);
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 pub fn agentEventToJsonValue(allocator: std.mem.Allocator, event: agent.AgentEvent) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "type", agentEventTypeToString(event.event_type));
+    try common.putString(allocator, &object, "type", agentEventTypeToString(event.event_type));
 
     switch (event.event_type) {
         .agent_start, .turn_start => {},
         .agent_end => {
             if (event.messages) |messages| {
-                try putField(&object, allocator, "messages", try messagesToJsonValue(allocator, messages));
+                try common.putValue(allocator, &object, "messages", try messagesToJsonValue(allocator, messages));
             }
         },
         .turn_end => {
             if (event.message) |message| {
-                try putField(&object, allocator, "message", try messageToJsonValue(allocator, message));
+                try common.putValue(allocator, &object, "message", try messageToJsonValue(allocator, message));
             }
             if (event.tool_results) |tool_results| {
-                try putField(&object, allocator, "toolResults", try toolResultMessagesToJsonValue(allocator, tool_results));
+                try common.putValue(allocator, &object, "toolResults", try toolResultMessagesToJsonValue(allocator, tool_results));
             }
         },
         .message_start, .message_end => {
             if (event.message) |message| {
-                try putField(&object, allocator, "message", try messageToJsonValue(allocator, message));
+                try common.putValue(allocator, &object, "message", try messageToJsonValue(allocator, message));
             }
         },
         .message_update => {
             if (event.message) |message| {
-                try putField(&object, allocator, "message", try messageToJsonValue(allocator, message));
+                try common.putValue(allocator, &object, "message", try messageToJsonValue(allocator, message));
             }
             if (event.assistant_message_event) |assistant_message_event| {
                 const fallback_partial = if (event.message) |message| switch (message) {
                     .assistant => |assistant| assistant,
                     else => null,
                 } else null;
-                try putField(&object, allocator, "assistantMessageEvent", try assistantMessageEventToJsonValue(allocator, assistant_message_event, fallback_partial));
+                try common.putValue(allocator, &object, "assistantMessageEvent", try assistantMessageEventToJsonValue(allocator, assistant_message_event, fallback_partial));
             }
         },
         .tool_execution_start => {
-            if (event.tool_call_id) |tool_call_id| try putStringField(&object, allocator, "toolCallId", tool_call_id);
-            if (event.tool_name) |tool_name| try putStringField(&object, allocator, "toolName", tool_name);
-            if (event.args) |args| try putField(&object, allocator, "args", try common.cloneJsonValue(allocator, args));
+            if (event.tool_call_id) |tool_call_id| try common.putString(allocator, &object, "toolCallId", tool_call_id);
+            if (event.tool_name) |tool_name| try common.putString(allocator, &object, "toolName", tool_name);
+            if (event.args) |args| try common.putValue(allocator, &object, "args", try common.cloneJsonValue(allocator, args));
         },
         .tool_execution_update => {
-            if (event.tool_call_id) |tool_call_id| try putStringField(&object, allocator, "toolCallId", tool_call_id);
-            if (event.tool_name) |tool_name| try putStringField(&object, allocator, "toolName", tool_name);
-            if (event.args) |args| try putField(&object, allocator, "args", try common.cloneJsonValue(allocator, args));
+            if (event.tool_call_id) |tool_call_id| try common.putString(allocator, &object, "toolCallId", tool_call_id);
+            if (event.tool_name) |tool_name| try common.putString(allocator, &object, "toolName", tool_name);
+            if (event.args) |args| try common.putValue(allocator, &object, "args", try common.cloneJsonValue(allocator, args));
             if (event.partial_result) |partial_result| {
-                try putField(&object, allocator, "partialResult", try agentToolResultToJsonValue(allocator, partial_result));
+                try common.putValue(allocator, &object, "partialResult", try agentToolResultToJsonValue(allocator, partial_result));
             }
         },
         .tool_execution_end => {
-            if (event.tool_call_id) |tool_call_id| try putStringField(&object, allocator, "toolCallId", tool_call_id);
-            if (event.tool_name) |tool_name| try putStringField(&object, allocator, "toolName", tool_name);
+            if (event.tool_call_id) |tool_call_id| try common.putString(allocator, &object, "toolCallId", tool_call_id);
+            if (event.tool_name) |tool_name| try common.putString(allocator, &object, "toolName", tool_name);
             if (event.result) |result| {
-                try putField(&object, allocator, "result", try agentToolResultToJsonValue(allocator, result));
+                try common.putValue(allocator, &object, "result", try agentToolResultToJsonValue(allocator, result));
             }
-            if (event.is_error) |is_error| try putBoolField(&object, allocator, "isError", is_error);
+            if (event.is_error) |is_error| try common.putBool(allocator, &object, "isError", is_error);
         },
         .before_provider_request => {
             if (event.messages) |messages| {
-                try putField(&object, allocator, "messages", try messagesToJsonValue(allocator, messages));
+                try common.putValue(allocator, &object, "messages", try messagesToJsonValue(allocator, messages));
             }
         },
         .after_provider_response => {},
@@ -97,56 +97,56 @@ pub fn assistantMessageEventToJsonValue(
     event: ai.AssistantMessageEvent,
     fallback_partial: ?ai.AssistantMessage,
 ) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "type", assistantEventTypeToString(event.event_type));
+    try common.putString(allocator, &object, "type", assistantEventTypeToString(event.event_type));
 
     switch (event.event_type) {
         .start => {
             if (assistantPartialForEvent(event, fallback_partial)) |partial| {
-                try putField(&object, allocator, "partial", try assistantMessageToJsonValue(allocator, partial));
+                try common.putValue(allocator, &object, "partial", try assistantMessageToJsonValue(allocator, partial));
             }
         },
         .text_start, .thinking_start, .toolcall_start => {
-            if (event.content_index) |content_index| try putIntField(&object, allocator, "contentIndex", content_index);
+            if (event.content_index) |content_index| try common.putInt(allocator, &object, "contentIndex", content_index);
             if (assistantPartialForEvent(event, fallback_partial)) |partial| {
-                try putField(&object, allocator, "partial", try assistantMessageToJsonValue(allocator, partial));
+                try common.putValue(allocator, &object, "partial", try assistantMessageToJsonValue(allocator, partial));
             }
         },
         .text_delta, .thinking_delta, .toolcall_delta => {
-            if (event.content_index) |content_index| try putIntField(&object, allocator, "contentIndex", content_index);
-            if (event.delta) |delta| try putStringField(&object, allocator, "delta", delta);
+            if (event.content_index) |content_index| try common.putInt(allocator, &object, "contentIndex", content_index);
+            if (event.delta) |delta| try common.putString(allocator, &object, "delta", delta);
             if (assistantPartialForEvent(event, fallback_partial)) |partial| {
-                try putField(&object, allocator, "partial", try assistantMessageToJsonValue(allocator, partial));
+                try common.putValue(allocator, &object, "partial", try assistantMessageToJsonValue(allocator, partial));
             }
         },
         .text_end, .thinking_end => {
-            if (event.content_index) |content_index| try putIntField(&object, allocator, "contentIndex", content_index);
-            if (event.content) |content| try putStringField(&object, allocator, "content", content);
+            if (event.content_index) |content_index| try common.putInt(allocator, &object, "contentIndex", content_index);
+            if (event.content) |content| try common.putString(allocator, &object, "content", content);
             if (assistantPartialForEvent(event, fallback_partial)) |partial| {
-                try putField(&object, allocator, "partial", try assistantMessageToJsonValue(allocator, partial));
+                try common.putValue(allocator, &object, "partial", try assistantMessageToJsonValue(allocator, partial));
             }
         },
         .toolcall_end => {
-            if (event.content_index) |content_index| try putIntField(&object, allocator, "contentIndex", content_index);
+            if (event.content_index) |content_index| try common.putInt(allocator, &object, "contentIndex", content_index);
             if (event.tool_call) |tool_call| {
-                try putField(&object, allocator, "toolCall", try toolCallToJsonValue(allocator, tool_call));
+                try common.putValue(allocator, &object, "toolCall", try toolCallToJsonValue(allocator, tool_call));
             }
             if (assistantPartialForEvent(event, fallback_partial)) |partial| {
-                try putField(&object, allocator, "partial", try assistantMessageToJsonValue(allocator, partial));
+                try common.putValue(allocator, &object, "partial", try assistantMessageToJsonValue(allocator, partial));
             }
         },
         .done => {
             if (event.message) |message| {
-                try putStringField(&object, allocator, "reason", stopReasonToString(message.stop_reason));
-                try putField(&object, allocator, "message", try assistantMessageToJsonValue(allocator, message));
+                try common.putString(allocator, &object, "reason", stopReasonToString(message.stop_reason));
+                try common.putValue(allocator, &object, "message", try assistantMessageToJsonValue(allocator, message));
             }
         },
         .error_event => {
             if (event.message) |message| {
-                try putStringField(&object, allocator, "reason", stopReasonToString(message.stop_reason));
-                try putField(&object, allocator, "error", try assistantMessageToJsonValue(allocator, message));
+                try common.putString(allocator, &object, "reason", stopReasonToString(message.stop_reason));
+                try common.putValue(allocator, &object, "error", try assistantMessageToJsonValue(allocator, message));
             }
         },
     }
@@ -684,12 +684,12 @@ fn asArray(allocator: std.mem.Allocator, value: std.json.Value, path: []const u8
 }
 
 fn agentToolResultToJsonValue(allocator: std.mem.Allocator, result: agent.AgentToolResult) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, result.content, false, null));
+    try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, result.content, false, null));
     if (result.details) |details| {
-        try putField(&object, allocator, "details", try common.cloneJsonValue(allocator, details));
+        try common.putValue(allocator, &object, "details", try common.cloneJsonValue(allocator, details));
     }
 
     return .{ .object = object };
@@ -700,11 +700,11 @@ fn configErrorsToJsonValue(allocator: std.mem.Allocator, errors: []const config_
     errdefer array.deinit();
 
     for (errors) |config_error| {
-        var object = try initObject(allocator);
+        var object = try common.jsonObject(allocator);
         errdefer common.deinitJsonValue(allocator, .{ .object = object });
-        try putStringField(&object, allocator, "source", config_errors.sourceName(config_error.source));
-        try putStringField(&object, allocator, "path", config_error.path);
-        try putStringField(&object, allocator, "message", config_error.message);
+        try common.putString(allocator, &object, "source", config_errors.sourceName(config_error.source));
+        try common.putString(allocator, &object, "path", config_error.path);
+        try common.putString(allocator, &object, "message", config_error.message);
         try array.append(.{ .object = object });
     }
 
@@ -736,57 +736,57 @@ pub fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMess
 }
 
 fn userMessageToJsonValue(allocator: std.mem.Allocator, user: ai.UserMessage) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "role", "user");
+    try common.putString(allocator, &object, "role", "user");
     if (user.content.len == 1 and user.content[0] == .text) {
-        try putStringField(&object, allocator, "content", user.content[0].text.text);
+        try common.putString(allocator, &object, "content", user.content[0].text.text);
     } else {
-        try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, user.content, false, null));
+        try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, user.content, false, null));
     }
-    try putIntField(&object, allocator, "timestamp", user.timestamp);
+    try common.putInt(allocator, &object, "timestamp", user.timestamp);
     return .{ .object = object };
 }
 
 fn assistantMessageToJsonValue(allocator: std.mem.Allocator, assistant: ai.AssistantMessage) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "role", "assistant");
+    try common.putString(allocator, &object, "role", "assistant");
     const mirror_tool_calls = if (ai.hasInlineToolCalls(assistant)) null else assistant.tool_calls;
-    try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, assistant.content, true, mirror_tool_calls));
-    try putStringField(&object, allocator, "api", assistant.api);
-    try putStringField(&object, allocator, "provider", assistant.provider);
-    try putStringField(&object, allocator, "model", assistant.model);
+    try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, assistant.content, true, mirror_tool_calls));
+    try common.putString(allocator, &object, "api", assistant.api);
+    try common.putString(allocator, &object, "provider", assistant.provider);
+    try common.putString(allocator, &object, "model", assistant.model);
     if (assistant.response_id) |response_id| {
-        try putStringField(&object, allocator, "responseId", response_id);
+        try common.putString(allocator, &object, "responseId", response_id);
     }
     if (assistant.response_model) |response_model| {
-        try putStringField(&object, allocator, "responseModel", response_model);
+        try common.putString(allocator, &object, "responseModel", response_model);
     }
-    try putField(&object, allocator, "usage", try usageToJsonValue(allocator, assistant.usage));
-    try putStringField(&object, allocator, "stopReason", stopReasonToString(assistant.stop_reason));
+    try common.putValue(allocator, &object, "usage", try usageToJsonValue(allocator, assistant.usage));
+    try common.putString(allocator, &object, "stopReason", stopReasonToString(assistant.stop_reason));
     if (assistant.error_message) |error_message| {
-        try putStringField(&object, allocator, "errorMessage", error_message);
+        try common.putString(allocator, &object, "errorMessage", error_message);
     }
-    try putIntField(&object, allocator, "timestamp", assistant.timestamp);
+    try common.putInt(allocator, &object, "timestamp", assistant.timestamp);
     return .{ .object = object };
 }
 
 fn toolResultMessageToJsonValue(allocator: std.mem.Allocator, tool_result: agent.types.ToolResultMessage) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "role", "toolResult");
-    try putStringField(&object, allocator, "toolCallId", tool_result.tool_call_id);
-    try putStringField(&object, allocator, "toolName", tool_result.tool_name);
-    try putField(&object, allocator, "content", try contentBlocksToJsonValue(allocator, tool_result.content, false, null));
+    try common.putString(allocator, &object, "role", "toolResult");
+    try common.putString(allocator, &object, "toolCallId", tool_result.tool_call_id);
+    try common.putString(allocator, &object, "toolName", tool_result.tool_name);
+    try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, tool_result.content, false, null));
     if (tool_result.details) |details| {
-        try putField(&object, allocator, "details", try common.cloneJsonValue(allocator, details));
+        try common.putValue(allocator, &object, "details", try common.cloneJsonValue(allocator, details));
     }
-    try putBoolField(&object, allocator, "isError", tool_result.is_error);
-    try putIntField(&object, allocator, "timestamp", tool_result.timestamp);
+    try common.putBool(allocator, &object, "isError", tool_result.is_error);
+    try common.putInt(allocator, &object, "timestamp", tool_result.timestamp);
     return .{ .object = object };
 }
 
@@ -799,28 +799,28 @@ fn contentBlocksToJsonValue(
     var array = std.json.Array.init(allocator);
 
     for (content) |block| {
-        var object = try initObject(allocator);
+        var object = try common.jsonObject(allocator);
         switch (block) {
             .text => |text| {
-                try putStringField(&object, allocator, "type", "text");
-                try putStringField(&object, allocator, "text", text.text);
+                try common.putString(allocator, &object, "type", "text");
+                try common.putString(allocator, &object, "text", text.text);
                 if (text.text_signature) |signature| {
-                    try putStringField(&object, allocator, "textSignature", signature);
+                    try common.putString(allocator, &object, "textSignature", signature);
                 }
             },
             .image => |image| {
-                try putStringField(&object, allocator, "type", "image");
-                try putStringField(&object, allocator, "data", image.data);
-                try putStringField(&object, allocator, "mimeType", image.mime_type);
+                try common.putString(allocator, &object, "type", "image");
+                try common.putString(allocator, &object, "data", image.data);
+                try common.putString(allocator, &object, "mimeType", image.mime_type);
             },
             .thinking => |thinking| {
-                try putStringField(&object, allocator, "type", "thinking");
-                try putStringField(&object, allocator, "thinking", thinking.thinking);
+                try common.putString(allocator, &object, "type", "thinking");
+                try common.putString(allocator, &object, "thinking", thinking.thinking);
                 if (ai.thinkingSignature(thinking)) |signature| {
-                    try putStringField(&object, allocator, "thinkingSignature", signature);
+                    try common.putString(allocator, &object, "thinkingSignature", signature);
                 }
                 if (thinking.redacted) {
-                    try putBoolField(&object, allocator, "redacted", true);
+                    try common.putBool(allocator, &object, "redacted", true);
                 }
             },
             .tool_call => |tool_call| {
@@ -844,36 +844,36 @@ fn contentBlocksToJsonValue(
 }
 
 fn usageToJsonValue(allocator: std.mem.Allocator, usage: ai.Usage) !std.json.Value {
-    var cost_object = try initObject(allocator);
+    var cost_object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = cost_object });
-    try putFloatField(&cost_object, allocator, "input", usage.cost.input);
-    try putFloatField(&cost_object, allocator, "output", usage.cost.output);
-    try putFloatField(&cost_object, allocator, "cacheRead", usage.cost.cache_read);
-    try putFloatField(&cost_object, allocator, "cacheWrite", usage.cost.cache_write);
-    try putFloatField(&cost_object, allocator, "total", usage.cost.total);
+    try common.putFloat(allocator, &cost_object, "input", usage.cost.input);
+    try common.putFloat(allocator, &cost_object, "output", usage.cost.output);
+    try common.putFloat(allocator, &cost_object, "cacheRead", usage.cost.cache_read);
+    try common.putFloat(allocator, &cost_object, "cacheWrite", usage.cost.cache_write);
+    try common.putFloat(allocator, &cost_object, "total", usage.cost.total);
 
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try putIntField(&object, allocator, "input", usage.input);
-    try putIntField(&object, allocator, "output", usage.output);
-    try putIntField(&object, allocator, "cacheRead", usage.cache_read);
-    try putIntField(&object, allocator, "cacheWrite", usage.cache_write);
-    try putIntField(&object, allocator, "totalTokens", usage.total_tokens);
-    try putField(&object, allocator, "cost", .{ .object = cost_object });
+    try common.putInt(allocator, &object, "input", usage.input);
+    try common.putInt(allocator, &object, "output", usage.output);
+    try common.putInt(allocator, &object, "cacheRead", usage.cache_read);
+    try common.putInt(allocator, &object, "cacheWrite", usage.cache_write);
+    try common.putInt(allocator, &object, "totalTokens", usage.total_tokens);
+    try common.putValue(allocator, &object, "cost", .{ .object = cost_object });
 
     return .{ .object = object };
 }
 
 fn toolCallToJsonValue(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !std.json.Value {
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try putStringField(&object, allocator, "type", "toolCall");
-    try putStringField(&object, allocator, "id", tool_call.id);
-    try putStringField(&object, allocator, "name", tool_call.name);
-    try putField(&object, allocator, "arguments", try common.cloneJsonValue(allocator, tool_call.arguments));
+    try common.putString(allocator, &object, "type", "toolCall");
+    try common.putString(allocator, &object, "id", tool_call.id);
+    try common.putString(allocator, &object, "name", tool_call.name);
+    try common.putValue(allocator, &object, "arguments", try common.cloneJsonValue(allocator, tool_call.arguments));
     if (tool_call.thought_signature) |signature| {
-        try putStringField(&object, allocator, "thoughtSignature", signature);
+        try common.putString(allocator, &object, "thoughtSignature", signature);
     }
     return .{ .object = object };
 }
@@ -901,30 +901,6 @@ fn assistantEventTypeToString(event_type: ai.EventType) []const u8 {
         .error_event => "error",
         else => @tagName(event_type),
     };
-}
-
-fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
-
-fn putField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try common.putValue(allocator, &object, key, value);
-}
-
-fn putStringField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    try putField(object, allocator, key, .{ .string = try allocator.dupe(u8, value) });
-}
-
-fn putBoolField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: bool) !void {
-    try putField(object, allocator, key, .{ .bool = value });
-}
-
-fn putIntField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: anytype) !void {
-    try putField(object, allocator, key, .{ .integer = @as(i64, @intCast(value)) });
-}
-
-fn putFloatField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: f64) !void {
-    try putField(object, allocator, key, .{ .float = value });
 }
 
 fn expectGoldenJson(comptime name: []const u8, actual: []const u8) !void {
@@ -1009,22 +985,22 @@ test "expectGoldenJson compares objects recursively without key-order sensitivit
 test "route-a m3 JSON wire golden corpus covers every envelope variant" {
     const allocator = std.testing.allocator;
 
-    var args_object = try initObject(allocator);
+    var args_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
-    try putStringField(&args_object, allocator, "command", "printf 'hello\\nworld'");
-    try putBoolField(&args_object, allocator, "stream", true);
+    try common.putString(allocator, &args_object, "command", "printf 'hello\\nworld'");
+    try common.putBool(allocator, &args_object, "stream", true);
     const args_value: std.json.Value = .{ .object = args_object };
 
-    var details_object = try initObject(allocator);
+    var details_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = details_object });
-    try putIntField(&details_object, allocator, "exitCode", 0);
-    try putBoolField(&details_object, allocator, "timedOut", false);
+    try common.putInt(allocator, &details_object, "exitCode", 0);
+    try common.putBool(allocator, &details_object, "timedOut", false);
     const details_value: std.json.Value = .{ .object = details_object };
 
-    var error_details_object = try initObject(allocator);
+    var error_details_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = error_details_object });
-    try putIntField(&error_details_object, allocator, "exitCode", 2);
-    try putBoolField(&error_details_object, allocator, "timedOut", false);
+    try common.putInt(allocator, &error_details_object, "exitCode", 2);
+    try common.putBool(allocator, &error_details_object, "timedOut", false);
     const error_details_value: std.json.Value = .{ .object = error_details_object };
 
     const user_content = [_]ai.ContentBlock{
@@ -1189,9 +1165,9 @@ test "route-a m3 JSON wire golden corpus covers every envelope variant" {
 test "validateAgentEventJson reports contextual schema errors" {
     const allocator = std.testing.allocator;
 
-    var object = try initObject(allocator);
+    var object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = object });
-    try putStringField(&object, allocator, "type", "tool_execution_end");
+    try common.putString(allocator, &object, "type", "tool_execution_end");
 
     try std.testing.expectError(error.InvalidJsonSchema, validateAgentEventJson(allocator, .{ .object = object }));
 }
@@ -1216,14 +1192,14 @@ test "stringifyAgentEventLine rejects malformed serialized events" {
 test "agent event JSON covers all top-level variants" {
     const allocator = std.testing.allocator;
 
-    var args_object = try initObject(allocator);
+    var args_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
-    try putStringField(&args_object, allocator, "path", "/tmp/file.txt");
+    try common.putString(allocator, &args_object, "path", "/tmp/file.txt");
     const args_value: std.json.Value = .{ .object = args_object };
 
-    var details_object = try initObject(allocator);
+    var details_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = details_object });
-    try putIntField(&details_object, allocator, "exit_code", 0);
+    try common.putInt(allocator, &details_object, "exit_code", 0);
     const details_value: std.json.Value = .{ .object = details_object };
 
     const user_content = [_]ai.ContentBlock{
@@ -1298,9 +1274,9 @@ test "agent event JSON covers all top-level variants" {
 test "assistant message event JSON covers all nested variants" {
     const allocator = std.testing.allocator;
 
-    var args_object = try initObject(allocator);
+    var args_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
-    try putStringField(&args_object, allocator, "command", "echo hi");
+    try common.putString(allocator, &args_object, "command", "echo hi");
     const args_value: std.json.Value = .{ .object = args_object };
 
     const assistant_content = [_]ai.ContentBlock{
@@ -1361,9 +1337,9 @@ test "assistant message event JSON covers all nested variants" {
 test "route-a m1 stringifies streaming toolcall message updates" {
     const allocator = std.testing.allocator;
 
-    var args_object = try initObject(allocator);
+    var args_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
-    try putStringField(&args_object, allocator, "command", "echo hi");
+    try common.putString(allocator, &args_object, "command", "echo hi");
     const args_value: std.json.Value = .{ .object = args_object };
 
     const assistant_message = ai.AssistantMessage{
@@ -1406,7 +1382,7 @@ test "route-a m1 stringifies streaming toolcall message updates" {
 test "partial toolcall message update serializes malformed argument fallback as empty object" {
     const allocator = std.testing.allocator;
 
-    const args_object = try initObject(allocator);
+    const args_object = try common.jsonObject(allocator);
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
     const args_value: std.json.Value = .{ .object = args_object };
 

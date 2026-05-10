@@ -640,10 +640,7 @@ fn autocompleteItemsFromPayload(allocator: std.mem.Allocator, payload: std.json.
     return items;
 }
 
-fn freeStringList(allocator: std.mem.Allocator, values: [][]u8) void {
-    for (values) |value| allocator.free(value);
-    allocator.free(values);
-}
+const freeStringList = @import("../slice_utils.zig").freeStringSlice;
 
 fn freeSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
     for (items) |item| {
