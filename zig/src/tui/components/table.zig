@@ -71,6 +71,7 @@ pub const Table = struct {
     column_spacing: u16 = 1,
     row_highlight_style: ?vaxis.Cell.Style = null,
     header_separator: bool = true,
+    row_separator: bool = false,
     highlight_symbol: []const u8 = ">",
     show_scrollbar: bool = false,
     scrollbar_thumb: []const u8 = "█",
@@ -168,9 +169,10 @@ pub const Table = struct {
         };
 
         const header_height: u16 = if (self.header != null) 1 else 0;
-        const separator_height: u16 = if (self.header != null and self.header_separator) 1 else 0;
-        const rows_available = if (area.height > header_height + separator_height)
-            area.height - header_height - separator_height
+        const header_sep_height: u16 = if (self.header != null and self.header_separator) 1 else 0;
+        const fixed_height = header_height + header_sep_height;
+        const rows_available = if (area.height > fixed_height)
+            area.height - fixed_height
         else
             0;
 
@@ -190,7 +192,11 @@ pub const Table = struct {
             self.column_spacing,
         );
 
-        const visible_rows = @min(self.rows.len, rows_available);
+        const row_count_with_seps = if (self.row_separator and self.rows.len > 0)
+            self.rows.len + self.rows.len - 1
+        else
+            self.rows.len;
+        const visible_rows = @min(row_count_with_seps, rows_available);
         state.scrollToSelected(visible_rows, self.rows.len);
 
         var y: u16 = 0;
@@ -206,7 +212,7 @@ pub const Table = struct {
                 y += 1;
             }
 
-            if (self.header_separator and y < area.height and separator_height > 0) {
+            if (self.header_separator and y < area.height and header_sep_height > 0) {
                 renderSeparator(window, area.width, y);
                 y += 1;
             }
@@ -222,6 +228,11 @@ pub const Table = struct {
             const hl = if (is_selected) self.row_highlight_style else null;
             try renderRow(ctx.arena, window, row, column_rects, selection_width, y, is_selected, hl, self.highlight_symbol, null, null);
             y += 1;
+
+            if (self.row_separator and y < area.height and index + 1 < self.rows.len) {
+                renderSeparator(window, area.width, y);
+                y += 1;
+            }
         }
 
         // Render scrollbar
@@ -232,7 +243,7 @@ pub const Table = struct {
             const thumb_start = if (max_offset == 0) 0 else (state.offset * (rows_available - thumb_height)) / max_offset;
 
             for (0..rows_available) |row_idx| {
-                const row_y = header_height + separator_height + @as(u16, @intCast(row_idx));
+                const row_y = fixed_height + @as(u16, @intCast(row_idx));
                 if (row_y >= area.height) break;
                 const is_thumb = row_idx >= thumb_start and row_idx < thumb_start + thumb_height;
                 window.writeCell(scroll_col, row_y, .{
