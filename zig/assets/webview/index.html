@@ -359,6 +359,36 @@
           <div class="panel-status" id="scoped-panel-status">Loading scoped models…</div>
           <div class="panel-list" id="scoped-list"></div>
         </section>
+        <section id="command-panel" class="panel" aria-label="Command discovery and utilities">
+          <h2>Commands and utilities</h2>
+          <div class="panel-controls">
+            <input id="command-search-input" placeholder="Search /commands, prompts, skills" autocomplete="off" />
+            <button id="copy-last-button" type="button">Copy last</button>
+            <button id="copy-all-button" type="button">Copy all</button>
+            <button id="copy-visible-button" type="button">Copy visible</button>
+            <button id="share-button" type="button">Share</button>
+          </div>
+          <div class="panel-controls">
+            <select id="export-format-select" aria-label="Export format">
+              <option value="html">html</option>
+              <option value="jsonl">jsonl</option>
+              <option value="json">json</option>
+              <option value="md">md</option>
+            </select>
+            <button id="export-button" type="button">Export</button>
+          </div>
+          <div class="panel-controls">
+            <input id="import-path-input" placeholder="Import JSONL path" autocomplete="off" />
+            <button id="import-button" type="button">Import</button>
+          </div>
+          <div class="panel-controls">
+            <input id="bash-command-input" placeholder="Bash command" autocomplete="off" />
+            <button id="bash-include-button" type="button">! run</button>
+            <button id="bash-exclude-button" type="button">!! run no context</button>
+          </div>
+          <div class="panel-status" id="command-panel-status">Loading commands…</div>
+          <div class="panel-list" id="command-list"></div>
+        </section>
       </section>
       <pre id="initial-input" hidden></pre>
       <section id="messages" aria-live="polite"></section>
@@ -416,6 +446,10 @@
         scopedUi: {
           search: "",
         },
+        commandUi: {
+          search: "",
+          lastCopyText: "",
+        },
         statusBaseText: "bridge: initializing",
         promptEnabled: true,
         activeFrameMonitor: null,
@@ -466,6 +500,20 @@
       const scopedSaveButtonEl = document.getElementById("scoped-save-button");
       const scopedPanelStatusEl = document.getElementById("scoped-panel-status");
       const scopedListEl = document.getElementById("scoped-list");
+      const commandSearchInputEl = document.getElementById("command-search-input");
+      const copyLastButtonEl = document.getElementById("copy-last-button");
+      const copyAllButtonEl = document.getElementById("copy-all-button");
+      const copyVisibleButtonEl = document.getElementById("copy-visible-button");
+      const shareButtonEl = document.getElementById("share-button");
+      const exportFormatSelectEl = document.getElementById("export-format-select");
+      const exportButtonEl = document.getElementById("export-button");
+      const importPathInputEl = document.getElementById("import-path-input");
+      const importButtonEl = document.getElementById("import-button");
+      const bashCommandInputEl = document.getElementById("bash-command-input");
+      const bashIncludeButtonEl = document.getElementById("bash-include-button");
+      const bashExcludeButtonEl = document.getElementById("bash-exclude-button");
+      const commandPanelStatusEl = document.getElementById("command-panel-status");
+      const commandListEl = document.getElementById("command-list");
 
       function postNativeMessage(message) {
         if (window.webkit?.messageHandlers?.pi) {
@@ -1016,6 +1064,137 @@
         });
       }
 
+      function catalogRows(catalog) {
+        const rows = [];
+        for (const item of catalog.builtins || []) rows.push({ kind: "built-in", command: `/${item.name}`, description: item.description, action: null });
+        for (const item of catalog.prompts || []) rows.push({ kind: "prompt", command: item.command, description: item.description, action: () => dispatchPromptTemplate(item.name) });
+        for (const item of catalog.skills || []) rows.push({ kind: "skill", command: item.command, description: item.description, action: () => dispatchSkill(item.name) });
+        for (const item of catalog.extensions || []) rows.push({ kind: "extension", command: `/${item.invocationName}`, description: item.description || item.extensionPath, action: () => dispatchExtensionCommand(item.invocationName) });
+        for (const item of catalog.utilities || []) rows.push({ kind: "utility", command: item.surface, description: item.description, action: null });
+        for (const item of catalog.hiddenDecisions || []) rows.push({ kind: "hidden", command: `/${item.name}`, description: item.decision, action: null });
+        return rows;
+      }
+
+      function commandRowMatches(row) {
+        const query = state.commandUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [row.kind, row.command, row.description].filter(Boolean).some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function renderCommandPanel(bridgeState) {
+        const catalog = bridgeState.commandCatalog || {};
+        const rows = catalogRows(catalog).filter(commandRowMatches);
+        commandPanelStatusEl.textContent = `${rows.length} commands · copy/export/import/share/bash via explicit bridge commands`;
+        commandListEl.textContent = "";
+        for (const row of rows) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "panel-row";
+          button.disabled = Boolean(state.activeTurnId) || !row.action;
+          const title = document.createElement("strong");
+          title.textContent = `${row.command} · ${row.kind}`;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = row.description || "";
+          button.append(title, meta);
+          if (row.action) button.addEventListener("click", row.action);
+          commandListEl.append(button);
+        }
+        markTelemetry("command_panel_rendered", {
+          childCount: commandListEl.childElementCount,
+          valueLength: rows.length,
+          searchLength: state.commandUi.search.length,
+        });
+      }
+
+      async function writePreparedClipboard(text) {
+        state.commandUi.lastCopyText = text || "";
+        if (navigator.clipboard?.writeText && text) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return "clipboard";
+          } catch (_) {
+            return "prepared";
+          }
+        }
+        return "prepared";
+      }
+
+      async function copySessionScope(scope) {
+        const payload = { scope };
+        if (scope === "visible") payload.visibleText = messagesEl.innerText || "";
+        const result = await sendBridge("copy_session", payload);
+        const target = await writePreparedClipboard(result.text || "");
+        commandPanelStatusEl.textContent = `${result.message || result.status} (${scope}, ${target})`;
+        markTelemetry("copy_command_status", { scope, bytes: result.bytes || 0, target });
+      }
+
+      async function exportSession() {
+        const format = exportFormatSelectEl.value;
+        const result = await sendBridge("export_session", { format });
+        commandPanelStatusEl.textContent = `Exported ${result.format} to ${result.path}`;
+        markTelemetry("export_command_status", { format: result.format, valueLength: (result.path || "").length });
+      }
+
+      async function importSession() {
+        const path = importPathInputEl.value.trim();
+        if (!path) return;
+        const result = await sendBridge("import_session", { path });
+        commandPanelStatusEl.textContent = `Imported ${result.sessionId} from ${path}`;
+        markTelemetry("import_command_status", { status: result.status, valueLength: path.length });
+        await refreshStatePanels();
+      }
+
+      async function shareSession() {
+        const result = await sendBridge("share_session");
+        const target = await writePreparedClipboard(result.text || "");
+        commandPanelStatusEl.textContent = `Share ${result.status} (${target})`;
+        markTelemetry("share_command_status", { bytes: result.bytes || 0, target });
+      }
+
+      async function runWebViewBash(excludeFromContext) {
+        const command = bashCommandInputEl.value.trim();
+        if (!command) return;
+        commandPanelStatusEl.textContent = `${excludeFromContext ? "!!" : "!"} running ${command}`;
+        markTelemetry("bash_command_start", { excludeFromContext, valueLength: command.length });
+        const result = await sendBridge("bash_execute", { command, excludeFromContext });
+        createStructuredCard(
+          result.exitCode === 0 || result.exitCode === null ? "tool-result-card" : "tool-result-card error",
+          "bash",
+          `${excludeFromContext ? "!!" : "!"} ${command}`,
+          `${result.output || ""}\nexit: ${result.exitCode ?? "unknown"}\ncontext: ${result.includedInContext ? "included" : "excluded"}`,
+        );
+        commandPanelStatusEl.textContent = `Bash ${result.status}; context ${result.includedInContext ? "included" : "excluded"}`;
+        markTelemetry("bash_command_status", {
+          exitCode: result.exitCode,
+          excludeFromContext: result.excludeFromContext,
+          outputLength: (result.output || "").length,
+        });
+      }
+
+      async function dispatchPromptTemplate(name) {
+        const args = window.prompt(`Arguments for /${name}`, "") || "";
+        const result = await sendBridge("prompt_template_dispatch", { name, args });
+        if (result.prompt) promptInputEl.value = result.prompt;
+        commandPanelStatusEl.textContent = `Prompt template ${result.status}: /${name}`;
+        markTelemetry("prompt_template_dispatched", { name, valueLength: (result.prompt || "").length });
+      }
+
+      async function dispatchSkill(name) {
+        const args = window.prompt(`Arguments for /skill:${name}`, "") || "";
+        const result = await sendBridge("skill_dispatch", { name, args });
+        if (result.prompt) promptInputEl.value = result.prompt;
+        commandPanelStatusEl.textContent = `Skill ${result.status}: /skill:${name}`;
+        markTelemetry("skill_command_dispatched", { name, valueLength: (result.prompt || "").length });
+      }
+
+      async function dispatchExtensionCommand(name) {
+        const args = window.prompt(`Arguments for /${name}`, "") || "";
+        const result = await sendBridge("extension_command_dispatch", { name, args });
+        commandPanelStatusEl.textContent = `Extension command ${result.status}: /${name}`;
+        markTelemetry("extension_command_dispatched", { name, status: result.status });
+      }
+
       async function refreshStatePanels() {
         const bridgeState = await sendBridge("get_state");
         state.bridgeState = bridgeState;
@@ -1033,6 +1212,7 @@
         renderThinkingPanel(bridgeState);
         renderThemePanel(bridgeState);
         renderScopedModelsPanel(bridgeState);
+        renderCommandPanel(bridgeState);
         return bridgeState;
       }
 
@@ -1819,6 +1999,35 @@
         await sendBridge("scoped_models_save");
         await refreshStatePanels();
       });
+
+      commandSearchInputEl.addEventListener("input", () => {
+        state.commandUi.search = commandSearchInputEl.value;
+        renderCommandPanel(state.bridgeState || {});
+      });
+      copyLastButtonEl.addEventListener("click", () => copySessionScope("last").catch((error) => {
+        commandPanelStatusEl.textContent = `Copy failed: ${error.message || error}`;
+      }));
+      copyAllButtonEl.addEventListener("click", () => copySessionScope("all").catch((error) => {
+        commandPanelStatusEl.textContent = `Copy failed: ${error.message || error}`;
+      }));
+      copyVisibleButtonEl.addEventListener("click", () => copySessionScope("visible").catch((error) => {
+        commandPanelStatusEl.textContent = `Copy failed: ${error.message || error}`;
+      }));
+      exportButtonEl.addEventListener("click", () => exportSession().catch((error) => {
+        commandPanelStatusEl.textContent = `Export failed: ${error.message || error}`;
+      }));
+      importButtonEl.addEventListener("click", () => importSession().catch((error) => {
+        commandPanelStatusEl.textContent = `Import failed: ${error.message || error}`;
+      }));
+      shareButtonEl.addEventListener("click", () => shareSession().catch((error) => {
+        commandPanelStatusEl.textContent = `Share failed: ${error.message || error}`;
+      }));
+      bashIncludeButtonEl.addEventListener("click", () => runWebViewBash(false).catch((error) => {
+        commandPanelStatusEl.textContent = `Bash failed: ${error.message || error}`;
+      }));
+      bashExcludeButtonEl.addEventListener("click", () => runWebViewBash(true).catch((error) => {
+        commandPanelStatusEl.textContent = `Bash failed: ${error.message || error}`;
+      }));
 
       promptInputEl.addEventListener("focus", () => {
         if (telemetry.inputFocusSent) return;

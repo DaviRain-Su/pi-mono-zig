@@ -41,6 +41,9 @@ pub const RunWebViewModeOptions = struct {
     auth_path: ?[]const u8 = null,
     runtime_config: ?*config_mod.RuntimeConfig = null,
     themes: []const resources_mod.Theme = &.{},
+    prompt_templates: []const resources_mod.PromptTemplate = &.{},
+    skills: []const resources_mod.Skill = &.{},
+    extension_commands: []const webview_bridge.WebViewExtensionCommand = &.{},
     active_theme_name: ?[]const u8 = null,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
@@ -181,6 +184,9 @@ pub fn runWebViewMode(
         .auth_path = options.auth_path,
         .runtime_config = options.runtime_config,
         .themes = options.themes,
+        .prompt_templates = options.prompt_templates,
+        .skills = options.skills,
+        .extension_commands = options.extension_commands,
         .active_theme_name = options.active_theme_name,
         .selected_tools = options.selected_tools,
         .active_tool_count = options.active_tool_count,
@@ -191,6 +197,9 @@ pub fn runWebViewMode(
             .session_mutation = true,
             .auth_mutation = true,
             .settings_mutation = true,
+            .utility_command = true,
+            .resource_command = true,
+            .extension_command = true,
         },
         .initial_prompt = options.initial_prompt,
         .initial_messages = options.initial_messages,
@@ -1112,4 +1121,27 @@ test "webview frontend asset includes settings theme thinking and scoped model p
     try std.testing.expect(std.mem.indexOf(u8, html, "thinking_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "theme_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "scoped_models_panel_rendered") != null);
+}
+
+test "webview frontend asset includes command and utility surfaces" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "command-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "copy_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "export_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "import_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "share_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "bash_execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "prompt_template_dispatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "skill_dispatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "extension_command_dispatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "command_panel_rendered") != null);
 }

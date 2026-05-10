@@ -322,6 +322,8 @@ fn dispatchWebViewMode(
             .auth_path = webview_auth_path,
             .runtime_config = &prepared.runtime_config,
             .themes = prepared.resource_bundle.themes,
+            .prompt_templates = prepared.resource_bundle.prompt_templates,
+            .skills = prepared.resource_bundle.skills,
             .active_theme_name = prepared.resource_bundle.selectedTheme().name,
             .selected_tools = construction_selected_tools,
             .active_tool_count = built_tools.items.len,

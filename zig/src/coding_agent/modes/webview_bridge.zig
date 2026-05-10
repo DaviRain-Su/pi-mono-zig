@@ -7,10 +7,15 @@ const json_event_wire = @import("json_event_wire.zig");
 const auth = @import("../auth/auth.zig");
 const common = @import("../tools/common.zig");
 const config_mod = @import("../config/config.zig");
+const command_router = @import("../interactive_mode/command_router.zig");
+const bash_execution = @import("../interactive_mode/bash_execution.zig");
+const slash_commands = @import("../interactive_mode/slash_commands.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
+const session_advanced = @import("../sessions/session_advanced.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
+const bash_tool_mod = @import("../tools/bash.zig");
 const tool_selection = @import("../tool_selection.zig");
 
 const writeJsonString = json_format.writeJsonString;
@@ -52,6 +57,15 @@ pub const Command = enum {
     session_tree_navigate,
     fork_messages_get,
     fork_session,
+    command_catalog,
+    copy_session,
+    export_session,
+    import_session,
+    share_session,
+    bash_execute,
+    prompt_template_dispatch,
+    skill_dispatch,
+    extension_command_dispatch,
 };
 
 pub const Permission = enum {
@@ -60,6 +74,9 @@ pub const Permission = enum {
     session_mutation,
     auth_mutation,
     settings_mutation,
+    utility_command,
+    resource_command,
+    extension_command,
 };
 
 pub const BridgePermissions = struct {
@@ -68,6 +85,9 @@ pub const BridgePermissions = struct {
     session_mutation: bool = false,
     auth_mutation: bool = false,
     settings_mutation: bool = false,
+    utility_command: bool = false,
+    resource_command: bool = false,
+    extension_command: bool = false,
 
     fn allows(self: BridgePermissions, permission: Permission) bool {
         return switch (permission) {
@@ -76,8 +96,18 @@ pub const BridgePermissions = struct {
             .session_mutation => self.session_mutation,
             .auth_mutation => self.auth_mutation,
             .settings_mutation => self.settings_mutation,
+            .utility_command => self.utility_command,
+            .resource_command => self.resource_command,
+            .extension_command => self.extension_command,
         };
     }
+};
+
+pub const WebViewExtensionCommand = struct {
+    name: []const u8,
+    invocation_name: []const u8,
+    description: ?[]const u8 = null,
+    extension_path: []const u8 = "",
 };
 
 pub const CommandSpec = struct {
@@ -112,6 +142,15 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "session_tree_navigate", .command = .session_tree_navigate, .permission = .session_mutation },
     .{ .name = "fork_messages_get", .command = .fork_messages_get, .permission = .skeleton_chat },
     .{ .name = "fork_session", .command = .fork_session, .permission = .session_mutation },
+    .{ .name = "command_catalog", .command = .command_catalog, .permission = .skeleton_chat },
+    .{ .name = "copy_session", .command = .copy_session, .permission = .utility_command },
+    .{ .name = "export_session", .command = .export_session, .permission = .utility_command },
+    .{ .name = "import_session", .command = .import_session, .permission = .session_mutation },
+    .{ .name = "share_session", .command = .share_session, .permission = .utility_command },
+    .{ .name = "bash_execute", .command = .bash_execute, .permission = .utility_command },
+    .{ .name = "prompt_template_dispatch", .command = .prompt_template_dispatch, .permission = .resource_command },
+    .{ .name = "skill_dispatch", .command = .skill_dispatch, .permission = .resource_command },
+    .{ .name = "extension_command_dispatch", .command = .extension_command_dispatch, .permission = .extension_command },
 };
 
 pub const BridgeContext = struct {
@@ -128,6 +167,9 @@ pub const BridgeContext = struct {
     auth_path: ?[]const u8 = null,
     runtime_config: ?*config_mod.RuntimeConfig = null,
     themes: []const resources_mod.Theme = &.{},
+    prompt_templates: []const resources_mod.PromptTemplate = &.{},
+    skills: []const resources_mod.Skill = &.{},
+    extension_commands: []const WebViewExtensionCommand = &.{},
     active_theme_name: ?[]const u8 = null,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
@@ -164,6 +206,15 @@ pub const DispatchCounters = struct {
     session_tree_navigate: usize = 0,
     fork_messages_get: usize = 0,
     fork_session: usize = 0,
+    command_catalog: usize = 0,
+    copy_session: usize = 0,
+    export_session: usize = 0,
+    import_session: usize = 0,
+    share_session: usize = 0,
+    bash_execute: usize = 0,
+    prompt_template_dispatch: usize = 0,
+    skill_dispatch: usize = 0,
+    extension_command_dispatch: usize = 0,
 
     fn increment(self: *DispatchCounters, command: Command) void {
         switch (command) {
@@ -192,6 +243,15 @@ pub const DispatchCounters = struct {
             .session_tree_navigate => self.session_tree_navigate += 1,
             .fork_messages_get => self.fork_messages_get += 1,
             .fork_session => self.fork_session += 1,
+            .command_catalog => self.command_catalog += 1,
+            .copy_session => self.copy_session += 1,
+            .export_session => self.export_session += 1,
+            .import_session => self.import_session += 1,
+            .share_session => self.share_session += 1,
+            .bash_execute => self.bash_execute += 1,
+            .prompt_template_dispatch => self.prompt_template_dispatch += 1,
+            .skill_dispatch => self.skill_dispatch += 1,
+            .extension_command_dispatch => self.extension_command_dispatch += 1,
         }
     }
 
@@ -220,7 +280,16 @@ pub const DispatchCounters = struct {
             self.session_tree_label +
             self.session_tree_navigate +
             self.fork_messages_get +
-            self.fork_session;
+            self.fork_session +
+            self.command_catalog +
+            self.copy_session +
+            self.export_session +
+            self.import_session +
+            self.share_session +
+            self.bash_execute +
+            self.prompt_template_dispatch +
+            self.skill_dispatch +
+            self.extension_command_dispatch;
     }
 };
 
@@ -549,6 +618,15 @@ pub const BridgeHost = struct {
             .session_tree_navigate => try self.writeSessionTreeNavigateResult(allocator, &writer.writer, payload.?),
             .fork_messages_get => try self.writeForkPanelState(allocator, &writer.writer),
             .fork_session => try self.writeForkSessionResult(allocator, &writer.writer, payload.?),
+            .command_catalog => try self.writeCommandCatalogResult(allocator, &writer.writer),
+            .copy_session => try self.writeCopySessionResult(allocator, &writer.writer, payload),
+            .export_session => try self.writeExportSessionResult(allocator, &writer.writer, payload),
+            .import_session => try self.writeImportSessionResult(allocator, &writer.writer, payload.?),
+            .share_session => try self.writeShareSessionResult(allocator, &writer.writer),
+            .bash_execute => try self.writeBashExecuteResult(allocator, &writer.writer, payload.?),
+            .prompt_template_dispatch => try self.writePromptTemplateDispatchResult(allocator, &writer.writer, payload.?),
+            .skill_dispatch => try self.writeSkillDispatchResult(allocator, &writer.writer, payload.?),
+            .extension_command_dispatch => try self.writeExtensionCommandDispatchResult(allocator, &writer.writer, payload.?),
         }
 
         try writer.writer.writeAll("}");
@@ -587,6 +665,8 @@ pub const BridgeHost = struct {
         try self.writeSessionTreeState(allocator, writer);
         try writer.writeAll(",\"forkPanel\":");
         try self.writeForkPanelState(allocator, writer);
+        try writer.writeAll(",\"commandCatalog\":");
+        try self.writeCommandCatalogResult(allocator, writer);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
         try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
@@ -1861,6 +1941,325 @@ pub const BridgeHost = struct {
         try writer.writeAll("}");
     }
 
+    fn writeCommandCatalogResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{\"builtins\":[");
+        for (command_router.BUILTIN_SLASH_COMMANDS, 0..) |command, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{");
+            try writeStringField(allocator, writer, "name", command.name, false);
+            try writeStringField(allocator, writer, "description", command.description, true);
+            try writer.writeAll(",\"argumentHint\":");
+            if (command.argument_hint) |hint| {
+                try writeJsonString(allocator, writer, hint);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"hiddenDecisions\":[");
+        try writeHiddenCommandDecision(allocator, writer, "label", "Covered by the WebView session tree label editor instead of primary autocomplete.", false);
+        try writeHiddenCommandDecision(allocator, writer, "quit", "Window close is the WebView-native quit surface; /quit remains discoverable as a built-in.", true);
+        try writer.writeAll("],\"utilities\":[");
+        try writeUtilityCommand(allocator, writer, "copy_session", "Copy last/all/visible transcript text without native temp-file fallback.", "copy", false);
+        try writeUtilityCommand(allocator, writer, "export_session", "Export the active session as html, jsonl, json, or md.", "export", true);
+        try writeUtilityCommand(allocator, writer, "import_session", "Import and switch to a JSONL session file.", "import", true);
+        try writeUtilityCommand(allocator, writer, "share_session", "Prepare sanitized session markdown for sharing.", "share", true);
+        try writeUtilityCommand(allocator, writer, "bash_execute", "Run ! or !! bash shortcuts with explicit context policy.", "bash", true);
+        try writer.writeAll("],\"bashShortcuts\":[{\"prefix\":\"!\",\"excludeFromContext\":false,\"description\":\"Run bash command and include summarized output in context\"},{\"prefix\":\"!!\",\"excludeFromContext\":true,\"description\":\"Run bash command and exclude output from model context\"}],\"prompts\":[");
+        for (self.context.prompt_templates, 0..) |template, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{");
+            try writeStringField(allocator, writer, "name", template.name, false);
+            try writeStringField(allocator, writer, "description", template.description, true);
+            try writer.writeAll(",\"argumentHint\":");
+            if (template.argument_hint) |hint| {
+                try writeJsonString(allocator, writer, hint);
+            } else {
+                try writer.writeAll("null");
+            }
+            const command_name = try std.fmt.allocPrint(allocator, "/{s}", .{template.name});
+            defer allocator.free(command_name);
+            try writeStringField(allocator, writer, "command", command_name, true);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"skills\":[");
+        var wrote_skill = false;
+        for (self.context.skills) |skill| {
+            if (skill.disable_model_invocation) continue;
+            if (wrote_skill) try writer.writeAll(",");
+            wrote_skill = true;
+            try writer.writeAll("{");
+            try writeStringField(allocator, writer, "name", skill.name, false);
+            try writeStringField(allocator, writer, "description", skill.description, true);
+            const skill_command = try std.fmt.allocPrint(allocator, "/skill:{s}", .{skill.name});
+            defer allocator.free(skill_command);
+            try writeStringField(allocator, writer, "command", skill_command, true);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"extensions\":[");
+        for (self.context.extension_commands, 0..) |command, index| {
+            if (index > 0) try writer.writeAll(",");
+            try writer.writeAll("{");
+            try writeStringField(allocator, writer, "name", command.name, false);
+            try writeStringField(allocator, writer, "invocationName", command.invocation_name, true);
+            try writer.writeAll(",\"description\":");
+            if (command.description) |description| {
+                try writeJsonString(allocator, writer, description);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writeStringField(allocator, writer, "extensionPath", command.extension_path, true);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"permissions\":{\"utility\":");
+        try writer.writeAll(if (self.context.permissions.utility_command) "true" else "false");
+        try writer.writeAll(",\"resources\":");
+        try writer.writeAll(if (self.context.permissions.resource_command) "true" else "false");
+        try writer.writeAll(",\"extensions\":");
+        try writer.writeAll(if (self.context.permissions.extension_command) "true" else "false");
+        try writer.writeAll("}}");
+    }
+
+    fn writeCopySessionResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: ?std.json.Value,
+    ) !void {
+        const scope_text = getPayloadString(payload, "scope") orelse "last";
+        const text = if (std.ascii.eqlIgnoreCase(scope_text, "visible")) blk: {
+            if (getPayloadString(payload, "visibleText")) |visible| break :blk try allocator.dupe(u8, visible);
+            break :blk try slash_commands.sessionTranscriptTextAlloc(allocator, self.context.session);
+        } else if (std.ascii.eqlIgnoreCase(scope_text, "all")) blk: {
+            break :blk try slash_commands.sessionTranscriptTextAlloc(allocator, self.context.session);
+        } else blk: {
+            break :blk slash_commands.lastAssistantTextAlloc(allocator, self.context.session) orelse try allocator.dupe(u8, "");
+        };
+        defer allocator.free(text);
+        const has_text = std.mem.trim(u8, text, " \t\r\n").len > 0;
+        try writer.writeAll("{\"status\":");
+        try writeJsonString(allocator, writer, if (has_text) "prepared" else "empty");
+        try writeStringField(allocator, writer, "scope", scope_text, true);
+        try writer.writeAll(",\"text\":");
+        try writeJsonString(allocator, writer, text);
+        try writeUsizeField(writer, "bytes", text.len, true);
+        try writer.writeAll(",\"clipboard\":\"webview\",\"tempPath\":null,\"secretEcho\":false,\"message\":");
+        try writeJsonString(allocator, writer, if (has_text) "Copy content prepared for the WebView clipboard" else "No transcript content to copy");
+        try writer.writeAll("}");
+    }
+
+    fn writeExportSessionResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: ?std.json.Value,
+    ) !void {
+        const format = canonicalExportFormat(getPayloadString(payload, "format") orelse "html") orelse {
+            try writer.writeAll("{\"status\":\"invalid\",\"accepted\":false,\"message\":\"Unsupported export format\"}");
+            return;
+        };
+        const requested_path = getPayloadString(payload, "path");
+        const owned_path = if (requested_path == null)
+            try std.fmt.allocPrint(allocator, "/tmp/pi-webview-export-{d}.{s}", .{ agent.nowMilliseconds(), format })
+        else
+            null;
+        defer if (owned_path) |path| allocator.free(path);
+        const output_path = requested_path orelse owned_path.?;
+        const exported_path = if (std.mem.eql(u8, format, "html"))
+            try session_advanced.exportToHtml(allocator, self.context.session.io, self.context.session, output_path)
+        else if (std.mem.eql(u8, format, "jsonl"))
+            try session_advanced.exportToJsonl(allocator, self.context.session.io, self.context.session, output_path)
+        else if (std.mem.eql(u8, format, "json"))
+            try session_advanced.exportToJson(allocator, self.context.session.io, self.context.session, output_path)
+        else
+            try session_advanced.exportToMarkdown(allocator, self.context.session.io, self.context.session, output_path);
+        defer allocator.free(exported_path);
+        try writer.writeAll("{\"status\":\"exported\",\"accepted\":true,\"format\":");
+        try writeJsonString(allocator, writer, format);
+        try writeStringField(allocator, writer, "path", exported_path, true);
+        try writer.writeAll(",\"message\":\"Session exported\"}");
+    }
+
+    fn writeImportSessionResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"message\":\"WebView import is blocked while a prompt is active\"}");
+            return;
+        }
+        const path = payload.object.get("path").?.string;
+        var next_manager = try session_manager_mod.SessionManager.open(
+            self.context.session.allocator,
+            self.context.session.io,
+            path,
+            null,
+        );
+        errdefer next_manager.deinit();
+        try self.replaceSessionManager(allocator, &next_manager);
+        try writer.writeAll("{\"status\":\"imported\",\"accepted\":true,\"sessionId\":");
+        try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+        try writeStringField(allocator, writer, "path", path, true);
+        try writer.writeAll(",\"messages\":");
+        try self.writeMessagesResult(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeShareSessionResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        const text = try slash_commands.buildShareText(allocator, self.context.session);
+        defer allocator.free(text);
+        try writer.writeAll("{\"status\":\"prepared\",\"accepted\":true,\"mode\":\"markdown\",\"secretEcho\":false,\"text\":");
+        try writeJsonString(allocator, writer, text);
+        try writeUsizeField(writer, "bytes", text.len, true);
+        try writer.writeAll(",\"message\":\"Share markdown prepared for the WebView clipboard or share sheet\"}");
+    }
+
+    fn writeBashExecuteResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"message\":\"WebView bash is blocked while a prompt is active\"}");
+            return;
+        }
+        const command = payload.object.get("command").?.string;
+        const exclude_from_context = if (payload.object.get("excludeFromContext")) |value| value == .bool and value.bool else false;
+        self.context.session.emitUserBashEvent(command, exclude_from_context) catch {};
+        const tool = bash_tool_mod.BashTool.init(self.context.cwd, self.context.session.io);
+        var result = try tool.execute(allocator, .{ .command = command }, null);
+        defer result.deinit(allocator);
+        const raw_output = try bash_execution.contentBlocksTextAlloc(allocator, result.content);
+        defer allocator.free(raw_output);
+        const output = try bash_execution.sanitizeBashToolOutputForDisplayAlloc(allocator, raw_output);
+        defer allocator.free(output);
+        const exit_code = if (result.details) |details| details.exit_code else null;
+        const truncated = if (result.details) |details| details.truncation != null else false;
+        const full_output_path = if (result.details) |details| details.full_output_path else null;
+        try bash_execution.recordBashExecution(
+            allocator,
+            self.context.session,
+            command,
+            output,
+            exit_code,
+            false,
+            truncated,
+            full_output_path,
+            exclude_from_context,
+        );
+        try writer.writeAll("{\"status\":\"completed\",\"accepted\":true,\"command\":");
+        try writeJsonString(allocator, writer, command);
+        try writer.writeAll(",\"output\":");
+        try writeJsonString(allocator, writer, output);
+        try writer.writeAll(",\"exitCode\":");
+        if (exit_code) |code| {
+            try writer.print("{d}", .{code});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"excludeFromContext\":");
+        try writer.writeAll(if (exclude_from_context) "true" else "false");
+        try writer.writeAll(",\"includedInContext\":");
+        try writer.writeAll(if (exclude_from_context) "false" else "true");
+        try writer.writeAll(",\"truncated\":");
+        try writer.writeAll(if (truncated) "true" else "false");
+        try writer.writeAll(",\"fullOutputPathExposed\":false}");
+    }
+
+    fn writePromptTemplateDispatchResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const name = payload.object.get("name").?.string;
+        const args = if (payload.object.get("args")) |value| if (value == .string) value.string else "" else "";
+        const raw = try std.fmt.allocPrint(allocator, "/{s}{s}{s}", .{ name, if (args.len > 0) " " else "", args });
+        defer allocator.free(raw);
+        const expanded = try resources_mod.expandPromptTemplate(allocator, raw, self.context.prompt_templates);
+        defer allocator.free(expanded);
+        const matched = !std.mem.eql(u8, expanded, raw);
+        try writer.writeAll("{\"status\":");
+        try writeJsonString(allocator, writer, if (matched) "expanded" else "not_found");
+        try writeStringField(allocator, writer, "name", name, true);
+        try writer.writeAll(",\"prompt\":");
+        try writeJsonString(allocator, writer, expanded);
+        try writer.writeAll(",\"dispatch\":\"prompt_text\",\"accepted\":");
+        try writer.writeAll(if (matched) "true" else "false");
+        try writer.writeAll("}");
+    }
+
+    fn writeSkillDispatchResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const name = payload.object.get("name").?.string;
+        const args = if (payload.object.get("args")) |value| if (value == .string) value.string else "" else "";
+        const raw = try std.fmt.allocPrint(allocator, "/skill:{s}{s}{s}", .{ name, if (args.len > 0) " " else "", args });
+        defer allocator.free(raw);
+        const expanded = try resources_mod.expandSkillCommand(allocator, self.context.session.io, raw, self.context.skills);
+        defer allocator.free(expanded);
+        const matched = !std.mem.eql(u8, expanded, raw);
+        try writer.writeAll("{\"status\":");
+        try writeJsonString(allocator, writer, if (matched) "expanded" else "not_found");
+        try writeStringField(allocator, writer, "name", name, true);
+        try writer.writeAll(",\"prompt\":");
+        try writeJsonString(allocator, writer, expanded);
+        try writer.writeAll(",\"dispatch\":\"prompt_text\",\"accepted\":");
+        try writer.writeAll(if (matched) "true" else "false");
+        try writer.writeAll("}");
+    }
+
+    fn writeExtensionCommandDispatchResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        const name = payload.object.get("name").?.string;
+        const args = if (payload.object.get("args")) |value| if (value == .string) value.string else "" else "";
+        const command = self.findExtensionCommand(name) orelse {
+            try writer.writeAll("{\"status\":\"not_found\",\"accepted\":false,\"message\":\"Extension command is not registered for this WebView session\"}");
+            return;
+        };
+        var details = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        defer common.deinitJsonValue(allocator, .{ .object = details });
+        try details.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, command.name) });
+        try details.put(allocator, try allocator.dupe(u8, "invocationName"), .{ .string = try allocator.dupe(u8, command.invocation_name) });
+        try details.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, command.extension_path) });
+        if (args.len > 0) try details.put(allocator, try allocator.dupe(u8, "argument"), .{ .string = try allocator.dupe(u8, args) });
+        _ = try self.context.session.session_manager.appendCustomMessageEntry(
+            "extensionCommand",
+            .{ .text = command.invocation_name },
+            true,
+            .{ .object = details },
+        );
+        try writer.writeAll("{\"status\":\"dispatched\",\"accepted\":true,\"name\":");
+        try writeJsonString(allocator, writer, command.name);
+        try writeStringField(allocator, writer, "invocationName", command.invocation_name, true);
+        try writer.writeAll(",\"permission\":\"extension_command\",\"message\":\"Extension command dispatched through explicit WebView bridge permission\"}");
+    }
+
+    fn findExtensionCommand(self: *const BridgeHost, invocation_name: []const u8) ?WebViewExtensionCommand {
+        for (self.context.extension_commands) |command| {
+            if (std.mem.eql(u8, command.invocation_name, invocation_name) or std.mem.eql(u8, command.name, invocation_name)) return command;
+        }
+        return null;
+    }
+
     fn availableModelForSelection(
         self: *const BridgeHost,
         provider: []const u8,
@@ -2056,7 +2455,7 @@ pub const BridgeHost = struct {
                 ) catch return error.InvalidSessionTarget;
                 session_manager_mod.freeSessionHeader(self.context.session.allocator, &header);
             },
-            .get_state, .get_messages, .prompt, .abort, .get_events => {},
+            .get_state, .get_messages, .prompt, .abort, .get_events, .command_catalog, .copy_session, .export_session, .share_session => {},
             .auth_status => {},
             .start_auth, .save_api_key, .remove_auth => {
                 if (payload) |value| {
@@ -2093,6 +2492,19 @@ pub const BridgeHost = struct {
                 const entry = self.context.session.session_manager.getEntry(entry_id_value.string) orelse return error.InvalidSessionTarget;
                 if (entry.* != .message or entry.message.message != .user) return error.InvalidSessionTarget;
             },
+            .import_session => {
+                const value = payload orelse return error.InvalidSessionTarget;
+                const path_value = value.object.get("path") orelse return error.InvalidSessionTarget;
+                if (path_value != .string or !isValidSessionPath(path_value.string)) return error.InvalidSessionTarget;
+                var header = session_manager_mod.readSessionHeader(
+                    self.context.session.allocator,
+                    self.context.session.io,
+                    path_value.string,
+                ) catch return error.InvalidSessionTarget;
+                session_manager_mod.freeSessionHeader(self.context.session.allocator, &header);
+            },
+            .bash_execute => {},
+            .prompt_template_dispatch, .skill_dispatch, .extension_command_dispatch => {},
         }
     }
 
@@ -2149,7 +2561,49 @@ fn permissionDeniedMessage(permission: Permission) []const u8 {
         .session_mutation => "WebView session mutation requires explicit session mutation permission",
         .auth_mutation => "WebView auth mutation requires explicit auth mutation permission",
         .settings_mutation => "WebView settings/theme/scoped-model mutation requires explicit settings mutation permission",
+        .utility_command => "WebView utility commands require explicit utility command permission",
+        .resource_command => "WebView prompt template and skill dispatch requires explicit resource command permission",
+        .extension_command => "WebView extension command dispatch requires explicit extension command permission",
     };
+}
+
+fn writeHiddenCommandDecision(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    name: []const u8,
+    decision: []const u8,
+    comma: bool,
+) !void {
+    if (comma) try writer.writeAll(",");
+    try writer.writeAll("{");
+    try writeStringField(allocator, writer, "name", name, false);
+    try writeStringField(allocator, writer, "decision", decision, true);
+    try writer.writeAll("}");
+}
+
+fn writeUtilityCommand(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    bridge_command: []const u8,
+    description: []const u8,
+    surface: []const u8,
+    comma: bool,
+) !void {
+    if (comma) try writer.writeAll(",");
+    try writer.writeAll("{");
+    try writeStringField(allocator, writer, "bridgeCommand", bridge_command, false);
+    try writeStringField(allocator, writer, "surface", surface, true);
+    try writeStringField(allocator, writer, "description", description, true);
+    try writer.writeAll("}");
+}
+
+fn canonicalExportFormat(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n.");
+    if (std.ascii.eqlIgnoreCase(trimmed, "html")) return "html";
+    if (std.ascii.eqlIgnoreCase(trimmed, "jsonl")) return "jsonl";
+    if (std.ascii.eqlIgnoreCase(trimmed, "json")) return "json";
+    if (std.ascii.eqlIgnoreCase(trimmed, "md") or std.ascii.eqlIgnoreCase(trimmed, "markdown")) return "md";
+    return null;
 }
 
 fn statusForTerminalOutcome(outcome: []const u8) []const u8 {
@@ -2362,7 +2816,7 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     if (value == .null) return command != .prompt;
     if (value != .object) return false;
     return switch (command) {
-        .get_state, .get_messages, .abort, .get_events, .settings_get, .scoped_models_get, .scoped_models_save, .session_tree_get, .fork_messages_get => true,
+        .get_state, .get_messages, .abort, .get_events, .settings_get, .scoped_models_get, .scoped_models_save, .session_tree_get, .fork_messages_get, .command_catalog, .share_session => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
         .model_select => value.object.get("provider") != null and
             value.object.get("provider").? == .string and
@@ -2393,6 +2847,17 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
             (value.object.get("summarize") == null or value.object.get("summarize").? == .bool) and
             (value.object.get("summaryText") == null or value.object.get("summaryText").? == .string),
         .fork_session => value.object.get("entryId") != null and value.object.get("entryId").? == .string,
+        .copy_session => (value.object.get("scope") == null or value.object.get("scope").? == .string) and
+            (value.object.get("visibleText") == null or value.object.get("visibleText").? == .string),
+        .export_session => (value.object.get("format") == null or value.object.get("format").? == .string) and
+            (value.object.get("path") == null or value.object.get("path").? == .string),
+        .import_session => value.object.get("path") != null and value.object.get("path").? == .string,
+        .bash_execute => value.object.get("command") != null and
+            value.object.get("command").? == .string and
+            (value.object.get("excludeFromContext") == null or value.object.get("excludeFromContext").? == .bool),
+        .prompt_template_dispatch, .skill_dispatch, .extension_command_dispatch => value.object.get("name") != null and
+            value.object.get("name").? == .string and
+            (value.object.get("args") == null or value.object.get("args").? == .string),
     };
 }
 
@@ -3397,7 +3862,7 @@ test "bridge command table exposes approved skeleton commands first" {
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 25), command_table.len);
+    try std.testing.expectEqual(@as(usize, 34), command_table.len);
     try std.testing.expectEqualStrings("new_session", command_table[6].name);
     try std.testing.expectEqual(Command.new_session, command_table[6].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
@@ -3431,7 +3896,7 @@ test "bridge command table exposes auth status and gates auth mutations" {
 }
 
 test "bridge command table exposes settings theme thinking and scoped model commands" {
-    try std.testing.expectEqual(@as(usize, 25), command_table.len);
+    try std.testing.expectEqual(@as(usize, 34), command_table.len);
     try std.testing.expectEqualStrings("settings_get", command_table[13].name);
     try std.testing.expectEqual(Command.settings_get, command_table[13].command);
     try std.testing.expectEqual(Permission.skeleton_chat, command_table[13].permission);
@@ -3450,7 +3915,7 @@ test "bridge command table exposes settings theme thinking and scoped model comm
 }
 
 test "bridge command table exposes session tree label navigation and fork commands" {
-    try std.testing.expectEqual(@as(usize, 25), command_table.len);
+    try std.testing.expectEqual(@as(usize, 34), command_table.len);
     try std.testing.expectEqualStrings("session_tree_get", command_table[20].name);
     try std.testing.expectEqual(Command.session_tree_get, command_table[20].command);
     try std.testing.expectEqual(Permission.skeleton_chat, command_table[20].permission);
@@ -3462,6 +3927,236 @@ test "bridge command table exposes session tree label navigation and fork comman
     try std.testing.expectEqual(Permission.skeleton_chat, command_table[23].permission);
     try std.testing.expectEqualStrings("fork_session", command_table[24].name);
     try std.testing.expectEqual(Permission.session_mutation, command_table[24].permission);
+}
+
+test "bridge command table exposes command and utility surfaces with explicit permissions" {
+    try std.testing.expectEqual(@as(usize, 34), command_table.len);
+    try std.testing.expectEqualStrings("command_catalog", command_table[25].name);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[25].permission);
+    try std.testing.expectEqualStrings("copy_session", command_table[26].name);
+    try std.testing.expectEqual(Permission.utility_command, command_table[26].permission);
+    try std.testing.expectEqualStrings("export_session", command_table[27].name);
+    try std.testing.expectEqual(Permission.utility_command, command_table[27].permission);
+    try std.testing.expectEqualStrings("import_session", command_table[28].name);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[28].permission);
+    try std.testing.expectEqualStrings("share_session", command_table[29].name);
+    try std.testing.expectEqual(Permission.utility_command, command_table[29].permission);
+    try std.testing.expectEqualStrings("bash_execute", command_table[30].name);
+    try std.testing.expectEqual(Permission.utility_command, command_table[30].permission);
+    try std.testing.expectEqualStrings("prompt_template_dispatch", command_table[31].name);
+    try std.testing.expectEqual(Permission.resource_command, command_table[31].permission);
+    try std.testing.expectEqualStrings("skill_dispatch", command_table[32].name);
+    try std.testing.expectEqual(Permission.resource_command, command_table[32].permission);
+    try std.testing.expectEqualStrings("extension_command_dispatch", command_table[33].name);
+    try std.testing.expectEqual(Permission.extension_command, command_table[33].permission);
+}
+
+test "webview command catalog discovers builtins hidden decisions resources and extensions" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    const prompts = [_]resources_mod.PromptTemplate{.{
+        .name = @constCast("review"),
+        .description = @constCast("Review code"),
+        .argument_hint = @constCast("<scope>"),
+        .content = @constCast("Review $@"),
+        .file_path = @constCast("/tmp/review.md"),
+        .source_info = .{
+            .path = @constCast("/tmp/review.md"),
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const skills = [_]resources_mod.Skill{.{
+        .name = @constCast("auditor"),
+        .description = @constCast("Audit safely"),
+        .file_path = @constCast("/tmp/skills/auditor/SKILL.md"),
+        .base_dir = @constCast("/tmp/skills/auditor"),
+        .source_info = .{
+            .path = @constCast("/tmp/skills/auditor/SKILL.md"),
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const extension_commands = [_]WebViewExtensionCommand{.{
+        .name = "say",
+        .invocation_name = "say",
+        .description = "Say from extension",
+        .extension_path = "/tmp/ext.ts",
+    }};
+    bridge.context.prompt_templates = prompts[0..];
+    bridge.context.skills = skills[0..];
+    bridge.context.extension_commands = extension_commands[0..];
+
+    const response = try bridge.handleRequestJson(allocator, "{\"id\":\"catalog\",\"command\":\"command_catalog\"}", trusted_bundle_origin);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"builtins\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"name\":\"help\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"hiddenDecisions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"name\":\"label\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"bridgeCommand\":\"copy_session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"prefix\":\"!!\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"command\":\"/review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"command\":\"/skill:auditor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"invocationName\":\"say\"") != null);
+}
+
+test "webview copy export share and bash utility commands are permissioned and statusful" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    try tmp.dir.createDirPath(std.testing.io, "exports");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+    const export_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "exports", allocator);
+    defer allocator.free(export_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    var user = try makeBridgeTestTextMessage(allocator, "user", "hello", 1, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &user);
+    var assistant = try makeBridgeTestTextMessage(allocator, "assistant", "world", 2, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &assistant);
+    _ = try session.session_manager.appendMessage(user);
+    _ = try session.session_manager.appendMessage(assistant);
+    try session.agent.setMessages(&.{ user, assistant });
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    const denied = try bridge.handleRequestJson(allocator, "{\"id\":\"copy-denied\",\"command\":\"copy_session\",\"payload\":{\"scope\":\"last\"}}", trusted_bundle_origin);
+    defer allocator.free(denied);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "\"code\":\"permission_denied\"") != null);
+
+    bridge.context.permissions.utility_command = true;
+    const copied = try bridge.handleRequestJson(allocator, "{\"id\":\"copy\",\"command\":\"copy_session\",\"payload\":{\"scope\":\"last\"}}", trusted_bundle_origin);
+    defer allocator.free(copied);
+    try std.testing.expect(std.mem.indexOf(u8, copied, "\"status\":\"prepared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied, "\"text\":\"world\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copied, "\"tempPath\":null") != null);
+
+    inline for (.{ "html", "jsonl", "json", "md" }) |format| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/session.{s}", .{ export_dir, format });
+        defer allocator.free(path);
+        var request: std.Io.Writer.Allocating = .init(allocator);
+        defer request.deinit();
+        try request.writer.writeAll("{\"id\":\"export\",\"command\":\"export_session\",\"payload\":{\"format\":");
+        try writeJsonString(allocator, &request.writer, format);
+        try request.writer.writeAll(",\"path\":");
+        try writeJsonString(allocator, &request.writer, path);
+        try request.writer.writeAll("}}");
+        const exported = try bridge.handleRequestJson(allocator, request.written(), trusted_bundle_origin);
+        defer allocator.free(exported);
+        try std.testing.expect(std.mem.indexOf(u8, exported, "\"status\":\"exported\"") != null);
+        const stat = try std.Io.Dir.statFile(.cwd(), std.testing.io, path, .{});
+        try std.testing.expect(stat.size > 0);
+    }
+
+    bridge.context.permissions.session_mutation = true;
+    const import_path = try std.fmt.allocPrint(allocator, "{s}/session.jsonl", .{export_dir});
+    defer allocator.free(import_path);
+    var import_request: std.Io.Writer.Allocating = .init(allocator);
+    defer import_request.deinit();
+    try import_request.writer.writeAll("{\"id\":\"import\",\"command\":\"import_session\",\"payload\":{\"path\":");
+    try writeJsonString(allocator, &import_request.writer, import_path);
+    try import_request.writer.writeAll("}}");
+    const imported = try bridge.handleRequestJson(allocator, import_request.written(), trusted_bundle_origin);
+    defer allocator.free(imported);
+    try std.testing.expect(std.mem.indexOf(u8, imported, "\"status\":\"imported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, imported, "\"messages\"") != null);
+
+    const shared = try bridge.handleRequestJson(allocator, "{\"id\":\"share\",\"command\":\"share_session\"}", trusted_bundle_origin);
+    defer allocator.free(shared);
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"status\":\"prepared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shared, "\"secretEcho\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shared, "Session ") != null);
+
+    const bash = try bridge.handleRequestJson(allocator, "{\"id\":\"bash\",\"command\":\"bash_execute\",\"payload\":{\"command\":\"printf webview-bash\",\"excludeFromContext\":true}}", trusted_bundle_origin);
+    defer allocator.free(bash);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "webview-bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "\"excludeFromContext\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bash, "\"fullOutputPathExposed\":false") != null);
+}
+
+test "webview prompt templates skills and extension commands dispatch through explicit permissions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "skills/auditor");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "skills/auditor/SKILL.md", .data = "---\ndescription: Audit\n---\nUse safe audit steps." });
+    const skill_path = try tmp.dir.realPathFileAlloc(std.testing.io, "skills/auditor/SKILL.md", allocator);
+    defer allocator.free(skill_path);
+    const skill_base = try tmp.dir.realPathFileAlloc(std.testing.io, "skills/auditor", allocator);
+    defer allocator.free(skill_base);
+
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    const prompts = [_]resources_mod.PromptTemplate{.{
+        .name = @constCast("review"),
+        .description = @constCast("Review code"),
+        .argument_hint = @constCast("<scope>"),
+        .content = @constCast("Review $@ now"),
+        .file_path = @constCast("/tmp/review.md"),
+        .source_info = .{
+            .path = @constCast("/tmp/review.md"),
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const skills = [_]resources_mod.Skill{.{
+        .name = @constCast("auditor"),
+        .description = @constCast("Audit safely"),
+        .file_path = skill_path,
+        .base_dir = skill_base,
+        .source_info = .{
+            .path = skill_path,
+            .source = @constCast("test"),
+            .scope = .temporary,
+            .origin = .top_level,
+        },
+    }};
+    const extension_commands = [_]WebViewExtensionCommand{.{
+        .name = "say",
+        .invocation_name = "say",
+        .description = "Say from extension",
+        .extension_path = "/tmp/ext.ts",
+    }};
+    bridge.context.prompt_templates = prompts[0..];
+    bridge.context.skills = skills[0..];
+    bridge.context.extension_commands = extension_commands[0..];
+
+    const denied = try bridge.handleRequestJson(allocator, "{\"id\":\"prompt-denied\",\"command\":\"prompt_template_dispatch\",\"payload\":{\"name\":\"review\",\"args\":\"src\"}}", trusted_bundle_origin);
+    defer allocator.free(denied);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "\"code\":\"permission_denied\"") != null);
+
+    bridge.context.permissions.resource_command = true;
+    bridge.context.permissions.extension_command = true;
+    const prompt = try bridge.handleRequestJson(allocator, "{\"id\":\"prompt\",\"command\":\"prompt_template_dispatch\",\"payload\":{\"name\":\"review\",\"args\":\"src\"}}", trusted_bundle_origin);
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"expanded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Review src now") != null);
+
+    const skill = try bridge.handleRequestJson(allocator, "{\"id\":\"skill\",\"command\":\"skill_dispatch\",\"payload\":{\"name\":\"auditor\",\"args\":\"focus\"}}", trusted_bundle_origin);
+    defer allocator.free(skill);
+    try std.testing.expect(std.mem.indexOf(u8, skill, "\"status\":\"expanded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill, "Use safe audit steps.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill, "focus") != null);
+
+    const ext = try bridge.handleRequestJson(allocator, "{\"id\":\"ext\",\"command\":\"extension_command_dispatch\",\"payload\":{\"name\":\"say\",\"args\":\"hello\"}}", trusted_bundle_origin);
+    defer allocator.free(ext);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "\"status\":\"dispatched\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "\"permission\":\"extension_command\"") != null);
+    var saw_extension_entry = false;
+    for (session.session_manager.getEntries()) |entry| {
+        if (entry == .custom_message and std.mem.eql(u8, entry.custom_message.custom_type, "extensionCommand")) saw_extension_entry = true;
+    }
+    try std.testing.expect(saw_extension_entry);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
