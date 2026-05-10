@@ -130,6 +130,8 @@ PI_WEBVIEW_SMOKE_PROMPT="hello" PI_WEBVIEW_AUTO_CLOSE_MS=1000 ./zig-out/bin/pi -
 
 Responsiveness smoke runs emit `PI_WEBVIEW_TELEMETRY` / `telemetry_mark` timing output for the WebView gate: ready ≤1.5s, submit/user-message feedback ≤100ms, running state ≤200ms, first assistant delta ≤800ms, abort visible state ≤250ms, and no active UI stall >100ms.
 
+WebView mode mirrors the TUI conversation surfaces: assistant answers exclude thinking/reasoning text, thinking is collapsed by default and expandable, and tool calls, tool results, tool errors, and abort states render as distinct surfaces. Model, auth, session, settings, theme, scoped-model, session-tree, fork, and command utility flows are available through WebView-native panels.
+
 ```bash
 cd zig
 PI_WEBVIEW_SMOKE_READY_INPUT=1 PI_WEBVIEW_AUTO_CLOSE_MS=1000 ./zig-out/bin/pi --webview --provider faux --no-session
