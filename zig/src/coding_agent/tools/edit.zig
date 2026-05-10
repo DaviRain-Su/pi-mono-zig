@@ -4,6 +4,11 @@ const common = @import("common.zig");
 const mutation_queue = @import("file_mutation_queue.zig");
 const write_mod = @import("write.zig");
 
+const parseOptionalString = common.parseOptionalString;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 const utf8_bom = "\xEF\xBB\xBF";
 
 pub const Edit = struct {
@@ -315,24 +320,18 @@ fn restoreLineEndings(
     };
 }
 
-fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
-}
-
 fn parseRequiredStringEither(object: std.json.ObjectMap, primary: []const u8, alternate: []const u8) ![]const u8 {
-    if (try parseOptionalString(object, primary)) |value| return value;
-    return (try parseOptionalString(object, alternate)) orelse error.InvalidToolArguments;
+    if (try common.parseOptionalString(object, primary)) |value| return value;
+    return (try common.parseOptionalString(object, alternate)) orelse error.InvalidToolArguments;
 }
 
 fn parseOptionalStringEither(object: std.json.ObjectMap, primary: []const u8, alternate: []const u8) !?[]const u8 {
-    if (try parseOptionalString(object, primary)) |value| return value;
-    return try parseOptionalString(object, alternate);
+    if (try common.parseOptionalString(object, primary)) |value| return value;
+    return try common.parseOptionalString(object, alternate);
 }
 
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
+fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return (try common.parseOptionalString(object, key)) orelse error.InvalidToolArguments;
 }
 
 fn editSchemaEntry(allocator: std.mem.Allocator) !std.json.Value {
@@ -376,26 +375,7 @@ fn schemaArrayProperty(
     return .{ .object = object };
 }
 
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description_text: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    return .{ .object = object };
-}
 
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
 
 const QueuedEditThreadContext = struct {
     path: []const u8,
@@ -814,4 +794,115 @@ test "edit tool validates required arguments" {
     }
 
     try std.testing.expectError(error.InvalidToolArguments, parseArguments(std.testing.allocator, .{ .object = object }));
+}
+
+test "edit tool preserves UTF-8 BOM on round-trip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "bom.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    // Write file with BOM
+    const bom = "\xEF\xBB\xBF";
+    const initial = bom ++ "hello world";
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = relative_path, .data = initial });
+
+    const tool = EditTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .edits = &[_]Edit{.{
+            .old_text = "hello",
+            .new_text = "goodbye",
+        }},
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+
+    // Verify BOM is preserved
+    const updated = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, relative_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(updated);
+    try std.testing.expect(std.mem.startsWith(u8, updated, bom));
+    try std.testing.expect(std.mem.indexOf(u8, updated, "goodbye world") != null);
+}
+
+test "edit tool preserves CRLF line endings on round-trip" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "crlf.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    // Write file with CRLF line endings
+    const initial = "line one\r\nline two\r\nline three";
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = relative_path, .data = initial });
+
+    const tool = EditTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .edits = &[_]Edit{.{
+            .old_text = "line two",
+            .new_text = "LINE TWO",
+        }},
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+
+    // Verify CRLF preserved
+    const updated = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, relative_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "LINE TWO") != null);
+    // No bare LF should exist outside CRLF pairs
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\n\r") == null); // no LF-CR inversions
+}
+
+test "edit tool reports error for empty edits array" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "noedits.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = EditTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .edits = &[_]Edit{},
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "at least one") != null);
+}
+
+test "detectLineEnding identifies CR-only line endings" {
+    try std.testing.expectEqual(LineEnding.cr, detectLineEnding("line one\rline two"));
+    try std.testing.expectEqual(LineEnding.crlf, detectLineEnding("line one\r\nline two"));
+    try std.testing.expectEqual(LineEnding.lf, detectLineEnding("line one\nline two"));
+    try std.testing.expectEqual(LineEnding.lf, detectLineEnding("no line endings"));
+    // CRLF takes precedence over lone CR
+    try std.testing.expectEqual(LineEnding.crlf, detectLineEnding("\r\n\r"));
 }

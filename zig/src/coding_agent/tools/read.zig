@@ -3,6 +3,13 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const parseRequiredString = common.parseRequiredString;
+const parseOptionalString = common.parseOptionalString;
+const getOptionalPositiveInt = common.getOptionalPositiveInt;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 pub const ReadArgs = struct {
     path: []const u8,
     offset: ?usize = null,
@@ -277,43 +284,7 @@ fn formatSize(allocator: std.mem.Allocator, bytes: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d:.1}MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)});
 }
 
-fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
-}
 
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
-fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usize {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer <= 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
-}
-
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description) });
-    return .{ .object = object };
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
 
 test "read tool returns full file contents" {
     var tmp = std.testing.tmpDir(.{});
@@ -447,4 +418,98 @@ test "read tool validates positive offset and limit" {
     });
     try limit_object.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "limit"), .{ .integer = 0 });
     try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = limit_object }));
+}
+
+test "detectImageMime identifies PNG JPEG GIF and WEBP" {
+    // PNG magic bytes
+    try std.testing.expectEqualStrings("image/png", detectImageMime("\x89PNG\r\n\x1a\nrest").?);
+    // JPEG magic bytes
+    try std.testing.expectEqualStrings("image/jpeg", detectImageMime("\xff\xd8\xffmore").?);
+    // GIF87a
+    try std.testing.expectEqualStrings("image/gif", detectImageMime("GIF87a123456").?);
+    // GIF89a
+    try std.testing.expectEqualStrings("image/gif", detectImageMime("GIF89a123456").?);
+    // WEBP
+    try std.testing.expectEqualStrings("image/webp", detectImageMime("RIFF????WEBP").?);
+    // Not an image
+    try std.testing.expect(detectImageMime("plain text") == null);
+    // Too short for PNG
+    try std.testing.expect(detectImageMime("\x89PNG\r\n") == null);
+}
+
+test "read tool returns offset-beyond-end error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "short.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = relative_path, .data = "line1\nline2\n" });
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = ReadTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .offset = 100,
+        .limit = null,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "beyond end") != null);
+}
+
+test "read tool offset and limit select correct range" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "ranged.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const data = "line1\nline2\nline3\nline4\nline5\n";
+    try std.Io.Dir.writeFile(.cwd(), std.testing.io, .{ .sub_path = relative_path, .data = data });
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = ReadTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .offset = 2,
+        .limit = 2,
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    const text = result.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "line2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "line3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "line1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "line4") == null);
+}
+
+test "formatSize formats bytes correctly" {
+    const allocator = std.testing.allocator;
+
+    const b = try formatSize(allocator, 512);
+    defer allocator.free(b);
+    try std.testing.expectEqualStrings("512B", b);
+
+    const kb = try formatSize(allocator, 1536);
+    defer allocator.free(kb);
+    try std.testing.expectEqualStrings("1.5KB", kb);
+
+    const mb = try formatSize(allocator, 2 * 1024 * 1024);
+    defer allocator.free(mb);
+    try std.testing.expectEqualStrings("2.0MB", mb);
 }

@@ -3,6 +3,12 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const mutation_queue = @import("file_mutation_queue.zig");
 
+const parseRequiredString = common.parseRequiredString;
+const parseOptionalString = common.parseOptionalString;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 pub const WriteArgs = struct {
     path: []const u8,
     content: []const u8,
@@ -100,36 +106,7 @@ pub fn parseArguments(args: std.json.Value) !WriteArgs {
     };
 }
 
-fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
-}
 
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description_text: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    return .{ .object = object };
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
 
 const QueuedWriteThreadContext = struct {
     path: []const u8,
@@ -258,4 +235,99 @@ test "write tool validates required arguments" {
     }
 
     try std.testing.expectError(error.InvalidToolArguments, parseArguments(.{ .object = object }));
+}
+
+test "write tool auto-creates nested parent directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "a",
+        "b",
+        "c",
+        "deep.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = WriteTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .content = "deeply nested",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+
+    const read_back = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, relative_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings("deeply nested", read_back);
+}
+
+test "write tool overwrites existing content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "overwrite.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = WriteTool.init(cwd, std.testing.io);
+
+    // Write initial content
+    var result1 = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .content = "initial",
+    });
+    result1.deinit(std.testing.allocator);
+
+    // Overwrite
+    var result2 = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .content = "replaced",
+    });
+    result2.deinit(std.testing.allocator);
+
+    const read_back = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, relative_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings("replaced", read_back);
+}
+
+test "write tool handles empty content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const relative_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "empty.txt",
+    });
+    defer std.testing.allocator.free(relative_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    const tool = WriteTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{
+        .path = relative_path,
+        .content = "",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+
+    const read_back = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, relative_path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings("", read_back);
 }

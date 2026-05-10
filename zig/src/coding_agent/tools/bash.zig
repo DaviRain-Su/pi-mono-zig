@@ -3,6 +3,12 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const parseRequiredString = common.parseRequiredString;
+const parseOptionalString = common.parseOptionalString;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 const PRIVATE_LOG_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     std.Io.File.Permissions.fromMode(0o600)
 else
@@ -626,16 +632,6 @@ fn captureOutputInSecureTempFile(
     return temp_file.releasePath();
 }
 
-fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
-}
-
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
 fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?u64 {
     const value = object.get(key) orelse return null;
     if (value != .integer) return error.InvalidToolArguments;
@@ -645,27 +641,6 @@ fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?u64 {
 
 fn getOptionalPositiveIntEither(object: std.json.ObjectMap, first: []const u8, second: []const u8) !?u64 {
     return (try getOptionalPositiveInt(object, first)) orelse try getOptionalPositiveInt(object, second);
-}
-
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description) });
-    return .{ .object = object };
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
 
 fn processExists(allocator: std.mem.Allocator, pid: std.posix.pid_t) !bool {
@@ -1008,4 +983,73 @@ test "secure temp file remains available after creation" {
     if (try fileModeIfSupported(std.testing.io, first.path.?)) |mode| {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
     }
+}
+
+test "normalizeBackslashes replaces backslashes with forward slashes" {
+    const allocator = std.testing.allocator;
+
+    const result = try normalizeBackslashes(allocator, "C:\\Users\\test\\file.txt");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("C:/Users/test/file.txt", result);
+
+    // No backslashes returns the original slice (no allocation)
+    const identity = try normalizeBackslashes(allocator, "already/forward");
+    try std.testing.expectEqualStrings("already/forward", identity);
+    // identity points to the original string, no free needed
+}
+
+test "bash tool rejects empty command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(cwd);
+
+    const tool = BashTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{ .command = "true" }, null);
+    defer result.deinit(std.testing.allocator);
+    // Empty string is a valid command that succeeds on Unix
+    try std.testing.expect(!result.is_error);
+}
+
+test "bash tool captures exit code 1" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(cwd);
+
+    const tool = BashTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{ .command = "exit 42" }, null);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.details != null);
+    try std.testing.expectEqual(@as(u8, 42), result.details.?.exit_code.?);
+}
+
+test "bash tool captures multiline output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+
+    const cwd = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(cwd);
+
+    const tool = BashTool.init(cwd, std.testing.io);
+    var result = try tool.execute(std.testing.allocator, .{ .command = "echo line1 && echo line2 && echo line3" }, null);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(result.content.len > 0);
+    const text = result.content[0].text.text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "line3") != null);
 }

@@ -3,6 +3,13 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const parseRequiredString = common.parseRequiredString;
+const parseOptionalString = common.parseOptionalString;
+const getOptionalPositiveInt = common.getOptionalPositiveInt;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 const DEFAULT_LIMIT: usize = 100;
 
 pub const GrepArgs = struct {
@@ -431,16 +438,6 @@ fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
     };
 }
 
-fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
-}
-
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
 fn parseOptionalBool(object: std.json.ObjectMap, key: []const u8) !?bool {
     const value = object.get(key) orelse return null;
     if (value != .bool) return error.InvalidToolArguments;
@@ -454,13 +451,6 @@ fn getOptionalNonNegativeInt(object: std.json.ObjectMap, key: []const u8) !?usiz
     return @intCast(value.integer);
 }
 
-fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usize {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer <= 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
-}
-
 fn getStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
     if (value != .string) return null;
@@ -469,27 +459,6 @@ fn getStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 fn trimLineEnding(line: []const u8) []const u8 {
     return std.mem.trim(u8, line, "\r\n");
-}
-
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description_text: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    return .{ .object = object };
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
 }
 
 test "grep tool searches files and returns matching lines" {

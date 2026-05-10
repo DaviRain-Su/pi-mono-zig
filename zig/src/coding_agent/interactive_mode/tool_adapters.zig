@@ -187,13 +187,9 @@ pub fn buildAgentToolsWithExtensionsSelection(
     errdefer if (locked_native_runtimes) |*runtime_set| runtime_set.deinit();
 
     if (extension_options.include_builtin_tools) {
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.ReadTool.name, tools.ReadTool.description, try tools.ReadTool.schema(allocator), runReadTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.BashTool.name, tools.BashTool.description, try tools.BashTool.schema(allocator), runBashTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.WriteTool.name, tools.WriteTool.description, try tools.WriteTool.schema(allocator), runWriteTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.EditTool.name, tools.EditTool.description, try tools.EditTool.schema(allocator), runEditTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.GrepTool.name, tools.GrepTool.description, try tools.GrepTool.schema(allocator), runGrepTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.FindTool.name, tools.FindTool.description, try tools.FindTool.schema(allocator), runFindTool);
-        try appendToolIfEnabled(allocator, &items, app_context, selection, tools.LsTool.name, tools.LsTool.description, try tools.LsTool.schema(allocator), runLsTool);
+        inline for (tools.ALL, 0..) |ToolT, i| {
+            try appendToolIfEnabled(allocator, &items, app_context, selection, ToolT.name, ToolT.description, try ToolT.schema(allocator), BUILTIN_TOOL_EXECUTORS[i]);
+        }
 
         // Load built-in native extensions (subagent)
         if (selection.hasAllowlist() and selection.allowsExtension(subagent.subagent_descriptor.tools[0].name)) {
@@ -1640,6 +1636,16 @@ fn parseEnvU64(env_map: ?*const std.process.Environ.Map, key: []const u8, defaul
 fn getAppContext(tool_context: ?*anyopaque) !*AppContext {
     return @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
 }
+
+const BUILTIN_TOOL_EXECUTORS = [_]agent.types.ExecuteToolFn{
+    runReadTool,
+    runBashTool,
+    runWriteTool,
+    runEditTool,
+    runGrepTool,
+    runFindTool,
+    runLsTool,
+};
 
 fn runReadTool(
     allocator: std.mem.Allocator,

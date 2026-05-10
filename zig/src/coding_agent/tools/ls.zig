@@ -3,6 +3,12 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const parseOptionalString = common.parseOptionalString;
+const getOptionalPositiveInt = common.getOptionalPositiveInt;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 const DEFAULT_LIMIT: usize = 500;
 
 pub const LsArgs = struct {
@@ -285,19 +291,6 @@ fn formatSize(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d:.1}MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)});
 }
 
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
-fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usize {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer <= 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
-}
-
 fn kindLabel(kind: std.Io.File.Kind) []const u8 {
     return switch (kind) {
         .directory => "dir",
@@ -316,27 +309,6 @@ fn lessThanEntryIgnoreCase(_: void, lhs: ListedEntry, rhs: ListedEntry) bool {
         if (left > right) return false;
     }
     return lhs.name.len < rhs.name.len;
-}
-
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description_text: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    return .{ .object = object };
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
 }
 
 test "ls tool lists directory contents with types and sizes" {

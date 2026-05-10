@@ -3,6 +3,12 @@ const ai = @import("ai");
 const common = @import("common.zig");
 const truncate = @import("truncate.zig");
 
+const parseOptionalString = common.parseOptionalString;
+const getOptionalPositiveInt = common.getOptionalPositiveInt;
+const schemaProperty = common.schemaProperty;
+const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
+const jsonObject = common.jsonObject;
+
 const DEFAULT_LIMIT: usize = 1000;
 
 pub const FindArgs = struct {
@@ -295,19 +301,6 @@ fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
     };
 }
 
-fn parseOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    if (value != .string) return error.InvalidToolArguments;
-    return value.string;
-}
-
-fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usize {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer <= 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
-}
-
 fn lessThanIgnoreCase(_: void, lhs: []const u8, rhs: []const u8) bool {
     var index: usize = 0;
     while (index < lhs.len and index < rhs.len) : (index += 1) {
@@ -319,33 +312,12 @@ fn lessThanIgnoreCase(_: void, lhs: []const u8, rhs: []const u8) bool {
     return lhs.len < rhs.len;
 }
 
-fn schemaProperty(
-    allocator: std.mem.Allocator,
-    type_name: []const u8,
-    description_text: []const u8,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    return .{ .object = object };
-}
-
 fn trimResultPath(line: []const u8) []const u8 {
     const without_newline = std.mem.trim(u8, line, "\r\n");
     return if (std.mem.startsWith(u8, without_newline, "./"))
         without_newline[2..]
     else
         without_newline;
-}
-
-fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
-    return try std.json.ObjectMap.init(allocator, &.{}, &.{});
-}
-
-fn makeAbsoluteTestPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(std.testing.io, allocator);
-    defer allocator.free(cwd);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ cwd, relative_path });
 }
 
 test "find tool recursively finds matching files" {

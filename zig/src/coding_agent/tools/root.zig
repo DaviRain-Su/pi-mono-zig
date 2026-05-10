@@ -57,6 +57,26 @@ pub const LsDetails = ls.LsDetails;
 pub const LsExecutionResult = ls.LsExecutionResult;
 pub const LsTool = ls.LsTool;
 
+/// Compile-time list of all built-in tool types, in registration order.
+/// Each entry must expose: name, description, fn schema(), and have an `init(cwd, io)` constructor.
+pub const ALL: []const type = &.{
+    ReadTool,
+    BashTool,
+    WriteTool,
+    EditTool,
+    GrepTool,
+    FindTool,
+    LsTool,
+};
+
+/// Visitor callback invoked once per built-in tool type at comptime.
+/// `ctx` is caller-supplied runtime context; `T` is the tool type.
+pub fn forEach(comptime ctx: anytype, comptime callback: fn (comptime ctx: @TypeOf(ctx), comptime T: type) void) void {
+    inline for (ALL) |T| {
+        callback(ctx, T);
+    }
+}
+
 test {
     _ = @import("common.zig");
     _ = @import("file_mutation_queue.zig");
