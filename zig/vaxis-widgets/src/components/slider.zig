@@ -39,9 +39,6 @@ pub const Slider = struct {
         else
             0;
 
-        const track_width = @min(self.width, @as(usize, window.width));
-        const thumb_pos = @min(track_width - 1, @as(usize, @intFromFloat(val_ratio * @as(f32, @floatFromInt(track_width - 1)))));
-
         // Label
         var col: u16 = 0;
         if (self.label.len > 0) {
@@ -49,6 +46,13 @@ pub const Slider = struct {
             _ = label_window.printSegment(.{ .text = self.label, .style = self.style }, .{ .wrap = .none });
             col += @intCast(@min(ansi.visibleWidth(self.label) + 1, window.width));
         }
+
+        const remaining_width = @as(usize, window.width - col);
+        const track_width = @min(self.width, remaining_width);
+        if (track_width == 0) {
+            return .{ .width = window.width, .height = 1 };
+        }
+        const thumb_pos = @min(track_width - 1, @as(usize, @intFromFloat(val_ratio * @as(f32, @floatFromInt(track_width - 1)))));
 
         const track_window = window.child(.{ .x_off = col, .width = @intCast(track_width) });
 
@@ -141,4 +145,13 @@ test "slider increment and decrement" {
     slider.decrement();
     slider.decrement();
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), slider.value, 0.001);
+}
+
+test "slider zero track width returns without underflow" {
+    const slider = Slider{ .width = 0 };
+
+    var screen = try test_helpers.renderToScreen(slider.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
 }

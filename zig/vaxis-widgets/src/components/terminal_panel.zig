@@ -61,11 +61,17 @@ pub const TerminalPanel = struct {
                 while (idx < line.text.len and col < content_window.width) {
                     const cluster = ansi.nextDisplayCluster(line.text, idx);
                     if (cluster.end <= idx) break;
+                    const width: u16 = @intCast(cluster.width);
+                    if (width == 0) {
+                        idx = cluster.end;
+                        continue;
+                    }
+                    if (col + width > content_window.width) break;
                     content_window.writeCell(col, 0, .{
-                        .char = .{ .grapheme = line.text[idx..cluster.end], .width = @intCast(cluster.width) },
+                        .char = .{ .grapheme = line.text[idx..cluster.end], .width = @intCast(width) },
                         .style = line.style,
                     });
-                    col += @intCast(cluster.width);
+                    col += width;
                     idx = cluster.end;
                 }
             }
@@ -113,4 +119,15 @@ test "terminal panel renders lines with line numbers" {
     try test_helpers.expectCell(&screen, 0, 0, "1", .{ .fg = .{ .index = 8 } });
     try test_helpers.expectCell(&screen, 4, 0, "f", .{ .fg = .{ .index = 82 } });
     try test_helpers.expectCell(&screen, 0, 1, "2", .{ .fg = .{ .index = 8 } });
+}
+
+test "terminal panel does not draw wide grapheme past narrow content" {
+    const lines = &[_]TerminalLine{.{ .text = "你" }};
+    const panel = TerminalPanel{ .lines = lines };
+
+    var screen = try test_helpers.renderToScreen(panel.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

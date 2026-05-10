@@ -48,11 +48,13 @@ pub const MenuBar = struct {
     ) std.mem.Allocator.Error!draw_mod.Size {
         _ = ctx;
         window.clear();
+        if (window.width == 0 or window.height == 0) return .{ .width = window.width, .height = 0 };
 
         var x: u16 = 2;
+        const selected_index = if (self.menus.len == 0) 0 else @min(self.selected_index, self.menus.len - 1);
         for (self.menus, 0..) |menu, i| {
             if (x >= window.width) break;
-            const is_selected = i == self.selected_index;
+            const is_selected = i == selected_index;
             const style = if (is_selected and self.open) self.highlight_style else if (is_selected) self.highlight_style else self.style;
 
             const label = menu.label;
@@ -82,8 +84,8 @@ pub const MenuBar = struct {
         }
 
         // Draw open menu dropdown
-        if (self.open and self.selected_index < self.menus.len) {
-            const menu = self.menus[self.selected_index];
+        if (self.open and selected_index < self.menus.len and window.height > 1) {
+            const menu = self.menus[selected_index];
             const dropdown_width = self.computeDropdownWidth(menu);
             const dropdown_height = @min(menu.items.len + 2, @as(usize, window.height) - 1);
 
@@ -194,6 +196,7 @@ pub const MenuBar = struct {
     }
 
     pub fn handleKey(self: *MenuBar, key: keys.Key) MenuResult {
+        self.clampSelectedMenu();
         if (!self.open) {
             switch (key) {
                 .left => {
@@ -215,13 +218,7 @@ pub const MenuBar = struct {
                 .down, .enter => {
                     if (self.menus.len > 0) {
                         self.open = true;
-                        self.menu_selected_index = 0;
-                        // Skip separators
-                        while (self.menu_selected_index < self.menus[self.selected_index].items.len and
-                            self.menus[self.selected_index].items[self.menu_selected_index].separator)
-                        {
-                            self.menu_selected_index += 1;
-                        }
+                        self.selectFirstMenuItem();
                     }
                     return .ignored;
                 },
@@ -279,14 +276,16 @@ pub const MenuBar = struct {
     }
 
     fn moveMenuSelection(self: *MenuBar, direction: i2) void {
+        self.clampSelectedMenu();
         if (self.selected_index >= self.menus.len) return;
         const menu = self.menus[self.selected_index];
         if (menu.items.len == 0) return;
 
         const count: i32 = @intCast(menu.items.len);
-        var new_idx: i32 = @intCast(self.menu_selected_index);
+        var new_idx: i32 = @intCast(@min(self.menu_selected_index, menu.items.len - 1));
 
-        while (true) {
+        var visited: usize = 0;
+        while (visited < menu.items.len) : (visited += 1) {
             new_idx += direction;
             if (new_idx < 0) new_idx = count - 1;
             if (new_idx >= count) new_idx = 0;
@@ -297,8 +296,26 @@ pub const MenuBar = struct {
                 break;
             }
 
-            // Prevent infinite loop if all items are separators
-            if (idx == self.menu_selected_index) break;
+        }
+    }
+
+    fn clampSelectedMenu(self: *MenuBar) void {
+        if (self.menus.len == 0) {
+            self.selected_index = 0;
+            self.menu_selected_index = 0;
+            return;
+        }
+        self.selected_index = @min(self.selected_index, self.menus.len - 1);
+        self.menu_selected_index = @min(self.menu_selected_index, self.menus[self.selected_index].items.len);
+    }
+
+    fn selectFirstMenuItem(self: *MenuBar) void {
+        self.clampSelectedMenu();
+        if (self.selected_index >= self.menus.len) return;
+        const menu = self.menus[self.selected_index];
+        self.menu_selected_index = 0;
+        while (self.menu_selected_index < menu.items.len and menu.items[self.menu_selected_index].separator) {
+            self.menu_selected_index += 1;
         }
     }
 
@@ -339,6 +356,9 @@ pub const ContextMenu = struct {
 
         const menu_width = self.width orelse self.computeWidth();
         const menu_height = @min(self.items.len + 2, @as(usize, window.height));
+        if (menu_width < 2 or menu_height < 2 or window.width < 2 or window.height < 2) {
+            return .{ .width = @intCast(@min(menu_width, @as(usize, window.width))), .height = @intCast(menu_height) };
+        }
 
         if (menu_width > window.width or menu_height > window.height) {
             return .{ .width = window.width, .height = window.height };
@@ -434,9 +454,10 @@ pub const ContextMenu = struct {
     fn moveSelection(self: *ContextMenu, direction: i2) void {
         if (self.items.len == 0) return;
         const count: i32 = @intCast(self.items.len);
-        var new_idx: i32 = @intCast(self.selected_index);
+        var new_idx: i32 = @intCast(@min(self.selected_index, self.items.len - 1));
 
-        while (true) {
+        var visited: usize = 0;
+        while (visited < self.items.len) : (visited += 1) {
             new_idx += direction;
             if (new_idx < 0) new_idx = count - 1;
             if (new_idx >= count) new_idx = 0;
@@ -446,7 +467,6 @@ pub const ContextMenu = struct {
                 self.selected_index = idx;
                 break;
             }
-            if (idx == self.selected_index) break;
         }
     }
 
@@ -526,4 +546,44 @@ test "context menu renders items with border" {
 
     const result = menu.handleKey(.enter);
     try std.testing.expectEqual(@as(usize, 0), result.selected);
+}
+
+test "menu bar clamps stale selected index before opening" {
+    const menus = &[_]Menu{
+        .{ .label = "File", .items = &[_]MenuItem{.{ .label = "Open" }} },
+    };
+
+    var menu_bar = MenuBar{ .menus = menus, .selected_index = 99 };
+    _ = menu_bar.handleKey(.down);
+
+    try std.testing.expect(menu_bar.open);
+    try std.testing.expectEqual(@as(usize, 0), menu_bar.selected_index);
+    try std.testing.expectEqual(@as(usize, 0), menu_bar.menu_selected_index);
+}
+
+test "menu bar all-separator menu navigation terminates" {
+    const menus = &[_]Menu{
+        .{ .label = "File", .items = &[_]MenuItem{
+            .{ .separator = true },
+            .{ .separator = true },
+        } },
+    };
+
+    var menu_bar = MenuBar{ .menus = menus };
+    _ = menu_bar.handleKey(.down);
+    _ = menu_bar.handleKey(.down);
+    _ = menu_bar.handleKey(.up);
+
+    try std.testing.expect(menu_bar.open);
+    try std.testing.expectEqual(@as(usize, 2), menu_bar.menu_selected_index);
+}
+
+test "context menu handles tiny windows" {
+    const items = &[_]MenuItem{.{ .label = "Copy" }};
+    const menu = ContextMenu{ .items = items, .width = 1 };
+
+    var screen = try test_helpers.renderToScreen(menu.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
 }

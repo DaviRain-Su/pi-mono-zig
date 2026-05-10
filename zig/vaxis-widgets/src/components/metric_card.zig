@@ -58,11 +58,17 @@ pub const MetricCard = struct {
             window.writeCell(@intCast(w - 1), @intCast(h - 1), .{ .char = .{ .grapheme = "┘", .width = 1 }, .style = self.border_style });
         }
 
+        const inner_width = if (self.border) w -| 2 else w;
+        const inner_height = if (self.border) h -| 2 else h;
+        if (inner_width == 0 or inner_height == 0) {
+            return .{ .width = @intCast(w), .height = @intCast(h) };
+        }
+
         const inner = window.child(.{
             .x_off = if (self.border) 1 else 0,
             .y_off = if (self.border) 1 else 0,
-            .width = @intCast(if (self.border) w - 2 else w),
-            .height = @intCast(if (self.border) h - 2 else h),
+            .width = @intCast(inner_width),
+            .height = @intCast(inner_height),
         });
         inner.clear();
 
@@ -127,4 +133,19 @@ test "metric card renders label value and trend" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "42%") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "↑") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "┌") != null);
+}
+
+test "metric card handles tiny bordered windows" {
+    const card = MetricCard{
+        .label = "CPU",
+        .value = "42",
+        .width = 1,
+        .height = 1,
+        .border = true,
+    };
+
+    var screen = try test_helpers.renderToScreen(card.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "┘", .{ .fg = .{ .index = 8 } });
 }

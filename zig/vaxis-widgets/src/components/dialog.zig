@@ -44,8 +44,12 @@ pub const Dialog = struct {
     ) std.mem.Allocator.Error!draw_mod.Size {
         window.clear();
 
-        const dialog_width = self.width orelse @min(60, @as(usize, window.width));
-        const dialog_height = self.computeHeight(dialog_width);
+        const requested_width = self.width orelse @min(60, @as(usize, window.width));
+        const dialog_width = @min(requested_width, @as(usize, window.width));
+        const dialog_height = @min(self.computeHeight(dialog_width), @as(usize, window.height));
+        if (dialog_width == 0 or dialog_height == 0) {
+            return .{ .width = window.width, .height = 0 };
+        }
 
         const x_off = if (window.width > dialog_width) (window.width - dialog_width) / 2 else 0;
         const y_off = if (window.height > dialog_height) (window.height - dialog_height) / 2 else 0;
@@ -69,7 +73,7 @@ pub const Dialog = struct {
         var row: u16 = 0;
 
         // Title
-        if (self.title.len > 0) {
+        if (self.title.len > 0 and row < inner.height) {
             const title_window = inner.child(.{ .y_off = row, .height = 1 });
             title_window.fill(.{
                 .char = .{ .grapheme = " ", .width = 1 },
@@ -80,13 +84,13 @@ pub const Dialog = struct {
         }
 
         // Separator between title and content
-        if (self.title.len > 0 and (self.content_text.len > 0 or self.content != null)) {
+        if (self.title.len > 0 and (self.content_text.len > 0 or self.content != null) and row < inner.height) {
             row += 1;
         }
 
         // Content
         if (self.content) |content| {
-            const content_height = inner.height - row - 2;
+            const content_height = inner.height -| row -| 2;
             if (content_height > 0) {
                 const content_window = inner.child(.{
                     .y_off = row,
@@ -95,7 +99,7 @@ pub const Dialog = struct {
                 _ = try content.draw(content_window, ctx);
             }
         } else if (self.content_text.len > 0) {
-            const content_height = inner.height - row - 2;
+            const content_height = inner.height -| row -| 2;
             if (content_height > 0) {
                 const content_window = inner.child(.{
                     .y_off = row,
@@ -106,7 +110,7 @@ pub const Dialog = struct {
         }
 
         // Buttons at bottom
-        if (self.buttons.len > 0) {
+        if (self.buttons.len > 0 and inner.height > 0) {
             const button_row = inner.height - 1;
             const button_window = inner.child(.{ .y_off = button_row, .height = 1 });
             self.drawButtons(button_window);
@@ -120,6 +124,7 @@ pub const Dialog = struct {
 
     fn drawFrame(self: *const Dialog, window: vaxis.Window) void {
         const style = self.border_style;
+        if (window.width == 0 or window.height == 0) return;
 
         // Top border
         for (0..window.width) |col| {
@@ -138,22 +143,24 @@ pub const Dialog = struct {
         }
 
         // Left and right borders
-        for (1..window.height - 1) |row| {
-            window.writeCell(0, @intCast(row), .{
-                .char = .{ .grapheme = "│", .width = 1 },
-                .style = style,
-            });
-            window.writeCell(window.width - 1, @intCast(row), .{
-                .char = .{ .grapheme = "│", .width = 1 },
-                .style = style,
-            });
+        if (window.height > 2 and window.width > 1) {
+            for (1..window.height - 1) |row| {
+                window.writeCell(0, @intCast(row), .{
+                    .char = .{ .grapheme = "│", .width = 1 },
+                    .style = style,
+                });
+                window.writeCell(window.width - 1, @intCast(row), .{
+                    .char = .{ .grapheme = "│", .width = 1 },
+                    .style = style,
+                });
+            }
         }
 
         // Corners
         window.writeCell(0, 0, .{ .char = .{ .grapheme = "┌", .width = 1 }, .style = style });
-        window.writeCell(window.width - 1, 0, .{ .char = .{ .grapheme = "┐", .width = 1 }, .style = style });
-        window.writeCell(0, window.height - 1, .{ .char = .{ .grapheme = "└", .width = 1 }, .style = style });
-        window.writeCell(window.width - 1, window.height - 1, .{ .char = .{ .grapheme = "┘", .width = 1 }, .style = style });
+        if (window.width > 1) window.writeCell(window.width - 1, 0, .{ .char = .{ .grapheme = "┐", .width = 1 }, .style = style });
+        if (window.height > 1) window.writeCell(0, window.height - 1, .{ .char = .{ .grapheme = "└", .width = 1 }, .style = style });
+        if (window.width > 1 and window.height > 1) window.writeCell(window.width - 1, window.height - 1, .{ .char = .{ .grapheme = "┘", .width = 1 }, .style = style });
     }
 
     fn drawButtons(self: *const Dialog, window: vaxis.Window) void {
@@ -307,4 +314,18 @@ test "dialog handleKey navigates buttons and confirms" {
 
     const esc = dialog.handleKey(.escape);
     try std.testing.expectEqual(DialogResult.dismissed, esc);
+}
+
+test "dialog handles one-row window without underflow" {
+    const dialog = Dialog{
+        .title = "Confirm",
+        .content_text = "Are you sure?",
+        .buttons = &[_]DialogButton{.{ .label = "OK", .id = "ok" }},
+        .width = 20,
+    };
+
+    var screen = try test_helpers.renderToScreen(dialog.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "┌", .{});
 }

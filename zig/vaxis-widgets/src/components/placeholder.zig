@@ -42,14 +42,20 @@ pub const Placeholder = struct {
             while (index < self.icon.len and col < window.width) {
                 const cluster = ansi.nextDisplayCluster(self.icon, index);
                 if (cluster.end <= index) break;
+                const width: u16 = @intCast(cluster.width);
+                if (width == 0) {
+                    index = cluster.end;
+                    continue;
+                }
+                if (col + width > window.width) break;
                 window.writeCell(col, row, .{
                     .char = .{
                         .grapheme = self.icon[index..cluster.end],
-                        .width = @intCast(cluster.width),
+                        .width = @intCast(width),
                     },
                     .style = self.style,
                 });
-                col += @intCast(cluster.width);
+                col += width;
                 index = cluster.end;
             }
             if (self.text.len > 0 and col < window.width) {
@@ -65,14 +71,20 @@ pub const Placeholder = struct {
         while (index < self.text.len and col < window.width) {
             const cluster = ansi.nextDisplayCluster(self.text, index);
             if (cluster.end <= index) break;
+            const width: u16 = @intCast(cluster.width);
+            if (width == 0) {
+                index = cluster.end;
+                continue;
+            }
+            if (col + width > window.width) break;
             window.writeCell(col, row, .{
                 .char = .{
                     .grapheme = self.text[index..cluster.end],
-                    .width = @intCast(cluster.width),
+                    .width = @intCast(width),
                 },
                 .style = self.style,
             });
-            col += @intCast(cluster.width);
+            col += width;
             index = cluster.end;
         }
 
@@ -111,4 +123,14 @@ test "placeholder renders icon and text" {
 
     try test_helpers.expectCell(&screen, 2, 1, "○", .{ .dim = true });
     try test_helpers.expectCell(&screen, 4, 1, "N", .{ .dim = true });
+}
+
+test "placeholder does not draw wide grapheme past narrow window" {
+    const placeholder = Placeholder{ .text = "你" };
+
+    var screen = try test_helpers.renderToScreen(placeholder.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

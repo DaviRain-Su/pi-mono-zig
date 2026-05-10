@@ -110,11 +110,17 @@ pub const LogViewer = struct {
                 while (idx < entry.text.len and ccol < content_window.width) {
                     const cluster = ansi.nextDisplayCluster(entry.text, idx);
                     if (cluster.end <= idx) break;
+                    const width: u16 = @intCast(cluster.width);
+                    if (width == 0) {
+                        idx = cluster.end;
+                        continue;
+                    }
+                    if (ccol + width > content_window.width) break;
                     content_window.writeCell(ccol, 0, .{
-                        .char = .{ .grapheme = entry.text[idx..cluster.end], .width = @intCast(cluster.width) },
+                        .char = .{ .grapheme = entry.text[idx..cluster.end], .width = @intCast(width) },
                         .style = style,
                     });
-                    ccol += @intCast(cluster.width);
+                    ccol += width;
                     idx = cluster.end;
                 }
             }
@@ -176,4 +182,15 @@ test "log viewer renders colored levels" {
     try test_helpers.expectCell(&screen, 0, 0, "I", .{});
     try test_helpers.expectCell(&screen, 0, 1, "E", .{ .fg = .{ .index = 196 } });
     try test_helpers.expectCell(&screen, 0, 2, "W", .{ .fg = .{ .index = 214 } });
+}
+
+test "log viewer does not draw wide grapheme past narrow content" {
+    const entries = &[_]LogEntry{.{ .text = "你", .level = .info }};
+    const viewer = LogViewer{ .entries = entries, .show_level = false };
+
+    var screen = try test_helpers.renderToScreen(viewer.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }

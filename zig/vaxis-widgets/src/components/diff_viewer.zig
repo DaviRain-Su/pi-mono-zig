@@ -105,14 +105,20 @@ pub const DiffViewer = struct {
                 while (idx < line.text.len and col < content_window.width) {
                     const cluster = ansi.nextDisplayCluster(line.text, idx);
                     if (cluster.end <= idx) break;
+                    const width: u16 = @intCast(cluster.width);
+                    if (width == 0) {
+                        idx = cluster.end;
+                        continue;
+                    }
+                    if (col + width > content_window.width) break;
                     content_window.writeCell(col, 0, .{
-                        .char = .{ .grapheme = line.text[idx..cluster.end], .width = @intCast(cluster.width) },
+                        .char = .{ .grapheme = line.text[idx..cluster.end], .width = @intCast(width) },
                         .style = .{
                             .fg = style.fg,
                             .bg = bg_style.bg,
                         },
                     });
-                    col += @intCast(cluster.width);
+                    col += width;
                     idx = cluster.end;
                 }
             }
@@ -148,4 +154,15 @@ test "diff viewer renders added removed and context lines" {
     try test_helpers.expectCell(&screen, 0, 1, "-", .{ .fg = .{ .index = 196 } });
     try test_helpers.expectCell(&screen, 0, 2, "+", .{ .fg = .{ .index = 82 } });
     try test_helpers.expectCell(&screen, 0, 3, " ", .{});
+}
+
+test "diff viewer does not draw wide grapheme past narrow content" {
+    const lines = &[_]DiffLine{.{ .text = "你", .line_type = .added }};
+    const viewer = DiffViewer{ .lines = lines, .show_line_numbers = false, .gutter_width = 0 };
+
+    var screen = try test_helpers.renderToScreen(viewer.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{});
+    try test_helpers.expectNoWideCellOverflow(&screen);
 }
