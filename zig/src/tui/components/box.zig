@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const style_mod = @import("../style.zig");
+const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
 const cell_rows = @import("../cell_rows.zig");
 const resources_mod = @import("../theme.zig");
@@ -35,6 +36,7 @@ pub const Box = struct {
     border_style: BorderStyle = .single,
     corner_style: CornerStyle = .square,
     title: []const u8 = "",
+    title_alignment: layout.AlignItems = .start,
     children: std.ArrayList(draw_mod.Component) = .empty,
 
     pub fn init(padding_x: usize, padding_y: usize) Box {
@@ -79,7 +81,14 @@ pub const Box = struct {
 
         if (self.title.len > 0 and self.border_style != .none and window.width >= 4) {
             const title_style: vaxis.Cell.Style = if (active_theme) |t| style_mod.styleFor(t, .box_border) else .{};
-            const start_col: u16 = 2;
+            const title_width = ansi.visibleWidth(self.title);
+            const max_title_width = @as(usize, window.width) -| 4;
+            const display_width = @min(title_width, max_title_width);
+            const start_col: u16 = switch (self.title_alignment) {
+                .start, .stretch => 2,
+                .center => @intCast(2 + (max_title_width -| display_width) / 2),
+                .end => @intCast(2 + (max_title_width -| display_width)),
+            };
             var col = start_col;
             var index: usize = 0;
             while (index < self.title.len and col < window.width -| 2) {
@@ -345,4 +354,32 @@ test "box renders title on top border" {
     try test_helpers.expectCell(&screen, 2, 0, "T", .{});
     try test_helpers.expectCell(&screen, 5, 0, "t", .{});
     try test_helpers.expectCell(&screen, 13, 0, "┐", .{});
+}
+
+test "box supports centered and right-aligned title" {
+    const text = @import("text.zig").Text{
+        .text = "x",
+        .padding_x = 0,
+        .padding_y = 0,
+    };
+
+    var centered = Box.init(1, 0);
+    defer centered.deinit(std.testing.allocator);
+    centered.title = "A";
+    centered.title_alignment = .center;
+    try centered.addChild(std.testing.allocator, text.drawComponent());
+
+    var centered_screen = try test_helpers.renderToScreen(centered.drawComponent(), 8, 3);
+    defer centered_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&centered_screen, 3, 0, "A", .{});
+
+    var right = Box.init(1, 0);
+    defer right.deinit(std.testing.allocator);
+    right.title = "B";
+    right.title_alignment = .end;
+    try right.addChild(std.testing.allocator, text.drawComponent());
+
+    var right_screen = try test_helpers.renderToScreen(right.drawComponent(), 8, 3);
+    defer right_screen.deinit(std.testing.allocator);
+    try test_helpers.expectCell(&right_screen, 5, 0, "B", .{});
 }
