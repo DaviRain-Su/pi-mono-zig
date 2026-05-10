@@ -33,6 +33,15 @@ pub const State = struct {
     pub fn last(self: *State) void {
         self.position = self.content_length -| 1;
     }
+
+    pub fn clamp(self: *State) void {
+        if (self.content_length == 0) {
+            self.position = 0;
+            return;
+        }
+        const viewport_len = if (self.viewport_content_length > 0) self.viewport_content_length else 1;
+        self.position = @min(self.position, self.content_length -| viewport_len);
+    }
 };
 
 pub const Scrollbar = struct {
@@ -120,8 +129,8 @@ pub const Scrollbar = struct {
     }
 
     fn trackLength(self: *const Scrollbar, window: vaxis.Window) u16 {
-        const begin_len: u16 = if (self.begin_symbol) |s| @intCast(s.len) else 0;
-        const end_len: u16 = if (self.end_symbol) |s| @intCast(s.len) else 0;
+        const begin_len: u16 = if (self.begin_symbol != null) 1 else 0;
+        const end_len: u16 = if (self.end_symbol != null) 1 else 0;
         const arrows = begin_len + end_len;
         if (self.orientation.isVertical()) {
             return window.height -| arrows;
@@ -186,16 +195,16 @@ pub const Scrollbar = struct {
 fn computeParts(track_len: u16, content_len: usize, position: usize, viewport_len: usize) [3]u16 {
     const track = @as(usize, track_len);
     if (track == 0 or content_len == 0) return .{ 0, 0, 0 };
+    if (viewport_len >= content_len) return .{ 0, @intCast(track), 0 };
 
-    const max_pos = content_len -| 1;
+    const max_pos = content_len - viewport_len;
     const pos = @min(position, max_pos);
-    const max_viewport_pos = max_pos + viewport_len;
-    if (max_viewport_pos == 0) return .{ 0, @intCast(track), 0 };
 
-    const thumb = @max(1, roundingDivide(viewport_len * track, max_viewport_pos));
+    const thumb = @max(1, roundingDivide(viewport_len * track, content_len));
     const clamped_thumb = @min(thumb, track);
 
-    const thumb_start = @min(roundingDivide(pos * track, max_viewport_pos), track -| 1);
+    const travel = track - clamped_thumb;
+    const thumb_start = if (max_pos == 0) 0 else @min(roundingDivide(pos * travel, max_pos), travel);
     const track_end = track -| (thumb_start + clamped_thumb);
 
     return .{
@@ -291,4 +300,40 @@ test "scrollbar empty content renders nothing" {
     defer arena.deinit();
     const size = try scrollbar.draw(window, .{ .window = window, .arena = arena.allocator() }, &state);
     try std.testing.expectEqual(@as(u16, 5), size.width);
+}
+
+test "scrollbar fills track when viewport covers content" {
+    const parts = computeParts(10, 5, 0, 5);
+    try std.testing.expectEqual(@as(u16, 0), parts[0]);
+    try std.testing.expectEqual(@as(u16, 10), parts[1]);
+    try std.testing.expectEqual(@as(u16, 0), parts[2]);
+}
+
+test "scrollbar default unicode end symbols consume one cell each" {
+    const allocator = std.testing.allocator;
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 5,
+        .cols = 1,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const scrollbar = Scrollbar{
+        .orientation = .vertical_right,
+    };
+    const state = State{ .content_length = 10, .position = 0, .viewport_content_length = 5 };
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try scrollbar.draw(window, .{ .window = window, .arena = arena.allocator() }, &state);
+
+    const begin = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    const thumb = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
+    const end = screen.readCell(0, 4) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("◄", begin.char.grapheme);
+    try std.testing.expectEqualStrings("█", thumb.char.grapheme);
+    try std.testing.expectEqualStrings("►", end.char.grapheme);
 }

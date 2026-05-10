@@ -130,6 +130,7 @@ pub const LineGauge = vw.LineGauge;
 pub const Paragraph = vw.Paragraph;
 pub const List = vw.List;
 pub const ListItem = vw.ListItem;
+pub const ListState = vw.ListState;
 pub const Chart = vw.Chart;
 pub const Dataset = vw.Dataset;
 pub const Canvas = vw.Canvas;
@@ -230,6 +231,7 @@ test "exports migrated widget aliases" {
     _ = ScrollbarOrientation;
     _ = BarChartBar;
     _ = List;
+    _ = ListState;
     _ = Tree;
     _ = TreeState;
 }

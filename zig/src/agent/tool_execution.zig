@@ -532,7 +532,14 @@ fn runParallelToolTask(task: *ParallelToolTask) void {
         task,
         emitParallelToolUpdate,
     ) catch {
-        task.result = createErrorToolResult(task.arena.allocator(), "Parallel tool execution failed") catch unreachable;
+        task.result = createErrorToolResult(task.arena.allocator(), "Parallel tool execution failed") catch
+            // Arena allocation failed in worker thread — produce a minimal
+            // static error result so the parallel task still reports failure
+            // to the agent loop without crashing.
+            @as(?types.AgentToolResult, .{
+                .content = &.{.{ .text = .{ .text = "Parallel tool execution failed" } }},
+                .is_error = true,
+            });
         task.is_error = true;
         task.completion_order = task.completion_counter.fetchAdd(1, .seq_cst);
         return;

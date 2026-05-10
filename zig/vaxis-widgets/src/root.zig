@@ -37,6 +37,7 @@ pub const Paragraph = @import("components/paragraph.zig").Paragraph;
 pub const List = @import("components/list.zig").List;
 pub const ListWidget = List;
 pub const ListItem = @import("components/list.zig").ListItem;
+pub const ListState = @import("components/list.zig").ListState;
 pub const Chart = @import("components/chart.zig").Chart;
 pub const Dataset = @import("components/chart.zig").Dataset;
 pub const Canvas = @import("components/canvas.zig").Canvas;

@@ -150,10 +150,7 @@ pub const BedrockProvider = struct {
         var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
         errdefer stream_instance.deinit();
 
-        streamProduction(allocator, io, model, context, options, &stream_instance) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => provider_stream.emitSetupRuntimeFailure(&stream_instance, model, options, err),
-        };
+        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
         return stream_instance;
     }
 
