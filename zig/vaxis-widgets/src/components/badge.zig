@@ -12,7 +12,7 @@ pub const Badge = struct {
     overflow_text: []const u8 = "+",
 
     pub fn drawComponent(self: *const Badge) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

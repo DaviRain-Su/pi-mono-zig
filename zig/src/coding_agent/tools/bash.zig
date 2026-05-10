@@ -5,7 +5,6 @@ const truncate = @import("truncate.zig");
 
 const parseRequiredString = common.parseRequiredString;
 const parseOptionalString = common.parseOptionalString;
-const schemaProperty = common.schemaProperty;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -68,14 +67,14 @@ pub fn detailsToJsonValue(allocator: std.mem.Allocator, details: BashDetails) !s
     }
 
     if (details.exit_code) |exit_code| {
-        try object.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = @intCast(exit_code) });
+        try common.putInt(allocator, &object, "exit_code", @intCast(exit_code));
     }
-    try object.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = details.timed_out });
+    try common.putBool(allocator, &object, "timed_out", details.timed_out);
     if (details.full_output_path) |path| {
-        try object.put(allocator, try allocator.dupe(u8, "full_output_path"), .{ .string = try allocator.dupe(u8, path) });
+        try common.putString(allocator, &object, "full_output_path", path);
     }
     if (details.truncation) |truncation_result| {
-        try object.put(allocator, try allocator.dupe(u8, "truncation"), try truncationToJsonValue(allocator, truncation_result));
+        try common.putValue(allocator, &object, "truncation", try truncationToJsonValue(allocator, truncation_result));
     }
 
     return .{ .object = object };
@@ -88,19 +87,19 @@ fn truncationToJsonValue(allocator: std.mem.Allocator, truncation_result: trunca
         common.deinitJsonValue(allocator, value);
     }
 
-    try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, truncation_result.content) });
-    try object.put(allocator, try allocator.dupe(u8, "truncated"), .{ .bool = truncation_result.truncated });
+    try common.putString(allocator, &object, "content", truncation_result.content);
+    try common.putBool(allocator, &object, "truncated", truncation_result.truncated);
     if (truncation_result.truncated_by) |truncated_by| {
-        try object.put(allocator, try allocator.dupe(u8, "truncated_by"), .{ .string = try allocator.dupe(u8, @tagName(truncated_by)) });
+        try common.putString(allocator, &object, "truncated_by", @tagName(truncated_by));
     }
-    try object.put(allocator, try allocator.dupe(u8, "total_lines"), .{ .integer = @intCast(truncation_result.total_lines) });
-    try object.put(allocator, try allocator.dupe(u8, "total_bytes"), .{ .integer = @intCast(truncation_result.total_bytes) });
-    try object.put(allocator, try allocator.dupe(u8, "output_lines"), .{ .integer = @intCast(truncation_result.output_lines) });
-    try object.put(allocator, try allocator.dupe(u8, "output_bytes"), .{ .integer = @intCast(truncation_result.output_bytes) });
-    try object.put(allocator, try allocator.dupe(u8, "last_line_partial"), .{ .bool = truncation_result.last_line_partial });
-    try object.put(allocator, try allocator.dupe(u8, "first_line_exceeds_limit"), .{ .bool = truncation_result.first_line_exceeds_limit });
-    try object.put(allocator, try allocator.dupe(u8, "max_lines"), .{ .integer = @intCast(truncation_result.max_lines) });
-    try object.put(allocator, try allocator.dupe(u8, "max_bytes"), .{ .integer = @intCast(truncation_result.max_bytes) });
+    try common.putInt(allocator, &object, "total_lines", @intCast(truncation_result.total_lines));
+    try common.putInt(allocator, &object, "total_bytes", @intCast(truncation_result.total_bytes));
+    try common.putInt(allocator, &object, "output_lines", @intCast(truncation_result.output_lines));
+    try common.putInt(allocator, &object, "output_bytes", @intCast(truncation_result.output_bytes));
+    try common.putBool(allocator, &object, "last_line_partial", truncation_result.last_line_partial);
+    try common.putBool(allocator, &object, "first_line_exceeds_limit", truncation_result.first_line_exceeds_limit);
+    try common.putInt(allocator, &object, "max_lines", @intCast(truncation_result.max_lines));
+    try common.putInt(allocator, &object, "max_bytes", @intCast(truncation_result.max_bytes));
 
     return .{ .object = object };
 }
@@ -128,36 +127,24 @@ pub const BashTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        errdefer {
-            const value = std.json.Value{ .object = properties };
-            common.deinitJsonValue(allocator, value);
-        }
-
-        try properties.put(allocator, try allocator.dupe(u8, "command"), try schemaProperty(
-            allocator,
-            "string",
-            "Shell command to execute",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "timeout_seconds"), try schemaProperty(
-            allocator,
-            "integer",
-            "Timeout in seconds before the process group is terminated. Accepts either timeout_seconds or timeout.",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "timeout"), try schemaProperty(
-            allocator,
-            "integer",
-            "Alias for timeout_seconds. Timeout in seconds before the process group is terminated.",
-        ));
-
-        var required = std.json.Array.init(allocator);
-        try required.append(.{ .string = try allocator.dupe(u8, "command") });
-
-        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
-        return .{ .object = root };
+        return common.objectSchema(allocator, &.{
+            .{
+                .name = "command",
+                .type_name = "string",
+                .description = "Shell command to execute",
+                .required = true,
+            },
+            .{
+                .name = "timeout_seconds",
+                .type_name = "integer",
+                .description = "Timeout in seconds before the process group is terminated. Accepts either timeout_seconds or timeout.",
+            },
+            .{
+                .name = "timeout",
+                .type_name = "integer",
+                .description = "Alias for timeout_seconds. Timeout in seconds before the process group is terminated.",
+            },
+        });
     }
 
     pub fn execute(

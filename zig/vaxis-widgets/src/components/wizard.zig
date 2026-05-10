@@ -22,10 +22,7 @@ pub const Wizard = struct {
     show_description: bool = false,
 
     pub fn drawComponent(self: *const Wizard) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

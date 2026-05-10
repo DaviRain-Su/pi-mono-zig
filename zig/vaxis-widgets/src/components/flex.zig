@@ -37,10 +37,7 @@ pub const Flex = struct {
     }
 
     pub fn drawComponent(self: *const Flex) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

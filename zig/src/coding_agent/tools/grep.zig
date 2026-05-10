@@ -6,7 +6,6 @@ const truncate = @import("truncate.zig");
 const parseRequiredString = common.parseRequiredString;
 const parseOptionalString = common.parseOptionalString;
 const getOptionalPositiveInt = common.getOptionalPositiveInt;
-const schemaProperty = common.schemaProperty;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -61,56 +60,44 @@ pub const GrepTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        errdefer {
-            const value = std.json.Value{ .object = properties };
-            common.deinitJsonValue(allocator, value);
-        }
-
-        try properties.put(allocator, try allocator.dupe(u8, "pattern"), try schemaProperty(
-            allocator,
-            "string",
-            "Search pattern (regex or literal string)",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "path"), try schemaProperty(
-            allocator,
-            "string",
-            "File or directory to search (defaults to cwd)",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "glob"), try schemaProperty(
-            allocator,
-            "string",
-            "Optional glob filter such as '*.ts' or 'src/**/*.zig'",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "ignoreCase"), try schemaProperty(
-            allocator,
-            "boolean",
-            "Case-insensitive search",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "literal"), try schemaProperty(
-            allocator,
-            "boolean",
-            "Treat pattern as a literal string instead of a regex",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "context"), try schemaProperty(
-            allocator,
-            "integer",
-            "Number of context lines to include before and after each match",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "limit"), try schemaProperty(
-            allocator,
-            "integer",
-            "Maximum number of matches to return",
-        ));
-
-        var required = std.json.Array.init(allocator);
-        try required.append(.{ .string = try allocator.dupe(u8, "pattern") });
-
-        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
-        return .{ .object = root };
+        return common.objectSchema(allocator, &.{
+            .{
+                .name = "pattern",
+                .type_name = "string",
+                .description = "Search pattern (regex or literal string)",
+                .required = true,
+            },
+            .{
+                .name = "path",
+                .type_name = "string",
+                .description = "File or directory to search (defaults to cwd)",
+            },
+            .{
+                .name = "glob",
+                .type_name = "string",
+                .description = "Optional glob filter such as '*.ts' or 'src/**/*.zig'",
+            },
+            .{
+                .name = "ignoreCase",
+                .type_name = "boolean",
+                .description = "Case-insensitive search",
+            },
+            .{
+                .name = "literal",
+                .type_name = "boolean",
+                .description = "Treat pattern as a literal string instead of a regex",
+            },
+            .{
+                .name = "context",
+                .type_name = "integer",
+                .description = "Number of context lines to include before and after each match",
+            },
+            .{
+                .name = "limit",
+                .type_name = "integer",
+                .description = "Maximum number of matches to return",
+            },
+        });
     }
 
     pub fn execute(

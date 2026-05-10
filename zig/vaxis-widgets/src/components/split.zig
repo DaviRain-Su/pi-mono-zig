@@ -16,10 +16,7 @@ pub const Split = struct {
     second: draw_mod.Component,
 
     pub fn drawComponent(self: *const Split) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

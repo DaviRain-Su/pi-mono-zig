@@ -2556,26 +2556,26 @@ fn emptyArrayJsonValue(allocator: std.mem.Allocator) !std.json.Value {
 fn defaultCancellationJsonValue(allocator: std.mem.Allocator) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "propagate"), .{ .bool = true });
+    try common.putBool(allocator, &object, "propagate", true);
     return .{ .object = object };
 }
 
 fn defaultReplayJsonValue(allocator: std.mem.Allocator) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "enabled"), .{ .bool = true });
-    try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "recorded") });
+    try common.putBool(allocator, &object, "enabled", true);
+    try common.putString(allocator, &object, "mode", "recorded");
     return .{ .object = object };
 }
 
 fn defaultChildAgentLimitsJsonValue(allocator: std.mem.Allocator, timeout_ms: u64) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "maxChildren"), .{ .integer = 1 });
-    try object.put(allocator, try allocator.dupe(u8, "maxTurns"), .{ .integer = 1 });
-    try object.put(allocator, try allocator.dupe(u8, "maxToolCalls"), .{ .integer = 0 });
-    try object.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = 0 });
-    try object.put(allocator, try allocator.dupe(u8, "timeoutMs"), .{ .integer = @intCast(timeout_ms) });
+    try common.putInt(allocator, &object, "maxChildren", 1);
+    try common.putInt(allocator, &object, "maxTurns", 1);
+    try common.putInt(allocator, &object, "maxToolCalls", 0);
+    try common.putInt(allocator, &object, "maxTokens", 0);
+    try common.putInt(allocator, &object, "timeoutMs", @intCast(timeout_ms));
     return .{ .object = object };
 }
 

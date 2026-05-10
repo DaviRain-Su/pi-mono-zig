@@ -19,7 +19,7 @@ pub const TerminalPanel = struct {
     max_lines: usize = 0, // 0 = unlimited
 
     pub fn drawComponent(self: *const TerminalPanel) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

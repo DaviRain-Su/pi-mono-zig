@@ -347,22 +347,22 @@ fn makeTestToolDetails(allocator: std.mem.Allocator, exit_code: i64, timed_out: 
         const value: std.json.Value = .{ .object = object };
         common.deinitJsonValue(allocator, value);
     }
-    try object.put(allocator, try allocator.dupe(u8, "exit_code"), .{ .integer = exit_code });
-    try object.put(allocator, try allocator.dupe(u8, "timed_out"), .{ .bool = timed_out });
+    try common.putInt(allocator, &object, "exit_code", exit_code);
+    try common.putBool(allocator, &object, "timed_out", timed_out);
 
     var truncation = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer {
         const value: std.json.Value = .{ .object = truncation };
         common.deinitJsonValue(allocator, value);
     }
-    try truncation.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, "tail output") });
-    try truncation.put(allocator, try allocator.dupe(u8, "truncated"), .{ .bool = true });
-    try truncation.put(allocator, try allocator.dupe(u8, "truncated_by"), .{ .string = try allocator.dupe(u8, "bytes") });
-    try truncation.put(allocator, try allocator.dupe(u8, "total_lines"), .{ .integer = 3000 });
-    try truncation.put(allocator, try allocator.dupe(u8, "output_lines"), .{ .integer = 42 });
+    try common.putString(allocator, &truncation, "content", "tail output");
+    try common.putBool(allocator, &truncation, "truncated", true);
+    try common.putString(allocator, &truncation, "truncated_by", "bytes");
+    try common.putInt(allocator, &truncation, "total_lines", 3000);
+    try common.putInt(allocator, &truncation, "output_lines", 42);
 
-    try object.put(allocator, try allocator.dupe(u8, "full_output_path"), .{ .string = try allocator.dupe(u8, "/tmp/pi-bash-test.log") });
-    try object.put(allocator, try allocator.dupe(u8, "truncation"), .{ .object = truncation });
+    try common.putString(allocator, &object, "full_output_path", "/tmp/pi-bash-test.log");
+    try common.putValue(allocator, &object, "truncation", .{ .object = truncation });
     return .{ .object = object };
 }
 
@@ -529,7 +529,7 @@ test "print mode json includes structured tool details" {
     defer registration.unregister();
 
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try args.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "echo hello") });
+    try common.putString(allocator, &args, "command", "echo hello");
     const args_value = std.json.Value{ .object = args };
     defer common.deinitJsonValue(allocator, args_value);
 
@@ -746,7 +746,7 @@ test "print mode executes tools end to end and prints final answer" {
     defer registration.unregister();
 
     var args = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try args.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, file_path) });
+    try common.putString(allocator, &args, "path", file_path);
     const args_value = std.json.Value{ .object = args };
     defer common.deinitJsonValue(allocator, args_value);
 

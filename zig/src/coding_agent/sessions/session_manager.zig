@@ -725,8 +725,8 @@ pub const SessionManager = struct {
 
         var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         errdefer common.deinitJsonValue(allocator, .{ .object = root });
-        try root.put(allocator, try allocator.dupe(u8, "header"), try headerToJsonValue(allocator, self.header));
-        try root.put(allocator, try allocator.dupe(u8, "entries"), .{ .array = entries });
+        try common.putValue(allocator, &root, "header", try headerToJsonValue(allocator, self.header));
+        try common.putValue(allocator, &root, "entries", .{ .array = entries });
 
         const json_value = std.json.Value{ .object = root };
         defer common.deinitJsonValue(allocator, json_value);

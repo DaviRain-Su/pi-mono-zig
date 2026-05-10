@@ -18,10 +18,7 @@ pub const Calendar = struct {
     show_weekdays: bool = true,
 
     pub fn drawComponent(self: *const Calendar) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

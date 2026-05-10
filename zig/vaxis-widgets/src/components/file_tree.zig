@@ -40,10 +40,7 @@ pub const FileTree = struct {
     show_icons: bool = false,
 
     pub fn drawComponent(self: *const FileTree) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

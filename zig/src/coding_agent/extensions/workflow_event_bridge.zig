@@ -170,7 +170,7 @@ fn workflowCapabilityJsonFromResponse(
             if (details) |value| return try tools_common.cloneJsonValue(allocator, value);
             var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
             errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
-            try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, content[0].text.text) });
+            try tools_common.putString(allocator, &object, "text", content[0].text.text);
             return .{ .object = object };
         }
     }
@@ -495,14 +495,14 @@ fn workflowToolDetails(
     var details = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
     errdefer tools_common.deinitJsonValue(allocator, details);
 
-    try details.object.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, "workflow.execution") });
-    try details.object.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, result.state.jsonName()) });
-    try details.object.put(allocator, try allocator.dupe(u8, "extension"), try processToolExtensionDetails(allocator, context));
-    try details.object.put(allocator, try allocator.dupe(u8, "toolName"), .{ .string = try allocator.dupe(u8, context.tool_name) });
-    try details.object.put(allocator, try allocator.dupe(u8, "toolCallId"), .{ .string = try allocator.dupe(u8, tool_call_id) });
-    try details.object.put(allocator, try allocator.dupe(u8, "input"), try tools_common.cloneJsonValue(allocator, params));
-    try details.object.put(allocator, try allocator.dupe(u8, "workflow"), try workflowMetadataJson(allocator, result));
-    try details.object.put(allocator, try allocator.dupe(u8, "diagnostics"), try workflowDiagnosticsJson(allocator, result.diagnostics.items));
+    try tools_common.putString(allocator, &details.object, "code", "workflow.execution");
+    try tools_common.putString(allocator, &details.object, "state", result.state.jsonName());
+    try tools_common.putValue(allocator, &details.object, "extension", try processToolExtensionDetails(allocator, context));
+    try tools_common.putString(allocator, &details.object, "toolName", context.tool_name);
+    try tools_common.putString(allocator, &details.object, "toolCallId", tool_call_id);
+    try tools_common.putValue(allocator, &details.object, "input", try tools_common.cloneJsonValue(allocator, params));
+    try tools_common.putValue(allocator, &details.object, "workflow", try workflowMetadataJson(allocator, result));
+    try tools_common.putValue(allocator, &details.object, "diagnostics", try workflowDiagnosticsJson(allocator, result.diagnostics.items));
     return details;
 }
 
@@ -510,15 +510,15 @@ pub fn workflowExecutionResultDataJson(allocator: std.mem.Allocator, result: wor
     var data = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
     errdefer tools_common.deinitJsonValue(allocator, data);
 
-    try data.object.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "workflow") });
-    try data.object.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, result.state.jsonName()) });
+    try tools_common.putString(allocator, &data.object, "kind", "workflow");
+    try tools_common.putString(allocator, &data.object, "state", result.state.jsonName());
     if (result.output) |output| {
-        try data.object.put(allocator, try allocator.dupe(u8, "output"), try tools_common.cloneJsonValue(allocator, output));
+        try tools_common.putValue(allocator, &data.object, "output", try tools_common.cloneJsonValue(allocator, output));
     } else {
-        try data.object.put(allocator, try allocator.dupe(u8, "output"), .null);
+        try tools_common.putNull(allocator, &data.object, "output");
     }
-    try data.object.put(allocator, try allocator.dupe(u8, "workflow"), try workflowMetadataJson(allocator, result));
-    try data.object.put(allocator, try allocator.dupe(u8, "diagnostics"), try workflowDiagnosticsJson(allocator, result.diagnostics.items));
+    try tools_common.putValue(allocator, &data.object, "workflow", try workflowMetadataJson(allocator, result));
+    try tools_common.putValue(allocator, &data.object, "diagnostics", try workflowDiagnosticsJson(allocator, result.diagnostics.items));
 
     const json = try std.json.Stringify.valueAlloc(allocator, data, .{});
     tools_common.deinitJsonValue(allocator, data);
@@ -528,55 +528,55 @@ pub fn workflowExecutionResultDataJson(allocator: std.mem.Allocator, result: wor
 fn workflowMetadataJson(allocator: std.mem.Allocator, result: workflow_execution.ExecutionResult) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, result.replay_metadata.workflow_id) });
-    try object.put(allocator, try allocator.dupe(u8, "terminalState"), .{ .string = try allocator.dupe(u8, result.replay_metadata.terminal_state.jsonName()) });
-    try object.put(allocator, try allocator.dupe(u8, "cancellationPoint"), optionalStringValue(allocator, result.replay_metadata.cancellation_point));
-    try object.put(allocator, try allocator.dupe(u8, "permissions"), try tools_common.cloneJsonValue(allocator, result.replay_metadata.permissions));
-    try object.put(allocator, try allocator.dupe(u8, "childAgentLimits"), try workflowChildAgentLimitsJson(allocator, result.replay_metadata.child_agent_limits));
+    try tools_common.putString(allocator, &object, "id", result.replay_metadata.workflow_id);
+    try tools_common.putString(allocator, &object, "terminalState", result.replay_metadata.terminal_state.jsonName());
+    try tools_common.putValue(allocator, &object, "cancellationPoint", optionalStringValue(allocator, result.replay_metadata.cancellation_point));
+    try tools_common.putValue(allocator, &object, "permissions", try tools_common.cloneJsonValue(allocator, result.replay_metadata.permissions));
+    try tools_common.putValue(allocator, &object, "childAgentLimits", try workflowChildAgentLimitsJson(allocator, result.replay_metadata.child_agent_limits));
 
     var steps = std.json.Array.init(allocator);
     for (result.replay_metadata.steps.items) |step| {
         var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try entry.put(allocator, try allocator.dupe(u8, "stepId"), .{ .string = try allocator.dupe(u8, step.step_id) });
-        try entry.put(allocator, try allocator.dupe(u8, "order"), .{ .integer = @intCast(step.order) });
-        try entry.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, step.kind) });
-        try entry.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, step.mode) });
-        try entry.put(allocator, try allocator.dupe(u8, "state"), .{ .string = try allocator.dupe(u8, step.state) });
-        try entry.put(allocator, try allocator.dupe(u8, "input"), try tools_common.cloneJsonValue(allocator, step.input));
-        try entry.put(allocator, try allocator.dupe(u8, "sideEffect"), .{ .bool = step.side_effect });
-        try entry.put(allocator, try allocator.dupe(u8, "selectedCapability"), optionalStringValue(allocator, step.selected_capability));
+        try tools_common.putString(allocator, &entry, "stepId", step.step_id);
+        try tools_common.putInt(allocator, &entry, "order", @intCast(step.order));
+        try tools_common.putString(allocator, &entry, "kind", step.kind);
+        try tools_common.putString(allocator, &entry, "mode", step.mode);
+        try tools_common.putString(allocator, &entry, "state", step.state);
+        try tools_common.putValue(allocator, &entry, "input", try tools_common.cloneJsonValue(allocator, step.input));
+        try tools_common.putBool(allocator, &entry, "sideEffect", step.side_effect);
+        try tools_common.putValue(allocator, &entry, "selectedCapability", optionalStringValue(allocator, step.selected_capability));
         try steps.append(.{ .object = entry });
     }
-    try object.put(allocator, try allocator.dupe(u8, "steps"), .{ .array = steps });
+    try tools_common.putValue(allocator, &object, "steps", .{ .array = steps });
 
     var usage = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try usage.put(allocator, try allocator.dupe(u8, "childrenStarted"), .{ .integer = @intCast(result.child_usage.children_started) });
-    try usage.put(allocator, try allocator.dupe(u8, "turns"), .{ .integer = @intCast(result.child_usage.turns) });
-    try usage.put(allocator, try allocator.dupe(u8, "toolCalls"), .{ .integer = @intCast(result.child_usage.tool_calls) });
-    try usage.put(allocator, try allocator.dupe(u8, "tokens"), .{ .integer = @intCast(result.child_usage.tokens) });
-    try usage.put(allocator, try allocator.dupe(u8, "elapsedMs"), .{ .integer = @intCast(result.child_usage.elapsed_ms) });
-    try object.put(allocator, try allocator.dupe(u8, "childUsage"), .{ .object = usage });
+    try tools_common.putInt(allocator, &usage, "childrenStarted", @intCast(result.child_usage.children_started));
+    try tools_common.putInt(allocator, &usage, "turns", @intCast(result.child_usage.turns));
+    try tools_common.putInt(allocator, &usage, "toolCalls", @intCast(result.child_usage.tool_calls));
+    try tools_common.putInt(allocator, &usage, "tokens", @intCast(result.child_usage.tokens));
+    try tools_common.putInt(allocator, &usage, "elapsedMs", @intCast(result.child_usage.elapsed_ms));
+    try tools_common.putValue(allocator, &object, "childUsage", .{ .object = usage });
     return .{ .object = object };
 }
 
 fn workflowChildAgentLimitsJson(allocator: std.mem.Allocator, limits: workflow_execution.ChildAgentLimits) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer tools_common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "maxChildren"), optionalIntegerValue(limits.max_children));
-    try object.put(allocator, try allocator.dupe(u8, "maxTurns"), optionalIntegerValue(limits.max_turns));
-    try object.put(allocator, try allocator.dupe(u8, "maxToolCalls"), optionalIntegerValue(limits.max_tool_calls));
-    try object.put(allocator, try allocator.dupe(u8, "maxTokens"), optionalIntegerValue(limits.max_tokens));
-    try object.put(allocator, try allocator.dupe(u8, "timeoutMs"), optionalIntegerValue(limits.timeout_ms));
+    try tools_common.putValue(allocator, &object, "maxChildren", optionalIntegerValue(limits.max_children));
+    try tools_common.putValue(allocator, &object, "maxTurns", optionalIntegerValue(limits.max_turns));
+    try tools_common.putValue(allocator, &object, "maxToolCalls", optionalIntegerValue(limits.max_tool_calls));
+    try tools_common.putValue(allocator, &object, "maxTokens", optionalIntegerValue(limits.max_tokens));
+    try tools_common.putValue(allocator, &object, "timeoutMs", optionalIntegerValue(limits.timeout_ms));
     if (limits.permission_grants_json) |permissions| {
-        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), try tools_common.cloneJsonValue(allocator, permissions));
+        try tools_common.putValue(allocator, &object, "permissionGrants", try tools_common.cloneJsonValue(allocator, permissions));
     } else if (limits.workflow_permissions_json) |permissions| {
-        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), try tools_common.cloneJsonValue(allocator, permissions));
+        try tools_common.putValue(allocator, &object, "permissionGrants", try tools_common.cloneJsonValue(allocator, permissions));
     } else {
         var grants = std.json.Array.init(allocator);
         for (limits.permission_grants) |grant| {
             try grants.append(.{ .string = try allocator.dupe(u8, grant) });
         }
-        try object.put(allocator, try allocator.dupe(u8, "permissionGrants"), .{ .array = grants });
+        try tools_common.putValue(allocator, &object, "permissionGrants", .{ .array = grants });
     }
     return .{ .object = object };
 }
@@ -590,11 +590,11 @@ fn workflowDiagnosticsJson(allocator: std.mem.Allocator, diagnostics: []const wo
     var array = std.json.Array.init(allocator);
     for (diagnostics) |diagnostic| {
         var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try entry.put(allocator, try allocator.dupe(u8, "code"), .{ .string = try allocator.dupe(u8, diagnostic.code) });
-        try entry.put(allocator, try allocator.dupe(u8, "workflowId"), .{ .string = try allocator.dupe(u8, diagnostic.workflow_id) });
-        try entry.put(allocator, try allocator.dupe(u8, "stepId"), optionalStringValue(allocator, diagnostic.step_id));
-        try entry.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, diagnostic.path) });
-        try entry.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, diagnostic.message) });
+        try tools_common.putString(allocator, &entry, "code", diagnostic.code);
+        try tools_common.putString(allocator, &entry, "workflowId", diagnostic.workflow_id);
+        try tools_common.putValue(allocator, &entry, "stepId", optionalStringValue(allocator, diagnostic.step_id));
+        try tools_common.putString(allocator, &entry, "path", diagnostic.path);
+        try tools_common.putString(allocator, &entry, "message", diagnostic.message);
         try array.append(.{ .object = entry });
     }
     return .{ .array = array };

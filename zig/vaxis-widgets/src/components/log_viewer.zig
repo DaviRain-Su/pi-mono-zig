@@ -34,10 +34,7 @@ pub const LogViewer = struct {
     trace: ?Scrollbar = null,
 
     pub fn drawComponent(self: *const LogViewer) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

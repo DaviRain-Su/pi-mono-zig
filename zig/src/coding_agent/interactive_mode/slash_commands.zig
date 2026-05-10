@@ -1359,7 +1359,7 @@ fn ensureNestedObject(allocator: std.mem.Allocator, object: *std.json.ObjectMap,
         }
         return &existing.object;
     }
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
+    try common.putValue(allocator, &object, key, .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
     return &object.getPtr(key).?.object;
 }
 
@@ -1369,7 +1369,7 @@ fn putOwnedValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key:
         existing.* = value;
         return;
     }
-    try object.put(allocator, try allocator.dupe(u8, key), value);
+    try common.putValue(allocator, &object, key, value);
 }
 
 fn parseBoolText(value: []const u8) bool {

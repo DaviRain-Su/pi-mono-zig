@@ -95,9 +95,9 @@ pub const EditTool = struct {
         try required.append(.{ .string = try allocator.dupe(u8, "path") });
 
         var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
+        try common.putString(allocator, &root, "type", "object");
+        try common.putValue(allocator, &root, "properties", .{ .object = properties });
+        try common.putValue(allocator, &root, "required", .{ .array = required });
         return .{ .object = root };
     }
 
@@ -335,45 +335,23 @@ fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 
 }
 
 fn editSchemaEntry(allocator: std.mem.Allocator) !std.json.Value {
-    var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer {
-        const value = std.json.Value{ .object = properties };
-        common.deinitJsonValue(allocator, value);
-    }
-
-    try properties.put(allocator, try allocator.dupe(u8, "oldText"), try schemaProperty(
-        allocator,
-        "string",
-        "Exact text to replace. It must match exactly one location in the original file.",
-    ));
-    try properties.put(allocator, try allocator.dupe(u8, "newText"), try schemaProperty(
-        allocator,
-        "string",
-        "Replacement text for the matched block.",
-    ));
-
-    var required = std.json.Array.init(allocator);
-    try required.append(.{ .string = try allocator.dupe(u8, "oldText") });
-    try required.append(.{ .string = try allocator.dupe(u8, "newText") });
-
-    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-    try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-    try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
-    return .{ .object = root };
+    return common.objectSchema(allocator, &.{
+        .{
+            .name = "oldText",
+            .type_name = "string",
+            .description = "Exact text to replace. It must match exactly one location in the original file.",
+            .required = true,
+        },
+        .{
+            .name = "newText",
+            .type_name = "string",
+            .description = "Replacement text for the matched block.",
+            .required = true,
+        },
+    });
 }
 
-fn schemaArrayProperty(
-    allocator: std.mem.Allocator,
-    description_text: []const u8,
-    item_schema: std.json.Value,
-) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "array") });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    try object.put(allocator, try allocator.dupe(u8, "items"), item_schema);
-    return .{ .object = object };
-}
+const schemaArrayProperty = common.schemaArrayProperty;
 
 
 

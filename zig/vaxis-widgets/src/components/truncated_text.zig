@@ -18,10 +18,7 @@ pub const TruncatedText = struct {
     mode: TruncationMode = .end,
 
     pub fn drawComponent(self: *const TruncatedText) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

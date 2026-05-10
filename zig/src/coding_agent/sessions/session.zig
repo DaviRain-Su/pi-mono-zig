@@ -1195,19 +1195,19 @@ fn makeObject(allocator: std.mem.Allocator) !std.json.Value {
 }
 
 fn putString(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
+    try tools_common.putString(allocator, &object, key, value);
 }
 
 fn putBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .bool = value });
+    try tools_common.putBool(allocator, &object, key, value);
 }
 
 fn putInt(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: i64) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .integer = value });
+    try tools_common.putInt(allocator, &object, key, value);
 }
 
 fn putValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), value);
+    try tools_common.putValue(allocator, &object, key, value);
 }
 
 fn jsonObjectWithString(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {

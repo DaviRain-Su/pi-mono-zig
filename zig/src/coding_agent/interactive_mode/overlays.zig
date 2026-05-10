@@ -15,6 +15,7 @@ const model_overlay_mod = @import("model_overlay.zig");
 const tree_overlay_mod = @import("tree_overlay.zig");
 const settings_overlay_mod = @import("settings_overlay.zig");
 const extension_dialog_mod = @import("extension_dialog.zig");
+const overlay_table = @import("overlay_table.zig");
 const settingsResources = shared.settingsResources;
 const blocksToText = formatting.blocksToText;
 const formatAssistantMessage = formatting.formatAssistantMessage;
@@ -104,8 +105,7 @@ pub const InfoOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -165,8 +165,7 @@ pub const ThemeOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -202,8 +201,7 @@ pub const ForkOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -243,8 +241,7 @@ pub const AuthOverlay = struct {
             if (item.description) |description| allocator.free(@constCast(description));
         }
         allocator.free(self.items);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -570,14 +567,7 @@ pub fn appendHotkeyOverlayItem(
     });
 }
 
-pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(item.value);
-        allocator.free(item.label);
-        if (item.description) |description| allocator.free(description);
-    }
-    allocator.free(items);
-}
+pub const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
 pub fn loadSessionOverlay(
     allocator: std.mem.Allocator,

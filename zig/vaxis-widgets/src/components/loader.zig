@@ -30,10 +30,7 @@ pub const Loader = struct {
     padding_y: usize = 0,
 
     pub fn drawComponent(self: *const Loader) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn setMessage(self: *Loader, message: []const u8) void {
@@ -147,10 +144,7 @@ pub const CancellableLoader = struct {
     abort_signal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn drawComponent(self: *const CancellableLoader) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn signal(self: *CancellableLoader) *std.atomic.Value(bool) {

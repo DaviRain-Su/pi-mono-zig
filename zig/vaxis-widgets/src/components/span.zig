@@ -16,7 +16,7 @@ pub const RichText = struct {
     style: vaxis.Cell.Style = .{},
 
     pub fn drawComponent(self: *const RichText) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

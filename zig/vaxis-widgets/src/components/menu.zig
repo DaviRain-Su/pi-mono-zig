@@ -35,10 +35,7 @@ pub const MenuBar = struct {
     separator_style: vaxis.Cell.Style = .{ .fg = .{ .index = 8 } },
 
     pub fn drawComponent(self: *const MenuBar) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(
@@ -340,10 +337,7 @@ pub const ContextMenu = struct {
     width: ?usize = null,
 
     pub fn drawComponent(self: *const ContextMenu) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

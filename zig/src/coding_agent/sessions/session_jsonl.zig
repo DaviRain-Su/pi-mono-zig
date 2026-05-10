@@ -488,13 +488,13 @@ fn deinitToolCall(allocator: std.mem.Allocator, tool_call: ai.ToolCall) void {
 
 pub fn headerToJsonValue(allocator: std.mem.Allocator, header: SessionHeader) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "session") });
-    try object.put(allocator, try allocator.dupe(u8, "version"), .{ .integer = CURRENT_SESSION_VERSION });
-    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, header.id) });
-    try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .string = try allocator.dupe(u8, header.timestamp) });
-    try object.put(allocator, try allocator.dupe(u8, "cwd"), .{ .string = try allocator.dupe(u8, header.cwd) });
+    try common.putString(allocator, &object, "type", "session");
+    try common.putInt(allocator, &object, "version", CURRENT_SESSION_VERSION);
+    try common.putString(allocator, &object, "id", header.id);
+    try common.putString(allocator, &object, "timestamp", header.timestamp);
+    try common.putString(allocator, &object, "cwd", header.cwd);
     if (header.parent_session) |parent_session| {
-        try object.put(allocator, try allocator.dupe(u8, "parentSession"), .{ .string = try allocator.dupe(u8, parent_session) });
+        try common.putString(allocator, &object, "parentSession", parent_session);
     }
     return .{ .object = object };
 }
@@ -503,18 +503,18 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
     return switch (entry) {
         .message => |message_entry| blk: {
             var object = try baseEntryObject(allocator, "message", message_entry.id, message_entry.parent_id, message_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "message"), try messageToJsonValue(allocator, message_entry.message));
+            try common.putValue(allocator, &object, "message", try messageToJsonValue(allocator, message_entry.message));
             break :blk .{ .object = object };
         },
         .thinking_level_change => |thinking_entry| blk: {
             var object = try baseEntryObject(allocator, "thinking_level_change", thinking_entry.id, thinking_entry.parent_id, thinking_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "thinkingLevel"), .{ .string = try allocator.dupe(u8, thinkingLevelToString(thinking_entry.thinking_level)) });
+            try common.putString(allocator, &object, "thinkingLevel", thinkingLevelToString(thinking_entry.thinking_level));
             break :blk .{ .object = object };
         },
         .model_change => |model_entry| blk: {
             var object = try baseEntryObject(allocator, "model_change", model_entry.id, model_entry.parent_id, model_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, model_entry.provider) });
-            try object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model_entry.model_id) });
+            try common.putString(allocator, &object, "provider", model_entry.provider);
+            try common.putString(allocator, &object, "modelId", model_entry.model_id);
             break :blk .{ .object = object };
         },
         .compaction => |compaction_entry| blk: {
@@ -524,7 +524,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
                 try allocator.dupe(u8, "firstKeptEntryId"),
                 .{ .string = try allocator.dupe(u8, compaction_entry.first_kept_entry_id) },
             );
-            try object.put(allocator, try allocator.dupe(u8, "tokensBefore"), .{ .integer = compaction_entry.tokens_before });
+            try common.putInt(allocator, &object, "tokensBefore", compaction_entry.tokens_before);
             try object.put(
                 allocator,
                 try allocator.dupe(u8, "summary"),
@@ -534,37 +534,37 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
         },
         .branch_summary => |branch_summary_entry| blk: {
             var object = try baseEntryObject(allocator, "branch_summary", branch_summary_entry.id, branch_summary_entry.parent_id, branch_summary_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "fromId"), .{ .string = try allocator.dupe(u8, branch_summary_entry.from_id) });
-            try object.put(allocator, try allocator.dupe(u8, "summary"), .{ .string = try allocator.dupe(u8, branch_summary_entry.summary) });
+            try common.putString(allocator, &object, "fromId", branch_summary_entry.from_id);
+            try common.putString(allocator, &object, "summary", branch_summary_entry.summary);
             if (branch_summary_entry.details) |details| {
-                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+                try common.putValue(allocator, &object, "details", try common.cloneJsonValue(allocator, details));
             }
             if (branch_summary_entry.from_hook) |from_hook| {
-                try object.put(allocator, try allocator.dupe(u8, "fromHook"), .{ .bool = from_hook });
+                try common.putBool(allocator, &object, "fromHook", from_hook);
             }
             break :blk .{ .object = object };
         },
         .custom => |custom_entry| blk: {
             var object = try baseEntryObject(allocator, "custom", custom_entry.id, custom_entry.parent_id, custom_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "customType"), .{ .string = try allocator.dupe(u8, custom_entry.custom_type) });
+            try common.putString(allocator, &object, "customType", custom_entry.custom_type);
             if (custom_entry.data) |data| {
-                try object.put(allocator, try allocator.dupe(u8, "data"), try common.cloneJsonValue(allocator, data));
+                try common.putValue(allocator, &object, "data", try common.cloneJsonValue(allocator, data));
             }
             break :blk .{ .object = object };
         },
         .custom_message => |custom_message_entry| blk: {
             var object = try baseEntryObject(allocator, "custom_message", custom_message_entry.id, custom_message_entry.parent_id, custom_message_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "customType"), .{ .string = try allocator.dupe(u8, custom_message_entry.custom_type) });
-            try object.put(allocator, try allocator.dupe(u8, "content"), try customMessageContentToJsonValue(allocator, custom_message_entry.content));
-            try object.put(allocator, try allocator.dupe(u8, "display"), .{ .bool = custom_message_entry.display });
+            try common.putString(allocator, &object, "customType", custom_message_entry.custom_type);
+            try common.putValue(allocator, &object, "content", try customMessageContentToJsonValue(allocator, custom_message_entry.content));
+            try common.putBool(allocator, &object, "display", custom_message_entry.display);
             if (custom_message_entry.details) |details| {
-                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+                try common.putValue(allocator, &object, "details", try common.cloneJsonValue(allocator, details));
             }
             break :blk .{ .object = object };
         },
         .label => |label_entry| blk: {
             var object = try baseEntryObject(allocator, "label", label_entry.id, label_entry.parent_id, label_entry.timestamp);
-            try object.put(allocator, try allocator.dupe(u8, "targetId"), .{ .string = try allocator.dupe(u8, label_entry.target_id) });
+            try common.putString(allocator, &object, "targetId", label_entry.target_id);
             try object.put(
                 allocator,
                 try allocator.dupe(u8, "label"),
@@ -575,9 +575,9 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
         .session_info => |session_info_entry| blk: {
             var object = try baseEntryObject(allocator, "session_info", session_info_entry.id, session_info_entry.parent_id, session_info_entry.timestamp);
             if (session_info_entry.name) |name| {
-                try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
+                try common.putString(allocator, &object, "name", name);
             } else {
-                try object.put(allocator, try allocator.dupe(u8, "name"), .null);
+                try common.putNull(allocator, &object, "name");
             }
             break :blk .{ .object = object };
         },
@@ -604,14 +604,14 @@ fn baseEntryObject(
     timestamp: []const u8,
 ) !std.json.ObjectMap {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, entry_type) });
-    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, id) });
+    try common.putString(allocator, &object, "type", entry_type);
+    try common.putString(allocator, &object, "id", id);
     try object.put(
         allocator,
         try allocator.dupe(u8, "parentId"),
         if (parent_id) |value| .{ .string = try allocator.dupe(u8, value) } else .null,
     );
-    try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .string = try allocator.dupe(u8, timestamp) });
+    try common.putString(allocator, &object, "timestamp", timestamp);
     return object;
 }
 
@@ -619,47 +619,47 @@ fn messageToJsonValue(allocator: std.mem.Allocator, message: agent.AgentMessage)
     return switch (message) {
         .user => |user| blk: {
             var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "user") });
+            try common.putString(allocator, &object, "role", "user");
             if (user.content.len == 1 and user.content[0] == .text) {
-                try object.put(allocator, try allocator.dupe(u8, "content"), .{ .string = try allocator.dupe(u8, user.content[0].text.text) });
+                try common.putString(allocator, &object, "content", user.content[0].text.text);
             } else {
-                try object.put(allocator, try allocator.dupe(u8, "content"), try contentBlocksToJsonValue(allocator, user.content, null));
+                try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, user.content, null));
             }
-            try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .integer = user.timestamp });
+            try common.putInt(allocator, &object, "timestamp", user.timestamp);
             break :blk .{ .object = object };
         },
         .assistant => |assistant| blk: {
             var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "assistant") });
-            try object.put(allocator, try allocator.dupe(u8, "content"), try contentBlocksToJsonValue(allocator, assistant.content, assistant.tool_calls));
-            try object.put(allocator, try allocator.dupe(u8, "api"), .{ .string = try allocator.dupe(u8, assistant.api) });
-            try object.put(allocator, try allocator.dupe(u8, "provider"), .{ .string = try allocator.dupe(u8, assistant.provider) });
-            try object.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, assistant.model) });
+            try common.putString(allocator, &object, "role", "assistant");
+            try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, assistant.content, assistant.tool_calls));
+            try common.putString(allocator, &object, "api", assistant.api);
+            try common.putString(allocator, &object, "provider", assistant.provider);
+            try common.putString(allocator, &object, "model", assistant.model);
             if (assistant.response_id) |response_id| {
-                try object.put(allocator, try allocator.dupe(u8, "responseId"), .{ .string = try allocator.dupe(u8, response_id) });
+                try common.putString(allocator, &object, "responseId", response_id);
             }
             if (assistant.response_model) |response_model| {
-                try object.put(allocator, try allocator.dupe(u8, "responseModel"), .{ .string = try allocator.dupe(u8, response_model) });
+                try common.putString(allocator, &object, "responseModel", response_model);
             }
-            try object.put(allocator, try allocator.dupe(u8, "usage"), try usageToJsonValue(allocator, assistant.usage));
-            try object.put(allocator, try allocator.dupe(u8, "stopReason"), .{ .string = try allocator.dupe(u8, stopReasonToString(assistant.stop_reason)) });
+            try common.putValue(allocator, &object, "usage", try usageToJsonValue(allocator, assistant.usage));
+            try common.putString(allocator, &object, "stopReason", stopReasonToString(assistant.stop_reason));
             if (assistant.error_message) |error_message| {
-                try object.put(allocator, try allocator.dupe(u8, "errorMessage"), .{ .string = try allocator.dupe(u8, error_message) });
+                try common.putString(allocator, &object, "errorMessage", error_message);
             }
-            try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .integer = assistant.timestamp });
+            try common.putInt(allocator, &object, "timestamp", assistant.timestamp);
             break :blk .{ .object = object };
         },
         .tool_result => |tool_result| blk: {
             var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, "toolResult") });
-            try object.put(allocator, try allocator.dupe(u8, "toolCallId"), .{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
-            try object.put(allocator, try allocator.dupe(u8, "toolName"), .{ .string = try allocator.dupe(u8, tool_result.tool_name) });
-            try object.put(allocator, try allocator.dupe(u8, "content"), try contentBlocksToJsonValue(allocator, tool_result.content, null));
+            try common.putString(allocator, &object, "role", "toolResult");
+            try common.putString(allocator, &object, "toolCallId", tool_result.tool_call_id);
+            try common.putString(allocator, &object, "toolName", tool_result.tool_name);
+            try common.putValue(allocator, &object, "content", try contentBlocksToJsonValue(allocator, tool_result.content, null));
             if (tool_result.details) |details| {
-                try object.put(allocator, try allocator.dupe(u8, "details"), try common.cloneJsonValue(allocator, details));
+                try common.putValue(allocator, &object, "details", try common.cloneJsonValue(allocator, details));
             }
-            try object.put(allocator, try allocator.dupe(u8, "isError"), .{ .bool = tool_result.is_error });
-            try object.put(allocator, try allocator.dupe(u8, "timestamp"), .{ .integer = tool_result.timestamp });
+            try common.putBool(allocator, &object, "isError", tool_result.is_error);
+            try common.putInt(allocator, &object, "timestamp", tool_result.timestamp);
             break :blk .{ .object = object };
         },
     };
@@ -676,25 +676,25 @@ fn contentBlocksToJsonValue(
         var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         switch (block) {
             .text => |text| {
-                try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "text") });
-                try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text.text) });
+                try common.putString(allocator, &object, "type", "text");
+                try common.putString(allocator, &object, "text", text.text);
                 if (text.text_signature) |signature| {
-                    try object.put(allocator, try allocator.dupe(u8, "textSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                    try common.putString(allocator, &object, "textSignature", signature);
                 }
             },
             .image => |image| {
-                try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "image") });
-                try object.put(allocator, try allocator.dupe(u8, "data"), .{ .string = try allocator.dupe(u8, image.data) });
-                try object.put(allocator, try allocator.dupe(u8, "mimeType"), .{ .string = try allocator.dupe(u8, image.mime_type) });
+                try common.putString(allocator, &object, "type", "image");
+                try common.putString(allocator, &object, "data", image.data);
+                try common.putString(allocator, &object, "mimeType", image.mime_type);
             },
             .thinking => |thinking| {
-                try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "thinking") });
-                try object.put(allocator, try allocator.dupe(u8, "thinking"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
+                try common.putString(allocator, &object, "type", "thinking");
+                try common.putString(allocator, &object, "thinking", thinking.thinking);
                 if (ai.thinkingSignature(thinking)) |signature| {
-                    try object.put(allocator, try allocator.dupe(u8, "thinkingSignature"), .{ .string = try allocator.dupe(u8, signature) });
+                    try common.putString(allocator, &object, "thinkingSignature", signature);
                 }
                 if (thinking.redacted) {
-                    try object.put(allocator, try allocator.dupe(u8, "redacted"), .{ .bool = true });
+                    try common.putBool(allocator, &object, "redacted", true);
                 }
             },
             .tool_call => |tool_call| {
@@ -727,12 +727,12 @@ fn contentBlocksToJsonValue(
 fn toolCallToJsonValue(allocator: std.mem.Allocator, tool_call: ai.ToolCall) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "toolCall") });
-    try object.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-    try object.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-    try object.put(allocator, try allocator.dupe(u8, "arguments"), try common.cloneJsonValue(allocator, tool_call.arguments));
+    try common.putString(allocator, &object, "type", "toolCall");
+    try common.putString(allocator, &object, "id", tool_call.id);
+    try common.putString(allocator, &object, "name", tool_call.name);
+    try common.putValue(allocator, &object, "arguments", try common.cloneJsonValue(allocator, tool_call.arguments));
     if (tool_call.thought_signature) |signature| {
-        try object.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
+        try common.putString(allocator, &object, "thoughtSignature", signature);
     }
     return .{ .object = object };
 }
@@ -749,19 +749,19 @@ fn customMessageContentToJsonValue(
 
 fn usageToJsonValue(allocator: std.mem.Allocator, usage: ai.Usage) !std.json.Value {
     var cost_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try cost_object.put(allocator, try allocator.dupe(u8, "input"), .{ .float = usage.cost.input });
-    try cost_object.put(allocator, try allocator.dupe(u8, "output"), .{ .float = usage.cost.output });
-    try cost_object.put(allocator, try allocator.dupe(u8, "cacheRead"), .{ .float = usage.cost.cache_read });
-    try cost_object.put(allocator, try allocator.dupe(u8, "cacheWrite"), .{ .float = usage.cost.cache_write });
-    try cost_object.put(allocator, try allocator.dupe(u8, "total"), .{ .float = usage.cost.total });
+    try common.putFloat(allocator, &cost_object, "input", usage.cost.input);
+    try common.putFloat(allocator, &cost_object, "output", usage.cost.output);
+    try common.putFloat(allocator, &cost_object, "cacheRead", usage.cost.cache_read);
+    try common.putFloat(allocator, &cost_object, "cacheWrite", usage.cost.cache_write);
+    try common.putFloat(allocator, &cost_object, "total", usage.cost.total);
 
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "input"), .{ .integer = usage.input });
-    try object.put(allocator, try allocator.dupe(u8, "output"), .{ .integer = usage.output });
-    try object.put(allocator, try allocator.dupe(u8, "cacheRead"), .{ .integer = usage.cache_read });
-    try object.put(allocator, try allocator.dupe(u8, "cacheWrite"), .{ .integer = usage.cache_write });
-    try object.put(allocator, try allocator.dupe(u8, "totalTokens"), .{ .integer = usage.total_tokens });
-    try object.put(allocator, try allocator.dupe(u8, "cost"), .{ .object = cost_object });
+    try common.putInt(allocator, &object, "input", usage.input);
+    try common.putInt(allocator, &object, "output", usage.output);
+    try common.putInt(allocator, &object, "cacheRead", usage.cache_read);
+    try common.putInt(allocator, &object, "cacheWrite", usage.cache_write);
+    try common.putInt(allocator, &object, "totalTokens", usage.total_tokens);
+    try common.putValue(allocator, &object, "cost", .{ .object = cost_object });
     return .{ .object = object };
 }
 

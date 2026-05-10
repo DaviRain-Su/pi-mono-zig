@@ -39,10 +39,7 @@ pub const SelectList = struct {
     unselected_symbol: []const u8 = "  ",
 
     pub fn drawComponent(self: *const SelectList) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn selectedIndex(self: *const SelectList) usize {

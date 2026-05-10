@@ -92,17 +92,17 @@ pub fn bashDetailsJsonValue(
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
 
-    try object.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, command) });
-    try object.put(allocator, try allocator.dupe(u8, "output"), .{ .string = try allocator.dupe(u8, output) });
+    try common.putString(allocator, &object, "command", command);
+    try common.putString(allocator, &object, "output", output);
     if (exit_code) |code| {
-        try object.put(allocator, try allocator.dupe(u8, "exitCode"), .{ .integer = @intCast(code) });
+        try common.putInt(allocator, &object, "exitCode", @intCast(code));
     }
-    try object.put(allocator, try allocator.dupe(u8, "cancelled"), .{ .bool = cancelled });
-    try object.put(allocator, try allocator.dupe(u8, "truncated"), .{ .bool = truncated });
+    try common.putBool(allocator, &object, "cancelled", cancelled);
+    try common.putBool(allocator, &object, "truncated", truncated);
     if (full_output_path) |path| {
-        try object.put(allocator, try allocator.dupe(u8, "fullOutputPath"), .{ .string = try allocator.dupe(u8, path) });
+        try common.putString(allocator, &object, "fullOutputPath", path);
     }
-    try object.put(allocator, try allocator.dupe(u8, "excludeFromContext"), .{ .bool = exclude_from_context });
+    try common.putBool(allocator, &object, "excludeFromContext", exclude_from_context);
 
     return .{ .object = object };
 }

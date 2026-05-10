@@ -58,10 +58,7 @@ pub const Canvas = struct {
     label_style: vaxis.Cell.Style = .{ .dim = true },
 
     pub fn drawComponent(self: *const Canvas) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

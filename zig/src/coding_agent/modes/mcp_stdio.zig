@@ -783,7 +783,7 @@ fn defaultInputSchema(allocator: std.mem.Allocator) !std.json.Value {
         const cleanup_value: std.json.Value = .{ .object = object };
         common.deinitJsonValue(allocator, cleanup_value);
     }
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+    try common.putString(allocator, &object, "type", "object");
     return .{ .object = object };
 }
 

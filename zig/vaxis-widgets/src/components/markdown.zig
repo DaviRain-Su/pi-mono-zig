@@ -60,10 +60,7 @@ pub const Markdown = struct {
     styles: MarkdownStyles = .{},
 
     pub fn drawComponent(self: *const Markdown) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

@@ -118,10 +118,7 @@ pub const Editor = struct {
     }
 
     pub fn drawComponent(self: *const Editor) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn text(self: *const Editor) []const u8 {

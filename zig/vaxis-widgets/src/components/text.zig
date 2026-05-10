@@ -19,10 +19,7 @@ pub const Text = struct {
     alignment: layout.AlignItems = .start,
 
     pub fn drawComponent(self: *const Text) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

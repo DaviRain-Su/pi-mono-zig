@@ -1102,14 +1102,7 @@ pub fn loadEditorAutocompleteItemsWithResources(
     return try items.toOwnedSlice(allocator);
 }
 
-pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(item.value);
-        allocator.free(item.label);
-        if (item.description) |description| allocator.free(description);
-    }
-    allocator.free(items);
-}
+pub const freeOwnedSelectItems = @import("overlay_table.zig").freeOwnedSelectItems;
 
 pub fn pollForInput() !bool {
     if (@import("builtin").os.tag == .windows) {

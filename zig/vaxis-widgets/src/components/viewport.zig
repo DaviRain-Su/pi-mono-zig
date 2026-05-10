@@ -19,10 +19,7 @@ pub const Viewport = struct {
     scrollbar_track: []const u8 = "│",
 
     pub fn drawComponent(self: *const Viewport) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

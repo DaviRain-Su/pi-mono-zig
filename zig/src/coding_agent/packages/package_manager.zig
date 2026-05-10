@@ -334,9 +334,9 @@ fn executeInstall(
         const cleanup: std.json.Value = .{ .object = entry_object };
         common.deinitJsonValue(allocator, cleanup);
     };
-    try entry_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, persisted_source) });
+    try common.putString(allocator, &entry_object, "source", persisted_source);
     if (install_metadata) |metadata| {
-        try entry_object.put(allocator, try allocator.dupe(u8, "installMetadata"), try common.cloneJsonValue(allocator, metadata));
+        try common.putValue(allocator, &entry_object, "installMetadata", try common.cloneJsonValue(allocator, metadata));
     }
     try packages_array_ptr.*.append(.{ .object = entry_object });
     entry_object_owned_by_settings = true;
@@ -463,19 +463,19 @@ fn createInstallMetadataForSource(
     var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = entry });
     const key = try std.fmt.allocPrint(allocator, "local:{s}", .{package_root_real});
-    try entry.put(allocator, try allocator.dupe(u8, "key"), .{ .string = key });
-    try entry.put(allocator, try allocator.dupe(u8, "scope"), .{ .string = try allocator.dupe(u8, if (is_project) "project" else "user") });
+    try common.putValue(allocator, &entry, "key", .{ .string = key });
+    try common.putString(allocator, &entry, "scope", if (is_project) "project" else "user");
 
     var source = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = source });
-    try source.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, if (isLocalSource(persisted_source)) "local" else "package") });
-    try source.put(allocator, try allocator.dupe(u8, "identity"), .{ .string = try allocator.dupe(u8, package_root_real) });
-    try source.put(allocator, try allocator.dupe(u8, "specifier"), .{ .string = try allocator.dupe(u8, persisted_source) });
-    try source.put(allocator, try allocator.dupe(u8, "inputSpecifier"), .{ .string = try allocator.dupe(u8, input_source) });
-    try entry.put(allocator, try allocator.dupe(u8, "source"), .{ .object = source });
+    try common.putString(allocator, &source, "type", if (isLocalSource(persisted_source)) "local" else "package");
+    try common.putString(allocator, &source, "identity", package_root_real);
+    try common.putString(allocator, &source, "specifier", persisted_source);
+    try common.putString(allocator, &source, "inputSpecifier", input_source);
+    try common.putValue(allocator, &entry, "source", .{ .object = source });
 
-    try entry.put(allocator, try allocator.dupe(u8, "packageRoot"), .{ .string = try allocator.dupe(u8, package_root_real) });
-    try entry.put(allocator, try allocator.dupe(u8, "manifestPath"), .{ .string = try allocator.dupe(u8, if (manifest_text != null) manifest_path else package_root) });
+    try common.putString(allocator, &entry, "packageRoot", package_root_real);
+    try common.putString(allocator, &entry, "manifestPath", if (manifest_text != null) manifest_path else package_root);
 
     var manifest = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = manifest });
@@ -494,36 +494,36 @@ fn createInstallMetadataForSource(
                 var manifest_set = try installManifestSetForMetadata(allocator, io, options, is_project, sources[0]);
                 defer manifest_set.deinit(allocator);
                 const record = manifestRecordForPath(manifest_set.records, manifest_path) orelse return null;
-                try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "pi-extension-package") });
-                try manifest.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, record.manifest.schema_version) });
-                try manifest.put(allocator, try allocator.dupe(u8, "id"), .{ .string = try allocator.dupe(u8, record.manifest.id) });
-                try manifest.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, record.manifest.name) });
-                try manifest.put(allocator, try allocator.dupe(u8, "version"), .{ .string = try allocator.dupe(u8, record.manifest.version) });
-                try manifest.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
-                try entry.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
-                try entry.put(allocator, try allocator.dupe(u8, "declarations"), try installManifestDeclarationsValue(allocator, record.manifest));
-                try entry.put(allocator, try allocator.dupe(u8, "installGraph"), try installGraphValue(allocator, manifest_set));
+                try common.putString(allocator, &manifest, "kind", "pi-extension-package");
+                try common.putString(allocator, &manifest, "schemaVersion", record.manifest.schema_version);
+                try common.putString(allocator, &manifest, "id", record.manifest.id);
+                try common.putString(allocator, &manifest, "name", record.manifest.name);
+                try common.putString(allocator, &manifest, "version", record.manifest.version);
+                try common.putString(allocator, &manifest, "runtime", record.manifest.runtime_kind.jsonName());
+                try common.putString(allocator, &entry, "runtime", record.manifest.runtime_kind.jsonName());
+                try common.putValue(allocator, &entry, "declarations", try installManifestDeclarationsValue(allocator, record.manifest));
+                try common.putValue(allocator, &entry, "installGraph", try installGraphValue(allocator, manifest_set));
             } else {
-                try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
-                try manifest.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, version) });
+                try common.putString(allocator, &manifest, "kind", "resource-package");
+                try common.putString(allocator, &manifest, "schemaVersion", version);
             }
         } else {
-            try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
+            try common.putString(allocator, &manifest, "kind", "resource-package");
         }
     } else {
-        try manifest.put(allocator, try allocator.dupe(u8, "kind"), .{ .string = try allocator.dupe(u8, "resource-package") });
+        try common.putString(allocator, &manifest, "kind", "resource-package");
     }
-    try entry.put(allocator, try allocator.dupe(u8, "manifest"), .{ .object = manifest });
+    try common.putValue(allocator, &entry, "manifest", .{ .object = manifest });
 
     var digests = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = digests });
-    try digests.put(allocator, try allocator.dupe(u8, "packageRootSha256"), .{ .string = try allocator.dupe(u8, package_root_sha256) });
+    try common.putString(allocator, &digests, "packageRootSha256", package_root_sha256);
     if (manifest_text) |text| {
         const manifest_sha256 = try sha256HexAlloc(allocator, text);
         defer allocator.free(manifest_sha256);
-        try digests.put(allocator, try allocator.dupe(u8, "manifestSha256"), .{ .string = try allocator.dupe(u8, manifest_sha256) });
+        try common.putString(allocator, &digests, "manifestSha256", manifest_sha256);
     }
-    try entry.put(allocator, try allocator.dupe(u8, "digests"), .{ .object = digests });
+    try common.putValue(allocator, &entry, "digests", .{ .object = digests });
     return .{ .object = entry };
 }
 
@@ -562,12 +562,12 @@ fn manifestRecordForPath(records: []const extension_manifest.ManifestRecord, man
 fn installManifestDeclarationsValue(allocator: std.mem.Allocator, manifest: extension_manifest.NormalizedManifest) !std.json.Value {
     var declarations = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = declarations });
-    try declarations.put(allocator, try allocator.dupe(u8, "tools"), try common.cloneJsonValue(allocator, manifest.tools));
-    try declarations.put(allocator, try allocator.dupe(u8, "hooks"), try common.cloneJsonValue(allocator, manifest.hooks));
-    try declarations.put(allocator, try allocator.dupe(u8, "capabilities"), try common.cloneJsonValue(allocator, manifest.capabilities));
-    try declarations.put(allocator, try allocator.dupe(u8, "permissions"), try common.cloneJsonValue(allocator, manifest.permissions));
-    try declarations.put(allocator, try allocator.dupe(u8, "dependencies"), try common.cloneJsonValue(allocator, manifest.dependencies));
-    try declarations.put(allocator, try allocator.dupe(u8, "workflows"), try common.cloneJsonValue(allocator, manifest.workflows));
+    try common.putValue(allocator, &declarations, "tools", try common.cloneJsonValue(allocator, manifest.tools));
+    try common.putValue(allocator, &declarations, "hooks", try common.cloneJsonValue(allocator, manifest.hooks));
+    try common.putValue(allocator, &declarations, "capabilities", try common.cloneJsonValue(allocator, manifest.capabilities));
+    try common.putValue(allocator, &declarations, "permissions", try common.cloneJsonValue(allocator, manifest.permissions));
+    try common.putValue(allocator, &declarations, "dependencies", try common.cloneJsonValue(allocator, manifest.dependencies));
+    try common.putValue(allocator, &declarations, "workflows", try common.cloneJsonValue(allocator, manifest.workflows));
     return .{ .object = declarations };
 }
 
@@ -619,8 +619,8 @@ fn writeExtensionProvenanceLockEntry(
 
     var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = root });
-    try root.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, provenance_lockfile.LOCK_SCHEMA_VERSION) });
-    try root.put(allocator, try allocator.dupe(u8, "entries"), .{ .array = entries });
+    try common.putString(allocator, &root, "schemaVersion", provenance_lockfile.LOCK_SCHEMA_VERSION);
+    try common.putValue(allocator, &root, "entries", .{ .array = entries });
     const value = std.json.Value{ .object = root };
     defer common.deinitJsonValue(allocator, value);
     const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
@@ -3119,7 +3119,7 @@ fn addPolicyToSettings(
 
     var policy = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = policy });
-    try policy.put(allocator, try allocator.dupe(u8, "approvedGrants"), .{ .array = approved_grants });
+    try common.putValue(allocator, &policy, "approvedGrants", .{ .array = approved_grants });
     try policies_ptr.put(
         allocator,
         try allocator.dupe(u8, policy_key),

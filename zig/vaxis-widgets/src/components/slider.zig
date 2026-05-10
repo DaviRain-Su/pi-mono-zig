@@ -20,10 +20,7 @@ pub const Slider = struct {
     thumb_style: vaxis.Cell.Style = .{ .fg = .{ .index = 39 } },
 
     pub fn drawComponent(self: *const Slider) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

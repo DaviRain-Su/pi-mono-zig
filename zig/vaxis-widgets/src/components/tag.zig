@@ -11,7 +11,7 @@ pub const Tag = struct {
     right_delim: []const u8 = "]",
 
     pub fn drawComponent(self: *const Tag) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(
@@ -87,7 +87,7 @@ pub const TagGroup = struct {
     style: vaxis.Cell.Style = .{},
 
     pub fn drawComponent(self: *const TagGroup) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

@@ -33,10 +33,7 @@ pub const DiffViewer = struct {
     gutter_width: usize = 1,
 
     pub fn drawComponent(self: *const DiffViewer) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

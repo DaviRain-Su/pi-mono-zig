@@ -71,8 +71,8 @@ pub fn schemaProperty(
     description: []const u8,
 ) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, type_name) });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description) });
+    try putString(allocator, &object, "type", type_name);
+    try putString(allocator, &object, "description", description);
     return .{ .object = object };
 }
 
@@ -94,21 +94,17 @@ pub fn objectSchema(allocator: std.mem.Allocator, comptime fields: []const Schem
     errdefer required.deinit();
 
     inline for (fields) |field| {
-        try properties.put(
-            allocator,
-            try allocator.dupe(u8, field.name),
-            try schemaProperty(allocator, field.type_name, field.description),
-        );
+        try putValue(allocator, &properties, field.name, try schemaProperty(allocator, field.type_name, field.description));
         if (field.required) {
             try required.append(.{ .string = try allocator.dupe(u8, field.name) });
         }
     }
 
     var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-    try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
+    try putString(allocator, &root, "type", "object");
+    try putValue(allocator, &root, "properties", .{ .object = properties });
     if (required.items.len > 0) {
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
+        try putValue(allocator, &root, "required", .{ .array = required });
     } else {
         required.deinit();
     }
@@ -125,9 +121,9 @@ pub fn schemaArrayProperty(
         const value = std.json.Value{ .object = object };
         deinitJsonValue(allocator, value);
     }
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "array") });
-    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
-    try object.put(allocator, try allocator.dupe(u8, "items"), item_schema);
+    try putString(allocator, &object, "type", "array");
+    try putString(allocator, &object, "description", description_text);
+    try putValue(allocator, &object, "items", item_schema);
     return .{ .object = object };
 }
 
@@ -151,6 +147,16 @@ pub fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?usi
 pub fn jsonObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return try std.json.ObjectMap.init(allocator, &.{}, &.{});
 }
+
+/// JSON ObjectMap put helpers re-exported from coding_agent.json_utils.
+/// Tools historically used this module; non-tool callers should import json_utils directly.
+const json_utils = @import("../json_utils.zig");
+pub const putString = json_utils.putString;
+pub const putBool = json_utils.putBool;
+pub const putInt = json_utils.putInt;
+pub const putFloat = json_utils.putFloat;
+pub const putNull = json_utils.putNull;
+pub const putValue = json_utils.putValue;
 
 /// Test helpers — only available in test builds.
 /// Resolves a relative test path against the current working directory.

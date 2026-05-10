@@ -12,7 +12,7 @@ pub const IndeterminateProgress = struct {
     tail_chars: []const u8 = "◀",
 
     pub fn drawComponent(self: *const IndeterminateProgress) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(
@@ -61,7 +61,7 @@ pub const Spinner = struct {
     style: vaxis.Cell.Style = .{ .fg = .{ .index = 39 } },
 
     pub fn drawComponent(self: *const Spinner) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

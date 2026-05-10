@@ -326,7 +326,7 @@ fn cloneStoredCredentialObject(
             try common.cloneJsonValue(allocator, entry.value_ptr.*),
         );
     }
-    try cloned.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, auth_type) });
+    try common.putString(allocator, &cloned, "type", auth_type);
     return .{ .object = cloned };
 }
 
@@ -340,8 +340,8 @@ fn makeApiKeyCredentialObject(
         common.deinitJsonValue(allocator, cleanup_value);
     }
 
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "api_key") });
-    try object.put(allocator, try allocator.dupe(u8, "key"), .{ .string = try allocator.dupe(u8, key) });
+    try common.putString(allocator, &object, "type", "api_key");
+    try common.putString(allocator, &object, "key", key);
     return .{ .object = object };
 }
 

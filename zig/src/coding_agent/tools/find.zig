@@ -5,7 +5,6 @@ const truncate = @import("truncate.zig");
 
 const parseOptionalString = common.parseOptionalString;
 const getOptionalPositiveInt = common.getOptionalPositiveInt;
-const schemaProperty = common.schemaProperty;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -56,36 +55,24 @@ pub const FindTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        errdefer {
-            const value = std.json.Value{ .object = properties };
-            common.deinitJsonValue(allocator, value);
-        }
-
-        try properties.put(allocator, try allocator.dupe(u8, "pattern"), try schemaProperty(
-            allocator,
-            "string",
-            "Glob pattern such as '*.ts' or 'src/**/*.zig'",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "path"), try schemaProperty(
-            allocator,
-            "string",
-            "Directory to search (defaults to cwd)",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "limit"), try schemaProperty(
-            allocator,
-            "integer",
-            "Maximum number of files to return",
-        ));
-
-        var required = std.json.Array.init(allocator);
-        try required.append(.{ .string = try allocator.dupe(u8, "pattern") });
-
-        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
-        return .{ .object = root };
+        return common.objectSchema(allocator, &.{
+            .{
+                .name = "pattern",
+                .type_name = "string",
+                .description = "Glob pattern such as '*.ts' or 'src/**/*.zig'",
+                .required = true,
+            },
+            .{
+                .name = "path",
+                .type_name = "string",
+                .description = "Directory to search (defaults to cwd)",
+            },
+            .{
+                .name = "limit",
+                .type_name = "integer",
+                .description = "Maximum number of files to return",
+            },
+        });
     }
 
     pub fn execute(

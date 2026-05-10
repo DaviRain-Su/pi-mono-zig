@@ -17,10 +17,7 @@ pub const Breadcrumbs = struct {
     last_style: vaxis.Cell.Style = .{ .bold = true },
 
     pub fn drawComponent(self: *const Breadcrumbs) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

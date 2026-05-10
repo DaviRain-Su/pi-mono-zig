@@ -5,7 +5,6 @@ const truncate = @import("truncate.zig");
 
 const parseOptionalString = common.parseOptionalString;
 const getOptionalPositiveInt = common.getOptionalPositiveInt;
-const schemaProperty = common.schemaProperty;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -55,27 +54,18 @@ pub const LsTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        errdefer {
-            const value = std.json.Value{ .object = properties };
-            common.deinitJsonValue(allocator, value);
-        }
-
-        try properties.put(allocator, try allocator.dupe(u8, "path"), try schemaProperty(
-            allocator,
-            "string",
-            "Directory to list (defaults to cwd)",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "limit"), try schemaProperty(
-            allocator,
-            "integer",
-            "Maximum number of directory entries to return",
-        ));
-
-        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        return .{ .object = root };
+        return common.objectSchema(allocator, &.{
+            .{
+                .name = "path",
+                .type_name = "string",
+                .description = "Directory to list (defaults to cwd)",
+            },
+            .{
+                .name = "limit",
+                .type_name = "integer",
+                .description = "Maximum number of directory entries to return",
+            },
+        });
     }
 
     pub fn execute(

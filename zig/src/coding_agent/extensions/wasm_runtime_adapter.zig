@@ -179,9 +179,9 @@ fn runtimeHookMutationResult(
     } else "";
     const mutated = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ input_text, runtime_name });
     errdefer allocator.free(mutated);
-    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = mutated });
-    try object.put(allocator, try allocator.dupe(u8, "runtime"), .{ .string = try allocator.dupe(u8, runtime_name) });
-    try object.put(allocator, try allocator.dupe(u8, "extensionId"), .{ .string = try allocator.dupe(u8, extension_id) });
+    try tools_common.putValue(allocator, &object, "text", .{ .string = mutated });
+    try tools_common.putString(allocator, &object, "runtime", runtime_name);
+    try tools_common.putString(allocator, &object, "extensionId", extension_id);
     return .{ .object = object };
 }
 
@@ -689,7 +689,7 @@ fn putOptionalJsonString(
     if (value) |text| {
         try putJsonString(allocator, object, key, text);
     } else {
-        try object.put(allocator, try allocator.dupe(u8, key), .null);
+        try tools_common.putNull(allocator, &object, key);
     }
 }
 

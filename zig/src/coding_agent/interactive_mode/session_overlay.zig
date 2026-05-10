@@ -1,6 +1,7 @@
 const std = @import("std");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const tui = @import("tui");
+const overlay_table = @import("overlay_table.zig");
 
 pub const SessionChoice = struct {
     path: []u8,
@@ -51,8 +52,7 @@ pub const SessionOverlay = struct {
         if (self.confirming_delete_path) |path| allocator.free(path);
         if (self.rename_target_path) |path| allocator.free(path);
         if (self.rename_text.len > 0) allocator.free(self.rename_text);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -178,17 +178,10 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
     overlay.list.selected_index = @min(overlay.list.selected_index, row_count - 1);
     overlay.list.max_visible = 12;
 
-    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
-    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
-    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
-    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
-    for (overlay.items, 0..) |item, i| {
-        table_cells[i * 2] = .{ .text = item.label };
-        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
-        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
-    }
-    overlay.table_cells = table_cells;
-    overlay.table_rows = table_rows;
+    overlay_table.freeTable(allocator, overlay.table_cells, overlay.table_rows);
+    const built = try overlay_table.buildLabelDescriptionTable(allocator, overlay.items);
+    overlay.table_cells = built.cells;
+    overlay.table_rows = built.rows;
 }
 
 pub fn toggleScope(allocator: std.mem.Allocator, overlay: *SessionOverlay) !void {
@@ -539,11 +532,4 @@ fn reloadSessions(allocator: std.mem.Allocator, io: std.Io, overlay: *SessionOve
     overlay.all_sessions = next_all;
 }
 
-fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(@constCast(item.value));
-        allocator.free(@constCast(item.label));
-        if (item.description) |description| allocator.free(@constCast(description));
-    }
-    allocator.free(items);
-}
+const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;

@@ -5,6 +5,7 @@ const config_mod = @import("../config/config.zig");
 const resources_mod = @import("../resources/resources.zig");
 const session_mod = @import("../sessions/session.zig");
 const tui = @import("tui");
+const overlay_table = @import("overlay_table.zig");
 
 pub const SettingId = enum {
     none,
@@ -73,8 +74,7 @@ pub const Overlay = struct {
         if (self.original_theme.len > 0) allocator.free(self.original_theme);
         for (self.available_themes) |theme| allocator.free(theme);
         allocator.free(self.available_themes);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -159,17 +159,10 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *Overlay) !void {
     overlay.list.max_visible = 12;
     overlay.hint = try formatHint(allocator, overlay);
 
-    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
-    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
-    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
-    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
-    for (overlay.items, 0..) |item, i| {
-        table_cells[i * 2] = .{ .text = item.label };
-        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
-        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
-    }
-    overlay.table_cells = table_cells;
-    overlay.table_rows = table_rows;
+    overlay_table.freeTable(allocator, overlay.table_cells, overlay.table_rows);
+    const built = try overlay_table.buildLabelDescriptionTable(allocator, overlay.items);
+    overlay.table_cells = built.cells;
+    overlay.table_rows = built.rows;
 }
 
 pub fn updateSearch(allocator: std.mem.Allocator, overlay: *Overlay, next_search: []const u8) !void {
@@ -426,14 +419,7 @@ fn freeChoices(allocator: std.mem.Allocator, choices: []Choice) void {
     allocator.free(choices);
 }
 
-pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(item.value);
-        allocator.free(item.label);
-        if (item.description) |description| allocator.free(description);
-    }
-    allocator.free(items);
-}
+pub const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
 test "settings overlay lists structured searchable rows and capability dependent images" {
     const allocator = std.testing.allocator;

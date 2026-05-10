@@ -2237,10 +2237,10 @@ pub const BridgeHost = struct {
         };
         var details = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         defer common.deinitJsonValue(allocator, .{ .object = details });
-        try details.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, command.name) });
-        try details.put(allocator, try allocator.dupe(u8, "invocationName"), .{ .string = try allocator.dupe(u8, command.invocation_name) });
-        try details.put(allocator, try allocator.dupe(u8, "extensionPath"), .{ .string = try allocator.dupe(u8, command.extension_path) });
-        if (args.len > 0) try details.put(allocator, try allocator.dupe(u8, "argument"), .{ .string = try allocator.dupe(u8, args) });
+        try common.putString(allocator, &details, "name", command.name);
+        try common.putString(allocator, &details, "invocationName", command.invocation_name);
+        try common.putString(allocator, &details, "extensionPath", command.extension_path);
+        if (args.len > 0) try common.putString(allocator, &details, "argument", args);
         _ = try self.context.session.session_manager.appendCustomMessageEntry(
             "extensionCommand",
             .{ .text = command.invocation_name },
@@ -3332,7 +3332,7 @@ fn ensureNestedObject(allocator: std.mem.Allocator, object: *std.json.ObjectMap,
         }
         return &existing.object;
     }
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
+    try common.putValue(allocator, &object, key, .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) });
     return &object.getPtr(key).?.object;
 }
 
@@ -3342,7 +3342,7 @@ fn putStringValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key
         existing.* = value;
         return;
     }
-    try object.put(allocator, try allocator.dupe(u8, key), value);
+    try common.putValue(allocator, &object, key, value);
 }
 
 fn parseUsizeText(value: []const u8) !usize {
@@ -4266,7 +4266,7 @@ test "webview message summaries preserve structured assistant content separately
     defer registration.unregister();
 
     var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try arguments.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "printf structured") });
+    try common.putString(allocator, &arguments, "command", "printf structured");
     const arguments_value = std.json.Value{ .object = arguments };
     defer ai.provider_json.freeValue(allocator, arguments_value);
 

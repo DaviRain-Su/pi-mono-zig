@@ -5,6 +5,7 @@ const config_mod = @import("../config/config.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const shared = @import("shared.zig");
 const tui = @import("tui");
+const overlay_table = @import("overlay_table.zig");
 
 const configuredCredentials = shared.configuredCredentials;
 
@@ -45,8 +46,7 @@ pub const ModelOverlay = struct {
         if (self.scoped_models.len > 0) allocator.free(self.scoped_models);
         freeModelChoices(allocator, self.choices);
         freeOwnedSelectItems(allocator, self.items);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -82,8 +82,7 @@ pub const ScopedModelsOverlay = struct {
         freeOwnedStrings(allocator, self.all_ids);
         if (self.enabled_ids) |ids| freeOwnedStrings(allocator, ids);
         if (self.search.len > 0) allocator.free(self.search);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -214,8 +213,7 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *ModelOverlay) !void {
     overlay.list.max_visible = 12;
 
     // Build table rows (only for actual model entries, not error/empty rows)
-    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
-    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    overlay_table.freeTable(allocator, overlay.table_cells, overlay.table_rows);
     overlay.table_cells = &[_]tui.TableCell{};
     overlay.table_rows = &[_]tui.TableRow{};
 
@@ -369,8 +367,7 @@ pub fn refreshScoped(allocator: std.mem.Allocator, overlay: *ScopedModelsOverlay
     overlay.list.max_visible = 8;
 
     // Build table rows (only for actual model entries, not empty row)
-    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
-    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
+    overlay_table.freeTable(allocator, overlay.table_cells, overlay.table_rows);
     overlay.table_cells = &[_]tui.TableCell{};
     overlay.table_rows = &[_]tui.TableRow{};
 
@@ -757,14 +754,7 @@ fn freeScopedModelChoices(allocator: std.mem.Allocator, choices: []ScopedModelCh
     allocator.free(choices);
 }
 
-fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(@constCast(item.value));
-        allocator.free(@constCast(item.label));
-        if (item.description) |description| allocator.free(@constCast(description));
-    }
-    allocator.free(items);
-}
+const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
 fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
     for (strings) |string| allocator.free(string);

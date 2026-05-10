@@ -6,7 +6,6 @@ const truncate = @import("truncate.zig");
 const parseRequiredString = common.parseRequiredString;
 const parseOptionalString = common.parseOptionalString;
 const getOptionalPositiveInt = common.getOptionalPositiveInt;
-const schemaProperty = common.schemaProperty;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -55,36 +54,24 @@ pub const ReadTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        errdefer {
-            const value = std.json.Value{ .object = properties };
-            common.deinitJsonValue(allocator, value);
-        }
-
-        try properties.put(allocator, try allocator.dupe(u8, "path"), try schemaProperty(
-            allocator,
-            "string",
-            "Path to the file to read (absolute or relative to cwd)",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "offset"), try schemaProperty(
-            allocator,
-            "integer",
-            "1-indexed line number to start reading from",
-        ));
-        try properties.put(allocator, try allocator.dupe(u8, "limit"), try schemaProperty(
-            allocator,
-            "integer",
-            "Maximum number of lines to read",
-        ));
-
-        var required = std.json.Array.init(allocator);
-        try required.append(.{ .string = try allocator.dupe(u8, "path") });
-
-        var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-        try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
-        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
-        return .{ .object = root };
+        return common.objectSchema(allocator, &.{
+            .{
+                .name = "path",
+                .type_name = "string",
+                .description = "Path to the file to read (absolute or relative to cwd)",
+                .required = true,
+            },
+            .{
+                .name = "offset",
+                .type_name = "integer",
+                .description = "1-indexed line number to start reading from",
+            },
+            .{
+                .name = "limit",
+                .type_name = "integer",
+                .description = "Maximum number of lines to read",
+            },
+        });
     }
 
     pub fn execute(

@@ -31,10 +31,7 @@ pub const Dialog = struct {
     selected_button: usize = 0,
 
     pub fn drawComponent(self: *const Dialog) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

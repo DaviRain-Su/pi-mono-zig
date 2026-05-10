@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ai = @import("ai");
 const json_format = @import("../shared/json_format.zig");
+const json_utils = @import("../json_utils.zig");
 const config_mod = @import("../config/config.zig");
 const provider_config = @import("../providers/provider_config.zig");
 const resources_mod = @import("../resources/resources.zig");
@@ -671,7 +672,7 @@ fn webViewStructuredSmokeFactory(
     _: ai.Model,
 ) !ai.providers.faux.FauxAssistantMessage {
     var arguments = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try arguments.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "printf 'structured smoke'") });
+    try json_utils.putString(allocator, &arguments, "command", "printf 'structured smoke'");
     const arguments_value = std.json.Value{ .object = arguments };
     defer ai.provider_json.freeValue(allocator, arguments_value);
 

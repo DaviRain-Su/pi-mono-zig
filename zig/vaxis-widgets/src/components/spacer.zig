@@ -7,10 +7,7 @@ pub const Spacer = struct {
     lines: usize = 1,
 
     pub fn drawComponent(self: *const Spacer) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn setLines(self: *Spacer, lines: usize) void {

@@ -5,6 +5,7 @@ const tui = @import("tui");
 const session_mod = @import("../sessions/session.zig");
 const session_manager_mod = @import("../sessions/session_manager.zig");
 const formatting = @import("formatting.zig");
+const overlay_table = @import("overlay_table.zig");
 
 const blocksToText = formatting.blocksToText;
 const formatAssistantMessage = formatting.formatAssistantMessage;
@@ -101,8 +102,7 @@ pub const Overlay = struct {
         if (self.label_target_id) |id| allocator.free(id);
         if (self.label_text.len > 0) allocator.free(self.label_text);
         if (self.summary_target_id) |id| allocator.free(id);
-        if (self.table_cells.len > 0) allocator.free(self.table_cells);
-        if (self.table_rows.len > 0) allocator.free(self.table_rows);
+        overlay_table.freeTable(allocator, self.table_cells, self.table_rows);
         self.* = undefined;
     }
 };
@@ -360,17 +360,10 @@ pub fn refresh(allocator: std.mem.Allocator, overlay: *Overlay) !void {
 }
 
 fn rebuildTableData(allocator: std.mem.Allocator, overlay: *Overlay) !void {
-    if (overlay.table_cells.len > 0) allocator.free(overlay.table_cells);
-    if (overlay.table_rows.len > 0) allocator.free(overlay.table_rows);
-    const table_cells = try allocator.alloc(tui.TableCell, overlay.items.len * 2);
-    const table_rows = try allocator.alloc(tui.TableRow, overlay.items.len);
-    for (overlay.items, 0..) |item, i| {
-        table_cells[i * 2] = .{ .text = item.label };
-        table_cells[i * 2 + 1] = .{ .text = item.description orelse "" };
-        table_rows[i] = .{ .cells = table_cells[i * 2 .. i * 2 + 2] };
-    }
-    overlay.table_cells = table_cells;
-    overlay.table_rows = table_rows;
+    overlay_table.freeTable(allocator, overlay.table_cells, overlay.table_rows);
+    const built = try overlay_table.buildLabelDescriptionTable(allocator, overlay.items);
+    overlay.table_cells = built.cells;
+    overlay.table_rows = built.rows;
 }
 
 fn refreshLabelMode(allocator: std.mem.Allocator, overlay: *Overlay) !void {
@@ -797,14 +790,7 @@ fn freeChoices(allocator: std.mem.Allocator, choices: []Choice) void {
     allocator.free(choices);
 }
 
-fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectItem) void {
-    for (items) |item| {
-        allocator.free(item.value);
-        allocator.free(item.label);
-        if (item.description) |description| allocator.free(description);
-    }
-    allocator.free(items);
-}
+const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
 fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
     for (strings) |string| allocator.free(string);

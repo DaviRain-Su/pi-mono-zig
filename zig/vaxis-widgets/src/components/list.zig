@@ -80,10 +80,7 @@ pub const List = struct {
     };
 
     pub fn drawComponent(self: *const List) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

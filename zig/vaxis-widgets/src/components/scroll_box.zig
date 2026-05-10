@@ -18,7 +18,7 @@ pub const ScrollBox = struct {
     scrollbar_thumb_style: vaxis.Cell.Style = .{ .fg = .{ .index = 7 } },
 
     pub fn drawComponent(self: *const ScrollBox) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

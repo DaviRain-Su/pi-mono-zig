@@ -883,7 +883,7 @@ pub fn upsertStoredCredential(
         }
     }
 
-    try next_object.put(allocator, try allocator.dupe(u8, provider_id), try credentialToJson(allocator, credential));
+    try common.putValue(allocator, &next_object, provider_id, try credentialToJson(allocator, credential));
     try writeAuthObjectUnlocked(allocator, io, auth_path, next_object);
 }
 
@@ -954,16 +954,16 @@ fn credentialToJson(allocator: std.mem.Allocator, credential: *const StoredCrede
 
     switch (credential.*) {
         .api_key => |key| {
-            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "api_key") });
-            try object.put(allocator, try allocator.dupe(u8, "key"), .{ .string = try allocator.dupe(u8, key) });
+            try common.putString(allocator, &object, "type", "api_key");
+            try common.putString(allocator, &object, "key", key);
         },
         .oauth => |oauth| {
-            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "oauth") });
-            try object.put(allocator, try allocator.dupe(u8, "access"), .{ .string = try allocator.dupe(u8, oauth.access) });
-            try object.put(allocator, try allocator.dupe(u8, "refresh"), .{ .string = try allocator.dupe(u8, oauth.refresh) });
-            try object.put(allocator, try allocator.dupe(u8, "expires"), .{ .integer = oauth.expires });
+            try common.putString(allocator, &object, "type", "oauth");
+            try common.putString(allocator, &object, "access", oauth.access);
+            try common.putString(allocator, &object, "refresh", oauth.refresh);
+            try common.putInt(allocator, &object, "expires", oauth.expires);
             if (oauth.project_id) |project_id| {
-                try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, project_id) });
+                try common.putString(allocator, &object, "projectId", project_id);
             }
         },
     }
@@ -1484,9 +1484,9 @@ fn refreshAnthropicStoredTokenWithUrl(
         common.deinitJsonValue(allocator, cleanup_value);
     }
 
-    try payload.put(allocator, try allocator.dupe(u8, "grant_type"), .{ .string = try allocator.dupe(u8, "refresh_token") });
-    try payload.put(allocator, try allocator.dupe(u8, "client_id"), .{ .string = try allocator.dupe(u8, DEFAULT_ANTHROPIC_CLIENT_ID) });
-    try payload.put(allocator, try allocator.dupe(u8, "refresh_token"), .{ .string = try allocator.dupe(u8, refresh_token) });
+    try common.putString(allocator, &payload, "grant_type", "refresh_token");
+    try common.putString(allocator, &payload, "client_id", DEFAULT_ANTHROPIC_CLIENT_ID);
+    try common.putString(allocator, &payload, "refresh_token", refresh_token);
 
     const payload_value: std.json.Value = .{ .object = payload };
     const json_body = try std.json.Stringify.valueAlloc(allocator, payload_value, .{});
@@ -1824,8 +1824,8 @@ fn buildGoogleStoredApiKey(allocator: std.mem.Allocator, access: []const u8, pro
         common.deinitJsonValue(allocator, cleanup_value);
     }
 
-    try object.put(allocator, try allocator.dupe(u8, "token"), .{ .string = try allocator.dupe(u8, access) });
-    try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, project_id) });
+    try common.putString(allocator, &object, "token", access);
+    try common.putString(allocator, &object, "projectId", project_id);
     const value: std.json.Value = .{ .object = object };
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
@@ -2326,9 +2326,9 @@ test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider js
         const cleanup_value: std.json.Value = .{ .object = object };
         common.deinitJsonValue(allocator, cleanup_value);
     }
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "oauth") });
-    try object.put(allocator, try allocator.dupe(u8, "access"), .{ .string = try allocator.dupe(u8, "access-token") });
-    try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, "project-123") });
+    try common.putString(allocator, &object, "type", "oauth");
+    try common.putString(allocator, &object, "access", "access-token");
+    try common.putString(allocator, &object, "projectId", "project-123");
 
     const api_key = (try buildApiKeyFromStoredEntry(allocator, "google-gemini-cli", object)).?;
     defer allocator.free(api_key);
@@ -2917,12 +2917,12 @@ fn makeOAuthTestObject(
         common.deinitJsonValue(allocator, cleanup_value);
     }
 
-    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "oauth") });
-    try object.put(allocator, try allocator.dupe(u8, "access"), .{ .string = try allocator.dupe(u8, access) });
-    try object.put(allocator, try allocator.dupe(u8, "refresh"), .{ .string = try allocator.dupe(u8, refresh) });
-    try object.put(allocator, try allocator.dupe(u8, "expires"), .{ .integer = expires });
+    try common.putString(allocator, &object, "type", "oauth");
+    try common.putString(allocator, &object, "access", access);
+    try common.putString(allocator, &object, "refresh", refresh);
+    try common.putInt(allocator, &object, "expires", expires);
     if (project_id) |value| {
-        try object.put(allocator, try allocator.dupe(u8, "projectId"), .{ .string = try allocator.dupe(u8, value) });
+        try common.putString(allocator, &object, "projectId", value);
     }
     return object;
 }

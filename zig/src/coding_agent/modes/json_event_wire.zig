@@ -908,7 +908,7 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
 }
 
 fn putField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: std.json.Value) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), value);
+    try common.putValue(allocator, &object, key, value);
 }
 
 fn putStringField(object: *std.json.ObjectMap, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {

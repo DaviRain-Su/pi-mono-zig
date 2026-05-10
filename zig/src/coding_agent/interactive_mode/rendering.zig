@@ -5417,7 +5417,7 @@ test "route-a m1 streams tool-call arguments and dedupes execution start" {
 
     var args_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     defer common.deinitJsonValue(allocator, .{ .object = args_object });
-    try args_object.put(allocator, try allocator.dupe(u8, "command"), .{ .string = try allocator.dupe(u8, "echo hi") });
+    try common.putString(allocator, &args_object, "command", "echo hi");
     const tool_call = ai.ToolCall{
         .id = "tool-1",
         .name = "bash",

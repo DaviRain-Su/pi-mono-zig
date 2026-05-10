@@ -24,10 +24,7 @@ pub const Accordion = struct {
     expanded_overrides: ?[]bool = null,
 
     pub fn drawComponent(self: *const Accordion) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

@@ -1004,7 +1004,7 @@ test "screen renders welcome prompt footer and tool lines" {
     try state.setFooter("faux-1", "session.jsonl");
     try state.setStatus("streaming");
     var args_map = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try args_map.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "README.md") });
+    try common.putString(allocator, &args_map, "path", "README.md");
     const args_object = std.json.Value{ .object = args_map };
     defer common.deinitJsonValue(allocator, args_object);
     try state.handleAgentEvent(.{
@@ -1424,7 +1424,7 @@ test "interactive mode renders tool execution details through a mock backend" {
     try state.setFooter("faux-1", "session.jsonl");
 
     var args_map = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    try args_map.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, "README.md") });
+    try common.putString(allocator, &args_map, "path", "README.md");
     const args_object = std.json.Value{ .object = args_map };
     defer common.deinitJsonValue(allocator, args_object);
 

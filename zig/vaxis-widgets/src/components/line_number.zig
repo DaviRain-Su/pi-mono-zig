@@ -21,7 +21,7 @@ pub const LineNumber = struct {
     line_colors: ?[]const vaxis.Cell.Style = null,
 
     pub fn drawComponent(self: *const LineNumber) draw_mod.Component {
-        return .{ .ptr = self, .drawFn = drawOpaque };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

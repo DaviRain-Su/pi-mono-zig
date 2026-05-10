@@ -22,10 +22,7 @@ pub const BarChart = struct {
     };
 
     pub fn drawComponent(self: *const BarChart) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

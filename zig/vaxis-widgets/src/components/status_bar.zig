@@ -17,10 +17,7 @@ pub const StatusBar = struct {
     separator: []const u8 = " ",
 
     pub fn drawComponent(self: *const StatusBar) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

@@ -57,10 +57,7 @@ pub const Scrollbar = struct {
     end_style: vaxis.Cell.Style = .{},
 
     pub fn drawComponent(self: *const Scrollbar) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

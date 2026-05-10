@@ -11,10 +11,7 @@ pub const Gauge = struct {
     use_unicode: bool = false,
 
     pub fn drawComponent(self: *const Gauge) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

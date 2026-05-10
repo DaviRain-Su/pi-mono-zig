@@ -54,7 +54,7 @@ pub fn buildMessagesJson(allocator: std.mem.Allocator, messages: []const agent.A
     const value = std.json.Value{ .object = blk: {
         var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         errdefer object.deinit(allocator);
-        try object.put(allocator, try allocator.dupe(u8, "messages"), .{ .array = array });
+        try common.putValue(allocator, &object, "messages", .{ .array = array });
         break :blk object;
     } };
     defer common.deinitJsonValue(allocator, value);

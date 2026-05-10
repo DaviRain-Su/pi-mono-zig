@@ -12,10 +12,7 @@ pub const Tooltip = struct {
     padding_x: usize = 1,
 
     pub fn drawComponent(self: *const Tooltip) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

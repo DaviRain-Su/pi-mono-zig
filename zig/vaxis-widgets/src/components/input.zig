@@ -22,10 +22,7 @@ pub const Input = struct {
     show_cursor: bool = true,
 
     pub fn drawComponent(self: *const Input) draw_mod.Component {
-        return .{
-            .ptr = self,
-            .drawFn = drawOpaque,
-        };
+        return draw_mod.component(self, drawOpaque);
     }
 
     pub fn draw(

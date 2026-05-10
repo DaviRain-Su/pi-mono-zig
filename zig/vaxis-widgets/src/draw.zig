@@ -19,6 +19,13 @@ pub const Component = struct {
     }
 };
 
+pub fn component(ptr: anytype, drawFn: *const fn (ptr: *const anyopaque, window: vaxis.Window, ctx: DrawContext) std.mem.Allocator.Error!Size) Component {
+    return .{
+        .ptr = ptr,
+        .drawFn = drawFn,
+    };
+}
+
 pub fn rootWindow(screen: *vaxis.Screen) vaxis.Window {
     return .{
         .x_off = 0,
