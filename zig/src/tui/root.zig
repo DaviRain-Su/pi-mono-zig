@@ -34,6 +34,7 @@ pub const components = struct {
     pub const sparkline = @import("components/sparkline.zig");
     pub const clear = @import("components/clear.zig");
     pub const bar_chart = @import("components/bar_chart.zig");
+    pub const line_gauge = @import("components/line_gauge.zig");
 };
 
 pub const DrawComponent = draw.Component;
@@ -99,6 +100,7 @@ pub const Sparkline = components.sparkline.Sparkline;
 pub const Clear = components.clear.Clear;
 pub const BarChart = components.bar_chart.BarChart;
 pub const BarChartBar = components.bar_chart.Bar;
+pub const LineGauge = components.line_gauge.LineGauge;
 
 test {
     _ = @import("ansi.zig");
@@ -132,6 +134,7 @@ test {
     _ = @import("components/sparkline.zig");
     _ = @import("components/clear.zig");
     _ = @import("components/bar_chart.zig");
+    _ = @import("components/line_gauge.zig");
 }
 
 test "components export autocomplete module" {
