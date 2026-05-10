@@ -2861,6 +2861,7 @@ pub const OverlayPanelComponent = struct {
             .rows = overlay.table_rows,
             .widths = overlay.table_widths,
             .row_highlight_style = highlight_style,
+            .show_scrollbar = true,
         };
         return try table.draw(list_window, .{
             .window = list_window,
