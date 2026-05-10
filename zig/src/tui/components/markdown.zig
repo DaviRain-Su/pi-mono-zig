@@ -66,7 +66,7 @@ pub const Markdown = struct {
             return .{ .width = window.width, .height = 0 };
         }
 
-        const active_theme = ctx.theme orelse self.theme;
+        const active_theme = self.theme;
         fillWindow(window, resolvedStyle(active_theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE));
 
         const content_window = innerWindow(window, self.padding_x, self.padding_y) orelse {
@@ -1426,21 +1426,17 @@ fn trimRightSpaces(text: []const u8) []const u8 {
 }
 
 test "markdown renders inline styles as cell styles" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
     const markdown = Markdown{
         .text = "**bold** *italic* `code` [link](https://example.com)",
-        .theme = &theme,
     };
 
-    var screen = try test_helpers.renderToScreenWithTheme(markdown.drawComponent(), 48, 2, &theme);
+    var screen = try test_helpers.renderToScreen(markdown.drawComponent(), 48, 2);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 0, 0, "b", mergeStyles(style_mod.styleFor(&theme, .markdown_text), .{ .bold = true }));
-    try test_helpers.expectCell(&screen, 5, 0, "i", mergeStyles(style_mod.styleFor(&theme, .markdown_text), .{ .italic = true }));
-    try test_helpers.expectCell(&screen, 12, 0, "c", style_mod.styleFor(&theme, .markdown_code));
-    try test_helpers.expectCell(&screen, 17, 0, "l", style_mod.styleFor(&theme, .markdown_link));
+    try test_helpers.expectCell(&screen, 0, 0, "b", mergeStyles(MARKDOWN_TEXT_FALLBACK_STYLE, .{ .bold = true }));
+    try test_helpers.expectCell(&screen, 5, 0, "i", mergeStyles(MARKDOWN_TEXT_FALLBACK_STYLE, .{ .italic = true }));
+    try test_helpers.expectCell(&screen, 12, 0, "c", CODE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 17, 0, "l", LINK_FALLBACK_STYLE);
 }
 
 test "markdown rich text segments delegate through vxfw RichText" {
@@ -1470,9 +1466,6 @@ test "markdown rich text segments delegate through vxfw RichText" {
 }
 
 test "markdown renders headings lists blockquotes rules and code blocks with cell styles" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
     const markdown = Markdown{
         .text =
         \\# Header
@@ -1483,19 +1476,18 @@ test "markdown renders headings lists blockquotes rules and code blocks with cel
         \\const answer = 42;
         \\```
         ,
-        .theme = &theme,
     };
 
-    var screen = try test_helpers.renderToScreenWithTheme(markdown.drawComponent(), 24, 8, &theme);
+    var screen = try test_helpers.renderToScreen(markdown.drawComponent(), 24, 8);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 0, 0, "H", mergeStyles(style_mod.styleFor(&theme, .markdown_heading), .{ .ul_style = .single }));
-    try test_helpers.expectCell(&screen, 0, 1, "•", style_mod.styleFor(&theme, .markdown_list_bullet));
-    try test_helpers.expectCell(&screen, 0, 2, "▍", style_mod.styleFor(&theme, .markdown_quote_border));
-    try test_helpers.expectCell(&screen, 0, 3, "─", style_mod.styleFor(&theme, .markdown_rule));
-    try test_helpers.expectCell(&screen, 0, 4, "┌", style_mod.styleFor(&theme, .markdown_code_border));
-    try test_helpers.expectCell(&screen, 2, 5, "c", style_mod.styleFor(&theme, .markdown_code));
-    try test_helpers.expectCell(&screen, 0, 6, "└", style_mod.styleFor(&theme, .markdown_code_border));
+    try test_helpers.expectCell(&screen, 0, 0, "H", mergeStyles(HEADER_ONE_FALLBACK_STYLE, .{ .ul_style = .single }));
+    try test_helpers.expectCell(&screen, 0, 1, "•", LIST_BULLET_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 2, "▍", QUOTE_BORDER_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 3, "─", RULE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 4, "┌", CODE_BORDER_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 2, 5, "c", CODE_FALLBACK_STYLE);
+    try test_helpers.expectCell(&screen, 0, 6, "└", CODE_BORDER_FALLBACK_STYLE);
 }
 
 test "markdown indents wrapped unordered list lines" {

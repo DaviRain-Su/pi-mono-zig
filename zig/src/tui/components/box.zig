@@ -2,11 +2,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
-const style_mod = @import("../style.zig");
 const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
-const cell_rows = @import("../cell_rows.zig");
-const resources_mod = @import("../theme.zig");
 
 pub const BorderStyle = enum {
     none,
@@ -39,12 +36,13 @@ const BorderGlyphs = struct {
 pub const Box = struct {
     padding_x: usize = 1,
     padding_y: usize = 1,
-    theme: ?*const resources_mod.Theme = null,
     border_style: BorderStyle = .single,
+    border_cell_style: vaxis.Cell.Style = .{},
     corner_style: CornerStyle = .square,
     borders: Borders = .{},
     title: []const u8 = "",
     title_alignment: layout.AlignItems = .start,
+    title_style: vaxis.Cell.Style = .{},
     children: std.ArrayList(draw_mod.Component) = .empty,
 
     pub fn init(padding_x: usize, padding_y: usize) Box {
@@ -80,15 +78,13 @@ pub const Box = struct {
         }
 
         window.clear();
-        const active_theme = ctx.theme orelse self.theme;
-        const bordered = if (self.borderStyle(active_theme)) |border|
+        const bordered = if (self.borderStyle()) |border|
             window.child(.{ .border = border })
         else
             window;
         bordered.clear();
 
         if (self.title.len > 0 and self.border_style != .none and window.width >= 4) {
-            const title_style: vaxis.Cell.Style = if (active_theme) |t| style_mod.styleFor(t, .box_border) else .{};
             const title_width = ansi.visibleWidth(self.title);
             const max_title_width = @as(usize, window.width) -| 4;
             const display_width = @min(title_width, max_title_width);
@@ -112,7 +108,7 @@ pub const Box = struct {
                         .grapheme = self.title[index..cluster.end],
                         .width = @intCast(cluster.width),
                     },
-                    .style = title_style,
+                    .style = self.title_style,
                 });
                 col += @intCast(cluster.width);
                 index = cluster.end;
@@ -130,9 +126,9 @@ pub const Box = struct {
         return .{ .width = window.width, .height = window.height };
     }
 
-    fn borderStyle(self: *const Box, theme: ?*const resources_mod.Theme) ?vaxis.Window.BorderOptions {
+    fn borderStyle(self: *const Box) ?vaxis.Window.BorderOptions {
         if (self.border_style == .none) return null;
-        const style: vaxis.Cell.Style = if (theme) |active_theme| style_mod.styleFor(active_theme, .box_border) else .{};
+        const style = self.border_cell_style;
         const glyphs: vaxis.Window.BorderOptions.Glyphs = switch (self.border_style) {
             .none => unreachable,
             .single => if (self.corner_style == .rounded) .single_rounded else .single_square,
@@ -238,51 +234,6 @@ fn innerWindow(window: vaxis.Window, padding_x: usize, padding_y: usize) ?vaxis.
     });
 }
 
-fn renderBorderLine(
-    allocator: std.mem.Allocator,
-    theme: *const resources_mod.Theme,
-    glyphs: BorderGlyphs,
-    top: bool,
-    interior_width: usize,
-) std.mem.Allocator.Error![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    try builder.appendSlice(allocator, if (top) glyphs.top_left else glyphs.bottom_left);
-    for (0..interior_width) |_| {
-        try builder.appendSlice(allocator, glyphs.horizontal);
-    }
-    try builder.appendSlice(allocator, if (top) glyphs.top_right else glyphs.bottom_right);
-    const themed = try theme.applyAlloc(allocator, .box_border, builder.items);
-    builder.deinit(allocator);
-    return themed;
-}
-
-fn renderInteriorLine(
-    allocator: std.mem.Allocator,
-    theme: *const resources_mod.Theme,
-    glyphs: BorderGlyphs,
-    child_line: []const u8,
-    padding_x: usize,
-    interior_width: usize,
-) std.mem.Allocator.Error![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    try builder.appendSlice(allocator, glyphs.vertical);
-    try builder.appendNTimes(allocator, ' ', padding_x);
-    try builder.appendSlice(allocator, child_line);
-    const padded = try ansi.padRightVisibleAlloc(allocator, builder.items, interior_width + 1);
-    defer allocator.free(padded);
-
-    var with_right = std.ArrayList(u8).empty;
-    errdefer with_right.deinit(allocator);
-    try with_right.appendSlice(allocator, padded);
-    try with_right.appendSlice(allocator, glyphs.vertical);
-    const themed = try theme.applyAlloc(allocator, .box_border, with_right.items);
-    with_right.deinit(allocator);
-    builder.deinit(allocator);
-    return themed;
-}
-
 test "box renders nested text with outer padding" {
     const text = @import("text.zig").Text{
         .text = "hello",
@@ -304,10 +255,7 @@ test "box renders nested text with outer padding" {
     try std.testing.expectEqualStrings("        \n hello  \n        ", rendered);
 }
 
-test "box renders themed borders via vaxis child windows" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
+test "box renders borders via vaxis child windows" {
     const text = @import("text.zig").Text{
         .text = "hello",
         .padding_x = 0,
@@ -316,18 +264,17 @@ test "box renders themed borders via vaxis child windows" {
 
     var box = Box.init(1, 0);
     defer box.deinit(std.testing.allocator);
-    box.theme = &theme;
     try box.addChild(std.testing.allocator, text.drawComponent());
 
-    var screen = try test_helpers.renderToScreenWithTheme(box.drawComponent(), 9, 3, &theme);
+    var screen = try test_helpers.renderToScreen(box.drawComponent(), 9, 3);
     defer screen.deinit(std.testing.allocator);
 
     const rendered = try test_helpers.screenToString(&screen);
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expectEqualStrings("┌───────┐\n│ hello │\n└───────┘", rendered);
-    try test_helpers.expectCell(&screen, 0, 0, "┌", style_mod.styleFor(&theme, .box_border));
-    try test_helpers.expectCell(&screen, 8, 2, "┘", style_mod.styleFor(&theme, .box_border));
+    try test_helpers.expectCell(&screen, 0, 0, "┌", .{});
+    try test_helpers.expectCell(&screen, 8, 2, "┘", .{});
 }
 
 test "box supports rounded, double, and thick border styles" {

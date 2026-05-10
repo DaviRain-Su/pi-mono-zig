@@ -4,7 +4,6 @@ const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
-const theme_mod = @import("../theme.zig");
 const constraints = @import("../constraints.zig");
 
 pub const FlexChild = struct {
@@ -96,7 +95,7 @@ pub const Flex = struct {
             self.children.items,
             @max(@as(usize, inner_window.width), 1),
             @max(@as(usize, inner_window.height), 1),
-            ctx.theme,
+            {},
         );
         defer freeRenderedDrawChildren(ctx.arena, rendered);
         const natural_sizes = try ctx.arena.alloc(usize, rendered.len);
@@ -221,7 +220,7 @@ pub const Flex = struct {
             self.children.items,
             assigned_widths,
             @max(@as(usize, inner_window.height), 1),
-            ctx.theme,
+            {},
         );
         defer freeRenderedDrawChildren(ctx.arena, rendered);
 
@@ -302,8 +301,9 @@ fn renderDrawChildren(
     children: []const FlexChild,
     width: usize,
     max_height: usize,
-    theme: ?*const theme_mod.Theme,
+    theme: void,
 ) std.mem.Allocator.Error![]RenderedDrawChild {
+    _ = theme;
     const rendered = try allocator.alloc(RenderedDrawChild, children.len);
     errdefer allocator.free(rendered);
 
@@ -313,7 +313,6 @@ fn renderDrawChildren(
             child.component,
             width,
             max_height,
-            theme,
         );
         errdefer {
             for (rendered[0 .. index + 1]) |entry| entry.screen.deinit(allocator);
@@ -328,8 +327,9 @@ fn renderDrawChildrenWithWidths(
     children: []const FlexChild,
     widths: []const usize,
     max_height: usize,
-    theme: ?*const theme_mod.Theme,
+    theme: void,
 ) std.mem.Allocator.Error![]RenderedDrawChild {
+    _ = theme;
     const rendered = try allocator.alloc(RenderedDrawChild, children.len);
     errdefer allocator.free(rendered);
 
@@ -339,7 +339,6 @@ fn renderDrawChildrenWithWidths(
             child.component,
             widths[index],
             max_height,
-            theme,
         );
         errdefer {
             for (rendered[0 .. index + 1]) |entry| entry.screen.deinit(allocator);
@@ -354,7 +353,6 @@ fn renderDrawComponentToScreen(
     component: draw_mod.Component,
     width: usize,
     max_height: usize,
-    theme: ?*const theme_mod.Theme,
 ) std.mem.Allocator.Error!RenderedDrawChild {
     var screen = try vaxis.Screen.init(allocator, .{
         .rows = @intCast(@max(max_height, 1)),
@@ -373,7 +371,6 @@ fn renderDrawComponentToScreen(
     const size = try component.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = theme,
     });
     const rendered = try cloneScreen(allocator, &screen, width, max_height);
     const used_width = usedColumnCount(rendered);

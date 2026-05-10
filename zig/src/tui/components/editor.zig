@@ -7,7 +7,6 @@ const keys = @import("../keys.zig");
 const select_list = @import("select_list.zig");
 const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
-const resources_mod = @import("../theme.zig");
 
 pub const HandleResult = enum {
     handled,
@@ -86,7 +85,7 @@ pub const Editor = struct {
     padding_x: usize = 0,
     padding_y: usize = 0,
     cursor_shape: vaxis.Cell.CursorShape = .beam_blink,
-    theme: ?*const resources_mod.Theme = null,
+    editor_style: vaxis.Cell.Style = .{},
     autocomplete_catalog: std.ArrayList(select_list.SelectItem) = .empty,
     autocomplete_matches: []select_list.SelectItem = &.{},
     autocomplete_list: ?select_list.SelectList = null,
@@ -239,11 +238,8 @@ pub const Editor = struct {
         };
     }
 
-    pub fn setTheme(self: *Editor, theme: ?*const resources_mod.Theme) void {
-        self.theme = theme;
-        if (self.autocomplete_list) |*list| {
-            list.theme = theme;
-        }
+    pub fn setEditorStyle(self: *Editor, style: vaxis.Cell.Style) void {
+        self.editor_style = style;
     }
 
     pub fn handleKey(self: *Editor, key: keys.Key) !HandleResult {
@@ -501,11 +497,8 @@ pub const Editor = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        const active_theme = ctx.theme orelse self.theme;
-        const base_style = if (active_theme) |theme|
-            style_mod.styleFor(theme, .editor)
-        else
-            vaxis.Cell.Style{};
+        _ = ctx;
+        const base_style = self.editor_style;
 
         window.fill(.{
             .char = .{ .grapheme = " ", .width = 1 },
@@ -683,7 +676,7 @@ pub const Editor = struct {
         self.autocomplete_list = .{
             .items = self.autocomplete_matches,
             .max_visible = self.autocomplete_max_visible,
-            .theme = self.theme,
+
         };
     }
 
@@ -1488,7 +1481,7 @@ fn renderEditorWithCursor(editor: *const Editor, width: usize, height: usize) !v
     _ = try editor.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = editor.theme,
+
     });
     return screen;
 }
@@ -2032,12 +2025,9 @@ test "editor single-row viewport scrolls to keep overflowing cursor visible" {
 test "editor applies theme colors to content and autocomplete without ansi parsing assertions" {
     const allocator = std.testing.allocator;
 
-    var theme = try resources_mod.Theme.initDefault(allocator);
-    defer theme.deinit(allocator);
-
     var editor = Editor.init(allocator);
     defer editor.deinit();
-    editor.setTheme(&theme);
+    editor.setEditorStyle(.{ .fg = .{ .index = 7 } });
     try editor.setAutocompleteItems(&[_]select_list.SelectItem{
         .{ .value = "apple", .label = "apple" },
         .{ .value = "apricot", .label = "apricot" },
@@ -2045,15 +2035,14 @@ test "editor applies theme colors to content and autocomplete without ansi parsi
 
     _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("a") });
 
-    var editor_screen = try test_helpers.renderToScreenWithTheme(editor.drawComponent(), 12, 1, &theme);
+    var editor_screen = try test_helpers.renderToScreen(editor.drawComponent(), 12, 1);
     defer editor_screen.deinit(std.testing.allocator);
-    try test_helpers.expectCell(&editor_screen, 0, 0, "a", style_mod.styleFor(&theme, .editor));
+    try test_helpers.expectCell(&editor_screen, 0, 0, "a", vaxis.Cell.Style{ .fg = .{ .index = 7 } });
 
-    var autocomplete_screen = try test_helpers.renderToScreenWithTheme(editor.drawAutocompleteComponent(), 12, 2, &theme);
+    var autocomplete_screen = try test_helpers.renderToScreen(editor.drawAutocompleteComponent(), 12, 2);
     defer autocomplete_screen.deinit(std.testing.allocator);
 
     const selected = autocomplete_screen.readCell(2, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(style_mod.styleFor(&theme, .select_selected), selected.style);
     try std.testing.expect(!selected.style.reverse);
     const description = autocomplete_screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(description.style.reverse == false);

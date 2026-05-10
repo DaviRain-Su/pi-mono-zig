@@ -151,7 +151,6 @@ pub const Renderer = struct {
         _ = try root.draw(window, .{
             .window = window,
             .arena = frame_allocator,
-            .theme = null,
         });
         try self.compositeDrawOverlays(size, window, frame_allocator);
         try vx.render(tty);
@@ -186,7 +185,6 @@ pub const Renderer = struct {
             const measured_size = try entry.component.draw(measure_window, .{
                 .window = measure_window,
                 .arena = frame_allocator,
-                .theme = null,
             });
             const overlay_height = @min(@max(@as(usize, measured_size.height), 1), measurement_height);
             const layout = resolveOverlayLayout(entry.options, width, overlay_height, size);
@@ -199,7 +197,6 @@ pub const Renderer = struct {
             _ = try entry.component.draw(overlay_window, .{
                 .window = overlay_window,
                 .arena = frame_allocator,
-                .theme = null,
             });
         }
     }

@@ -1,6 +1,5 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const theme_mod = @import("theme.zig");
 
 pub const Size = vaxis.vxfw.Size;
 pub const VxfwWidget = vaxis.vxfw.Widget;
@@ -8,7 +7,6 @@ pub const VxfwWidget = vaxis.vxfw.Widget;
 pub const DrawContext = struct {
     window: vaxis.Window,
     arena: std.mem.Allocator,
-    theme: ?*const theme_mod.Theme = null,
 };
 
 pub const Component = struct {

@@ -98,7 +98,6 @@ test "vaxis m8 visual parity snapshot covers editor text and native cursor state
     _ = try editor.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = null,
     });
 
     var snapshot = try vaxis.AllocatingScreen.init(allocator, 8, 3);

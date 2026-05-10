@@ -2,10 +2,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
-const style_mod = @import("../style.zig");
 const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
-const resources_mod = @import("../theme.zig");
 
 pub const TextGradient = struct {
     start_hex: []const u8,
@@ -16,7 +14,7 @@ pub const Text = struct {
     text: []const u8 = "",
     padding_x: usize = 1,
     padding_y: usize = 1,
-    theme: ?*const resources_mod.Theme = null,
+    style: vaxis.Cell.Style = .{},
     gradient: ?TextGradient = null,
     alignment: layout.AlignItems = .start,
 
@@ -36,12 +34,8 @@ pub const Text = struct {
             return .{ .width = window.width, .height = 0 };
         }
 
-        const active_theme = ctx.theme orelse self.theme;
-        const base_style = if (active_theme) |theme|
-            style_mod.styleFor(theme, .text)
-        else
-            vaxis.Cell.Style{};
-        fillWindow(window, active_theme != null, base_style);
+        const base_style = self.style;
+        fillWindow(window, base_style);
 
         const content_window = innerWindow(window, self.padding_x, self.padding_y) orelse {
             return .{ .width = window.width, .height = @min(window.height, @as(u16, @intCast(self.padding_y * 2))) };
@@ -138,8 +132,8 @@ fn innerWindow(window: vaxis.Window, padding_x: usize, padding_y: usize) ?vaxis.
     });
 }
 
-fn fillWindow(window: vaxis.Window, themed: bool, style: vaxis.Cell.Style) void {
-    if (!themed) {
+fn fillWindow(window: vaxis.Window, style: vaxis.Cell.Style) void {
+    if (std.meta.eql(style, vaxis.Cell.Style{})) {
         window.clear();
         return;
     }
@@ -203,17 +197,15 @@ fn interpolateChannel(start: u8, end: u8, index: usize, total: usize) u8 {
     return @intFromFloat(@round(start_value + delta * ratio));
 }
 
-test "text renders wrapped content with themed padding via cells" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
+test "text renders wrapped content with padding via cells" {
     const text = Text{
         .text = "red blue",
         .padding_x = 1,
         .padding_y = 1,
+        .style = .{ .fg = .{ .index = 7 } },
     };
 
-    var screen = try test_helpers.renderToScreenWithTheme(text.drawComponent(), 6, 4, &theme);
+    var screen = try test_helpers.renderToScreen(text.drawComponent(), 6, 4);
     defer screen.deinit(std.testing.allocator);
 
     const rendered = try test_helpers.screenToString(&screen);
@@ -221,10 +213,9 @@ test "text renders wrapped content with themed padding via cells" {
 
     try std.testing.expectEqualStrings("      \n red  \n blue \n      ", rendered);
 
-    const text_style = style_mod.styleFor(&theme, .text);
-    try test_helpers.expectCell(&screen, 0, 0, " ", text_style);
-    try test_helpers.expectCell(&screen, 1, 1, "r", text_style);
-    try test_helpers.expectCell(&screen, 1, 2, "b", text_style);
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{ .fg = .{ .index = 7 } });
+    try test_helpers.expectCell(&screen, 1, 1, "r", .{ .fg = .{ .index = 7 } });
+    try test_helpers.expectCell(&screen, 1, 2, "b", .{ .fg = .{ .index = 7 } });
 }
 
 test "text supports horizontal gradients with per-grapheme colors" {

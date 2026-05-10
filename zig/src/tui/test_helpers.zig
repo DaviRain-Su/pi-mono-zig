@@ -1,18 +1,8 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const draw_mod = @import("draw.zig");
-const theme_mod = @import("theme.zig");
 
 pub fn renderToScreen(component: draw_mod.Component, width: usize, height: usize) !vaxis.AllocatingScreen {
-    return renderToScreenWithTheme(component, width, height, null);
-}
-
-pub fn renderToScreenWithTheme(
-    component: draw_mod.Component,
-    width: usize,
-    height: usize,
-    theme: ?*const theme_mod.Theme,
-) !vaxis.AllocatingScreen {
     var screen = try vaxis.Screen.init(std.testing.allocator, .{
         .rows = @intCast(@max(height, 1)),
         .cols = @intCast(@max(width, 1)),
@@ -30,7 +20,6 @@ pub fn renderToScreenWithTheme(
     _ = try component.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = theme,
     });
 
     var rendered = try vaxis.AllocatingScreen.init(

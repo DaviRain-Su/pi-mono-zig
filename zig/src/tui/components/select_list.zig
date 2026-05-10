@@ -3,9 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
-const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
-const resources_mod = @import("../theme.zig");
 
 pub const SelectItem = struct {
     value: []const u8,
@@ -30,7 +28,10 @@ pub const SelectList = struct {
     max_visible: usize = 5,
     padding_x: usize = 0,
     padding_y: usize = 0,
-    theme: ?*const resources_mod.Theme = null,
+    selected_style: vaxis.Cell.Style = .{},
+    description_style: vaxis.Cell.Style = .{ .fg = .{ .index = 8 } },
+    empty_style: vaxis.Cell.Style = .{ .dim = true },
+    scroll_style: vaxis.Cell.Style = .{ .dim = true },
     show_scrollbar: bool = false,
     scrollbar_thumb: []const u8 = "█",
     scrollbar_track: []const u8 = "│",
@@ -89,7 +90,6 @@ pub const SelectList = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        const active_theme = ctx.theme orelse self.theme;
         window.clear();
 
         const top_padding: u16 = @intCast(@min(self.padding_y, window.height));
@@ -98,12 +98,8 @@ pub const SelectList = struct {
         if (self.items.len == 0) {
             if (row < window.height) {
                 const empty_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
-                const empty_style = if (active_theme) |theme|
-                    style_mod.styleFor(theme, .select_empty)
-                else
-                    vaxis.Cell.Style{};
-                empty_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = empty_style });
-                _ = empty_window.printSegment(.{ .text = "No items", .style = empty_style }, .{ .wrap = .none });
+                empty_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = self.empty_style });
+                _ = empty_window.printSegment(.{ .text = "No items", .style = self.empty_style }, .{ .wrap = .none });
                 row += 1;
             }
         } else {
@@ -116,7 +112,7 @@ pub const SelectList = struct {
             for (start_index..end_index) |index| {
                 if (row >= window.height) break;
                 const row_window = window.child(.{ .y_off = @intCast(row), .height = 1, .width = content_width });
-                try self.drawItemRow(ctx.arena, row_window, active_theme, self.items[index], index == self.selectedIndex());
+                try self.drawItemRow(ctx.arena, row_window, self.items[index], index == self.selectedIndex());
                 row += 1;
             }
 
@@ -137,14 +133,10 @@ pub const SelectList = struct {
             }
 
             if (self.items.len > visible_count and row < window.height and !self.show_scrollbar) {
-                const info_style = if (active_theme) |theme|
-                    style_mod.styleFor(theme, .select_scroll)
-                else
-                    vaxis.Cell.Style{};
                 const info_window = window.child(.{ .y_off = @intCast(row), .height = 1 });
-                info_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = info_style });
+                info_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = self.scroll_style });
                 const info = try std.fmt.allocPrint(ctx.arena, "  ({d}/{d})", .{ self.selectedIndex() + 1, self.items.len });
-                _ = info_window.printSegment(.{ .text = info, .style = info_style }, .{ .wrap = .none });
+                _ = info_window.printSegment(.{ .text = info, .style = self.scroll_style }, .{ .wrap = .none });
                 row += 1;
             }
         }
@@ -158,7 +150,6 @@ pub const SelectList = struct {
         self: *const SelectList,
         allocator: std.mem.Allocator,
         row_window: vaxis.Window,
-        active_theme: ?*const resources_mod.Theme,
         item: SelectItem,
         is_selected: bool,
     ) std.mem.Allocator.Error!void {
@@ -166,14 +157,7 @@ pub const SelectList = struct {
         const prefix_width = ansi.visibleWidth(prefix);
         const content_width = @as(usize, row_window.width) - @min(@as(usize, row_window.width), prefix_width);
 
-        const base_style = if (active_theme) |theme|
-            style_mod.styleFor(theme, .text)
-        else
-            vaxis.Cell.Style{};
-        const row_style = if (is_selected)
-            if (active_theme) |theme| style_mod.styleFor(theme, .select_selected) else base_style
-        else
-            base_style;
+        const row_style = if (is_selected) self.selected_style else vaxis.Cell.Style{};
         row_window.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = row_style });
 
         var segments = std.ArrayList(vaxis.Segment).empty;
@@ -199,12 +183,7 @@ pub const SelectList = struct {
                     try segments.append(allocator, .{ .text = spaces, .style = row_style });
                 }
 
-                const description_style = if (is_selected)
-                    row_style
-                else if (active_theme) |theme|
-                    style_mod.styleFor(theme, .select_description)
-                else
-                    vaxis.Cell.Style{};
+                const description_style = if (is_selected) row_style else self.description_style;
                 try segments.append(allocator, .{ .text = truncated_description, .style = description_style });
             } else {
                 const truncated = try truncatePlainAlloc(allocator, display, content_width);
@@ -240,23 +219,13 @@ pub const SelectList = struct {
 
 fn renderPaddedLine(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
     text: []const u8,
     width: usize,
     selected: bool,
 ) std.mem.Allocator.Error![]u8 {
+    _ = selected;
     const padded = try ansi.padRightVisibleAlloc(allocator, text, width);
     defer allocator.free(padded);
-
-    if (theme) |active_theme| {
-        if (selected) {
-            return active_theme.applyAlloc(allocator, .select_selected, padded);
-        }
-        if (std.mem.startsWith(u8, padded, "  (")) {
-            return active_theme.applyAlloc(allocator, .select_scroll, padded);
-        }
-    }
-
     return allocator.dupe(u8, padded);
 }
 
@@ -335,30 +304,24 @@ test "select list confirms the selected item on enter" {
 }
 
 test "select list uses selected token and muted description styling" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
     var list = SelectList{
         .items = &[_]SelectItem{
             .{ .value = "one", .description = "first" },
             .{ .value = "two", .description = "second" },
         },
         .selected_index = 1,
-        .theme = &theme,
+        .selected_style = .{ .reverse = true },
+        .description_style = .{ .fg = .{ .index = 8 } },
     };
 
-    var screen = try test_helpers.renderToScreenWithTheme(list.drawComponent(), 24, 2, &theme);
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 24, 2);
     defer screen.deinit(std.testing.allocator);
 
-    const muted = style_mod.styleFor(&theme, .select_description);
-    try test_helpers.expectCell(&screen, 13, 0, "f", muted);
-
-    const selected_style = style_mod.styleFor(&theme, .select_selected);
-    try test_helpers.expectCell(&screen, 13, 1, "s", selected_style);
+    try test_helpers.expectCell(&screen, 13, 0, "f", .{ .fg = .{ .index = 8 } });
+    try test_helpers.expectCell(&screen, 13, 1, "s", .{ .reverse = true });
 
     const selected_label = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(selected_style, selected_label.style);
-    try std.testing.expect(!selected_label.style.reverse);
+    try std.testing.expect(selected_label.style.reverse);
 }
 
 test "select list truncation respects display width for wide and combining graphemes" {

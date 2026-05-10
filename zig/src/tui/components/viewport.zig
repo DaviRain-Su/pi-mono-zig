@@ -3,9 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const layout = @import("../layout.zig");
-const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
-const resources_mod = @import("../theme.zig");
 
 pub const Viewport = struct {
     child: draw_mod.Component,
@@ -14,11 +12,10 @@ pub const Viewport = struct {
     anchor: layout.ViewportAnchor = .top,
     padding: layout.Insets = .{},
     show_indicators: bool = false,
-    indicator_token: resources_mod.ThemeToken = .status,
+    indicator_style: vaxis.Cell.Style = .{},
     show_scrollbar: bool = false,
     scrollbar_thumb: []const u8 = "█",
     scrollbar_track: []const u8 = "│",
-    theme: ?*const resources_mod.Theme = null,
 
     pub fn drawComponent(self: *const Viewport) draw_mod.Component {
         return .{
@@ -52,7 +49,6 @@ pub const Viewport = struct {
             self.child,
             @max(@as(usize, inner_window.width), 1),
             @max(measurement_height, 1),
-            ctx.theme,
         );
         defer {
             rendered.screen.deinit(ctx.arena);
@@ -84,13 +80,12 @@ pub const Viewport = struct {
 
         if (self.show_indicators and inner_height > 0) {
             if (overflow_above) {
-                drawIndicator(inner_window.child(.{ .y_off = 0, .height = 1 }), ctx.theme orelse self.theme, self.indicator_token, "↑ more");
+                drawIndicator(inner_window.child(.{ .y_off = 0, .height = 1 }), self.indicator_style, "↑ more");
             }
             if (overflow_below and inner_height <= inner_window.height) {
                 drawIndicator(
                     inner_window.child(.{ .y_off = @intCast(inner_height - 1), .height = 1 }),
-                    ctx.theme orelse self.theme,
-                    self.indicator_token,
+                    self.indicator_style,
                     "↓ more",
                 );
             }
@@ -142,27 +137,11 @@ fn resolveVisibleSlice(
     };
 }
 
-fn indicatorLine(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    token: resources_mod.ThemeToken,
-    width: usize,
-    text: []const u8,
-) std.mem.Allocator.Error![]u8 {
-    const fitted = try ansi.padRightVisibleAlloc(allocator, text, width);
-    defer allocator.free(fitted);
-    if (theme) |selected_theme| {
-        return selected_theme.applyAlloc(allocator, token, fitted);
-    }
-    return allocator.dupe(u8, fitted);
-}
-
 fn renderChildToScreen(
     allocator: std.mem.Allocator,
     child: draw_mod.Component,
     width: usize,
     min_height: usize,
-    theme: ?*const resources_mod.Theme,
 ) std.mem.Allocator.Error!RenderedChild {
     var screen = try vaxis.Screen.init(allocator, .{
         .rows = @intCast(@max(min_height, 1)),
@@ -181,7 +160,6 @@ fn renderChildToScreen(
     const size = try child.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = theme,
     });
     return .{
         .screen = try cloneScreen(allocator, &screen, width, @max(min_height, @as(usize, size.height))),
@@ -259,11 +237,9 @@ fn blitAllocatingScreen(source: *vaxis.AllocatingScreen, destination: vaxis.Wind
 
 fn drawIndicator(
     window: vaxis.Window,
-    theme: ?*const resources_mod.Theme,
-    token: resources_mod.ThemeToken,
+    style: vaxis.Cell.Style,
     text: []const u8,
 ) void {
-    const style = if (theme) |active_theme| style_mod.styleFor(active_theme, token) else vaxis.Cell.Style{};
     window.fill(.{
         .char = .{ .grapheme = " ", .width = 1 },
         .style = style,
@@ -333,9 +309,6 @@ test "viewport bottom anchor keeps latest lines visible" {
 }
 
 test "viewport adds indicators when clipping overflow" {
-    var theme = try resources_mod.Theme.initDefault(std.testing.allocator);
-    defer theme.deinit(std.testing.allocator);
-
     const child = StaticLinesDrawComponent{
         .lines = &[_][]const u8{ "one", "two", "three", "four" },
     };
@@ -344,15 +317,14 @@ test "viewport adds indicators when clipping overflow" {
         .height = 2,
         .scroll_offset = 1,
         .show_indicators = true,
-        .theme = &theme,
+        .indicator_style = .{ .dim = true },
     };
 
     var screen = try test_helpers.renderToScreen(viewport.drawComponent(), 10, 2);
     defer screen.deinit(std.testing.allocator);
 
-    const indicator_style = style_mod.styleFor(&theme, .select_scroll);
-    try test_helpers.expectCell(&screen, 0, 0, "↑", indicator_style);
-    try test_helpers.expectCell(&screen, 0, 1, "↓", indicator_style);
+    try test_helpers.expectCell(&screen, 0, 0, "↑", .{ .dim = true });
+    try test_helpers.expectCell(&screen, 0, 1, "↓", .{ .dim = true });
 }
 
 test "viewport draw scrolls a borrowed cell window" {
