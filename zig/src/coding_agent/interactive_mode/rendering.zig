@@ -4477,9 +4477,8 @@ test "collapse m2 items at or under threshold render without indicator" {
     }, 0, 0, false);
 
     try std.testing.expectEqual(@as(usize, 1), rendered);
-    var lines = tui.LineList.empty;
+    const lines = try tui.cell_rows.screenRowsToLinesAlloc(allocator, &screen, 80, rendered);
     defer freeLinesSlice(allocator, lines);
-    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, 80, rendered, &lines);
     try std.testing.expect(!renderedLinesContain(lines, "to expand"));
 }
 

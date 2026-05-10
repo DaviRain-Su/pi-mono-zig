@@ -1,6 +1,5 @@
 const std = @import("std");
 const ansi = @import("ansi.zig");
-const component_mod = @import("component.zig");
 
 pub const Axis = enum {
     row,

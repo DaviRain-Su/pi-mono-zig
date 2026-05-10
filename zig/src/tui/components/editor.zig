@@ -2,7 +2,6 @@ const std = @import("std");
 const autocomplete = @import("autocomplete.zig");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
-const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
 const select_list = @import("select_list.zig");

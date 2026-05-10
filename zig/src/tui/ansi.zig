@@ -1,7 +1,5 @@
 const std = @import("std");
-const component = @import("component.zig");
 
-pub const LineList = component.LineList;
 
 /// One user-visible grapheme cluster and its terminal cell width.
 pub const DisplayCluster = struct {
@@ -115,41 +113,6 @@ pub fn parseHexColor(text: []const u8) ?RgbColor {
 }
 
 /// Wraps plain UTF-8 text into display-width-bounded lines.
-pub fn wrapTextAlloc(allocator: std.mem.Allocator, text: []const u8, width: usize, lines: *LineList) std.mem.Allocator.Error!void {
-    const effective_width = @max(width, 1);
-    var current_line = std.ArrayList(u8).empty;
-    defer current_line.deinit(allocator);
-
-    var current_width: usize = 0;
-    var index: usize = 0;
-
-    while (index < text.len) {
-        if (text[index] == '\n') {
-            try lines.append(allocator, try current_line.toOwnedSlice(allocator));
-            current_line = .empty;
-            current_width = 0;
-            index += 1;
-            continue;
-        }
-
-        const cluster = nextDisplayCluster(text, index);
-        if (cluster.end <= index) break;
-        if (current_width > 0 and current_width + cluster.width > effective_width) {
-            try lines.append(allocator, try current_line.toOwnedSlice(allocator));
-            current_line = .empty;
-            current_width = 0;
-        }
-
-        try current_line.appendSlice(allocator, text[index..cluster.end]);
-        current_width += cluster.width;
-        index = cluster.end;
-    }
-
-    if (current_line.items.len > 0 or text.len == 0) {
-        try lines.append(allocator, try current_line.toOwnedSlice(allocator));
-    }
-}
-
 /// Slices plain UTF-8 text by terminal display columns without splitting grapheme clusters.
 pub fn sliceVisibleAlloc(
     allocator: std.mem.Allocator,
@@ -382,18 +345,6 @@ fn isWideCodepoint(codepoint: u21) bool {
 test "visible width counts CJK and emoji as wide graphemes" {
     try std.testing.expectEqual(@as(usize, 8), visibleWidth("ab你好🙂"));
     try std.testing.expectEqual(@as(usize, 2), visibleWidth("👩‍💻"));
-}
-
-test "wrap text uses display width for wide graphemes" {
-    const allocator = std.testing.allocator;
-    var lines = LineList.empty;
-    defer component.freeLines(allocator, &lines);
-
-    try wrapTextAlloc(allocator, "ab你好🙂", 4, &lines);
-
-    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expectEqualStrings("ab你", lines.items[0]);
-    try std.testing.expectEqualStrings("好🙂", lines.items[1]);
 }
 
 test "slice visible range respects wide grapheme boundaries" {

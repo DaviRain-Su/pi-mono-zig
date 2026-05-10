@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const vaxis = @import("vaxis");
 pub const ansi = @import("ansi.zig");
-pub const component = @import("component.zig");
+
 pub const cell_rows = @import("cell_rows.zig");
 pub const draw = @import("draw.zig");
 pub const keys = @import("keys.zig");
@@ -33,7 +33,6 @@ pub const components = struct {
 pub const DrawComponent = draw.Component;
 pub const DrawContext = draw.DrawContext;
 pub const DrawSize = draw.Size;
-pub const LineList = component.LineList;
 pub const Key = keys.Key;
 pub const Axis = layout.Axis;
 pub const JustifyContent = layout.JustifyContent;
@@ -88,7 +87,6 @@ pub const TableRow = components.table.Row;
 
 test {
     _ = @import("ansi.zig");
-    _ = @import("component.zig");
     _ = @import("cell_rows.zig");
     _ = @import("draw.zig");
     _ = @import("keys.zig");

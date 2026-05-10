@@ -1,6 +1,5 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const component_mod = @import("../component.zig");
 const draw_mod = @import("../draw.zig");
 const test_helpers = @import("../test_helpers.zig");
 
