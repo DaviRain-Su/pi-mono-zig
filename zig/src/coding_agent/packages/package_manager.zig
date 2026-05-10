@@ -434,9 +434,6 @@ const WasmPackageListMetadata = struct {
     }
 };
 
-const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
-const EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION = "pi-extension-lock.v0";
-
 fn createInstallMetadataForSource(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -450,7 +447,7 @@ fn createInstallMetadataForSource(
     defer allocator.free(package_root);
     if (!pathExists(io, package_root)) return null;
 
-    const package_root_real = realpathAlloc(allocator, package_root) catch try allocator.dupe(u8, package_root);
+    const package_root_real = try package_sources.realpathOrResolved(allocator, package_root);
     defer allocator.free(package_root_real);
     const package_root_sha256 = try wasm_manifest.computePackageRootSha256(allocator, package_root);
     defer allocator.free(package_root_sha256);
@@ -591,7 +588,7 @@ fn writeExtensionProvenanceLockEntry(
 ) !void {
     if (entry != .object) return;
     const entry_key = jsonStringField(entry.object, "key") orelse return;
-    const lock_path = try extensionProvenanceLockfilePath(allocator, is_project, options);
+    const lock_path = try provenance_lockfile.lockfilePath(allocator, provenanceScope(is_project), options.cwd, options.agent_dir);
     defer allocator.free(lock_path);
     var entries = std.json.Array.init(allocator);
     errdefer common.deinitJsonValue(allocator, .{ .array = entries });
@@ -622,33 +619,13 @@ fn writeExtensionProvenanceLockEntry(
 
     var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = root });
-    try root.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION) });
+    try root.put(allocator, try allocator.dupe(u8, "schemaVersion"), .{ .string = try allocator.dupe(u8, provenance_lockfile.LOCK_SCHEMA_VERSION) });
     try root.put(allocator, try allocator.dupe(u8, "entries"), .{ .array = entries });
     const value = std.json.Value{ .object = root };
     defer common.deinitJsonValue(allocator, value);
     const serialized = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(serialized);
     try common.writeFileAbsolute(io, lock_path, serialized, true);
-}
-
-fn extensionProvenanceLockfilePath(
-    allocator: std.mem.Allocator,
-    is_project: bool,
-    options: ExecuteOptions,
-) ![]u8 {
-    if (is_project) return std.fs.path.join(allocator, &[_][]const u8{ options.cwd, ".pi", EXTENSION_PROVENANCE_LOCKFILE_NAME });
-    return std.fs.path.join(allocator, &[_][]const u8{ options.agent_dir, EXTENSION_PROVENANCE_LOCKFILE_NAME });
-}
-
-fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (@import("builtin").os.tag == .windows) {
-        return std.fs.path.resolve(allocator, &.{path}) catch allocator.dupe(u8, path);
-    }
-    const z_path = try allocator.dupeZ(u8, path);
-    defer allocator.free(z_path);
-    var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const resolved = std.c.realpath(z_path.ptr, &buffer) orelse return error.FileNotFound;
-    return allocator.dupe(u8, std.mem.span(resolved));
 }
 
 fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -1225,19 +1202,12 @@ fn wasmPolicyLookupKeyFromLockEntry(
     return policy_key_mod.wasmPolicyLookupKey(allocator, handoff);
 }
 
-fn nativePolicyLookupKeyFromLockEntry(
-    allocator: std.mem.Allocator,
-    entry: provenance_lockfile.LockEntry,
-) ![]u8 {
-    return provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, entry);
-}
-
 fn policyLookupKeyFromLockEntry(
     allocator: std.mem.Allocator,
     entry: provenance_lockfile.LockEntry,
 ) ![]u8 {
     if (std.mem.eql(u8, entry.manifest_kind, "native-extension")) {
-        return nativePolicyLookupKeyFromLockEntry(allocator, entry);
+        return provenance_lockfile.nativePolicyLookupKeyFromLockEntry(allocator, entry);
     }
     return wasmPolicyLookupKeyFromLockEntry(allocator, entry);
 }
@@ -1543,8 +1513,8 @@ const PolicyCleanupPlan = struct {
     native_prefixes: std.ArrayList([]u8) = .empty,
 
     fn deinit(self: *PolicyCleanupPlan, allocator: std.mem.Allocator) void {
-        freeOwnedStrings(allocator, &self.exact_keys);
-        freeOwnedStrings(allocator, &self.native_prefixes);
+        package_settings_store.freeOwnedStrings(allocator, &self.exact_keys);
+        package_settings_store.freeOwnedStrings(allocator, &self.native_prefixes);
         self.* = undefined;
     }
 };
@@ -1747,7 +1717,7 @@ fn collectUpdateSources(
     errdefer freeUpdateSources(allocator, &result);
 
     var user_sources = try collectScopePackages(allocator, io, options, false);
-    defer freeOwnedStrings(allocator, &user_sources);
+    defer package_settings_store.freeOwnedStrings(allocator, &user_sources);
     for (user_sources.items) |entry| {
         if (source_filter) |filter| {
             if (!try packageSourcesMatchForScope(allocator, entry, filter, false, options)) continue;
@@ -1759,7 +1729,7 @@ fn collectUpdateSources(
     }
 
     var project_sources = try collectScopePackages(allocator, io, options, true);
-    defer freeOwnedStrings(allocator, &project_sources);
+    defer package_settings_store.freeOwnedStrings(allocator, &project_sources);
     for (project_sources.items) |entry| {
         if (source_filter) |filter| {
             if (!try packageSourcesMatchForScope(allocator, entry, filter, true, options)) continue;
@@ -2311,30 +2281,6 @@ fn removeProvenanceEntry(
 ) !bool {
     if (options.fail_lockfile_write_for_testing) return error.InjectedLockfileWriteFailure;
     return try provenance_lockfile.removeEntry(allocator, io, scope, lockfile_path, key);
-}
-
-fn findInstalledScope(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    options: ExecuteOptions,
-    source: []const u8,
-) !?bool {
-    var user_sources = try collectScopePackages(allocator, io, options, false);
-    defer freeOwnedStrings(allocator, &user_sources);
-    for (user_sources.items) |entry| {
-        if (std.mem.eql(u8, entry, source)) return false;
-    }
-    var project_sources = try collectScopePackages(allocator, io, options, true);
-    defer freeOwnedStrings(allocator, &project_sources);
-    for (project_sources.items) |entry| {
-        if (std.mem.eql(u8, entry, source)) return true;
-    }
-    return null;
-}
-
-fn freeOwnedStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
-    for (list.items) |entry| allocator.free(entry);
-    list.deinit(allocator);
 }
 
 // ---------------------------------------------------------------------
