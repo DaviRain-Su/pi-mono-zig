@@ -1305,74 +1305,19 @@ fn deinitResourcePathList(allocator: std.mem.Allocator, list: *std.ArrayList(Res
     list.deinit(allocator);
 }
 
+const event_surface_name_table: [@typeInfo(ExtensionEventType).@"enum".fields.len][]const u8 = blk: {
+    const fields = @typeInfo(ExtensionEventType).@"enum".fields;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = field.name;
+    break :blk names;
+};
+
 pub fn eventSurfaceNames() []const []const u8 {
-    return &.{
-        "resources_discover",
-        "session_start",
-        "session_before_switch",
-        "session_before_fork",
-        "session_before_compact",
-        "session_compact",
-        "session_shutdown",
-        "session_before_tree",
-        "session_tree",
-        "before_agent_start",
-        "agent_start",
-        "agent_end",
-        "sub_agent_readiness",
-        "turn_start",
-        "turn_end",
-        "message_start",
-        "message_update",
-        "message_end",
-        "tool_execution_start",
-        "tool_execution_update",
-        "tool_execution_end",
-        "tool_call",
-        "tool_result",
-        "user_bash",
-        "context",
-        "before_provider_request",
-        "after_provider_response",
-        "model_select",
-        "thinking_level_select",
-        "input",
-    };
+    return &event_surface_name_table;
 }
 
 pub fn eventName(event_type: ExtensionEventType) []const u8 {
-    return switch (event_type) {
-        .resources_discover => "resources_discover",
-        .session_start => "session_start",
-        .session_before_switch => "session_before_switch",
-        .session_before_fork => "session_before_fork",
-        .session_before_compact => "session_before_compact",
-        .session_compact => "session_compact",
-        .session_shutdown => "session_shutdown",
-        .session_before_tree => "session_before_tree",
-        .session_tree => "session_tree",
-        .before_agent_start => "before_agent_start",
-        .agent_start => "agent_start",
-        .agent_end => "agent_end",
-        .sub_agent_readiness => "sub_agent_readiness",
-        .turn_start => "turn_start",
-        .turn_end => "turn_end",
-        .message_start => "message_start",
-        .message_update => "message_update",
-        .message_end => "message_end",
-        .tool_execution_start => "tool_execution_start",
-        .tool_execution_update => "tool_execution_update",
-        .tool_execution_end => "tool_execution_end",
-        .tool_call => "tool_call",
-        .tool_result => "tool_result",
-        .user_bash => "user_bash",
-        .context => "context",
-        .before_provider_request => "before_provider_request",
-        .after_provider_response => "after_provider_response",
-        .model_select => "model_select",
-        .thinking_level_select => "thinking_level_select",
-        .input => "input",
-    };
+    return @tagName(event_type);
 }
 
 // ---------------------------------------------------------------------------
