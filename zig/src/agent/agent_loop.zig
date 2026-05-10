@@ -1,6 +1,3 @@
-// TODO(review-B8): This file still covers too many concerns
-// (tool execution, streaming). accumulator.zig and json_schema.zig
-// have been extracted. Next: tool execution and streaming modules.
 const std = @import("std");
 const ai = @import("ai");
 const provider_json = ai.provider_json;
