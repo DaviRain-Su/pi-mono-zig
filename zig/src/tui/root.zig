@@ -52,6 +52,9 @@ pub const components = struct {
     pub const clear = vw.components.clear;
     pub const bar_chart = vw.components.bar_chart;
     pub const line_gauge = vw.components.line_gauge;
+    pub const dialog = vw.components.dialog;
+    pub const menu = vw.components.menu;
+    pub const toast = vw.components.toast;
 };
 
 // Top-level re-exports (backward compatible)
@@ -144,6 +147,17 @@ pub const TreeNode = vw.TreeNode;
 pub const TreeState = vw.TreeState;
 pub const Input = vw.Input;
 pub const Popup = vw.Popup;
+pub const Dialog = vw.Dialog;
+pub const DialogButton = vw.DialogButton;
+pub const DialogResult = vw.DialogResult;
+pub const MenuBar = vw.MenuBar;
+pub const Menu = vw.Menu;
+pub const MenuItem = vw.MenuItem;
+pub const MenuResult = vw.MenuResult;
+pub const ContextMenu = vw.ContextMenu;
+pub const Toast = vw.Toast;
+pub const ToastLevel = vw.ToastLevel;
+pub const ToastStack = vw.ToastStack;
 
 test {
     _ = @import("cell_rows.zig");

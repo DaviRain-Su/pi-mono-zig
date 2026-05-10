@@ -56,6 +56,19 @@ pub const Markdown = @import("components/markdown.zig").Markdown;
 pub const MarkdownStyles = @import("components/markdown.zig").MarkdownStyles;
 pub const Autocomplete = @import("components/autocomplete.zig");
 
+// Dialog, Menu, Toast
+pub const Dialog = @import("components/dialog.zig").Dialog;
+pub const DialogButton = @import("components/dialog.zig").DialogButton;
+pub const DialogResult = @import("components/dialog.zig").DialogResult;
+pub const MenuBar = @import("components/menu.zig").MenuBar;
+pub const Menu = @import("components/menu.zig").Menu;
+pub const MenuItem = @import("components/menu.zig").MenuItem;
+pub const MenuResult = @import("components/menu.zig").MenuResult;
+pub const ContextMenu = @import("components/menu.zig").ContextMenu;
+pub const Toast = @import("components/toast.zig").Toast;
+pub const ToastLevel = @import("components/toast.zig").ToastLevel;
+pub const ToastStack = @import("components/toast.zig").ToastStack;
+
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -88,6 +101,9 @@ pub const components = struct {
     pub const clear = @import("components/clear.zig");
     pub const bar_chart = @import("components/bar_chart.zig");
     pub const line_gauge = @import("components/line_gauge.zig");
+    pub const dialog = @import("components/dialog.zig");
+    pub const menu = @import("components/menu.zig");
+    pub const toast = @import("components/toast.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;
