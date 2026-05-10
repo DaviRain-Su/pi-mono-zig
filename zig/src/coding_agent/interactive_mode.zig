@@ -1033,14 +1033,14 @@ test "screen renders welcome prompt footer and tool lines" {
     const lines = try rendering.renderScreenToLines(allocator, &screen, 80);
     defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(lines.items.len >= 3);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
+    try std.testing.expect(lines.len >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "╭") != null);
     try std.testing.expect(renderedLinesContain(lines, "pi · session.jsonl"));
     try std.testing.expect(renderedLinesContain(lines, "Welcome to pi"));
     try std.testing.expect(renderedLinesContain(lines, "╭"));
     try std.testing.expect(renderedLinesContain(lines, "> w"));
     try std.testing.expect(renderedLinesContain(lines, "╰"));
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "Session: session.jsonl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[lines.len - 1], "Session: session.jsonl") != null);
 }
 
 test "interactive mode startup renders welcome message and footer through a mock backend" {
@@ -1482,11 +1482,11 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     const lines = try rendering.renderScreenToLines(allocator, &screen, 60);
     defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(lines.items.len >= 5);
+    try std.testing.expect(lines.len >= 5);
     var saw_prompt_border = false;
     var saw_prompt_glyph = false;
     var saw_overflow = false;
-    for (lines.items) |line| {
+    for (lines) |line| {
         if (std.mem.indexOf(u8, line, "╭") != null) saw_prompt_border = true;
         if (std.mem.indexOf(u8, line, "> ") != null) saw_prompt_glyph = true;
         if (std.mem.indexOf(u8, line, "↓ more") != null) saw_overflow = true;
@@ -1494,7 +1494,7 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
     try std.testing.expect(saw_prompt_border);
     try std.testing.expect(saw_prompt_glyph);
     try std.testing.expect(saw_overflow);
-    try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "TERM") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[lines.len - 1], "TERM") != null);
 }
 
 test "screen renders themed output without persistent keybinding hints" {
@@ -1532,7 +1532,7 @@ test "screen renders themed output without persistent keybinding hints" {
     defer freeLinesSlice(allocator, lines);
 
     var saw_custom_hint = false;
-    for (lines.items) |line| {
+    for (lines) |line| {
         if (std.mem.indexOf(u8, line, "Ctrl+X sessions") != null) saw_custom_hint = true;
     }
 
@@ -1592,7 +1592,7 @@ test "screen renders assistant markdown while keeping user messages plain" {
     var saw_list = false;
     var saw_code = false;
 
-    for (lines.items) |line| {
+    for (lines) |line| {
         if (std.mem.indexOf(u8, line, ASSISTANT_PREFIX) != null) saw_prefix = true;
         if (std.mem.indexOf(u8, line, "You: literal **stars** [plain](https://example.com)") != null) saw_user_literal = true;
         if (std.mem.indexOf(u8, line, "bold") != null) saw_bold = true;
@@ -4025,14 +4025,14 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 24 } };
     defer backend.deinit(allocator);
 
-    const lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
+    var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
     defer freeLinesSlice(allocator, lines);
     try std.testing.expect(renderedLinesContain(lines, "[bookmark]"));
 
     overlay.?.deinit(allocator);
     overlay = null;
     freeLinesSlice(allocator, lines);
-    lines = .empty;
+    lines = &.{};
 
     _ = try editor.handlePaste("/label");
     try handleInputKey(
@@ -5552,7 +5552,7 @@ test "interactive tool conversation renders tool lines and persists session entr
     var saw_tool_result = false;
     var saw_assistant_prefix = false;
     var saw_final_response = false;
-    for (lines.items) |line| {
+    for (lines) |line| {
         if (std.mem.indexOf(u8, line, "You: what is in the file?") != null) saw_user = true;
         if (std.mem.indexOf(u8, line, "Read ") != null and std.mem.indexOf(u8, line, file_path) != null) saw_tool_call = true;
         if (std.mem.indexOf(u8, line, "Read result read:") != null or std.mem.indexOf(u8, line, "secret note") != null) saw_tool_result = true;
@@ -5651,7 +5651,7 @@ test "interactive bash tool conversation preserves structured details" {
     defer freeLinesSlice(allocator, lines);
 
     var saw_bash_output = false;
-    for (lines.items) |line| {
+    for (lines) |line| {
         if (std.mem.indexOf(u8, line, "3000") != null) saw_bash_output = true;
     }
     try std.testing.expect(saw_bash_output);
