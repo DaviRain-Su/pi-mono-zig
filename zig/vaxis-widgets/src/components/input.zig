@@ -49,67 +49,70 @@ pub const Input = struct {
         const use_placeholder = self.text.len == 0;
         const text_style = if (use_placeholder) self.placeholder_style else self.style;
 
-        // Compute visible window based on cursor position
-        const clamped_cursor = @min(self.cursor, display_text.len);
+        var graphemes = std.ArrayList(struct { byte_start: usize, byte_end: usize, width: usize }).empty;
+        defer graphemes.deinit(ctx.arena);
+
+        var cursor_grapheme_index: usize = 0;
+        var idx: usize = 0;
+        while (idx < display_text.len) {
+            const cluster = ansi.nextDisplayCluster(display_text, idx);
+            if (cluster.end <= idx) break;
+            if (idx < @min(self.cursor, display_text.len)) cursor_grapheme_index = graphemes.items.len + 1;
+            try graphemes.append(ctx.arena, .{
+                .byte_start = idx,
+                .byte_end = cluster.end,
+                .width = cluster.width,
+            });
+            idx = cluster.end;
+        }
+        cursor_grapheme_index = @min(cursor_grapheme_index, graphemes.items.len);
+
         var cursor_col: u16 = 0;
 
         // If text is too wide, scroll to keep cursor visible
         if (self.mask) |mask_char| {
             // Simple mask: all chars show as mask_char
             const mask_width = ansi.visibleWidth(&[_]u8{mask_char});
-            const total_mask_width = display_text.len * mask_width;
-            if (total_mask_width > effective_width and clamped_cursor > 0) {
+            const total_mask_width = graphemes.items.len * mask_width;
+            if (total_mask_width > effective_width and cursor_grapheme_index > 0) {
                 // Center cursor
-                const before_width = clamped_cursor * mask_width;
+                const before_width = cursor_grapheme_index * mask_width;
                 _ = before_width;
             }
 
             var col: u16 = 0;
             var i: usize = 0;
-            while (i < display_text.len and col < effective_width) : (i += 1) {
-                if (i == clamped_cursor and self.show_cursor and !use_placeholder) {
+            while (i < graphemes.items.len and col < effective_width) : (i += 1) {
+                if (i == cursor_grapheme_index and self.show_cursor and !use_placeholder) {
                     cursor_col = col;
                 }
                 const grapheme = try std.fmt.allocPrint(ctx.arena, "{c}", .{mask_char});
                 window.writeCell(col, row, .{
                     .char = .{ .grapheme = grapheme, .width = @intCast(mask_width) },
-                    .style = if (i == clamped_cursor and self.show_cursor and !use_placeholder)
+                    .style = if (i == cursor_grapheme_index and self.show_cursor and !use_placeholder)
                         self.cursor_style
                     else
                         text_style,
                 });
                 col += @intCast(mask_width);
             }
+            if (cursor_grapheme_index == graphemes.items.len) cursor_col = col;
 
             if (self.show_cursor and !use_placeholder and cursor_col < effective_width) {
                 window.writeCell(cursor_col, row, .{
-                    .char = .{ .grapheme = &[_]u8{mask_char}, .width = @intCast(mask_width) },
+                    .char = .{ .grapheme = if (cursor_grapheme_index < graphemes.items.len) &[_]u8{mask_char} else " ", .width = @intCast(mask_width) },
                     .style = self.cursor_style,
                 });
             }
         } else {
             // Normal text rendering with grapheme awareness
             var col: u16 = 0;
-            var graphemes = std.ArrayList(struct { byte_start: usize, byte_end: usize, width: usize }).empty;
-            defer graphemes.deinit(std.heap.page_allocator);
-
-            var idx: usize = 0;
-            while (idx < display_text.len) {
-                const cluster = ansi.nextDisplayCluster(display_text, idx);
-                if (cluster.end <= idx) break;
-                try graphemes.append(std.heap.page_allocator, .{
-                    .byte_start = idx,
-                    .byte_end = cluster.end,
-                    .width = cluster.width,
-                });
-                idx = cluster.end;
-            }
 
             // Find start grapheme for scrolling
             var start_grapheme: usize = 0;
-            if (graphemes.items.len > 0 and clamped_cursor > 0) {
+            if (graphemes.items.len > 0 and cursor_grapheme_index > 0) {
                 var width_before: usize = 0;
-                for (graphemes.items[0..clamped_cursor], 0..) |g, i| {
+                for (graphemes.items[0..cursor_grapheme_index], 0..) |g, i| {
                     width_before += g.width;
                     if (width_before > effective_width / 2) {
                         start_grapheme = i;
@@ -120,7 +123,7 @@ pub const Input = struct {
 
             for (graphemes.items[start_grapheme..], start_grapheme..) |g, gi| {
                 if (col >= effective_width) break;
-                const is_cursor = gi == clamped_cursor and self.show_cursor and !use_placeholder;
+                const is_cursor = gi == cursor_grapheme_index and self.show_cursor and !use_placeholder;
                 if (is_cursor) cursor_col = col;
                 window.writeCell(col, row, .{
                     .char = .{ .grapheme = display_text[g.byte_start..g.byte_end], .width = @intCast(g.width) },
@@ -128,17 +131,18 @@ pub const Input = struct {
                 });
                 col += @intCast(g.width);
             }
+            if (cursor_grapheme_index == graphemes.items.len) cursor_col = col;
 
             if (self.show_cursor and !use_placeholder and cursor_col < effective_width) {
-                const g = if (clamped_cursor < graphemes.items.len)
-                    graphemes.items[clamped_cursor]
+                const g = if (cursor_grapheme_index < graphemes.items.len)
+                    graphemes.items[cursor_grapheme_index]
                 else if (graphemes.items.len > 0)
                     graphemes.items[graphemes.items.len - 1]
                 else
                     null;
                 if (g) |grapheme| {
                     window.writeCell(cursor_col, row, .{
-                        .char = .{ .grapheme = display_text[grapheme.byte_start..grapheme.byte_end], .width = @intCast(grapheme.width) },
+                        .char = .{ .grapheme = if (cursor_grapheme_index < graphemes.items.len) display_text[grapheme.byte_start..grapheme.byte_end] else " ", .width = if (cursor_grapheme_index < graphemes.items.len) @intCast(grapheme.width) else 1 },
                         .style = self.cursor_style,
                     });
                 }
@@ -212,4 +216,19 @@ test "input masks password text" {
 
     const cell = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("*", cell.char.grapheme);
+}
+
+test "input handles multibyte cursor offsets" {
+    const input = Input{
+        .text = "你🙂x",
+        .cursor = "你🙂x".len,
+    };
+
+    var screen = try test_helpers.renderToScreen(input.drawComponent(), 10, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "你", .{});
+    try test_helpers.expectCell(&screen, 2, 0, "🙂", .{});
+    try test_helpers.expectCell(&screen, 4, 0, "x", .{});
+    try test_helpers.expectCell(&screen, 5, 0, " ", .{ .reverse = true });
 }

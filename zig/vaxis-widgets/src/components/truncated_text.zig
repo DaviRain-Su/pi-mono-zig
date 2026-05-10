@@ -36,7 +36,7 @@ pub const TruncatedText = struct {
         };
 
         const single_line = firstLine(self.text);
-        const display = try truncateCodepointsAlloc(ctx.arena, single_line, content_window.width, self.ellipsis, self.mode);
+        const display = try truncateVisibleAlloc(ctx.arena, single_line, content_window.width, self.ellipsis, self.mode);
         _ = content_window.printSegment(.{ .text = display }, .{ .wrap = .none });
 
         const total_height = @min(window.height, @as(u16, @intCast(self.padding_y * 2 + 1)));
@@ -70,50 +70,50 @@ fn firstLine(text: []const u8) []const u8 {
     return text[0..newline_index];
 }
 
-fn truncateCodepointsAlloc(
+fn truncateVisibleAlloc(
     allocator: std.mem.Allocator,
     text: []const u8,
-    max_units: usize,
+    max_width: usize,
     ellipsis: []const u8,
     mode: TruncationMode,
 ) std.mem.Allocator.Error![]u8 {
-    if (max_units == 0) return allocator.dupe(u8, "");
+    if (max_width == 0) return allocator.dupe(u8, "");
 
-    const unit_count = countCodepoints(text);
-    if (unit_count <= max_units) return allocator.dupe(u8, text);
+    const text_width = ansi.visibleWidth(text);
+    if (text_width <= max_width) return allocator.dupe(u8, text);
 
-    const ellipsis_units = countCodepoints(ellipsis);
-    if (ellipsis_units == 0) return sliceCodepointsAlloc(allocator, text, 0, max_units);
-    if (ellipsis_units >= max_units) return sliceCodepointsAlloc(allocator, ellipsis, 0, max_units);
+    const ellipsis_width = ansi.visibleWidth(ellipsis);
+    if (ellipsis_width == 0) return ansi.sliceVisibleAlloc(allocator, text, 0, max_width);
+    if (ellipsis_width >= max_width) return ansi.sliceVisibleAlloc(allocator, ellipsis, 0, max_width);
 
-    const kept_units = max_units - ellipsis_units;
+    const kept_width = max_width - ellipsis_width;
     var builder = std.ArrayList(u8).empty;
     errdefer builder.deinit(allocator);
 
     switch (mode) {
         .end => {
-            const prefix = try sliceCodepointsAlloc(allocator, text, 0, kept_units);
+            const prefix = try ansi.sliceVisibleAlloc(allocator, text, 0, kept_width);
             defer allocator.free(prefix);
             try builder.appendSlice(allocator, prefix);
             try builder.appendSlice(allocator, ellipsis);
         },
         .start => {
-            const suffix = try sliceCodepointsAlloc(allocator, text, unit_count - kept_units, kept_units);
+            const suffix = try suffixVisibleAlloc(allocator, text, kept_width);
             defer allocator.free(suffix);
             try builder.appendSlice(allocator, ellipsis);
             try builder.appendSlice(allocator, suffix);
         },
         .middle => {
-            const prefix_units = std.math.divCeil(usize, kept_units, 2) catch kept_units;
-            const suffix_units = kept_units - prefix_units;
+            const prefix_width = std.math.divCeil(usize, kept_width, 2) catch kept_width;
+            const suffix_width = kept_width - prefix_width;
 
-            const prefix = try sliceCodepointsAlloc(allocator, text, 0, prefix_units);
+            const prefix = try ansi.sliceVisibleAlloc(allocator, text, 0, prefix_width);
             defer allocator.free(prefix);
             try builder.appendSlice(allocator, prefix);
             try builder.appendSlice(allocator, ellipsis);
 
-            if (suffix_units > 0) {
-                const suffix = try sliceCodepointsAlloc(allocator, text, unit_count - suffix_units, suffix_units);
+            if (suffix_width > 0) {
+                const suffix = try suffixVisibleAlloc(allocator, text, suffix_width);
                 defer allocator.free(suffix);
                 try builder.appendSlice(allocator, suffix);
             }
@@ -123,43 +123,11 @@ fn truncateCodepointsAlloc(
     return builder.toOwnedSlice(allocator);
 }
 
-fn countCodepoints(text: []const u8) usize {
-    var count: usize = 0;
-    var index: usize = 0;
-    while (index < text.len) {
-        const sequence_len = std.unicode.utf8ByteSequenceLength(text[index]) catch break;
-        index += sequence_len;
-        count += 1;
-    }
-    return count;
-}
-
-fn sliceCodepointsAlloc(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-    start: usize,
-    count: usize,
-) std.mem.Allocator.Error![]u8 {
-    if (count == 0) return allocator.dupe(u8, "");
-
-    var index: usize = 0;
-    var current: usize = 0;
-    var start_byte: ?usize = null;
-    var end_byte: ?usize = null;
-
-    while (index < text.len) {
-        if (current == start and start_byte == null) start_byte = index;
-        const sequence_len = std.unicode.utf8ByteSequenceLength(text[index]) catch break;
-        index += sequence_len;
-        current += 1;
-        if (current == start + count) {
-            end_byte = index;
-            break;
-        }
-    }
-
-    const begin = start_byte orelse return allocator.dupe(u8, "");
-    return allocator.dupe(u8, text[begin .. end_byte orelse text.len]);
+fn suffixVisibleAlloc(allocator: std.mem.Allocator, text: []const u8, width: usize) std.mem.Allocator.Error![]u8 {
+    if (width == 0) return allocator.dupe(u8, "");
+    const text_width = ansi.visibleWidth(text);
+    if (text_width <= width) return allocator.dupe(u8, text);
+    return ansi.sliceVisibleAlloc(allocator, text, text_width - width, width);
 }
 
 test "truncated text ellipsizes overflowing content at the end" {
@@ -203,6 +171,25 @@ test "truncated text supports middle truncation" {
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expectEqualStrings("abcd…hij", rendered);
+}
+
+test "truncated text respects display width for wide graphemes" {
+    const allocator = std.testing.allocator;
+
+    const end = try truncateVisibleAlloc(allocator, "你好世界", 5, "…", .end);
+    defer allocator.free(end);
+    try std.testing.expectEqualStrings("你好…", end);
+    try std.testing.expect(ansi.visibleWidth(end) <= 5);
+
+    const start = try truncateVisibleAlloc(allocator, "你好世界", 5, "…", .start);
+    defer allocator.free(start);
+    try std.testing.expectEqualStrings("…世界", start);
+    try std.testing.expect(ansi.visibleWidth(start) <= 5);
+
+    const emoji = try truncateVisibleAlloc(allocator, "🙂🙂x", 4, "…", .end);
+    defer allocator.free(emoji);
+    try std.testing.expectEqualStrings("🙂…", emoji);
+    try std.testing.expect(ansi.visibleWidth(emoji) <= 4);
 }
 
 test "truncated text respects padding and only renders the first line" {
