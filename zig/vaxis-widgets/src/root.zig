@@ -77,6 +77,13 @@ pub const Toggle = @import("components/toggle.zig").Toggle;
 pub const Accordion = @import("components/accordion.zig").Accordion;
 pub const AccordionItem = @import("components/accordion.zig").AccordionItem;
 
+// Navigation and display
+pub const Tooltip = @import("components/tooltip.zig").Tooltip;
+pub const Slider = @import("components/slider.zig").Slider;
+pub const Breadcrumbs = @import("components/breadcrumbs.zig").Breadcrumbs;
+pub const BreadcrumbItem = @import("components/breadcrumbs.zig").BreadcrumbItem;
+pub const Pagination = @import("components/pagination.zig").Pagination;
+
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -116,6 +123,10 @@ pub const components = struct {
     pub const radio = @import("components/radio.zig");
     pub const toggle = @import("components/toggle.zig");
     pub const accordion = @import("components/accordion.zig");
+    pub const tooltip = @import("components/tooltip.zig");
+    pub const slider = @import("components/slider.zig");
+    pub const breadcrumbs = @import("components/breadcrumbs.zig");
+    pub const pagination = @import("components/pagination.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;

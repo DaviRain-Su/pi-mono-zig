@@ -164,6 +164,11 @@ pub const RadioOption = vw.RadioOption;
 pub const Toggle = vw.Toggle;
 pub const Accordion = vw.Accordion;
 pub const AccordionItem = vw.AccordionItem;
+pub const Tooltip = vw.Tooltip;
+pub const Slider = vw.Slider;
+pub const Breadcrumbs = vw.Breadcrumbs;
+pub const BreadcrumbItem = vw.BreadcrumbItem;
+pub const Pagination = vw.Pagination;
 
 test {
     _ = @import("cell_rows.zig");
