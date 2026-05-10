@@ -84,6 +84,20 @@ pub const Breadcrumbs = @import("components/breadcrumbs.zig").Breadcrumbs;
 pub const BreadcrumbItem = @import("components/breadcrumbs.zig").BreadcrumbItem;
 pub const Pagination = @import("components/pagination.zig").Pagination;
 
+// Specialized viewers
+pub const DiffViewer = @import("components/diff_viewer.zig").DiffViewer;
+pub const DiffLine = @import("components/diff_viewer.zig").DiffLine;
+pub const DiffLineType = @import("components/diff_viewer.zig").DiffLineType;
+pub const LogViewer = @import("components/log_viewer.zig").LogViewer;
+pub const LogEntry = @import("components/log_viewer.zig").LogEntry;
+pub const LogLevel = @import("components/log_viewer.zig").LogLevel;
+pub const FileTree = @import("components/file_tree.zig").FileTree;
+pub const FileTreeNode = @import("components/file_tree.zig").FileTreeNode;
+pub const FileType = @import("components/file_tree.zig").FileType;
+pub const ResizableSplit = @import("components/resizable_split.zig").ResizableSplit;
+pub const Wizard = @import("components/wizard.zig").Wizard;
+pub const WizardStep = @import("components/wizard.zig").WizardStep;
+
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -127,6 +141,11 @@ pub const components = struct {
     pub const slider = @import("components/slider.zig");
     pub const breadcrumbs = @import("components/breadcrumbs.zig");
     pub const pagination = @import("components/pagination.zig");
+    pub const diff_viewer = @import("components/diff_viewer.zig");
+    pub const log_viewer = @import("components/log_viewer.zig");
+    pub const file_tree = @import("components/file_tree.zig");
+    pub const resizable_split = @import("components/resizable_split.zig");
+    pub const wizard = @import("components/wizard.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;

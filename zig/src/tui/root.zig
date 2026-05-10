@@ -169,6 +169,18 @@ pub const Slider = vw.Slider;
 pub const Breadcrumbs = vw.Breadcrumbs;
 pub const BreadcrumbItem = vw.BreadcrumbItem;
 pub const Pagination = vw.Pagination;
+pub const DiffViewer = vw.DiffViewer;
+pub const DiffLine = vw.DiffLine;
+pub const DiffLineType = vw.DiffLineType;
+pub const LogViewer = vw.LogViewer;
+pub const LogEntry = vw.LogEntry;
+pub const LogLevel = vw.LogLevel;
+pub const FileTree = vw.FileTree;
+pub const FileTreeNode = vw.FileTreeNode;
+pub const FileType = vw.FileType;
+pub const ResizableSplit = vw.ResizableSplit;
+pub const Wizard = vw.Wizard;
+pub const WizardStep = vw.WizardStep;
 
 test {
     _ = @import("cell_rows.zig");
