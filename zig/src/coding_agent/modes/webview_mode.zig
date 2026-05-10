@@ -176,6 +176,7 @@ pub fn runWebViewMode(
         .initial_messages = options.initial_messages,
         .initial_images_count = options.initial_images_count,
     });
+    defer bridge.deinit();
     cleanup_state.bridge_registered = true;
 
     if (env_map.get("PI_WEBVIEW_SMOKE_PROMPT")) |prompt_text| {
@@ -362,7 +363,12 @@ fn runBridgeSmokePrompt(
     try prompt_request.writer.writeAll("{\"id\":\"smoke-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":");
     try writeJsonString(allocator, &prompt_request.writer, prompt_text);
     try prompt_request.writer.writeAll("}}");
-    try writeBridgeSmokeResponse(allocator, bridge, "prompt", prompt_request.written(), stdout);
+    const prompt_response = try writeBridgeSmokeResponseAlloc(allocator, bridge, "prompt", prompt_request.written(), stdout);
+    defer allocator.free(prompt_response);
+    const turn_id = try extractBridgeTurnId(allocator, prompt_response);
+    defer allocator.free(turn_id);
+    const events = try pollBridgeSmokeEvents(allocator, bridge, turn_id, "prompt_events", stdout);
+    defer allocator.free(events);
 
     try writeBridgeSmokeResponse(allocator, bridge, "messages_after", "{\"id\":\"smoke-messages-after\",\"command\":\"get_messages\"}", stdout);
 }
@@ -379,7 +385,12 @@ fn runBridgeSmokeProviderError(
     try prompt_request.writer.writeAll("{\"id\":\"smoke-error-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":");
     try writeJsonString(allocator, &prompt_request.writer, prompt_text);
     try prompt_request.writer.writeAll("}}");
-    try writeBridgeSmokeResponse(allocator, bridge, "provider_error", prompt_request.written(), stdout);
+    const prompt_response = try writeBridgeSmokeResponseAlloc(allocator, bridge, "provider_error", prompt_request.written(), stdout);
+    defer allocator.free(prompt_response);
+    const turn_id = try extractBridgeTurnId(allocator, prompt_response);
+    defer allocator.free(turn_id);
+    const events = try pollBridgeSmokeEvents(allocator, bridge, turn_id, "provider_error_events", stdout);
+    defer allocator.free(events);
     try writeBridgeSmokeResponse(allocator, bridge, "state_after_error", "{\"id\":\"smoke-error-state-after\",\"command\":\"get_state\"}", stdout);
 }
 
@@ -395,29 +406,31 @@ fn runBridgeSmokeAbortFlow(
     try writeJsonString(allocator, &prompt_request.writer, prompt_text);
     try prompt_request.writer.writeAll("}}");
 
-    var thread_result = BridgeSmokeThreadResult{};
-    const prompt_request_owned = try allocator.dupe(u8, prompt_request.written());
-    defer allocator.free(prompt_request_owned);
-    const prompt_thread = try std.Thread.spawn(.{}, runBridgeSmokePromptThread, .{ bridge, prompt_request_owned, &thread_result });
+    const prompt_response = try writeBridgeSmokeResponseAlloc(allocator, bridge, "abort_prompt_accepted", prompt_request.written(), stdout);
+    defer allocator.free(prompt_response);
+    const turn_id = try extractBridgeTurnId(allocator, prompt_response);
+    defer allocator.free(turn_id);
     while (!bridge.active_generation.load(.seq_cst)) {
         std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(10), .awake) catch {};
     }
     std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .awake) catch {};
 
     try writeBridgeSmokeResponse(allocator, bridge, "abort", "{\"id\":\"smoke-abort\",\"command\":\"abort\"}", stdout);
-    prompt_thread.join();
-    if (thread_result.err) |err| return err;
-    const prompt_response = thread_result.response orelse return error.WebViewSmokePromptMissingResponse;
-    defer std.heap.c_allocator.free(prompt_response);
-    try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label=aborted_prompt response={s}\n", .{prompt_response});
+    const aborted_events = try pollBridgeSmokeEvents(allocator, bridge, turn_id, "aborted_prompt_events", stdout);
+    defer allocator.free(aborted_events);
 
-    try writeBridgeSmokeResponse(
+    const retry_response = try writeBridgeSmokeResponseAlloc(
         allocator,
         bridge,
         "retry_after_abort",
         "{\"id\":\"smoke-retry\",\"command\":\"prompt\",\"payload\":{\"text\":\"retry after abort\"}}",
         stdout,
     );
+    defer allocator.free(retry_response);
+    const retry_turn_id = try extractBridgeTurnId(allocator, retry_response);
+    defer allocator.free(retry_turn_id);
+    const retry_events = try pollBridgeSmokeEvents(allocator, bridge, retry_turn_id, "retry_after_abort_events", stdout);
+    defer allocator.free(retry_events);
     try writeBridgeSmokeResponse(allocator, bridge, "state_after_abort_retry", "{\"id\":\"smoke-abort-state-after\",\"command\":\"get_state\"}", stdout);
 }
 
@@ -433,10 +446,10 @@ fn runBridgeSmokeCloseFlow(
     try writeJsonString(allocator, &prompt_request.writer, prompt_text);
     try prompt_request.writer.writeAll("}}");
 
-    var thread_result = BridgeSmokeThreadResult{};
-    const prompt_request_owned = try allocator.dupe(u8, prompt_request.written());
-    defer allocator.free(prompt_request_owned);
-    const prompt_thread = try std.Thread.spawn(.{}, runBridgeSmokePromptThread, .{ bridge, prompt_request_owned, &thread_result });
+    const prompt_response = try writeBridgeSmokeResponseAlloc(allocator, bridge, "close_prompt_accepted", prompt_request.written(), stdout);
+    defer allocator.free(prompt_response);
+    const turn_id = try extractBridgeTurnId(allocator, prompt_response);
+    defer allocator.free(turn_id);
     while (!bridge.active_generation.load(.seq_cst)) {
         std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(10), .awake) catch {};
     }
@@ -446,32 +459,9 @@ fn runBridgeSmokeCloseFlow(
         "PI_WEBVIEW_CLOSE_DURING_ACTIVE aborted={s} active_before_join={s}\n",
         .{ boolText(aborted), boolText(bridge.active_generation.load(.seq_cst)) },
     );
-    prompt_thread.join();
-    if (thread_result.err) |err| return err;
-    const prompt_response = thread_result.response orelse return error.WebViewSmokePromptMissingResponse;
-    defer std.heap.c_allocator.free(prompt_response);
-    try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label=closed_prompt response={s}\n", .{prompt_response});
+    const closed_events = try pollBridgeSmokeEvents(allocator, bridge, turn_id, "closed_prompt_events", stdout);
+    defer allocator.free(closed_events);
     try stdout.print("PI_WEBVIEW_CLOSE_CLEANUP active_after_join={s}\n", .{boolText(bridge.active_generation.load(.seq_cst))});
-}
-
-const BridgeSmokeThreadResult = struct {
-    response: ?[]u8 = null,
-    err: ?anyerror = null,
-};
-
-fn runBridgeSmokePromptThread(
-    bridge: *webview_bridge.BridgeHost,
-    request_json: []const u8,
-    result: *BridgeSmokeThreadResult,
-) void {
-    result.response = bridge.handleRequestJson(
-        std.heap.c_allocator,
-        request_json,
-        webview_bridge.trusted_bundle_origin,
-    ) catch |err| {
-        result.err = err;
-        return;
-    };
 }
 
 fn configureFauxWebViewSmokeFixtures(
@@ -481,6 +471,18 @@ fn configureFauxWebViewSmokeFixtures(
     registration_out: *?ai.providers.faux.FauxProviderRegistration,
 ) !void {
     if (!std.mem.eql(u8, provider, "faux")) return;
+    if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+            .tokens_per_second = 200,
+            .token_size = .{ .min = 1, .max = 1 },
+        });
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewSlowSmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
     if (env_map.get("PI_WEBVIEW_SMOKE_ABORT_PROMPT") != null) {
         const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
             .tokens_per_second = 5,
@@ -583,9 +585,64 @@ fn writeBridgeSmokeResponse(
     request_json: []const u8,
     stdout: *std.Io.Writer,
 ) !void {
-    const response = try bridge.handleRequestJson(allocator, request_json, webview_bridge.trusted_bundle_origin);
+    const response = try writeBridgeSmokeResponseAlloc(allocator, bridge, label, request_json, stdout);
     defer allocator.free(response);
+}
+
+fn writeBridgeSmokeResponseAlloc(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    label: []const u8,
+    request_json: []const u8,
+    stdout: *std.Io.Writer,
+) ![]u8 {
+    const response = try bridge.handleRequestJson(allocator, request_json, webview_bridge.trusted_bundle_origin);
     try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label={s} response={s}\n", .{ label, response });
+    return response;
+}
+
+fn extractBridgeTurnId(allocator: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.WebViewSmokePromptMissingResponse;
+    const turn_id = result.object.get("turnId") orelse return error.WebViewSmokePromptMissingResponse;
+    if (turn_id != .string) return error.WebViewSmokePromptMissingResponse;
+    return try allocator.dupe(u8, turn_id.string);
+}
+
+fn responseResultBool(allocator: std.mem.Allocator, response: []const u8, field_name: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return false;
+    const field = result.object.get(field_name) orelse return false;
+    if (field != .bool) return false;
+    return field.bool;
+}
+
+fn pollBridgeSmokeEvents(
+    allocator: std.mem.Allocator,
+    bridge: *webview_bridge.BridgeHost,
+    turn_id: []const u8,
+    label: []const u8,
+    stdout: *std.Io.Writer,
+) ![]u8 {
+    var request: std.Io.Writer.Allocating = .init(allocator);
+    defer request.deinit();
+    try request.writer.writeAll("{\"id\":\"smoke-events\",\"command\":\"get_events\",\"payload\":{\"turnId\":");
+    try writeJsonString(allocator, &request.writer, turn_id);
+    try request.writer.writeAll(",\"afterSequence\":0}}");
+
+    var spins: usize = 0;
+    while (spins < 1000) : (spins += 1) {
+        const response = try bridge.handleRequestJson(allocator, request.written(), webview_bridge.trusted_bundle_origin);
+        if (try responseResultBool(allocator, response, "terminal")) {
+            try stdout.print("PI_WEBVIEW_BRIDGE_TRANSCRIPT label={s} response={s}\n", .{ label, response });
+            return response;
+        }
+        allocator.free(response);
+        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.WebViewSmokePromptMissingResponse;
 }
 
 fn parsePositiveIntEnv(env_map: *const std.process.Environ.Map, key: []const u8) ?u32 {

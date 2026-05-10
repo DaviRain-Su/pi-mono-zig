@@ -27,6 +27,7 @@ pub const Command = enum {
     get_messages,
     prompt,
     abort,
+    get_events,
     model_select,
     new_session,
     resume_session,
@@ -71,6 +72,7 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "get_messages", .command = .get_messages, .permission = .skeleton_chat },
     .{ .name = "prompt", .command = .prompt, .permission = .skeleton_chat },
     .{ .name = "abort", .command = .abort, .permission = .skeleton_chat },
+    .{ .name = "get_events", .command = .get_events, .permission = .skeleton_chat },
     .{ .name = "model_select", .command = .model_select, .permission = .model_selection },
     .{ .name = "new_session", .command = .new_session, .permission = .session_mutation },
     .{ .name = "resume_session", .command = .resume_session, .permission = .session_mutation },
@@ -104,6 +106,7 @@ pub const DispatchCounters = struct {
     get_messages: usize = 0,
     prompt: usize = 0,
     abort: usize = 0,
+    get_events: usize = 0,
     model_select: usize = 0,
     new_session: usize = 0,
     resume_session: usize = 0,
@@ -119,6 +122,7 @@ pub const DispatchCounters = struct {
             .get_messages => self.get_messages += 1,
             .prompt => self.prompt += 1,
             .abort => self.abort += 1,
+            .get_events => self.get_events += 1,
             .model_select => self.model_select += 1,
             .new_session => self.new_session += 1,
             .resume_session => self.resume_session += 1,
@@ -135,6 +139,7 @@ pub const DispatchCounters = struct {
             self.get_messages +
             self.prompt +
             self.abort +
+            self.get_events +
             self.model_select +
             self.new_session +
             self.resume_session +
@@ -146,6 +151,12 @@ pub const DispatchCounters = struct {
     }
 };
 
+const QueuedEventFrame = struct {
+    sequence: usize,
+    terminal: bool,
+    bytes: []u8,
+};
+
 pub const BridgeHost = struct {
     context: BridgeContext,
     limits: Limits = .{},
@@ -155,9 +166,81 @@ pub const BridgeHost = struct {
     active_generation: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     close_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     next_turn_index: usize = 0,
+    event_mutex: std.Io.Mutex = .init,
+    event_frames: std.ArrayList(QueuedEventFrame) = .empty,
+    terminal_seen: bool = false,
+    terminal_outcome: []const u8 = "success",
+    terminal_error_message: ?[]u8 = null,
+    worker_thread: ?std.Thread = null,
+    worker_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+    worker_allocator: std.mem.Allocator = std.heap.c_allocator,
 
     pub fn init(context: BridgeContext) BridgeHost {
         return .{ .context = context };
+    }
+
+    pub fn deinit(self: *BridgeHost) void {
+        _ = self.closeAndAbortActiveWork();
+        self.joinWorkerIfPresent();
+        self.event_mutex.lockUncancelable(self.context.session.io);
+        defer self.event_mutex.unlock(self.context.session.io);
+        self.clearPromptStateLocked();
+    }
+
+    fn joinCompletedWorker(self: *BridgeHost) void {
+        if (!self.worker_done.load(.seq_cst)) return;
+        self.joinWorkerIfPresent();
+    }
+
+    fn joinWorkerIfPresent(self: *BridgeHost) void {
+        if (self.worker_thread) |thread| {
+            thread.join();
+            self.worker_thread = null;
+            self.worker_done.store(true, .seq_cst);
+        }
+    }
+
+    fn clearPromptStateLocked(self: *BridgeHost) void {
+        for (self.event_frames.items) |frame| {
+            self.worker_allocator.free(frame.bytes);
+        }
+        self.event_frames.clearAndFree(self.worker_allocator);
+        if (self.active_turn_id) |turn_id| {
+            self.worker_allocator.free(@constCast(turn_id));
+            self.active_turn_id = null;
+        }
+        if (self.terminal_error_message) |message| {
+            self.worker_allocator.free(message);
+            self.terminal_error_message = null;
+        }
+        self.terminal_seen = false;
+        self.terminal_outcome = "success";
+        self.close_requested.store(false, .seq_cst);
+    }
+
+    fn enqueueEventFrame(
+        self: *BridgeHost,
+        frame: []u8,
+        sequence: usize,
+        terminal: bool,
+        terminal_outcome: []const u8,
+        terminal_error_message: ?[]const u8,
+    ) !void {
+        self.event_mutex.lockUncancelable(self.context.session.io);
+        defer self.event_mutex.unlock(self.context.session.io);
+        errdefer self.worker_allocator.free(frame);
+        try self.event_frames.append(self.worker_allocator, .{
+            .sequence = sequence,
+            .terminal = terminal,
+            .bytes = frame,
+        });
+        if (terminal and !self.terminal_seen) {
+            self.terminal_seen = true;
+            self.terminal_outcome = terminal_outcome;
+            if (terminal_error_message) |message| {
+                self.terminal_error_message = try self.worker_allocator.dupe(u8, message);
+            }
+        }
     }
 
     pub fn handleRequestJson(
@@ -322,6 +405,7 @@ pub const BridgeHost = struct {
             .get_messages => try self.writeMessagesResult(allocator, &writer.writer),
             .prompt => try self.writePromptResult(allocator, &writer.writer, payload.?),
             .abort => try self.writeAbortResult(&writer.writer),
+            .get_events => try self.writeEventsResult(allocator, &writer.writer, payload),
             .model_select => try self.writeModelSelectResult(allocator, &writer.writer, payload.?),
             .new_session, .resume_session, .switch_session => try self.writeSessionMutationGatedResult(allocator, &writer.writer, command),
             .auth_status => try self.writeAuthStatusResult(allocator, &writer.writer),
@@ -353,6 +437,9 @@ pub const BridgeHost = struct {
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
         try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
+        if (self.active_turn_id) |turn_id| {
+            try writeStringField(allocator, writer, "activeTurnId", turn_id, true);
+        }
         if (self.context.initial_prompt != null or self.context.initial_messages.len > 0 or self.context.initial_images_count > 0) {
             try writer.writeAll(",\"initialInput\":{");
             try writeOptionalStringField(allocator, writer, "prompt", self.context.initial_prompt, false);
@@ -475,6 +562,7 @@ pub const BridgeHost = struct {
         writer: *std.Io.Writer,
         payload: std.json.Value,
     ) !void {
+        self.joinCompletedWorker();
         const text = payload.object.get("text").?.string;
         if (self.authRequired()) {
             try writer.writeAll("{\"status\":\"auth_required\",\"accepted\":false,\"queued\":false,\"message\":");
@@ -491,80 +579,102 @@ pub const BridgeHost = struct {
             return;
         }
 
-        const turn_id = try std.fmt.allocPrint(allocator, "webview-turn-{d}", .{self.next_turn_index});
-        defer allocator.free(turn_id);
+        const turn_id = try std.fmt.allocPrint(self.worker_allocator, "webview-turn-{d}", .{self.next_turn_index});
+        errdefer self.worker_allocator.free(turn_id);
+        const text_copy = try self.worker_allocator.dupe(u8, text);
+        errdefer self.worker_allocator.free(text_copy);
+        const session_id = try self.worker_allocator.dupe(u8, self.context.session.session_manager.getSessionId());
+        errdefer self.worker_allocator.free(session_id);
+
+        self.event_mutex.lockUncancelable(self.context.session.io);
+        self.clearPromptStateLocked();
+        self.active_turn_id = turn_id;
+        self.event_mutex.unlock(self.context.session.io);
+
         self.next_turn_index += 1;
         self.active_generation.store(true, .seq_cst);
-        self.active_turn_id = turn_id;
-        defer {
-            self.active_turn_id = null;
+        self.worker_done.store(false, .seq_cst);
+
+        const runner = try self.worker_allocator.create(AsyncPromptRunner);
+        errdefer self.worker_allocator.destroy(runner);
+        runner.* = .{
+            .allocator = self.worker_allocator,
+            .bridge = self,
+            .text = text_copy,
+            .session_id = session_id,
+            .turn_id = turn_id,
+        };
+        self.worker_thread = std.Thread.spawn(.{}, runAsyncPrompt, .{runner}) catch |err| {
             self.active_generation.store(false, .seq_cst);
-            self.close_requested.store(false, .seq_cst);
-        }
-
-        var capture = PromptEventCapture.init(
-            allocator,
-            self.context.session.session_manager.getSessionId(),
-            turn_id,
-        );
-        defer capture.deinit();
-
-        const subscriber = agent.AgentSubscriber{
-            .context = &capture,
-            .callback = handleWebViewPromptEvent,
-        };
-        try self.context.session.agent.subscribe(subscriber);
-        defer {
-            _ = self.context.session.agent.unsubscribe(subscriber);
-        }
-
-        var acceptance = PromptAcceptance{};
-        const accepted_callback = agent.PromptAcceptedCallback{
-            .context = &acceptance,
-            .callback = markPromptAccepted,
+            self.worker_done.store(true, .seq_cst);
+            self.event_mutex.lockUncancelable(self.context.session.io);
+            self.clearPromptStateLocked();
+            self.event_mutex.unlock(self.context.session.io);
+            return err;
         };
 
-        const prompt_result = self.context.session.promptWithAcceptedCallback(
-            .{ .text = text, .images = &[_]ai.ImageContent{} },
-            accepted_callback,
-        );
-        if (prompt_result) |_| {
-            if (!capture.terminal_seen) {
-                try capture.appendSyntheticTerminal("success", "prompt completed without an agent_end event");
+        try writer.writeAll("{\"status\":\"accepted\",\"accepted\":true,\"queued\":false,\"sessionId\":");
+        try writeJsonString(allocator, writer, session_id);
+        try writer.writeAll(",\"turnId\":");
+        try writeJsonString(allocator, writer, turn_id);
+        try writer.writeAll(",\"nextSequence\":1,\"events\":[]}");
+    }
+
+    fn writeEventsResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: ?std.json.Value,
+    ) !void {
+        self.joinCompletedWorker();
+        const requested_turn_id = getPayloadString(payload, "turnId");
+        const after_sequence = getPayloadUsize(payload, "afterSequence") orelse 0;
+
+        self.event_mutex.lockUncancelable(self.context.session.io);
+        defer self.event_mutex.unlock(self.context.session.io);
+
+        const active_turn_id = self.active_turn_id;
+        try writer.writeAll("{\"status\":");
+        if (requested_turn_id) |requested| {
+            if (active_turn_id == null or !std.mem.eql(u8, requested, active_turn_id.?)) {
+                try writeJsonString(allocator, writer, "stale");
+                try writer.writeAll(",\"turnId\":");
+                try writeJsonString(allocator, writer, requested);
+                try writer.writeAll(",\"active\":false,\"terminal\":true,\"events\":[]}");
+                return;
             }
-            try writer.writeAll("{\"status\":");
-            try writeJsonString(allocator, writer, statusForTerminalOutcome(capture.terminal_outcome));
-            try writer.writeAll(",\"accepted\":");
-            try writer.writeAll(if (acceptance.accepted) "true" else "false");
-            try writer.writeAll(",\"queued\":false,\"sessionId\":");
-            try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
-            try writer.writeAll(",\"turnId\":");
+        }
+
+        try writeJsonString(allocator, writer, "ok");
+        try writer.writeAll(",\"sessionId\":");
+        try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+        try writer.writeAll(",\"turnId\":");
+        if (active_turn_id) |turn_id| {
             try writeJsonString(allocator, writer, turn_id);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"active\":");
+        try writer.writeAll(if (self.active_generation.load(.seq_cst)) "true" else "false");
+        try writer.writeAll(",\"terminal\":");
+        try writer.writeAll(if (self.terminal_seen) "true" else "false");
+        if (self.terminal_seen) {
             try writer.writeAll(",\"terminalOutcome\":");
-            try writeJsonString(allocator, writer, capture.terminal_outcome);
-            if (capture.terminal_error_message) |message| {
+            try writeJsonString(allocator, writer, self.terminal_outcome);
+            if (self.terminal_error_message) |message| {
                 try writer.writeAll(",\"error\":");
                 try writeJsonString(allocator, writer, message);
             }
-            try writer.writeAll(",\"events\":[");
-            try capture.writeFrames(writer);
-            try writer.writeAll("]}");
-        } else |err| {
-            if (!capture.terminal_seen) {
-                try capture.appendSyntheticTerminal("setup_failure", @errorName(err));
-            }
-            try writer.writeAll("{\"status\":\"failed\",\"accepted\":");
-            try writer.writeAll(if (acceptance.accepted) "true" else "false");
-            try writer.writeAll(",\"queued\":false,\"sessionId\":");
-            try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
-            try writer.writeAll(",\"turnId\":");
-            try writeJsonString(allocator, writer, turn_id);
-            try writer.writeAll(",\"terminalOutcome\":\"setup_failure\",\"error\":");
-            try writeJsonString(allocator, writer, @errorName(err));
-            try writer.writeAll(",\"events\":[");
-            try capture.writeFrames(writer);
-            try writer.writeAll("]}");
         }
+        try writer.writeAll(",\"events\":[");
+        var wrote = false;
+        for (self.event_frames.items) |frame| {
+            if (frame.sequence <= after_sequence) continue;
+            if (wrote) try writer.writeAll(",");
+            try writer.writeAll(frame.bytes);
+            wrote = true;
+        }
+        try writer.writeAll("]}");
     }
 
     fn writeAbortResult(
@@ -642,7 +752,7 @@ pub const BridgeHost = struct {
                 ) catch return error.InvalidSessionTarget;
                 session_manager_mod.freeSessionHeader(self.context.session.allocator, &header);
             },
-            .get_state, .get_messages, .prompt, .abort => {},
+            .get_state, .get_messages, .prompt, .abort, .get_events => {},
             .auth_status => {},
             .start_auth, .save_api_key, .remove_auth => {
                 if (payload) |value| {
@@ -750,7 +860,7 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     if (value == .null) return command != .prompt;
     if (value != .object) return false;
     return switch (command) {
-        .get_state, .get_messages, .abort => true,
+        .get_state, .get_messages, .abort, .get_events => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
         .model_select => value.object.get("provider") != null and
             value.object.get("provider").? == .string and
@@ -821,6 +931,26 @@ fn getObjectString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = object.get(key) orelse return null;
     return switch (value) {
         .string => |text| text,
+        else => null,
+    };
+}
+
+fn getPayloadString(payload: ?std.json.Value, key: []const u8) ?[]const u8 {
+    const value = payload orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn getPayloadUsize(payload: ?std.json.Value, key: []const u8) ?usize {
+    const value = payload orelse return null;
+    if (value != .object) return null;
+    const field = value.object.get(key) orelse return null;
+    return switch (field) {
+        .integer => |number| if (number >= 0) @as(usize, @intCast(number)) else null,
         else => null,
     };
 }
@@ -1056,27 +1186,81 @@ fn markPromptAccepted(context: ?*anyopaque) !void {
     acceptance.accepted = true;
 }
 
+const AsyncPromptRunner = struct {
+    allocator: std.mem.Allocator,
+    bridge: *BridgeHost,
+    text: []u8,
+    session_id: []u8,
+    turn_id: []const u8,
+};
+
+fn runAsyncPrompt(runner: *AsyncPromptRunner) void {
+    defer {
+        runner.bridge.active_generation.store(false, .seq_cst);
+        runner.bridge.worker_done.store(true, .seq_cst);
+        runner.allocator.free(runner.text);
+        runner.allocator.free(runner.session_id);
+        runner.allocator.destroy(runner);
+    }
+
+    var capture = PromptEventCapture.init(
+        runner.allocator,
+        runner.bridge,
+        runner.session_id,
+        runner.turn_id,
+    );
+    defer capture.deinit();
+
+    const subscriber = agent.AgentSubscriber{
+        .context = &capture,
+        .callback = handleWebViewPromptEvent,
+    };
+    runner.bridge.context.session.agent.subscribe(subscriber) catch |err| {
+        capture.appendSyntheticTerminal("setup_failure", @errorName(err)) catch {};
+        return;
+    };
+    defer {
+        _ = runner.bridge.context.session.agent.unsubscribe(subscriber);
+    }
+
+    var acceptance = PromptAcceptance{};
+    const accepted_callback = agent.PromptAcceptedCallback{
+        .context = &acceptance,
+        .callback = markPromptAccepted,
+    };
+
+    runner.bridge.context.session.promptWithAcceptedCallback(
+        .{ .text = runner.text, .images = &[_]ai.ImageContent{} },
+        accepted_callback,
+    ) catch |err| {
+        capture.appendSyntheticTerminal("setup_failure", @errorName(err)) catch {};
+        return;
+    };
+    if (!capture.terminal_seen) {
+        capture.appendSyntheticTerminal("success", "prompt completed without an agent_end event") catch {};
+    }
+}
+
 const PromptEventCapture = struct {
     allocator: std.mem.Allocator,
+    host: *BridgeHost,
     session_id: []const u8,
     turn_id: []const u8,
-    frames: std.ArrayList([]u8) = .empty,
     next_sequence: usize = 1,
     terminal_seen: bool = false,
     terminal_outcome: []const u8 = "success",
     terminal_error_message: ?[]u8 = null,
 
-    fn init(allocator: std.mem.Allocator, session_id: []const u8, turn_id: []const u8) PromptEventCapture {
+    fn init(allocator: std.mem.Allocator, host: *BridgeHost, session_id: []const u8, turn_id: []const u8) PromptEventCapture {
         return .{
             .allocator = allocator,
+            .host = host,
             .session_id = session_id,
             .turn_id = turn_id,
         };
     }
 
     fn deinit(self: *PromptEventCapture) void {
-        for (self.frames.items) |frame| self.allocator.free(frame);
-        self.frames.deinit(self.allocator);
         if (self.terminal_error_message) |message| self.allocator.free(message);
         self.* = undefined;
     }
@@ -1111,8 +1295,15 @@ const PromptEventCapture = struct {
         try writer.writer.writeAll(",\"event\":");
         try writer.writer.writeAll(event_json);
         try writer.writer.writeAll("}");
+        const sequence = self.next_sequence;
         self.next_sequence += 1;
-        try self.frames.append(self.allocator, try writer.toOwnedSlice());
+        try self.host.enqueueEventFrame(
+            try writer.toOwnedSlice(),
+            sequence,
+            terminal,
+            self.terminal_outcome,
+            self.terminal_error_message,
+        );
     }
 
     fn appendSyntheticTerminal(self: *PromptEventCapture, outcome: []const u8, message: []const u8) !void {
@@ -1130,8 +1321,15 @@ const PromptEventCapture = struct {
         try writer.writer.writeAll(",\"event\":{\"type\":\"terminal\",\"message\":");
         try writeJsonString(self.allocator, &writer.writer, message);
         try writer.writer.writeAll("}}");
+        const sequence = self.next_sequence;
         self.next_sequence += 1;
-        try self.frames.append(self.allocator, try writer.toOwnedSlice());
+        try self.host.enqueueEventFrame(
+            try writer.toOwnedSlice(),
+            sequence,
+            true,
+            self.terminal_outcome,
+            self.terminal_error_message,
+        );
     }
 
     fn observeTerminalOutcome(self: *PromptEventCapture, event: agent.AgentEvent) !void {
@@ -1155,18 +1353,50 @@ const PromptEventCapture = struct {
             self.terminal_error_message = try self.allocator.dupe(u8, text);
         }
     }
-
-    fn writeFrames(self: *const PromptEventCapture, writer: *std.Io.Writer) !void {
-        for (self.frames.items, 0..) |frame, index| {
-            if (index > 0) try writer.writeAll(",");
-            try writer.writeAll(frame);
-        }
-    }
 };
 
 fn handleWebViewPromptEvent(context: ?*anyopaque, event: agent.AgentEvent) !void {
     const capture: *PromptEventCapture = @ptrCast(@alignCast(context.?));
     try capture.appendEvent(event);
+}
+
+fn extractResultStringField(allocator: std.mem.Allocator, response: []const u8, field_name: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.MissingResult;
+    const field = result.object.get(field_name) orelse return error.MissingResultField;
+    if (field != .string) return error.InvalidResultField;
+    return try allocator.dupe(u8, field.string);
+}
+
+fn responseResultBool(response: []const u8, field_name: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result") orelse return error.MissingResult;
+    const field = result.object.get(field_name) orelse return error.MissingResultField;
+    if (field != .bool) return error.InvalidResultField;
+    return field.bool;
+}
+
+fn waitForTerminalEvents(
+    allocator: std.mem.Allocator,
+    bridge: *BridgeHost,
+    turn_id: []const u8,
+) ![]u8 {
+    var request: std.Io.Writer.Allocating = .init(allocator);
+    defer request.deinit();
+    try request.writer.writeAll("{\"id\":\"events\",\"command\":\"get_events\",\"payload\":{\"turnId\":");
+    try writeJsonString(allocator, &request.writer, turn_id);
+    try request.writer.writeAll(",\"afterSequence\":0}}");
+
+    var spins: usize = 0;
+    while (spins < 1000) : (spins += 1) {
+        const response = try bridge.handleRequestJson(allocator, request.written(), trusted_bundle_origin);
+        if (try responseResultBool(response, "terminal")) return response;
+        allocator.free(response);
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    return error.TestTimeout;
 }
 
 test "bridge command table exposes approved skeleton commands first" {
@@ -1175,40 +1405,41 @@ test "bridge command table exposes approved skeleton commands first" {
     try std.testing.expectEqualStrings("get_messages", command_table[1].name);
     try std.testing.expectEqualStrings("prompt", command_table[2].name);
     try std.testing.expectEqualStrings("abort", command_table[3].name);
+    try std.testing.expectEqualStrings("get_events", command_table[4].name);
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 12), command_table.len);
-    try std.testing.expectEqualStrings("new_session", command_table[5].name);
-    try std.testing.expectEqual(Command.new_session, command_table[5].command);
-    try std.testing.expectEqual(Permission.session_mutation, command_table[5].permission);
-    try std.testing.expectEqualStrings("resume_session", command_table[6].name);
-    try std.testing.expectEqual(Command.resume_session, command_table[6].command);
+    try std.testing.expectEqual(@as(usize, 13), command_table.len);
+    try std.testing.expectEqualStrings("new_session", command_table[6].name);
+    try std.testing.expectEqual(Command.new_session, command_table[6].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
-    try std.testing.expectEqualStrings("switch_session", command_table[7].name);
-    try std.testing.expectEqual(Command.switch_session, command_table[7].command);
+    try std.testing.expectEqualStrings("resume_session", command_table[7].name);
+    try std.testing.expectEqual(Command.resume_session, command_table[7].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[7].permission);
+    try std.testing.expectEqualStrings("switch_session", command_table[8].name);
+    try std.testing.expectEqual(Command.switch_session, command_table[8].command);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[8].permission);
 }
 
 test "bridge command table explicitly gates future model selection command" {
-    try std.testing.expectEqualStrings("model_select", command_table[4].name);
-    try std.testing.expectEqual(Command.model_select, command_table[4].command);
-    try std.testing.expectEqual(Permission.model_selection, command_table[4].permission);
+    try std.testing.expectEqualStrings("model_select", command_table[5].name);
+    try std.testing.expectEqual(Command.model_select, command_table[5].command);
+    try std.testing.expectEqual(Permission.model_selection, command_table[5].permission);
 }
 
 test "bridge command table exposes auth status and gates auth mutations" {
-    try std.testing.expectEqualStrings("auth_status", command_table[8].name);
-    try std.testing.expectEqual(Command.auth_status, command_table[8].command);
-    try std.testing.expectEqual(Permission.skeleton_chat, command_table[8].permission);
-    try std.testing.expectEqualStrings("start_auth", command_table[9].name);
-    try std.testing.expectEqual(Command.start_auth, command_table[9].command);
-    try std.testing.expectEqual(Permission.auth_mutation, command_table[9].permission);
-    try std.testing.expectEqualStrings("save_api_key", command_table[10].name);
-    try std.testing.expectEqual(Command.save_api_key, command_table[10].command);
+    try std.testing.expectEqualStrings("auth_status", command_table[9].name);
+    try std.testing.expectEqual(Command.auth_status, command_table[9].command);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[9].permission);
+    try std.testing.expectEqualStrings("start_auth", command_table[10].name);
+    try std.testing.expectEqual(Command.start_auth, command_table[10].command);
     try std.testing.expectEqual(Permission.auth_mutation, command_table[10].permission);
-    try std.testing.expectEqualStrings("remove_auth", command_table[11].name);
-    try std.testing.expectEqual(Command.remove_auth, command_table[11].command);
+    try std.testing.expectEqualStrings("save_api_key", command_table[11].name);
+    try std.testing.expectEqual(Command.save_api_key, command_table[11].command);
     try std.testing.expectEqual(Permission.auth_mutation, command_table[11].permission);
+    try std.testing.expectEqualStrings("remove_auth", command_table[12].name);
+    try std.testing.expectEqual(Command.remove_auth, command_table[12].command);
+    try std.testing.expectEqual(Permission.auth_mutation, command_table[12].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -1216,6 +1447,7 @@ test "bridge dispatches every approved skeleton command through command table" {
     var session = try testSession(allocator);
     defer session.deinit();
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     var counters = DispatchCounters{};
     bridge.dispatch_counters = &counters;
 
@@ -1232,7 +1464,21 @@ test "bridge dispatches every approved skeleton command through command table" {
     const prompt = try bridge.handleRequestJson(allocator, "{\"id\":\"prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"hello\"}}", trusted_bundle_origin);
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"id\":\"prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+
+    var events_request: std.Io.Writer.Allocating = .init(allocator);
+    defer events_request.deinit();
+    try events_request.writer.writeAll("{\"id\":\"events\",\"command\":\"get_events\",\"payload\":{\"turnId\":");
+    try writeJsonString(allocator, &events_request.writer, turn_id);
+    try events_request.writer.writeAll(",\"afterSequence\":0}}");
+    const events = try bridge.handleRequestJson(allocator, events_request.written(), trusted_bundle_origin);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"id\":\"events\"") != null);
+
+    const terminal = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(terminal);
 
     const abort = try bridge.handleRequestJson(allocator, "{\"id\":\"abort\",\"command\":\"abort\"}", trusted_bundle_origin);
     defer allocator.free(abort);
@@ -1243,6 +1489,7 @@ test "bridge dispatches every approved skeleton command through command table" {
     try std.testing.expectEqual(@as(usize, 1), counters.get_messages);
     try std.testing.expectEqual(@as(usize, 1), counters.prompt);
     try std.testing.expectEqual(@as(usize, 1), counters.abort);
+    try std.testing.expect(counters.get_events >= 2);
 }
 
 test "webview prompt runs through AgentSession and returns ordered correlated events" {
@@ -1258,6 +1505,7 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     var session = try testSessionWithModel(allocator, registration.getModel());
     defer session.deinit();
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     bridge.context.model = registration.getModel();
 
     const before = try bridge.handleRequestJson(allocator, "{\"id\":\"before\",\"command\":\"get_messages\"}", trusted_bundle_origin);
@@ -1272,12 +1520,17 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     );
     defer allocator.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"id\":\"prompt\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "\"turnId\":\"webview-turn-0\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminal\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"success\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "webview answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"events\":[]") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminal\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "webview answer") != null);
 
     const after = try bridge.handleRequestJson(allocator, "{\"id\":\"after\",\"command\":\"get_messages\"}", trusted_bundle_origin);
     defer allocator.free(after);
@@ -1287,6 +1540,62 @@ test "webview prompt runs through AgentSession and returns ordered correlated ev
     try std.testing.expect(std.mem.indexOf(u8, after, "webview answer") != null);
     try std.testing.expect(std.mem.indexOf(u8, after, "webview-turn-0") == null);
     try std.testing.expect(std.mem.indexOf(u8, after, "\"sequence\"") == null);
+}
+
+test "webview prompt accepts asynchronously and polls ordered incremental events" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{
+        .tokens_per_second = 20,
+        .token_size = .{ .min = 1, .max = 1 },
+    });
+    defer registration.unregister();
+    const blocks = [_]faux.FauxContentBlock{faux.fauxText("async webview streaming answer")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks[0..], .{}) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.model = registration.getModel();
+
+    const before_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"async-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"stream async\"}}",
+        trusted_bundle_origin,
+    );
+    const after_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    try std.testing.expect(after_ns - before_ns < 100 * std.time.ns_per_ms);
+    try std.testing.expect(bridge.active_generation.load(.seq_cst));
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+
+    const state = try bridge.handleRequestJson(allocator, "{\"id\":\"state-active\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"busy\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"activeTurnId\"") != null);
+
+    const terminal = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(terminal);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "\"sequence\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "\"sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal, "async webview streaming answer") != null);
+
+    var after_request: std.Io.Writer.Allocating = .init(allocator);
+    defer after_request.deinit();
+    try after_request.writer.writeAll("{\"id\":\"events-after-one\",\"command\":\"get_events\",\"payload\":{\"turnId\":");
+    try writeJsonString(allocator, &after_request.writer, turn_id);
+    try after_request.writer.writeAll(",\"afterSequence\":1}}");
+    const after_events = try bridge.handleRequestJson(allocator, after_request.written(), trusted_bundle_origin);
+    defer allocator.free(after_events);
+    try std.testing.expect(std.mem.indexOf(u8, after_events, "\"sequence\":1,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after_events, "\"terminal\":true") != null);
 }
 
 test "webview get_state mirrors existing session without mutating persisted state" {
@@ -1696,6 +2005,7 @@ test "webview no-session prompt remains in memory without session file persisten
     var session = try testSessionWithModel(allocator, registration.getModel());
     defer session.deinit();
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     bridge.context.model = registration.getModel();
     bridge.context.no_session = true;
 
@@ -1705,7 +2015,12 @@ test "webview no-session prompt remains in memory without session file persisten
         trusted_bundle_origin,
     );
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminalOutcome\":\"success\"") != null);
 
     const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages\",\"command\":\"get_messages\"}", trusted_bundle_origin);
     defer allocator.free(messages);
@@ -1749,6 +2064,7 @@ test "webview provider error is surfaced safely and bridge remains usable" {
     var session = try testSessionWithModel(allocator, registration.getModel());
     defer session.deinit();
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     bridge.context.model = registration.getModel();
 
     const prompt = try bridge.handleRequestJson(
@@ -1757,9 +2073,13 @@ test "webview provider error is surfaced safely and bridge remains usable" {
         trusted_bundle_origin,
     );
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"failed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"provider_error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "faux provider failed safely") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminalOutcome\":\"provider_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events, "faux provider failed safely") != null);
 
     const state = try bridge.handleRequestJson(allocator, "{\"id\":\"after-error\",\"command\":\"get_state\"}", trusted_bundle_origin);
     defer allocator.free(state);
@@ -1792,6 +2112,7 @@ test "webview provider error persists explicit canonical policy for non-webview 
     const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
     defer allocator.free(session_file);
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     bridge.context.model = registration.getModel();
     bridge.context.no_session = false;
 
@@ -1801,7 +2122,12 @@ test "webview provider error persists explicit canonical policy for non-webview 
         trusted_bundle_origin,
     );
     defer allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"terminalOutcome\":\"provider_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminalOutcome\":\"provider_error\"") != null);
 
     const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages-after-error\",\"command\":\"get_messages\"}", trusted_bundle_origin);
     defer allocator.free(messages);
@@ -1863,34 +2189,18 @@ test "webview abort cancels active generation suppresses late events and support
     var session = try testSessionWithModel(allocator, registration.getModel());
     defer session.deinit();
     var bridge = testBridge(&session);
+    defer bridge.deinit();
     bridge.context.model = registration.getModel();
 
-    const ThreadResult = struct {
-        response: ?[]u8 = null,
-        err: ?anyerror = null,
-        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-        fn run(host: *BridgeHost, result: *@This()) void {
-            defer result.done.store(true, .seq_cst);
-            result.response = host.handleRequestJson(
-                std.heap.c_allocator,
-                "{\"id\":\"abort-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"abort me\"}}",
-                trusted_bundle_origin,
-            ) catch |err| {
-                result.err = err;
-                return;
-            };
-        }
-    };
-
-    var thread_result = ThreadResult{};
-    const prompt_thread = try std.Thread.spawn(.{}, ThreadResult.run, .{ &bridge, &thread_result });
-    var prompt_thread_joined = false;
-    defer if (!prompt_thread_joined) prompt_thread.join();
-    var spins: usize = 0;
-    while (!bridge.active_generation.load(.seq_cst) and !thread_result.done.load(.seq_cst) and spins < 5000) : (spins += 1) {
-        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
-    }
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"abort-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"abort me\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"accepted\"") != null);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
     try std.testing.expect(bridge.active_generation.load(.seq_cst));
     std.Io.sleep(std.testing.io, .fromMilliseconds(250), .awake) catch {};
 
@@ -1899,22 +2209,21 @@ test "webview abort cancels active generation suppresses late events and support
     try std.testing.expect(std.mem.indexOf(u8, abort, "\"status\":\"abort_requested\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, abort, "\"aborted\":true") != null);
 
-    prompt_thread.join();
-    prompt_thread_joined = true;
-    if (thread_result.err) |err| return err;
-    const aborted_prompt = thread_result.response.?;
-    defer std.heap.c_allocator.free(aborted_prompt);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"status\":\"aborted\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminalOutcome\":\"abort\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, "\"terminal\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, aborted_prompt, slow_text) == null);
+    const aborted_events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(aborted_events);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_events, "\"terminalOutcome\":\"abort\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_events, "\"terminal\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted_events, slow_text) == null);
     try std.testing.expect(!bridge.active_generation.load(.seq_cst));
 
-    var capture = PromptEventCapture.init(allocator, "session", "turn");
+    var capture_host = testBridge(&session);
+    capture_host.worker_allocator = allocator;
+    defer capture_host.deinit();
+    var capture = PromptEventCapture.init(allocator, &capture_host, "session", "turn");
     defer capture.deinit();
     try capture.appendSyntheticTerminal("abort", "Request was aborted");
     try capture.appendEvent(.{ .event_type = .message_update });
-    try std.testing.expectEqual(@as(usize, 1), capture.frames.items.len);
+    try std.testing.expectEqual(@as(usize, 1), capture_host.event_frames.items.len);
 
     const retry = try bridge.handleRequestJson(
         allocator,
@@ -1922,9 +2231,13 @@ test "webview abort cancels active generation suppresses late events and support
         trusted_bundle_origin,
     );
     defer allocator.free(retry);
-    try std.testing.expect(std.mem.indexOf(u8, retry, "\"status\":\"completed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, retry, "\"terminalOutcome\":\"success\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, retry, "retry succeeded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry, "\"status\":\"accepted\"") != null);
+    const retry_turn_id = try extractResultStringField(allocator, retry, "turnId");
+    defer allocator.free(retry_turn_id);
+    const retry_events = try waitForTerminalEvents(allocator, &bridge, retry_turn_id);
+    defer allocator.free(retry_events);
+    try std.testing.expect(std.mem.indexOf(u8, retry_events, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry_events, "retry succeeded") != null);
 }
 
 test "webview close aborts active generation cleanup path" {

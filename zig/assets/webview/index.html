@@ -122,6 +122,7 @@
         apiKeyPresent: false,
         inputFocusSent: false,
         typedInputSent: false,
+        autoSubmitSent: false,
       };
       window.piWebViewReady = false;
       const state = {
@@ -129,6 +130,8 @@
         pending: new Map(),
         activeTurnId: null,
         lastSequenceByTurn: new Map(),
+        submitPerfByTurn: new Map(),
+        firstDeltaSeenByTurn: new Set(),
       };
       const statusEl = document.getElementById("status");
       const messagesEl = document.getElementById("messages");
@@ -174,6 +177,7 @@
         block.append(strong, document.createTextNode("\n"), body);
         messagesEl.append(block);
         messagesEl.scrollTop = messagesEl.scrollHeight;
+        return block;
       }
 
       function renderMessages(messages) {
@@ -196,6 +200,15 @@
         const assistant = event.assistantMessageEvent || {};
         if (assistant.delta) {
           appendBlock("event", `${frame.sequence} ${frame.type}`, assistant.delta);
+          if (!state.firstDeltaSeenByTurn.has(frame.turnId)) {
+            state.firstDeltaSeenByTurn.add(frame.turnId);
+            const submitPerfMs = state.submitPerfByTurn.get(frame.turnId);
+            markTelemetry("first_assistant_delta", {
+              turnId: frame.turnId,
+              sequence: frame.sequence,
+              submitToFirstDeltaMs: submitPerfMs === undefined ? null : performance.now() - submitPerfMs,
+            });
+          }
         } else if (frame.terminal) {
           const terminalText = frame.error
             ? `${frame.terminalOutcome || "done"}: ${frame.error}`
@@ -206,8 +219,26 @@
         }
         if (frame.terminal) {
           state.activeTurnId = null;
+          state.submitPerfByTurn.delete(frame.turnId);
           promptInputEl.disabled = false;
           submitButtonEl.disabled = false;
+        }
+      }
+
+      function delay(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      async function pollTurnEvents(turnId) {
+        let idlePolls = 0;
+        while (state.activeTurnId === turnId) {
+          const lastSequence = state.lastSequenceByTurn.get(turnId) || 0;
+          const result = await sendBridge("get_events", { turnId, afterSequence: lastSequence });
+          const frames = result.events || [];
+          for (const frame of frames) renderEvent(frame);
+          if (result.terminal || frames.some((frame) => frame.terminal)) break;
+          idlePolls += frames.length === 0 ? 1 : 0;
+          await delay(idlePolls > 2 ? 50 : 25);
         }
       }
 
@@ -273,6 +304,13 @@
             promptInputEl.value = smokeText;
             promptInputEl.dispatchEvent(new Event("input", { bubbles: true }));
           }
+          if (nativeBootstrap.autoSubmitPrompt && !telemetry.autoSubmitSent) {
+            telemetry.autoSubmitSent = true;
+            promptInputEl.value = nativeBootstrap.autoSubmitPrompt;
+            promptInputEl.dispatchEvent(new Event("input", { bubbles: true }));
+            markTelemetry("auto_submit_scheduled", { valueLength: promptInputEl.value.length });
+            requestAnimationFrame(() => formEl.requestSubmit());
+          }
           markTelemetry("input_ready_check", {
             reason,
             activeElement: document.activeElement === promptInputEl ? "prompt" : "other",
@@ -284,14 +322,31 @@
       formEl.addEventListener("submit", async (event) => {
         event.preventDefault();
         const text = promptInputEl.value;
-        if (!text.trim()) return;
-        promptInputEl.disabled = true;
+        if (!text.trim() || state.activeTurnId) return;
+        const submitPerfMs = performance.now();
+        markTelemetry("submit_action", { valueLength: text.length });
         submitButtonEl.disabled = true;
         try {
           appendBlock("message user", "user", text);
+          markTelemetry("submitted_user_message", {
+            submitToVisibleMs: performance.now() - submitPerfMs,
+            valueLength: text.length,
+          });
           const result = await sendBridge("prompt", { text });
           state.activeTurnId = result.turnId;
-          for (const frame of result.events || []) renderEvent(frame);
+          state.lastSequenceByTurn.set(result.turnId, 0);
+          state.submitPerfByTurn.set(result.turnId, submitPerfMs);
+          appendBlock("event", "running", "streaming response…");
+          markTelemetry("running_state", {
+            turnId: result.turnId,
+            submitToRunningMs: performance.now() - submitPerfMs,
+          });
+          await pollTurnEvents(result.turnId);
+          const terminalPerfMs = performance.now();
+          markTelemetry("terminal_state", {
+            turnId: result.turnId,
+            submitToTerminalMs: terminalPerfMs - submitPerfMs,
+          });
           const transcript = await sendBridge("get_messages");
           renderMessages(transcript.messages || []);
           promptInputEl.value = "";
