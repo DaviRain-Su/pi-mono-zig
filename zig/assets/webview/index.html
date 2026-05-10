@@ -98,13 +98,28 @@
         opacity: 0.58;
       }
       .settings-row,
-      .scoped-row {
+      .scoped-row,
+      .tree-row,
+      .fork-row {
         grid-template-columns: 1fr auto;
         align-items: start;
       }
       .settings-row .meta,
-      .scoped-row .meta {
+      .scoped-row .meta,
+      .tree-row .meta,
+      .fork-row .meta {
         grid-column: 1 / -1;
+      }
+      .tree-label {
+        color: #7ee787;
+      }
+      .tree-marker {
+        opacity: 0.82;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .summary-prompt {
+        border-color: rgba(255, 171, 0, 0.7);
+        background: rgba(255, 171, 0, 0.12);
       }
       .theme-swatch {
         display: inline-block;
@@ -287,6 +302,36 @@
           <input id="session-search-input" placeholder="Search sessions" autocomplete="off" />
           <div class="panel-list" id="session-list"></div>
         </section>
+        <section id="session-tree-panel" class="panel" aria-label="Session tree panel">
+          <h2>Session tree</h2>
+          <div class="panel-controls">
+            <select id="tree-filter-select" aria-label="Tree filter">
+              <option value="default">Default</option>
+              <option value="no-tools">No tools</option>
+              <option value="user-only">User only</option>
+              <option value="labeled-only">Labeled</option>
+              <option value="all">All</option>
+            </select>
+            <label><input id="tree-label-timestamps-toggle" type="checkbox" /> label times</label>
+          </div>
+          <input id="tree-search-input" placeholder="Search session tree" autocomplete="off" />
+          <div class="panel-status" id="tree-panel-status">Loading tree…</div>
+          <div class="panel-list" id="tree-list"></div>
+          <div class="panel-status summary-prompt" id="tree-summary-prompt" hidden>
+            <strong>Branch summary?</strong>
+            <div class="panel-controls">
+              <button id="tree-summary-skip-button" type="button">No summary</button>
+              <button id="tree-summary-add-button" type="button">Summarize</button>
+              <input id="tree-summary-input" placeholder="Custom summary prompt" autocomplete="off" />
+            </div>
+          </div>
+        </section>
+        <section id="fork-panel" class="panel" aria-label="Fork panel">
+          <h2>Fork from message</h2>
+          <input id="fork-search-input" placeholder="Search user messages" autocomplete="off" />
+          <div class="panel-status" id="fork-panel-status">Loading forkable messages…</div>
+          <div class="panel-list" id="fork-list"></div>
+        </section>
         <section id="settings-panel" class="panel" aria-label="Settings panel">
           <h2>Settings</h2>
           <input id="settings-search-input" placeholder="Search settings" autocomplete="off" />
@@ -355,6 +400,16 @@
           showPath: false,
           search: "",
         },
+        treeUi: {
+          filter: "default",
+          search: "",
+          showLabelTimestamps: false,
+          foldedIds: new Set(),
+          pendingNavigationEntryId: null,
+        },
+        forkUi: {
+          search: "",
+        },
         settingsUi: {
           search: "",
         },
@@ -386,6 +441,18 @@
       const sessionSearchInputEl = document.getElementById("session-search-input");
       const sessionNewButtonEl = document.getElementById("session-new-button");
       const sessionListEl = document.getElementById("session-list");
+      const treeFilterSelectEl = document.getElementById("tree-filter-select");
+      const treeLabelTimestampsToggleEl = document.getElementById("tree-label-timestamps-toggle");
+      const treeSearchInputEl = document.getElementById("tree-search-input");
+      const treePanelStatusEl = document.getElementById("tree-panel-status");
+      const treeListEl = document.getElementById("tree-list");
+      const treeSummaryPromptEl = document.getElementById("tree-summary-prompt");
+      const treeSummarySkipButtonEl = document.getElementById("tree-summary-skip-button");
+      const treeSummaryAddButtonEl = document.getElementById("tree-summary-add-button");
+      const treeSummaryInputEl = document.getElementById("tree-summary-input");
+      const forkSearchInputEl = document.getElementById("fork-search-input");
+      const forkPanelStatusEl = document.getElementById("fork-panel-status");
+      const forkListEl = document.getElementById("fork-list");
       const settingsSearchInputEl = document.getElementById("settings-search-input");
       const settingsPanelStatusEl = document.getElementById("settings-panel-status");
       const settingsListEl = document.getElementById("settings-list");
@@ -569,6 +636,186 @@
         markTelemetry("session_panel_rendered", {
           childCount: sessionListEl.childElementCount,
           valueLength: sessions.length,
+        });
+      }
+
+      function treeEntryMatchesSearch(entry) {
+        const query = state.treeUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [entry.id, entry.kind, entry.display, entry.label]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function treeEntryPassesFilter(entry) {
+        if (entry.current) return true;
+        switch (state.treeUi.filter) {
+          case "no-tools":
+            return !entry.bookkeeping && entry.kind !== "tool_result";
+          case "user-only":
+            return entry.kind === "user";
+          case "labeled-only":
+            return Boolean(entry.label);
+          case "all":
+            return true;
+          case "default":
+          default:
+            return !entry.bookkeeping;
+        }
+      }
+
+      function formatTreeLabelTimestamp(timestamp) {
+        if (!timestamp || timestamp.length < 16) return timestamp ? `${timestamp} ` : "";
+        const year = timestamp.slice(2, 4);
+        const month = String(Number(timestamp.slice(5, 7)));
+        const day = String(Number(timestamp.slice(8, 10)));
+        return `${year}/${month}/${day} ${timestamp.slice(11, 16)} `;
+      }
+
+      function visibleTreeEntries(tree) {
+        const entries = tree.entries || [];
+        const byId = new Map(entries.map((entry) => [entry.id, entry]));
+        return entries.filter((entry) => {
+          if (!treeEntryPassesFilter(entry) || !treeEntryMatchesSearch(entry)) return false;
+          let parentId = entry.parentId;
+          while (parentId) {
+            if (state.treeUi.foldedIds.has(parentId)) return false;
+            parentId = byId.get(parentId)?.parentId || null;
+          }
+          return true;
+        });
+      }
+
+      function renderSessionTreePanel(bridgeState) {
+        const tree = bridgeState.sessionTree || {};
+        if ((tree.entries || []).length > 0 && state.treeUi.filter === "default" && tree.defaultFilter) {
+          treeFilterSelectEl.value = state.treeUi.filter;
+        }
+        const visible = visibleTreeEntries(tree);
+        const visibleChildParents = new Set(visible.map((entry) => entry.parentId).filter(Boolean));
+        treePanelStatusEl.textContent = `${visible.length}/${(tree.entries || []).length} entries · ${state.treeUi.filter}${tree.branchSummaryPromptRequired ? " · branch summary prompt on" : " · summary prompt skipped"}`;
+        treeListEl.textContent = "";
+        for (const entry of visible) {
+          const row = document.createElement("div");
+          row.className = `panel-row tree-row${entry.current ? " current" : ""}`;
+          row.style.paddingLeft = `${10 + (entry.depth || 0) * 14}px`;
+          const select = document.createElement("button");
+          select.type = "button";
+          select.disabled = Boolean(state.activeTurnId);
+          const marker = document.createElement("span");
+          marker.className = "tree-marker";
+          const folded = state.treeUi.foldedIds.has(entry.id);
+          marker.textContent = `${folded ? "⊞" : visibleChildParents.has(entry.id) ? "⊟" : " "} ${entry.activePath ? "•" : " "}`;
+          const title = document.createElement("strong");
+          const labelText = entry.label ? `[${entry.label}] ` : "";
+          title.textContent = `${marker.textContent} ${labelText}${state.treeUi.showLabelTimestamps && entry.label ? formatTreeLabelTimestamp(entry.labelTimestamp) : ""}${entry.display}`;
+          if (entry.label) title.classList.add("tree-label");
+          select.append(title);
+          select.addEventListener("click", async () => {
+            await navigateTreeEntry(entry.id);
+          });
+          const controls = document.createElement("span");
+          controls.className = "panel-controls";
+          const fold = document.createElement("button");
+          fold.type = "button";
+          fold.textContent = folded ? "Unfold" : "Fold";
+          fold.disabled = !entry.hasChildren;
+          fold.addEventListener("click", () => {
+            if (state.treeUi.foldedIds.has(entry.id)) state.treeUi.foldedIds.delete(entry.id);
+            else state.treeUi.foldedIds.add(entry.id);
+            renderSessionTreePanel(state.bridgeState || {});
+          });
+          const label = document.createElement("button");
+          label.type = "button";
+          label.textContent = "Label";
+          label.disabled = Boolean(state.activeTurnId);
+          label.addEventListener("click", async () => {
+            const next = window.prompt("Tree label (empty clears)", entry.label || "");
+            if (next === null) return;
+            markTelemetry("session_tree_label_edit", { entryId: entry.id, valueLength: next.length });
+            await sendBridge("session_tree_label", { entryId: entry.id, label: next });
+            await refreshStatePanels();
+          });
+          controls.append(fold, label);
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = `${entry.kind} · ${entry.timestamp}${entry.labelTimestamp && state.treeUi.showLabelTimestamps ? ` · label ${formatTreeLabelTimestamp(entry.labelTimestamp).trim()}` : ""}`;
+          row.append(select, controls, meta);
+          treeListEl.append(row);
+        }
+        markTelemetry("session_tree_panel_rendered", {
+          childCount: treeListEl.childElementCount,
+          valueLength: visible.length,
+          filter: state.treeUi.filter,
+          showLabelTimestamps: state.treeUi.showLabelTimestamps,
+        });
+      }
+
+      async function navigateTreeEntry(entryId, summarize = undefined, summaryText = undefined) {
+        const payload = { entryId };
+        if (summarize !== undefined) payload.summarize = summarize;
+        if (summaryText) payload.summaryText = summaryText;
+        markTelemetry("session_tree_navigate", { entryId, summarize: summarize === undefined ? "prompt" : String(Boolean(summarize)) });
+        const result = await sendBridge("session_tree_navigate", payload);
+        if (result.status === "summary_required") {
+          state.treeUi.pendingNavigationEntryId = entryId;
+          treeSummaryPromptEl.hidden = false;
+          treeSummaryInputEl.focus();
+          markTelemetry("session_tree_summary_prompt", { entryId });
+          return result;
+        }
+        treeSummaryPromptEl.hidden = true;
+        state.treeUi.pendingNavigationEntryId = null;
+        if (result.editorText) {
+          promptInputEl.value = result.editorText;
+          promptInputEl.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        await refreshStatePanels();
+        const transcript = await sendBridge("get_messages");
+        renderMessages(transcript.messages || []);
+        return result;
+      }
+
+      function forkMessageMatchesSearch(message) {
+        const query = state.forkUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [message.entryId, message.text, message.timestamp]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function renderForkPanel(bridgeState) {
+        const panel = bridgeState.forkPanel || {};
+        const messages = (panel.messages || []).filter(forkMessageMatchesSearch);
+        forkPanelStatusEl.textContent = `${messages.length}/${(panel.messages || []).length} forkable user messages`;
+        forkListEl.textContent = "";
+        for (const message of messages) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = "panel-row fork-row";
+          row.disabled = Boolean(state.activeTurnId);
+          const title = document.createElement("strong");
+          title.textContent = message.text;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = `Message ${message.index} · ${message.timestamp}`;
+          row.append(title, meta);
+          row.addEventListener("click", async () => {
+            markTelemetry("fork_panel_create", { entryId: message.entryId, valueLength: message.text.length });
+            const result = await sendBridge("fork_session", { entryId: message.entryId });
+            if (result.editorText) {
+              promptInputEl.value = result.editorText;
+              promptInputEl.dispatchEvent(new Event("input", { bubbles: true }));
+            }
+            await refreshStatePanels();
+            const transcript = await sendBridge("get_messages");
+            renderMessages(transcript.messages || []);
+          });
+          forkListEl.append(row);
+        }
+        markTelemetry("fork_panel_rendered", {
+          childCount: forkListEl.childElementCount,
+          valueLength: messages.length,
         });
       }
 
@@ -780,6 +1027,8 @@
         renderModelPanel(bridgeState);
         renderAuthPanel(bridgeState);
         renderSessionPanel(bridgeState);
+        renderSessionTreePanel(bridgeState);
+        renderForkPanel(bridgeState);
         renderSettingsPanel(bridgeState);
         renderThinkingPanel(bridgeState);
         renderThemePanel(bridgeState);
@@ -1507,6 +1756,38 @@
         await refreshStatePanels();
         const transcript = await sendBridge("get_messages");
         renderMessages(transcript.messages || []);
+      });
+
+      treeFilterSelectEl.addEventListener("change", () => {
+        state.treeUi.filter = treeFilterSelectEl.value;
+        renderSessionTreePanel(state.bridgeState || {});
+      });
+      treeLabelTimestampsToggleEl.addEventListener("change", () => {
+        state.treeUi.showLabelTimestamps = treeLabelTimestampsToggleEl.checked;
+        renderSessionTreePanel(state.bridgeState || {});
+        markTelemetry("session_tree_label_timestamps", { enabled: state.treeUi.showLabelTimestamps });
+      });
+      treeSearchInputEl.addEventListener("input", () => {
+        state.treeUi.search = treeSearchInputEl.value;
+        renderSessionTreePanel(state.bridgeState || {});
+      });
+      treeSummarySkipButtonEl.addEventListener("click", async () => {
+        if (!state.treeUi.pendingNavigationEntryId) return;
+        await navigateTreeEntry(state.treeUi.pendingNavigationEntryId, false);
+      });
+      treeSummaryAddButtonEl.addEventListener("click", async () => {
+        if (!state.treeUi.pendingNavigationEntryId) return;
+        const custom = treeSummaryInputEl.value.trim();
+        await navigateTreeEntry(
+          state.treeUi.pendingNavigationEntryId,
+          true,
+          custom || "Branch summary selected from the session tree.",
+        );
+        treeSummaryInputEl.value = "";
+      });
+      forkSearchInputEl.addEventListener("input", () => {
+        state.forkUi.search = forkSearchInputEl.value;
+        renderForkPanel(state.bridgeState || {});
       });
 
       settingsSearchInputEl.addEventListener("input", () => {

@@ -1076,9 +1076,16 @@ test "webview frontend asset includes model auth and session panels" {
     try std.testing.expect(std.mem.indexOf(u8, html, "remove_auth") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "switch_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "new_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session-tree-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "fork-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session_tree_label") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session_tree_navigate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "fork_session") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "model_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "auth_panel_rendered") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "session_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session_tree_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "fork_panel_rendered") != null);
 }
 
 test "webview frontend asset includes settings theme thinking and scoped model panels" {

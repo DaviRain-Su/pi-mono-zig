@@ -47,6 +47,11 @@ pub const Command = enum {
     scoped_models_get,
     scoped_models_update,
     scoped_models_save,
+    session_tree_get,
+    session_tree_label,
+    session_tree_navigate,
+    fork_messages_get,
+    fork_session,
 };
 
 pub const Permission = enum {
@@ -102,6 +107,11 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "scoped_models_get", .command = .scoped_models_get, .permission = .skeleton_chat },
     .{ .name = "scoped_models_update", .command = .scoped_models_update, .permission = .settings_mutation },
     .{ .name = "scoped_models_save", .command = .scoped_models_save, .permission = .settings_mutation },
+    .{ .name = "session_tree_get", .command = .session_tree_get, .permission = .skeleton_chat },
+    .{ .name = "session_tree_label", .command = .session_tree_label, .permission = .session_mutation },
+    .{ .name = "session_tree_navigate", .command = .session_tree_navigate, .permission = .session_mutation },
+    .{ .name = "fork_messages_get", .command = .fork_messages_get, .permission = .skeleton_chat },
+    .{ .name = "fork_session", .command = .fork_session, .permission = .session_mutation },
 };
 
 pub const BridgeContext = struct {
@@ -149,6 +159,11 @@ pub const DispatchCounters = struct {
     scoped_models_get: usize = 0,
     scoped_models_update: usize = 0,
     scoped_models_save: usize = 0,
+    session_tree_get: usize = 0,
+    session_tree_label: usize = 0,
+    session_tree_navigate: usize = 0,
+    fork_messages_get: usize = 0,
+    fork_session: usize = 0,
 
     fn increment(self: *DispatchCounters, command: Command) void {
         switch (command) {
@@ -172,6 +187,11 @@ pub const DispatchCounters = struct {
             .scoped_models_get => self.scoped_models_get += 1,
             .scoped_models_update => self.scoped_models_update += 1,
             .scoped_models_save => self.scoped_models_save += 1,
+            .session_tree_get => self.session_tree_get += 1,
+            .session_tree_label => self.session_tree_label += 1,
+            .session_tree_navigate => self.session_tree_navigate += 1,
+            .fork_messages_get => self.fork_messages_get += 1,
+            .fork_session => self.fork_session += 1,
         }
     }
 
@@ -195,7 +215,12 @@ pub const DispatchCounters = struct {
             self.theme_select +
             self.scoped_models_get +
             self.scoped_models_update +
-            self.scoped_models_save;
+            self.scoped_models_save +
+            self.session_tree_get +
+            self.session_tree_label +
+            self.session_tree_navigate +
+            self.fork_messages_get +
+            self.fork_session;
     }
 };
 
@@ -519,6 +544,11 @@ pub const BridgeHost = struct {
             .scoped_models_get => try self.writeScopedModelsResult(allocator, &writer.writer),
             .scoped_models_update => try self.writeScopedModelsUpdateResult(allocator, &writer.writer, payload.?),
             .scoped_models_save => try self.writeScopedModelsSaveResult(allocator, &writer.writer),
+            .session_tree_get => try self.writeSessionTreeState(allocator, &writer.writer),
+            .session_tree_label => try self.writeSessionTreeLabelResult(allocator, &writer.writer, payload.?),
+            .session_tree_navigate => try self.writeSessionTreeNavigateResult(allocator, &writer.writer, payload.?),
+            .fork_messages_get => try self.writeForkPanelState(allocator, &writer.writer),
+            .fork_session => try self.writeForkSessionResult(allocator, &writer.writer, payload.?),
         }
 
         try writer.writer.writeAll("}");
@@ -553,6 +583,10 @@ pub const BridgeHost = struct {
         try self.writeThemeSelectionState(allocator, writer);
         try writer.writeAll(",\"scopedModels\":");
         try self.writeScopedModelsResult(allocator, writer);
+        try writer.writeAll(",\"sessionTree\":");
+        try self.writeSessionTreeState(allocator, writer);
+        try writer.writeAll(",\"forkPanel\":");
+        try self.writeForkPanelState(allocator, writer);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
         try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
@@ -1544,6 +1578,289 @@ pub const BridgeHost = struct {
         try writer.writeAll("]}");
     }
 
+    fn writeSessionTreeState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        const tree = try self.context.session.session_manager.getTree(allocator);
+        defer {
+            for (tree) |*node| node.deinit(allocator);
+            allocator.free(tree);
+        }
+        const current_leaf_id = self.context.session.session_manager.getLeafId();
+        try writer.writeAll("{\"status\":\"ready\",\"permissionRequired\":");
+        try writer.writeAll(if (self.context.permissions.session_mutation) "false" else "true");
+        try writer.writeAll(",\"currentLeafId\":");
+        if (current_leaf_id) |id| {
+            try writeJsonString(allocator, writer, id);
+        } else {
+            try writer.writeAll("null");
+        }
+        const prompt_required = if (self.context.runtime_config) |config| !config.branchSummarySkipPrompt() else true;
+        try writer.writeAll(",\"branchSummaryPromptRequired\":");
+        try writer.writeAll(if (prompt_required) "true" else "false");
+        const default_filter = if (self.context.runtime_config) |config| treeFilterName(config.treeFilterMode()) else "default";
+        try writer.writeAll(",\"defaultFilter\":");
+        try writeJsonString(allocator, writer, default_filter);
+        try writer.writeAll(",\"filters\":[\"default\",\"no-tools\",\"user-only\",\"labeled-only\",\"all\"],\"controls\":{\"search\":true,\"folding\":true,\"labels\":true,\"labelTimestamps\":true,\"navigate\":true,\"branchSummaryPrompt\":true},\"entries\":[");
+        var wrote = false;
+        try self.writeSessionTreeNodes(allocator, writer, tree, current_leaf_id, 0, &wrote);
+        try writer.writeAll("]}");
+    }
+
+    fn writeSessionTreeNodes(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        nodes: []const session_manager_mod.SessionTreeNode,
+        current_leaf_id: ?[]const u8,
+        depth: usize,
+        wrote: *bool,
+    ) !void {
+        var pass: usize = 0;
+        while (pass < 2) : (pass += 1) {
+            for (nodes) |node| {
+                const active_subtree = treeSubtreeContains(node, current_leaf_id);
+                if ((pass == 0) != active_subtree) continue;
+                if (wrote.*) try writer.writeAll(",");
+                wrote.* = true;
+                try self.writeSessionTreeEntry(allocator, writer, node, current_leaf_id, depth);
+                try self.writeSessionTreeNodes(allocator, writer, node.children, current_leaf_id, depth + 1, wrote);
+            }
+        }
+    }
+
+    fn writeSessionTreeEntry(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        node: session_manager_mod.SessionTreeNode,
+        current_leaf_id: ?[]const u8,
+        depth: usize,
+    ) !void {
+        _ = self;
+        const entry = node.entry.*;
+        const kind = sessionEntryKindName(entry);
+        const display = try sessionEntryDisplayText(allocator, entry);
+        defer allocator.free(display);
+        try writer.writeAll("{");
+        try writeStringField(allocator, writer, "id", entry.id(), false);
+        try writer.writeAll(",\"parentId\":");
+        if (entry.parentId()) |parent_id| {
+            try writeJsonString(allocator, writer, parent_id);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writeStringField(allocator, writer, "timestamp", entry.timestamp(), true);
+        try writeStringField(allocator, writer, "kind", kind, true);
+        try writeStringField(allocator, writer, "display", display, true);
+        try writer.writeAll(",\"label\":");
+        if (node.label) |label| {
+            try writeJsonString(allocator, writer, label);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"labelTimestamp\":");
+        if (node.label_timestamp) |timestamp| {
+            try writeJsonString(allocator, writer, timestamp);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writeUsizeField(writer, "depth", depth, true);
+        try writeBoolField(writer, "hasChildren", node.children.len > 0, true);
+        try writeBoolField(writer, "activePath", treeSubtreeContains(node, current_leaf_id), true);
+        try writeBoolField(writer, "current", if (current_leaf_id) |id| std.mem.eql(u8, id, entry.id()) else false, true);
+        try writeBoolField(writer, "bookkeeping", sessionEntryIsBookkeeping(entry), true);
+        try writer.writeAll("}");
+    }
+
+    fn writeSessionTreeLabelResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"message\":\"WebView session tree labels are blocked while a prompt is active\"}");
+            return;
+        }
+        const entry_id = payload.object.get("entryId").?.string;
+        const label_text = payload.object.get("label").?.string;
+        const trimmed = std.mem.trim(u8, label_text, &std.ascii.whitespace);
+        _ = try self.context.session.session_manager.appendLabelChange(entry_id, if (trimmed.len == 0) null else trimmed);
+        try writer.writeAll("{\"status\":");
+        try writeJsonString(allocator, writer, if (trimmed.len == 0) "cleared" else "saved");
+        try writer.writeAll(",\"accepted\":true,\"entryId\":");
+        try writeJsonString(allocator, writer, entry_id);
+        try writer.writeAll(",\"label\":");
+        if (trimmed.len == 0) {
+            try writer.writeAll("null");
+        } else {
+            try writeJsonString(allocator, writer, trimmed);
+        }
+        try writer.writeAll(",\"sessionTree\":");
+        try self.writeSessionTreeState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeSessionTreeNavigateResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"message\":\"WebView session tree navigation is blocked while a prompt is active\"}");
+            return;
+        }
+        const entry_id = payload.object.get("entryId").?.string;
+        if (self.context.session.session_manager.getLeafId()) |leaf_id| {
+            if (std.mem.eql(u8, leaf_id, entry_id)) {
+                try writer.writeAll("{\"status\":\"already_current\",\"accepted\":false,\"entryId\":");
+                try writeJsonString(allocator, writer, entry_id);
+                try writer.writeAll(",\"sessionTree\":");
+                try self.writeSessionTreeState(allocator, writer);
+                try writer.writeAll("}");
+                return;
+            }
+        }
+        const prompt_required = if (self.context.runtime_config) |config| !config.branchSummarySkipPrompt() else true;
+        const summarize_value = payload.object.get("summarize");
+        if (prompt_required and summarize_value == null) {
+            try writer.writeAll("{\"status\":\"summary_required\",\"accepted\":false,\"entryId\":");
+            try writeJsonString(allocator, writer, entry_id);
+            try writer.writeAll(",\"choices\":[\"skip\",\"summarize\",\"summarize-custom\"],\"message\":\"Choose branch summary behavior\"}");
+            return;
+        }
+        const summarize = if (summarize_value) |value| value == .bool and value.bool else false;
+        const summary_text = if (payload.object.get("summaryText")) |value|
+            if (value == .string and value.string.len > 0) value.string else "Branch summary selected from the session tree."
+        else
+            "Branch summary selected from the session tree.";
+        var result = try self.context.session.navigateTree(allocator, entry_id, .{
+            .summarize = summarize,
+            .summary_text = if (summarize) summary_text else null,
+        });
+        defer result.deinit(allocator);
+        try writer.writeAll("{\"status\":\"navigated\",\"accepted\":true,\"entryId\":");
+        try writeJsonString(allocator, writer, entry_id);
+        try writer.writeAll(",\"sessionId\":");
+        try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+        try writer.writeAll(",\"currentLeafId\":");
+        if (self.context.session.session_manager.getLeafId()) |leaf_id| {
+            try writeJsonString(allocator, writer, leaf_id);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"summaryEntryId\":");
+        if (result.summary_entry_id) |summary_id| {
+            try writeJsonString(allocator, writer, summary_id);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"editorText\":");
+        if (result.editor_text) |text| {
+            try writeJsonString(allocator, writer, text);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"sessionTree\":");
+        try self.writeSessionTreeState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
+    fn writeForkPanelState(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{\"status\":\"ready\",\"permissionRequired\":");
+        try writer.writeAll(if (self.context.permissions.session_mutation) "false" else "true");
+        try writer.writeAll(",\"messages\":[");
+        var wrote = false;
+        var index: usize = 0;
+        for (self.context.session.session_manager.getEntries()) |entry| {
+            if (entry != .message or entry.message.message != .user) continue;
+            const text = try contentBlocksPlainTextAlloc(allocator, entry.message.message.user.content);
+            defer allocator.free(text);
+            const trimmed = std.mem.trim(u8, text, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            if (wrote) try writer.writeAll(",");
+            wrote = true;
+            index += 1;
+            try writer.writeAll("{");
+            try writeStringField(allocator, writer, "entryId", entry.message.id, false);
+            try writer.writeAll(",\"parentId\":");
+            if (entry.message.parent_id) |parent_id| {
+                try writeJsonString(allocator, writer, parent_id);
+            } else {
+                try writer.writeAll("null");
+            }
+            try writeStringField(allocator, writer, "timestamp", entry.message.timestamp, true);
+            try writeStringField(allocator, writer, "text", trimmed, true);
+            try writer.print(",\"index\":{d}", .{index});
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"controls\":{\"fork\":true,\"search\":true}}");
+    }
+
+    fn writeForkSessionResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        payload: std.json.Value,
+    ) !void {
+        if (self.active_generation.load(.seq_cst)) {
+            try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"message\":\"WebView session fork is blocked while a prompt is active\"}");
+            return;
+        }
+        const entry_id = payload.object.get("entryId").?.string;
+        const selected_entry = self.context.session.session_manager.getEntry(entry_id) orelse return error.EntryNotFound;
+        if (selected_entry.* != .message or selected_entry.message.message != .user) return error.InvalidSessionTarget;
+        const selected_text = try contentBlocksPlainTextAlloc(allocator, selected_entry.message.message.user.content);
+        defer allocator.free(selected_text);
+        const trimmed = std.mem.trim(u8, selected_text, " \t\r\n");
+        const target_leaf_id = selected_entry.message.parent_id;
+        const session_dir = self.context.session.session_manager.getSessionDir();
+
+        var next_manager = if (target_leaf_id) |leaf_id|
+            try self.context.session.session_manager.createBranchedSession(leaf_id)
+        else if (self.context.session.session_manager.getSessionFile() != null and session_dir.len > 0)
+            try session_manager_mod.SessionManager.createWithParent(
+                self.context.session.allocator,
+                self.context.session.io,
+                self.context.session.cwd,
+                session_dir,
+                self.context.session.session_manager.getSessionFile(),
+            )
+        else
+            try session_manager_mod.SessionManager.inMemory(
+                self.context.session.allocator,
+                self.context.session.io,
+                self.context.session.cwd,
+            );
+        errdefer next_manager.deinit();
+        try self.replaceSessionManager(allocator, &next_manager);
+        try writer.writeAll("{\"status\":\"forked\",\"accepted\":true,\"entryId\":");
+        try writeJsonString(allocator, writer, entry_id);
+        try writer.writeAll(",\"sessionId\":");
+        try writeJsonString(allocator, writer, self.context.session.session_manager.getSessionId());
+        try writer.writeAll(",\"sessionPath\":");
+        if (self.context.session.session_manager.getSessionFile()) |path| {
+            try writeJsonString(allocator, writer, path);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"editorText\":");
+        try writeJsonString(allocator, writer, trimmed);
+        try writer.writeAll(",\"sessionTree\":");
+        try self.writeSessionTreeState(allocator, writer);
+        try writer.writeAll(",\"forkPanel\":");
+        try self.writeForkPanelState(allocator, writer);
+        try writer.writeAll("}");
+    }
+
     fn availableModelForSelection(
         self: *const BridgeHost,
         provider: []const u8,
@@ -1750,11 +2067,32 @@ pub const BridgeHost = struct {
                     }
                 }
             },
-            .settings_get, .scoped_models_get, .scoped_models_save => {},
+            .settings_get, .scoped_models_get, .scoped_models_save, .session_tree_get, .fork_messages_get => {},
             .settings_set => {},
             .thinking_set => {},
             .theme_select => {},
             .scoped_models_update => {},
+            .session_tree_label, .session_tree_navigate => {
+                const value = payload orelse return error.InvalidSessionTarget;
+                const entry_id_value = value.object.get("entryId") orelse return error.InvalidSessionTarget;
+                if (entry_id_value != .string or !isValidSessionEntryId(entry_id_value.string)) return error.InvalidSessionTarget;
+                if (self.context.session.session_manager.getEntry(entry_id_value.string) == null) return error.InvalidSessionTarget;
+                if (command == .session_tree_navigate) {
+                    if (value.object.get("summarize")) |summarize| {
+                        if (summarize != .bool) return error.InvalidSessionTarget;
+                    }
+                    if (value.object.get("summaryText")) |summary_text| {
+                        if (summary_text != .string) return error.InvalidSessionTarget;
+                    }
+                }
+            },
+            .fork_session => {
+                const value = payload orelse return error.InvalidSessionTarget;
+                const entry_id_value = value.object.get("entryId") orelse return error.InvalidSessionTarget;
+                if (entry_id_value != .string or !isValidSessionEntryId(entry_id_value.string)) return error.InvalidSessionTarget;
+                const entry = self.context.session.session_manager.getEntry(entry_id_value.string) orelse return error.InvalidSessionTarget;
+                if (entry.* != .message or entry.message.message != .user) return error.InvalidSessionTarget;
+            },
         }
     }
 
@@ -2024,7 +2362,7 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
     if (value == .null) return command != .prompt;
     if (value != .object) return false;
     return switch (command) {
-        .get_state, .get_messages, .abort, .get_events, .settings_get, .scoped_models_get, .scoped_models_save => true,
+        .get_state, .get_messages, .abort, .get_events, .settings_get, .scoped_models_get, .scoped_models_save, .session_tree_get, .fork_messages_get => true,
         .prompt => value.object.get("text") != null and value.object.get("text").? == .string,
         .model_select => value.object.get("provider") != null and
             value.object.get("provider").? == .string and
@@ -2046,6 +2384,15 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
         .thinking_set => value.object.get("level") != null and value.object.get("level").? == .string,
         .theme_select => value.object.get("theme") != null and value.object.get("theme").? == .string,
         .scoped_models_update => value.object.get("action") != null and value.object.get("action").? == .string,
+        .session_tree_label => value.object.get("entryId") != null and
+            value.object.get("entryId").? == .string and
+            value.object.get("label") != null and
+            value.object.get("label").? == .string,
+        .session_tree_navigate => value.object.get("entryId") != null and
+            value.object.get("entryId").? == .string and
+            (value.object.get("summarize") == null or value.object.get("summarize").? == .bool) and
+            (value.object.get("summaryText") == null or value.object.get("summaryText").? == .string),
+        .fork_session => value.object.get("entryId") != null and value.object.get("entryId").? == .string,
     };
 }
 
@@ -2077,6 +2424,12 @@ fn isValidProviderId(provider: []const u8) bool {
     if (provider.len == 0) return false;
     if (std.mem.indexOfScalar(u8, provider, 0) != null) return false;
     return true;
+}
+
+fn isValidSessionEntryId(entry_id: []const u8) bool {
+    if (entry_id.len == 0) return false;
+    if (entry_id.len > 256) return false;
+    return std.mem.indexOfScalar(u8, entry_id, 0) == null;
 }
 
 fn validateValueBounds(value: std.json.Value, limits: Limits, depth: usize) error{ PayloadTooDeep, StringTooLong }!void {
@@ -2240,6 +2593,107 @@ fn writeContentBlocksSummary(
         try writer.writeAll("}");
     }
     try writer.writeAll("]");
+}
+
+fn treeSubtreeContains(node: session_manager_mod.SessionTreeNode, needle: ?[]const u8) bool {
+    const id = needle orelse return false;
+    if (std.mem.eql(u8, node.entry.id(), id)) return true;
+    for (node.children) |child| {
+        if (treeSubtreeContains(child, id)) return true;
+    }
+    return false;
+}
+
+fn sessionEntryKindName(entry: session_manager_mod.SessionEntry) []const u8 {
+    return switch (entry) {
+        .message => |message_entry| switch (message_entry.message) {
+            .user => "user",
+            .assistant => "assistant",
+            .tool_result => "tool_result",
+        },
+        .thinking_level_change => "thinking_level_change",
+        .model_change => "model_change",
+        .compaction => "compaction",
+        .branch_summary => "branch_summary",
+        .custom => "custom",
+        .custom_message => "custom_message",
+        .label => "label",
+        .session_info => "session_info",
+    };
+}
+
+fn sessionEntryIsBookkeeping(entry: session_manager_mod.SessionEntry) bool {
+    return switch (entry) {
+        .label, .custom, .model_change, .thinking_level_change => true,
+        else => false,
+    };
+}
+
+fn sessionEntryDisplayText(allocator: std.mem.Allocator, entry: session_manager_mod.SessionEntry) ![]u8 {
+    return switch (entry) {
+        .message => |message_entry| switch (message_entry.message) {
+            .user => |user_message| blk: {
+                const text = try contentBlocksPlainTextAlloc(allocator, user_message.content);
+                defer allocator.free(text);
+                break :blk std.fmt.allocPrint(allocator, "user: {s}", .{trimTreeSummaryText(text)});
+            },
+            .assistant => |assistant_message| blk: {
+                const text = try contentBlocksPlainTextAlloc(allocator, assistant_message.content);
+                defer allocator.free(text);
+                const trimmed = trimTreeSummaryText(text);
+                break :blk if (trimmed.len > 0)
+                    std.fmt.allocPrint(allocator, "assistant: {s}", .{trimmed})
+                else
+                    allocator.dupe(u8, "assistant: (no content)");
+            },
+            .tool_result => |tool_result| blk: {
+                const text = try contentBlocksPlainTextAlloc(allocator, tool_result.content);
+                defer allocator.free(text);
+                break :blk std.fmt.allocPrint(allocator, "[{s}]: {s}", .{ tool_result.tool_name, trimTreeSummaryText(text) });
+            },
+        },
+        .thinking_level_change => |thinking_entry| std.fmt.allocPrint(allocator, "[thinking: {s}]", .{@tagName(thinking_entry.thinking_level)}),
+        .model_change => |model_entry| std.fmt.allocPrint(allocator, "[model: {s}/{s}]", .{ model_entry.provider, model_entry.model_id }),
+        .compaction => |compaction_entry| std.fmt.allocPrint(allocator, "[compaction: {d}k tokens]", .{compaction_entry.tokens_before / 1000}),
+        .branch_summary => |branch_summary_entry| std.fmt.allocPrint(allocator, "[branch summary]: {s}", .{trimTreeSummaryText(branch_summary_entry.summary)}),
+        .custom => |custom_entry| std.fmt.allocPrint(allocator, "[custom: {s}]", .{custom_entry.custom_type}),
+        .custom_message => |custom_message_entry| blk: {
+            const text = switch (custom_message_entry.content) {
+                .text => |value| try allocator.dupe(u8, value),
+                .blocks => |blocks| try contentBlocksPlainTextAlloc(allocator, blocks),
+            };
+            defer allocator.free(text);
+            break :blk std.fmt.allocPrint(allocator, "[{s}]: {s}", .{ custom_message_entry.custom_type, trimTreeSummaryText(text) });
+        },
+        .label => |label_entry| if (label_entry.label) |label|
+            std.fmt.allocPrint(allocator, "[label: {s}]", .{label})
+        else
+            allocator.dupe(u8, "[label: (cleared)]"),
+        .session_info => |session_info_entry| if (session_info_entry.name) |name|
+            std.fmt.allocPrint(allocator, "session name: {s}", .{name})
+        else
+            allocator.dupe(u8, "session name cleared"),
+    };
+}
+
+fn contentBlocksPlainTextAlloc(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    for (blocks) |block| {
+        switch (block) {
+            .text => |text| try out.writer.writeAll(text.text),
+            .thinking => |thinking| try out.writer.writeAll(thinking.thinking),
+            .image => |image| try out.writer.print("[Image: {s}]", .{image.mime_type}),
+            .tool_call => |tool_call| try out.writer.print("{s}", .{tool_call.name}),
+        }
+        try out.writer.writeByte('\n');
+    }
+    return try allocator.dupe(u8, std.mem.trim(u8, out.written(), " \t\r\n"));
+}
+
+fn trimTreeSummaryText(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return if (trimmed.len > 72) trimmed[0..72] else trimmed;
 }
 
 fn writeSessionSearchInfo(
@@ -2688,6 +3142,29 @@ fn testBridge(session: *session_mod.AgentSession) BridgeHost {
     });
 }
 
+fn makeBridgeTestTextMessage(allocator: std.mem.Allocator, role: []const u8, text: []const u8, timestamp: i64, model: ai.Model) !agent.AgentMessage {
+    const blocks = try allocator.alloc(ai.ContentBlock, 1);
+    blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    if (std.mem.eql(u8, role, "user")) {
+        return .{ .user = .{
+            .role = try allocator.dupe(u8, "user"),
+            .content = blocks,
+            .timestamp = timestamp,
+        } };
+    }
+    return .{ .assistant = .{
+        .role = try allocator.dupe(u8, "assistant"),
+        .content = blocks,
+        .tool_calls = null,
+        .api = try allocator.dupe(u8, model.api),
+        .provider = try allocator.dupe(u8, model.provider),
+        .model = try allocator.dupe(u8, model.id),
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = timestamp,
+    } };
+}
+
 const PromptAcceptance = struct {
     accepted: bool = false,
 };
@@ -2920,7 +3397,7 @@ test "bridge command table exposes approved skeleton commands first" {
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 20), command_table.len);
+    try std.testing.expectEqual(@as(usize, 25), command_table.len);
     try std.testing.expectEqualStrings("new_session", command_table[6].name);
     try std.testing.expectEqual(Command.new_session, command_table[6].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[6].permission);
@@ -2954,7 +3431,7 @@ test "bridge command table exposes auth status and gates auth mutations" {
 }
 
 test "bridge command table exposes settings theme thinking and scoped model commands" {
-    try std.testing.expectEqual(@as(usize, 20), command_table.len);
+    try std.testing.expectEqual(@as(usize, 25), command_table.len);
     try std.testing.expectEqualStrings("settings_get", command_table[13].name);
     try std.testing.expectEqual(Command.settings_get, command_table[13].command);
     try std.testing.expectEqual(Permission.skeleton_chat, command_table[13].permission);
@@ -2970,6 +3447,21 @@ test "bridge command table exposes settings theme thinking and scoped model comm
     try std.testing.expectEqual(Permission.settings_mutation, command_table[18].permission);
     try std.testing.expectEqualStrings("scoped_models_save", command_table[19].name);
     try std.testing.expectEqual(Permission.settings_mutation, command_table[19].permission);
+}
+
+test "bridge command table exposes session tree label navigation and fork commands" {
+    try std.testing.expectEqual(@as(usize, 25), command_table.len);
+    try std.testing.expectEqualStrings("session_tree_get", command_table[20].name);
+    try std.testing.expectEqual(Command.session_tree_get, command_table[20].command);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[20].permission);
+    try std.testing.expectEqualStrings("session_tree_label", command_table[21].name);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[21].permission);
+    try std.testing.expectEqualStrings("session_tree_navigate", command_table[22].name);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[22].permission);
+    try std.testing.expectEqualStrings("fork_messages_get", command_table[23].name);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[23].permission);
+    try std.testing.expectEqualStrings("fork_session", command_table[24].name);
+    try std.testing.expectEqual(Permission.session_mutation, command_table[24].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -3924,6 +4416,165 @@ test "webview session selector exposes controls and permitted switch/new flows" 
     defer allocator.free(created);
     try std.testing.expect(std.mem.indexOf(u8, created, "\"status\":\"created\"") != null);
     try std.testing.expect(!std.mem.eql(u8, first_path, second.session_manager.getSessionFile().?));
+}
+
+test "webview session tree exposes active path filters fold markers and persists labels" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    var root = try makeBridgeTestTextMessage(allocator, "user", "root prompt", 1, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &root);
+    const root_id = try session.session_manager.appendMessage(root);
+    var main = try makeBridgeTestTextMessage(allocator, "assistant", "main branch", 2, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &main);
+    _ = try session.session_manager.appendMessage(main);
+    try session.session_manager.branch(root_id);
+    var alternate = try makeBridgeTestTextMessage(allocator, "assistant", "alternate branch", 3, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &alternate);
+    const alternate_id = try session.session_manager.appendMessage(alternate);
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    bridge.context.permissions.session_mutation = true;
+
+    const state = try bridge.handleRequestJson(allocator, "{\"id\":\"tree\",\"command\":\"session_tree_get\"}", trusted_bundle_origin);
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"session_tree_get\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"filters\":[\"default\",\"no-tools\",\"user-only\",\"labeled-only\",\"all\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"display\":\"assistant: alternate branch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"hasChildren\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"activePath\":true") != null);
+
+    var label_request: std.Io.Writer.Allocating = .init(allocator);
+    defer label_request.deinit();
+    try label_request.writer.writeAll("{\"id\":\"label\",\"command\":\"session_tree_label\",\"payload\":{\"entryId\":");
+    try writeJsonString(allocator, &label_request.writer, alternate_id);
+    try label_request.writer.writeAll(",\"label\":\"  bookmark  \"}}");
+    const labeled = try bridge.handleRequestJson(allocator, label_request.written(), trusted_bundle_origin);
+    defer allocator.free(labeled);
+    try std.testing.expect(std.mem.indexOf(u8, labeled, "\"status\":\"saved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, labeled, "\"label\":\"bookmark\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, labeled, "\"labelTimestamp\"") != null);
+    try std.testing.expectEqualStrings("bookmark", session.session_manager.getLabel(alternate_id).?);
+
+    const session_file = session.session_manager.getSessionFile().?;
+    var reopened = try session_manager_mod.SessionManager.open(allocator, std.testing.io, session_file, null);
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings("bookmark", reopened.getLabel(alternate_id).?);
+}
+
+test "webview session tree navigation prompts for branch summary and can summarize or skip" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var root = try makeBridgeTestTextMessage(allocator, "user", "root prompt", 1, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &root);
+    const root_id = try session.session_manager.appendMessage(root);
+    var main = try makeBridgeTestTextMessage(allocator, "assistant", "main branch", 2, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &main);
+    const main_id = try session.session_manager.appendMessage(main);
+    try session.session_manager.branch(root_id);
+    var alternate = try makeBridgeTestTextMessage(allocator, "assistant", "alternate branch", 3, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &alternate);
+    const alternate_id = try session.session_manager.appendMessage(alternate);
+
+    var bridge = testBridge(&session);
+    bridge.context.permissions.session_mutation = true;
+
+    var prompt_request: std.Io.Writer.Allocating = .init(allocator);
+    defer prompt_request.deinit();
+    try prompt_request.writer.writeAll("{\"id\":\"nav-prompt\",\"command\":\"session_tree_navigate\",\"payload\":{\"entryId\":");
+    try writeJsonString(allocator, &prompt_request.writer, main_id);
+    try prompt_request.writer.writeAll("}}");
+    const prompt = try bridge.handleRequestJson(allocator, prompt_request.written(), trusted_bundle_origin);
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"summary_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"choices\":[\"skip\",\"summarize\",\"summarize-custom\"]") != null);
+    try std.testing.expectEqualStrings(alternate_id, session.session_manager.getLeafId().?);
+
+    var navigate_request: std.Io.Writer.Allocating = .init(allocator);
+    defer navigate_request.deinit();
+    try navigate_request.writer.writeAll("{\"id\":\"nav-summary\",\"command\":\"session_tree_navigate\",\"payload\":{\"entryId\":");
+    try writeJsonString(allocator, &navigate_request.writer, main_id);
+    try navigate_request.writer.writeAll(",\"summarize\":true,\"summaryText\":\"webview branch summary\"}}");
+    const navigated = try bridge.handleRequestJson(allocator, navigate_request.written(), trusted_bundle_origin);
+    defer allocator.free(navigated);
+    try std.testing.expect(std.mem.indexOf(u8, navigated, "\"status\":\"navigated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, navigated, "\"summaryEntryId\":null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, navigated, "webview branch summary") != null);
+    const leaf = session.session_manager.getLeafId().?;
+    const leaf_entry = session.session_manager.getEntry(leaf).?;
+    try std.testing.expect(leaf_entry.* == .branch_summary);
+
+    var skip_request: std.Io.Writer.Allocating = .init(allocator);
+    defer skip_request.deinit();
+    try skip_request.writer.writeAll("{\"id\":\"nav-skip\",\"command\":\"session_tree_navigate\",\"payload\":{\"entryId\":");
+    try writeJsonString(allocator, &skip_request.writer, root_id);
+    try skip_request.writer.writeAll(",\"summarize\":false}}");
+    const skipped = try bridge.handleRequestJson(allocator, skip_request.written(), trusted_bundle_origin);
+    defer allocator.free(skipped);
+    try std.testing.expect(std.mem.indexOf(u8, skipped, "\"status\":\"navigated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skipped, "\"summaryEntryId\":null") != null);
+}
+
+test "webview fork panel lists user messages and forks selected entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    const original_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(original_file);
+    var first_user = try makeBridgeTestTextMessage(allocator, "user", "first prompt", 1, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &first_user);
+    _ = try session.session_manager.appendMessage(first_user);
+    var first_assistant = try makeBridgeTestTextMessage(allocator, "assistant", "first answer", 2, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &first_assistant);
+    _ = try session.session_manager.appendMessage(first_assistant);
+    var second_user = try makeBridgeTestTextMessage(allocator, "user", "second prompt", 3, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &second_user);
+    const second_user_id = try session.session_manager.appendMessage(second_user);
+    var second_assistant = try makeBridgeTestTextMessage(allocator, "assistant", "second answer", 4, testModel());
+    defer session_manager_mod.deinitMessage(allocator, &second_assistant);
+    _ = try session.session_manager.appendMessage(second_assistant);
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    bridge.context.permissions.session_mutation = true;
+
+    const panel = try bridge.handleRequestJson(allocator, "{\"id\":\"forks\",\"command\":\"fork_messages_get\"}", trusted_bundle_origin);
+    defer allocator.free(panel);
+    try std.testing.expect(std.mem.indexOf(u8, panel, "\"messages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panel, "first prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, panel, "second prompt") != null);
+
+    var fork_request: std.Io.Writer.Allocating = .init(allocator);
+    defer fork_request.deinit();
+    try fork_request.writer.writeAll("{\"id\":\"fork\",\"command\":\"fork_session\",\"payload\":{\"entryId\":");
+    try writeJsonString(allocator, &fork_request.writer, second_user_id);
+    try fork_request.writer.writeAll("}}");
+    const forked = try bridge.handleRequestJson(allocator, fork_request.written(), trusted_bundle_origin);
+    defer allocator.free(forked);
+    try std.testing.expect(std.mem.indexOf(u8, forked, "\"status\":\"forked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forked, "\"editorText\":\"second prompt\"") != null);
+    try std.testing.expect(session.session_manager.getSessionFile() != null);
+    try std.testing.expect(!std.mem.eql(u8, original_file, session.session_manager.getSessionFile().?));
+
+    const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"after-fork\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "first prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "first answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "second prompt") == null);
 }
 
 test "webview auth mutation commands deny without echoing credential payloads" {
