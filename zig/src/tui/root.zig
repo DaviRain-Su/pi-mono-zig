@@ -28,6 +28,9 @@ pub const components = struct {
     pub const truncated_text = @import("components/truncated_text.zig");
     pub const viewport = @import("components/viewport.zig");
     pub const table = @import("components/table.zig");
+    pub const tabs = @import("components/tabs.zig");
+    pub const gauge = @import("components/gauge.zig");
+    pub const scrollbar = @import("components/scrollbar.zig");
 };
 
 pub const DrawComponent = draw.Component;
@@ -84,6 +87,11 @@ pub const Table = components.table.Table;
 pub const TableState = components.table.TableState;
 pub const TableCell = components.table.Cell;
 pub const TableRow = components.table.Row;
+pub const Tabs = components.tabs.Tabs;
+pub const Gauge = components.gauge.Gauge;
+pub const Scrollbar = components.scrollbar.Scrollbar;
+pub const ScrollbarState = components.scrollbar.State;
+pub const ScrollbarOrientation = components.scrollbar.Orientation;
 
 test {
     _ = @import("ansi.zig");
@@ -111,6 +119,9 @@ test {
     _ = @import("components/viewport.zig");
     _ = @import("constraints.zig");
     _ = @import("components/table.zig");
+    _ = @import("components/tabs.zig");
+    _ = @import("components/gauge.zig");
+    _ = @import("components/scrollbar.zig");
 }
 
 test "components export autocomplete module" {
