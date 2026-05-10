@@ -17,6 +17,62 @@ pub fn runSetupOrEmit(
     };
 }
 
+/// comptime factory that returns a struct with the standard `stream`
+/// and `streamSimple` boilerplate shared by every provider that follows
+/// the `streamProduction` pattern.  `api_name` becomes the struct's `api`
+/// constant; `ProductionFn` is the provider-specific setup routine (must
+/// match the signature
+/// `fn(allocator, io, model, context, options, *AssistantMessageEventStream) !void`).
+///
+/// Usage in a provider file:
+/// ```zig
+/// const Base = provider_stream.DefineProvider("openai-completions", streamProduction);
+/// pub const OpenAIProvider = struct {
+///     pub const api = Base.api;
+///     pub const stream = Base.stream;
+///     pub const streamSimple = Base.streamSimple;
+/// };
+/// ```
+///
+/// Providers that need a custom `streamSimple` (e.g. Bedrock's token
+/// adjustment) should NOT re-export `Base.streamSimple` and instead
+/// define their own.
+pub fn DefineProvider(comptime api_name: []const u8, comptime ProductionFn: anytype) type {
+    return struct {
+        pub const api = api_name;
+
+        pub fn stream(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            model: types.Model,
+            context: types.Context,
+            options: ?types.StreamOptions,
+        ) !event_stream.AssistantMessageEventStream {
+            var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+            errdefer stream_instance.deinit();
+
+            try runSetupOrEmit(
+                ProductionFn,
+                .{ allocator, io, model, context, options, &stream_instance },
+                &stream_instance,
+                model,
+                options,
+            );
+            return stream_instance;
+        }
+
+        pub fn streamSimple(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            model: types.Model,
+            context: types.Context,
+            options: ?types.StreamOptions,
+        ) !event_stream.AssistantMessageEventStream {
+            return try stream(allocator, io, model, context, options);
+        }
+    };
+}
+
 pub fn emitSetupRuntimeFailure(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     model: types.Model,

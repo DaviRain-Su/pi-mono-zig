@@ -23,6 +23,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         allocator: std.mem.Allocator,
         queue: std.ArrayList(T),
+        read_index: usize = 0,
         done: bool = false,
         final_result: ?R = null,
         mutex: std.Io.Mutex = .init,
@@ -104,12 +105,14 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
-            while (self.queue.items.len == 0 and !self.done) {
+            while (self.read_index >= self.queue.items.len and !self.done) {
                 self.condition.waitUncancelable(self.io, &self.mutex);
             }
 
-            if (self.queue.items.len > 0) {
-                return self.queue.orderedRemove(0);
+            if (self.read_index < self.queue.items.len) {
+                const event = self.queue.items[self.read_index];
+                self.read_index += 1;
+                return event;
             }
 
             return null;

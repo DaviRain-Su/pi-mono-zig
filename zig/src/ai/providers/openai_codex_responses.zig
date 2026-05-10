@@ -25,21 +25,11 @@ const finalizeCurrentBlock = responses_api.finalizeCurrentBlock;
 const updateCurrentMessagePart = responses_api.updateCurrentMessagePart;
 
 pub const OpenAICodexResponsesProvider = struct {
-    pub const api = "openai-codex-responses";
+    const BaseProvider = provider_stream.DefineProvider("openai-codex-responses", streamProduction);
+    pub const api = BaseProvider.api;
+    pub const stream = BaseProvider.stream;
+    pub const streamSimple = BaseProvider.streamSimple;
 
-    pub fn stream(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
-        errdefer stream_instance.deinit();
-
-        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
-        return stream_instance;
-    }
 
     fn streamProduction(
         allocator: std.mem.Allocator,
@@ -140,16 +130,6 @@ pub const OpenAICodexResponsesProvider = struct {
         }
 
         try parseSseStreamLines(allocator, stream_instance, &response, model, options);
-    }
-
-    pub fn streamSimple(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        return try stream(allocator, io, model, context, options);
     }
 };
 

@@ -12,21 +12,11 @@ const stop_reason_mod = @import("../shared/stop_reason.zig");
 const test_stream_server = @import("test_stream_server.zig");
 
 pub const GoogleProvider = struct {
-    pub const api = "google-generative-ai";
+    const BaseProvider = provider_stream.DefineProvider("google-generative-ai", streamProduction);
+    pub const api = BaseProvider.api;
+    pub const stream = BaseProvider.stream;
+    pub const streamSimple = BaseProvider.streamSimple;
 
-    pub fn stream(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
-        errdefer stream_instance.deinit();
-
-        try provider_stream.runSetupOrEmit(streamProduction, .{ allocator, io, model, context, options, &stream_instance }, &stream_instance, model, options);
-        return stream_instance;
-    }
 
     fn streamProduction(
         allocator: std.mem.Allocator,
@@ -95,16 +85,6 @@ pub const GoogleProvider = struct {
         }
 
         try parseSseStreamLines(allocator, stream_instance, &response, model, options);
-    }
-
-    pub fn streamSimple(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        return stream(allocator, io, model, context, options);
     }
 };
 

@@ -17,27 +17,10 @@ const parseChunkUsage = chat_sse.parseChunkUsage;
 const mapStopReason = chat_sse.mapStopReason;
 
 pub const OpenAIProvider = struct {
-    pub const api = "openai-completions";
-
-    pub fn stream(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        var event_stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
-        errdefer event_stream_instance.deinit();
-
-        try provider_stream.runSetupOrEmit(
-            streamProduction,
-            .{ allocator, io, model, context, options, &event_stream_instance },
-            &event_stream_instance,
-            model,
-            options,
-        );
-        return event_stream_instance;
-    }
+    const BaseProvider = provider_stream.DefineProvider("openai-completions", streamProduction);
+    pub const api = BaseProvider.api;
+    pub const stream = BaseProvider.stream;
+    pub const streamSimple = BaseProvider.streamSimple;
 
     fn streamProduction(
         allocator: std.mem.Allocator,
@@ -134,16 +117,6 @@ pub const OpenAIProvider = struct {
 
         // Parse SSE stream incrementally from lines
         try parseSseStreamLines(allocator, event_stream_instance, &streaming, model, options);
-    }
-
-    pub fn streamSimple(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        return try stream(allocator, io, model, context, options);
     }
 };
 

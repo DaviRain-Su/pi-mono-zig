@@ -78,6 +78,16 @@ pub const OpenAIResponsesProvider = struct {
         return stream_instance;
     }
 
+    pub fn streamSimple(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        model: types.Model,
+        context: types.Context,
+        options: ?types.StreamOptions,
+    ) !event_stream.AssistantMessageEventStream {
+        return stream(allocator, io, model, context, options);
+    }
+
     fn streamProduction(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -175,17 +185,8 @@ pub const OpenAIResponsesProvider = struct {
 
         try parseSseStreamLines(allocator, stream_instance, &response, model, options);
     }
-
-    pub fn streamSimple(
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        model: types.Model,
-        context: types.Context,
-        options: ?types.StreamOptions,
-    ) !event_stream.AssistantMessageEventStream {
-        return stream(allocator, io, model, context, options);
-    }
 };
+
 
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
