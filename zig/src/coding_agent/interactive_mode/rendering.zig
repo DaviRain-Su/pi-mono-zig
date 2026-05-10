@@ -2324,7 +2324,7 @@ pub const ScreenComponent = struct {
     }
 };
 
-pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenComponent, width: usize) !tui.LineList {
+pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenComponent, width: usize) ![]const []const u8 {
     var vscreen = try tui.vaxis.Screen.init(allocator, .{
         .rows = @intCast(@max(screen.height, 1)),
         .cols = @intCast(@max(width, 1)),
@@ -2344,7 +2344,11 @@ pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenCo
         .theme = screen.theme,
     });
 
-    var lines = tui.LineList.empty;
+    var lines = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
     for (0..screen.height) |row| {
         var builder = std.ArrayList(u8).empty;
         errdefer builder.deinit(allocator);
@@ -2359,10 +2363,9 @@ pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenCo
                 col += 1;
             }
         }
-        const owned = try builder.toOwnedSlice(allocator);
-        try tui.component.appendOwnedLine(&lines, allocator, owned);
+        try lines.append(allocator, try builder.toOwnedSlice(allocator));
     }
-    return lines;
+    return lines.toOwnedSlice(allocator);
 }
 
 fn styleForToken(theme: ?*const resources_mod.Theme, token: resources_mod.ThemeToken) tui.vaxis.Cell.Style {
@@ -3091,12 +3094,9 @@ pub fn parseEnvSize(value: ?[]const u8) ?usize {
     return std.fmt.parseInt(usize, text, 10) catch null;
 }
 
-pub fn freeLinesSafe(allocator: std.mem.Allocator, lines: *tui.LineList) void {
-    if (lines.items.len == 0) {
-        lines.deinit(allocator);
-        return;
-    }
-    tui.component.freeLines(allocator, lines);
+pub fn freeLinesSlice(allocator: std.mem.Allocator, lines: []const []const u8) void {
+    for (lines) |line| allocator.free(line);
+    allocator.free(lines);
 }
 
 pub const INPUT_PROMPT_PREFIX = render_text.INPUT_PROMPT_PREFIX;
@@ -3793,7 +3793,7 @@ pub fn renderScreenWithMockBackend(
     allocator: std.mem.Allocator,
     screen: *const ScreenComponent,
     backend: *InteractiveModeTestBackend,
-) !tui.LineList {
+) ![]const []const u8 {
     var terminal = tui.Terminal.init(backend.backend());
     try terminal.start();
     defer terminal.stop();
@@ -3801,10 +3801,7 @@ pub fn renderScreenWithMockBackend(
     var rendered = try tui.test_helpers.renderToScreen(screen.drawComponent(), backend.size.width, backend.size.height);
     defer rendered.deinit(std.testing.allocator);
 
-    var lines = tui.LineList.empty;
-    errdefer freeLinesSafe(allocator, &lines);
-    try tui.cell_rows.appendAllocatingScreenRowsAsPlainLines(allocator, &rendered, backend.size.width, backend.size.height, &lines);
-    return lines;
+    return tui.cell_rows.allocatingScreenRowsToLinesAlloc(allocator, &rendered, backend.size.width, backend.size.height);
 }
 
 pub fn renderScreenWithMockBackendAndOverlay(
@@ -3812,7 +3809,7 @@ pub fn renderScreenWithMockBackendAndOverlay(
     screen: *const ScreenComponent,
     overlay: *SelectorOverlay,
     backend: *InteractiveModeTestBackend,
-) !tui.LineList {
+) ![]const []const u8 {
     var terminal = tui.Terminal.init(backend.backend());
     try terminal.start();
     defer terminal.stop();
@@ -3836,10 +3833,7 @@ pub fn renderScreenWithMockBackendAndOverlay(
 
     try renderer.renderToVaxis(screen.drawComponent(), &vx, &writer.writer);
 
-    var lines = tui.LineList.empty;
-    errdefer freeLinesSafe(allocator, &lines);
-    try tui.cell_rows.appendAllocatingScreenRowsAsPlainLines(allocator, &vx.screen_last, backend.size.width, backend.size.height, &lines);
-    return lines;
+    return tui.cell_rows.allocatingScreenRowsToLinesAlloc(allocator, &vx.screen_last, backend.size.width, backend.size.height);
 }
 
 pub fn renderedLinesContain(lines: []const []const u8, needle: []const u8) bool {
@@ -4484,9 +4478,9 @@ test "collapse m2 items at or under threshold render without indicator" {
 
     try std.testing.expectEqual(@as(usize, 1), rendered);
     var lines = tui.LineList.empty;
-    defer tui.component.freeLines(allocator, &lines);
+    defer freeLinesSlice(allocator, lines);
     try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, 80, rendered, &lines);
-    try std.testing.expect(!renderedLinesContain(lines.items, "to expand"));
+    try std.testing.expect(!renderedLinesContain(lines, "to expand"));
 }
 
 test "tool expansion rerenders existing bash details immediately" {
@@ -4524,16 +4518,16 @@ test "tool expansion rerenders existing bash details immediately" {
         .height = 12,
     };
 
-    var collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
-    defer freeLinesSafe(allocator, &collapsed_lines);
-    try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "Details:"));
-    try std.testing.expect(renderedLinesContain(collapsed_lines.items, "to expand"));
+    const collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
+    defer freeLinesSlice(allocator, collapsed_lines);
+    try std.testing.expect(!renderedLinesContain(collapsed_lines, "Details:"));
+    try std.testing.expect(renderedLinesContain(collapsed_lines, "to expand"));
 
     state.toggleAllExpanded();
-    var expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
-    defer freeLinesSafe(allocator, &expanded_lines);
-    try std.testing.expect(renderedLinesContain(expanded_lines.items, "Details:"));
-    try std.testing.expect(renderedLinesContain(expanded_lines.items, "\"exit_code\":0"));
+    const expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
+    defer freeLinesSlice(allocator, expanded_lines);
+    try std.testing.expect(renderedLinesContain(expanded_lines, "Details:"));
+    try std.testing.expect(renderedLinesContain(expanded_lines, "\"exit_code\":0"));
 }
 
 test "tool expansion rerenders existing user bash tail preview immediately" {
@@ -4566,15 +4560,15 @@ test "tool expansion rerenders existing user bash tail preview immediately" {
         .height = 16,
     };
 
-    var collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
-    defer freeLinesSafe(allocator, &collapsed_lines);
-    try std.testing.expect(renderedLinesContain(collapsed_lines.items, "line 25"));
-    try std.testing.expect(!renderedLinesContain(collapsed_lines.items, "line 5"));
+    const collapsed_lines = try renderScreenToLines(allocator, &screen_component, 80);
+    defer freeLinesSlice(allocator, collapsed_lines);
+    try std.testing.expect(renderedLinesContain(collapsed_lines, "line 25"));
+    try std.testing.expect(!renderedLinesContain(collapsed_lines, "line 5"));
 
     state.toggleAllExpanded();
-    var expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
-    defer freeLinesSafe(allocator, &expanded_lines);
-    try std.testing.expect(renderedLinesContain(expanded_lines.items, "line 1"));
+    const expanded_lines = try renderScreenToLines(allocator, &screen_component, 80);
+    defer freeLinesSlice(allocator, expanded_lines);
+    try std.testing.expect(renderedLinesContain(expanded_lines, "line 1"));
 }
 
 test "extension UI hooks render widgets editor footer and status lifecycle" {
@@ -4613,14 +4607,14 @@ test "extension UI hooks render widgets editor footer and status lifecycle" {
         .height = 14,
     };
 
-    var lines = try renderScreenToLines(allocator, &screen, 100);
-    defer freeLinesSafe(allocator, &lines);
-    try std.testing.expect(renderedLinesContain(lines.items, "ext header"));
-    try std.testing.expect(renderedLinesContain(lines.items, "above one"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Extension editor: VimEditor"));
-    try std.testing.expect(renderedLinesContain(lines.items, "below one"));
-    try std.testing.expect(renderedLinesContain(lines.items, "ext footer"));
-    try std.testing.expect(renderedLinesContain(lines.items, "first"));
+    const lines = try renderScreenToLines(allocator, &screen, 100);
+    defer freeLinesSlice(allocator, lines);
+    try std.testing.expect(renderedLinesContain(lines, "ext header"));
+    try std.testing.expect(renderedLinesContain(lines, "above one"));
+    try std.testing.expect(renderedLinesContain(lines, "Extension editor: VimEditor"));
+    try std.testing.expect(renderedLinesContain(lines, "below one"));
+    try std.testing.expect(renderedLinesContain(lines, "ext footer"));
+    try std.testing.expect(renderedLinesContain(lines, "first"));
 
     _ = registry.clearWidgetHook("above");
     _ = registry.clearFooterHook();
@@ -4765,24 +4759,24 @@ test "active operation indicator animates agent wait and clears on agent end" {
         .now_ms = 1_000,
     };
 
-    var first = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &first);
-    try std.testing.expect(renderedLinesContain(first.items, "Working... 0s elapsed"));
-    try std.testing.expect(renderedLinesContain(first.items, "Esc to interrupt"));
-    try std.testing.expect(renderedLinesContain(first.items, "⠋ Working"));
+    const first = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, first);
+    try std.testing.expect(renderedLinesContain(first, "Working... 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(first, "Esc to interrupt"));
+    try std.testing.expect(renderedLinesContain(first, "⠋ Working"));
 
     const item_count = state.items.items.len;
     screen.now_ms = 1_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
-    var second = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &second);
+    const second = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, second);
     try std.testing.expectEqual(item_count, state.items.items.len);
-    try std.testing.expect(renderedLinesContain(second.items, "⠙ Working"));
+    try std.testing.expect(renderedLinesContain(second, "⠙ Working"));
 
     try state.handleAgentEvent(.{ .event_type = .agent_end });
-    var completed = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &completed);
-    try std.testing.expect(!renderedLinesContain(completed.items, "Working..."));
-    try std.testing.expect(renderedLinesContain(completed.items, "Status: idle"));
+    const completed = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, completed);
+    try std.testing.expect(!renderedLinesContain(completed, "Working..."));
+    try std.testing.expect(renderedLinesContain(completed, "Status: idle"));
 }
 
 test "active operation indicator identifies running tool without appending animation rows" {
@@ -4809,17 +4803,17 @@ test "active operation indicator identifies running tool without appending anima
         .now_ms = 5_000,
     };
 
-    var first = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &first);
-    try std.testing.expect(renderedLinesContain(first.items, "Running read 0s elapsed"));
-    try std.testing.expect(renderedLinesContain(first.items, "⠋ Running read"));
+    const first = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, first);
+    try std.testing.expect(renderedLinesContain(first, "Running read 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(first, "⠋ Running read"));
 
     const item_count = state.items.items.len;
     screen.now_ms = 5_000 + @as(i64, @intCast(tui.components.loader.DEFAULT_INTERVAL_MS));
-    var second = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &second);
+    const second = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, second);
     try std.testing.expectEqual(item_count, state.items.items.len);
-    try std.testing.expect(renderedLinesContain(second.items, "⠙ Running read"));
+    try std.testing.expect(renderedLinesContain(second, "⠙ Running read"));
 }
 
 test "active operation retry countdown and compaction elapsed render dynamically" {
@@ -4846,37 +4840,37 @@ test "active operation retry countdown and compaction elapsed render dynamically
         .error_message = "rate limit",
     } });
 
-    var retry_first = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &retry_first);
-    try std.testing.expect(renderedLinesContain(retry_first.items, "Retrying (2/4) in 3s..."));
-    try std.testing.expect(renderedLinesContain(retry_first.items, "Esc to cancel"));
+    const retry_first = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, retry_first);
+    try std.testing.expect(renderedLinesContain(retry_first, "Retrying (2/4) in 3s..."));
+    try std.testing.expect(renderedLinesContain(retry_first, "Esc to cancel"));
 
     screen.now_ms = 11_100;
-    var retry_second = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &retry_second);
-    try std.testing.expect(renderedLinesContain(retry_second.items, "Retrying (2/4) in 2s..."));
+    const retry_second = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, retry_second);
+    try std.testing.expect(renderedLinesContain(retry_second, "Retrying (2/4) in 2s..."));
 
     try state.handleRetryLifecycleEvent(.{ .end = .{
         .success = true,
         .attempt = 2,
         .final_error = null,
     } });
-    var retry_end = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &retry_end);
-    try std.testing.expect(!renderedLinesContain(retry_end.items, "Retrying (2/4)"));
+    const retry_end = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, retry_end);
+    try std.testing.expect(!renderedLinesContain(retry_end, "Retrying (2/4)"));
 
     clock.now_ms = 20_000;
     try state.handleCompactionLifecycleEvent(.{ .start = .{ .reason = .threshold } });
     screen.now_ms = 20_000;
-    var compact_first = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &compact_first);
-    try std.testing.expect(renderedLinesContain(compact_first.items, "Auto-compacting... 0s elapsed"));
-    try std.testing.expect(renderedLinesContain(compact_first.items, "Esc to cancel"));
+    const compact_first = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, compact_first);
+    try std.testing.expect(renderedLinesContain(compact_first, "Auto-compacting... 0s elapsed"));
+    try std.testing.expect(renderedLinesContain(compact_first, "Esc to cancel"));
 
     screen.now_ms = 21_000;
-    var compact_second = try renderScreenToLines(allocator, &screen, 140);
-    defer freeLinesSafe(allocator, &compact_second);
-    try std.testing.expect(renderedLinesContain(compact_second.items, "Auto-compacting... 1s elapsed"));
+    const compact_second = try renderScreenToLines(allocator, &screen, 140);
+    defer freeLinesSlice(allocator, compact_second);
+    try std.testing.expect(renderedLinesContain(compact_second, "Auto-compacting... 1s elapsed"));
 }
 
 test "extension widgets replace by key and truncate after ten lines" {
@@ -5166,7 +5160,7 @@ test "screen rendering releases app state lock before expensive rendering work" 
     const RenderThreadContext = struct {
         allocator: std.mem.Allocator,
         screen: *const ScreenComponent,
-        lines: tui.LineList = tui.LineList.empty,
+        lines: []const []const u8 = &.{},
         render_error: ?std.mem.Allocator.Error = null,
 
         fn run(self: *@This()) void {
@@ -5235,9 +5229,9 @@ test "screen rendering releases app state lock before expensive rendering work" 
 
     try std.testing.expect(setter_finished_before_release);
     try std.testing.expectEqual(@as(?std.mem.Allocator.Error, null), render_context.render_error);
-    defer freeLinesSafe(allocator, &render_context.lines);
-    try std.testing.expect(renderedLinesContain(render_context.lines.items, "Status: snapshot status"));
-    try std.testing.expect(!renderedLinesContain(render_context.lines.items, "updated while rendering"));
+    defer freeLinesSlice(allocator, render_context.lines);
+    try std.testing.expect(renderedLinesContain(render_context.lines, "Status: snapshot status"));
+    try std.testing.expect(!renderedLinesContain(render_context.lines, "updated while rendering"));
 }
 
 test "formatFooterLine excludes provider auth status after task header split" {
@@ -5350,20 +5344,20 @@ test "vaxis m8 visual parity snapshot covers chat rows footer and queue" {
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 160, .height = 20 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen_component, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen_component, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "M8 heading"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Tool read:"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued during compaction"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
-    try std.testing.expect(renderedLinesContain(lines.items, "> pending prompt"));
-    try std.testing.expect(!renderedLinesContain(lines.items, "⏎ send · Alt+⏎ follow-up"));
-    try std.testing.expect(!renderedLinesContain(lines.items, "Alt+Up dequeue"));
-    try std.testing.expect(!renderedLinesContain(lines.items, "Ctrl+C/Ctrl+D clear/exit"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Faux"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
+    try std.testing.expect(renderedLinesContain(lines, "M8 heading"));
+    try std.testing.expect(renderedLinesContain(lines, "Tool read:"));
+    try std.testing.expect(renderedLinesContain(lines, "Steering: queued during compaction"));
+    try std.testing.expect(renderedLinesContain(lines, "Follow-up: queued follow-up"));
+    try std.testing.expect(renderedLinesContain(lines, "> pending prompt"));
+    try std.testing.expect(!renderedLinesContain(lines, "⏎ send · Alt+⏎ follow-up"));
+    try std.testing.expect(!renderedLinesContain(lines, "Alt+Up dequeue"));
+    try std.testing.expect(!renderedLinesContain(lines, "Ctrl+C/Ctrl+D clear/exit"));
+    try std.testing.expect(renderedLinesContain(lines, "Faux"));
+    try std.testing.expect(renderedLinesContain(lines, "Queue: 1 steering, 1 follow-up"));
+    try std.testing.expect(renderedLinesContain(lines, "Model: faux-1"));
 }
 
 test "vaxis m8 visual parity snapshot covers codex layout at 100x30 and 60x20" {
@@ -5441,10 +5435,10 @@ test "vaxis m8 visual parity snapshot covers overlay composition" {
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 100, .height = 24 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen_component, &overlay, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen_component, &overlay, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "Keyboard shortcuts"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+C"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Ctrl+L"));
+    try std.testing.expect(renderedLinesContain(lines, "Keyboard shortcuts"));
+    try std.testing.expect(renderedLinesContain(lines, "Ctrl+C"));
+    try std.testing.expect(renderedLinesContain(lines, "Ctrl+L"));
 }

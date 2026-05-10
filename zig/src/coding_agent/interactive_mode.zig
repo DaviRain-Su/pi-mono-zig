@@ -108,7 +108,7 @@ pub const findGitRoot = rendering.findGitRoot;
 pub const resolveGitDirectory = rendering.resolveGitDirectory;
 pub const parseGitHeadBranch = rendering.parseGitHeadBranch;
 pub const parseEnvSize = rendering.parseEnvSize;
-pub const freeLinesSafe = rendering.freeLinesSafe;
+pub const freeLinesSlice = rendering.freeLinesSlice;
 pub const INPUT_PROMPT_PREFIX = rendering.INPUT_PROMPT_PREFIX;
 pub const formatFooterLine = rendering.formatFooterLine;
 pub const appendFooterPart = rendering.appendFooterPart;
@@ -1030,16 +1030,16 @@ test "screen renders welcome prompt footer and tool lines" {
         .height = 14,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 80);
+    defer freeLinesSlice(allocator, lines);
 
     try std.testing.expect(lines.items.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, lines.items[0], "╭") != null);
-    try std.testing.expect(renderedLinesContain(lines.items, "pi · session.jsonl"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi"));
-    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
-    try std.testing.expect(renderedLinesContain(lines.items, "> w"));
-    try std.testing.expect(renderedLinesContain(lines.items, "╰"));
+    try std.testing.expect(renderedLinesContain(lines, "pi · session.jsonl"));
+    try std.testing.expect(renderedLinesContain(lines, "Welcome to pi"));
+    try std.testing.expect(renderedLinesContain(lines, "╭"));
+    try std.testing.expect(renderedLinesContain(lines, "> w"));
+    try std.testing.expect(renderedLinesContain(lines, "╰"));
     try std.testing.expect(std.mem.indexOf(u8, lines.items[lines.items.len - 1], "Session: session.jsonl") != null);
 }
 
@@ -1062,8 +1062,8 @@ test "interactive mode startup renders welcome message and footer through a mock
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 10 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
     try std.testing.expect(backend.entered_raw);
     try std.testing.expect(backend.restored);
@@ -1076,15 +1076,15 @@ test "interactive mode startup renders welcome message and footer through a mock
         tui.terminal.testing.expectedStopSequence(expected_use_kitty),
         backend.writes.items[backend.writes.items.len - 1],
     );
-    try std.testing.expect(renderedLinesContain(lines.items, "Welcome to pi (Zig interactive mode)."));
-    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
-    try std.testing.expect(renderedLinesContain(lines.items, "> "));
-    try std.testing.expect(renderedLinesContain(lines.items, "╰"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Session: session.jsonl"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Status: idle"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Model: faux-1"));
-    try std.testing.expect(!renderedLinesContain(lines.items, "⏎ send"));
-    try std.testing.expect(!renderedLinesContain(lines.items, "Alt+⏎ queue"));
+    try std.testing.expect(renderedLinesContain(lines, "Welcome to pi (Zig interactive mode)."));
+    try std.testing.expect(renderedLinesContain(lines, "╭"));
+    try std.testing.expect(renderedLinesContain(lines, "> "));
+    try std.testing.expect(renderedLinesContain(lines, "╰"));
+    try std.testing.expect(renderedLinesContain(lines, "Session: session.jsonl"));
+    try std.testing.expect(renderedLinesContain(lines, "Status: idle"));
+    try std.testing.expect(renderedLinesContain(lines, "Model: faux-1"));
+    try std.testing.expect(!renderedLinesContain(lines, "⏎ send"));
+    try std.testing.expect(!renderedLinesContain(lines, "Alt+⏎ queue"));
 }
 
 test "terminal title and progress helpers emit TS control sequences without duplicates" {
@@ -1282,12 +1282,12 @@ test "interactive mode renders pending clipboard image placeholders in the promp
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
-    try std.testing.expect(renderedLinesContain(lines.items, "> "));
-    try std.testing.expect(renderedLinesContain(lines.items, "[image 1: image/png]"));
+    try std.testing.expect(renderedLinesContain(lines, "╭"));
+    try std.testing.expect(renderedLinesContain(lines, "> "));
+    try std.testing.expect(renderedLinesContain(lines, "[image 1: image/png]"));
 }
 
 test "interactive mode renders submitted user messages through a mock backend" {
@@ -1316,10 +1316,10 @@ test "interactive mode renders submitted user messages through a mock backend" {
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "You: hello from interactive mode"));
+    try std.testing.expect(renderedLinesContain(lines, "You: hello from interactive mode"));
 }
 
 test "interactive mode renders streaming assistant updates through a mock backend" {
@@ -1371,11 +1371,11 @@ test "interactive mode renders streaming assistant updates through a mock backen
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, ASSISTANT_PREFIX));
-    try std.testing.expect(renderedLinesContain(lines.items, "streaming reply"));
+    try std.testing.expect(renderedLinesContain(lines, ASSISTANT_PREFIX));
+    try std.testing.expect(renderedLinesContain(lines, "streaming reply"));
     try std.testing.expectEqualStrings("streaming", state.status);
 }
 
@@ -1407,12 +1407,12 @@ test "interactive mode renders thinking placeholder before assistant text" {
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "You: hello"));
-    try std.testing.expect(renderedLinesContain(lines.items, ASSISTANT_PREFIX));
-    try std.testing.expect(renderedLinesContain(lines.items, "Thinking..."));
+    try std.testing.expect(renderedLinesContain(lines, "You: hello"));
+    try std.testing.expect(renderedLinesContain(lines, ASSISTANT_PREFIX));
+    try std.testing.expect(renderedLinesContain(lines, "Thinking..."));
     try std.testing.expectEqualStrings("thinking", state.status);
 }
 
@@ -1454,12 +1454,12 @@ test "interactive mode renders tool execution details through a mock backend" {
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 12 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "Read README.md"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Read result read:"));
-    try std.testing.expect(renderedLinesContain(lines.items, "project notes"));
+    try std.testing.expect(renderedLinesContain(lines, "Read README.md"));
+    try std.testing.expect(renderedLinesContain(lines, "Read result read:"));
+    try std.testing.expect(renderedLinesContain(lines, "project notes"));
 }
 
 test "screen renders multi-line prompt with wrapped continuation lines" {
@@ -1479,8 +1479,8 @@ test "screen renders multi-line prompt with wrapped continuation lines" {
         .height = 8,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 60);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 60);
+    defer freeLinesSlice(allocator, lines);
 
     try std.testing.expect(lines.items.len >= 5);
     var saw_prompt_border = false;
@@ -1528,8 +1528,8 @@ test "screen renders themed output without persistent keybinding hints" {
         .theme = &theme,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 80);
+    defer freeLinesSlice(allocator, lines);
 
     var saw_custom_hint = false;
     for (lines.items) |line| {
@@ -1582,8 +1582,8 @@ test "screen renders assistant markdown while keeping user messages plain" {
         .height = 20,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 80);
+    defer freeLinesSlice(allocator, lines);
 
     var saw_prefix = false;
     var saw_user_literal = false;
@@ -1816,13 +1816,13 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
     };
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 8 } };
     defer backend.deinit(allocator);
-    var lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try renderScreenWithMockBackend(allocator, &screen, &backend);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(!renderedLinesContain(lines.items, "keep me?"));
-    try std.testing.expect(renderedLinesContain(lines.items, "╭"));
-    try std.testing.expect(renderedLinesContain(lines.items, "> "));
-    try std.testing.expect(renderedLinesContain(lines.items, "Status: display cleared"));
+    try std.testing.expect(!renderedLinesContain(lines, "keep me?"));
+    try std.testing.expect(renderedLinesContain(lines, "╭"));
+    try std.testing.expect(renderedLinesContain(lines, "> "));
+    try std.testing.expect(renderedLinesContain(lines, "Status: display cleared"));
 
     try handleInputKey(
         allocator,
@@ -1865,13 +1865,13 @@ test "screen renders queued messages and the dequeue hint" {
         .height = 12,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 80);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 80);
+    defer freeLinesSlice(allocator, lines);
 
-    try std.testing.expect(renderedLinesContain(lines.items, "Steering: queued steer"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Follow-up: queued follow-up"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Alt+Up to edit queued messages"));
-    try std.testing.expect(renderedLinesContain(lines.items, "Queue: 1 steering, 1 follow-up"));
+    try std.testing.expect(renderedLinesContain(lines, "Steering: queued steer"));
+    try std.testing.expect(renderedLinesContain(lines, "Follow-up: queued follow-up"));
+    try std.testing.expect(renderedLinesContain(lines, "Alt+Up to edit queued messages"));
+    try std.testing.expect(renderedLinesContain(lines, "Queue: 1 steering, 1 follow-up"));
 }
 
 test "submitEditorText queues steering messages while streaming" {
@@ -4025,13 +4025,13 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     var backend = InteractiveModeTestBackend{ .size = .{ .width = 80, .height = 24 } };
     defer backend.deinit(allocator);
 
-    var lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
-    defer freeLinesSafe(allocator, &lines);
-    try std.testing.expect(renderedLinesContain(lines.items, "[bookmark]"));
+    const lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
+    defer freeLinesSlice(allocator, lines);
+    try std.testing.expect(renderedLinesContain(lines, "[bookmark]"));
 
     overlay.?.deinit(allocator);
     overlay = null;
-    freeLinesSafe(allocator, &lines);
+    freeLinesSlice(allocator, lines);
     lines = .empty;
 
     _ = try editor.handlePaste("/label");
@@ -4087,7 +4087,7 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     );
 
     lines = try renderScreenWithMockBackendAndOverlay(allocator, &screen, &overlay.?, &backend);
-    try std.testing.expect(!renderedLinesContain(lines.items, "[bookmark]"));
+    try std.testing.expect(!renderedLinesContain(lines, "[bookmark]"));
 }
 
 test "submitEditorText resets editor autocomplete state after submit" {
@@ -5544,8 +5544,8 @@ test "interactive tool conversation renders tool lines and persists session entr
         .height = 24,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 240);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 240);
+    defer freeLinesSlice(allocator, lines);
 
     var saw_user = false;
     var saw_tool_call = false;
@@ -5647,8 +5647,8 @@ test "interactive bash tool conversation preserves structured details" {
         .height = 24,
     };
 
-    var lines = try rendering.renderScreenToLines(allocator, &screen, 240);
-    defer freeLinesSafe(allocator, &lines);
+    const lines = try rendering.renderScreenToLines(allocator, &screen, 240);
+    defer freeLinesSlice(allocator, lines);
 
     var saw_bash_output = false;
     for (lines.items) |line| {
