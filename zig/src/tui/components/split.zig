@@ -84,22 +84,6 @@ pub const Split = struct {
 };
 
 test "split divides window horizontally" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const text = @import("text.zig");
     const left_text = text.Text{ .text = "L", .padding_x = 0, .padding_y = 0 };
     const right_text = text.Text{ .text = "R", .padding_x = 0, .padding_y = 0 };
@@ -111,32 +95,14 @@ test "split divides window horizontally" {
         .second = right_text.drawComponent(),
     };
 
-    _ = try split.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(split.drawComponent(), 10, 3);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "L", .{});
     try test_helpers.expectCell(&screen, 5, 0, "R", .{});
 }
 
 test "split divides window vertically" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 4,
-        .cols = 6,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const text = @import("text.zig");
     const top_text = text.Text{ .text = "T", .padding_x = 0, .padding_y = 0 };
     const bottom_text = text.Text{ .text = "B", .padding_x = 0, .padding_y = 0 };
@@ -148,10 +114,8 @@ test "split divides window vertically" {
         .second = bottom_text.drawComponent(),
     };
 
-    _ = try split.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(split.drawComponent(), 6, 4);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "T", .{});
     try test_helpers.expectCell(&screen, 0, 2, "B", .{});

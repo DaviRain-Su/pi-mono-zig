@@ -153,8 +153,10 @@ fn drawLine(
 
     for (0..@as(u16, @intCast(steps + 1))) |i| {
         const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
-        const x = @as(u16, @intCast(@min(@as(u16, @intCast(@abs(x1) + @as(u16, @intFromFloat(t * @as(f64, @floatFromInt(dx)))))), window.width -| 1)));
-        const y = @as(u16, @intCast(@min(@as(u16, @intCast(@abs(y1) + @as(u16, @intFromFloat(t * @as(f64, @floatFromInt(dy)))))), window.height -| 1)));
+        const fx = @as(f64, @floatFromInt(x1)) + t * @as(f64, @floatFromInt(dx));
+        const fy = @as(f64, @floatFromInt(y1)) + t * @as(f64, @floatFromInt(dy));
+        const x = @as(u16, @intCast(@max(0, @min(@as(i32, @intFromFloat(@round(fx))), window.width -| 1))));
+        const y = @as(u16, @intCast(@max(0, @min(@as(i32, @intFromFloat(@round(fy))), window.height -| 1))));
         if (x < window.width and y < window.height) {
             window.writeCell(x, y, .{
                 .char = .{ .grapheme = symbol, .width = 1 },
@@ -165,22 +167,6 @@ fn drawLine(
 }
 
 test "canvas maps points to window coordinates" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 5,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const canvas = Canvas{
         .x_bounds = .{ 0, 10 },
         .y_bounds = .{ 0, 10 },
@@ -191,10 +177,8 @@ test "canvas maps points to window coordinates" {
         },
     };
 
-    _ = try canvas.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 10, 5);
+    defer screen.deinit(std.testing.allocator);
 
     // Bottom-left corner (0,0) maps to bottom row
     const bottom_left = screen.readCell(0, 4) orelse return error.TestUnexpectedResult;
@@ -206,22 +190,6 @@ test "canvas maps points to window coordinates" {
 }
 
 test "canvas draws lines between coordinates" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 5,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const canvas = Canvas{
         .x_bounds = .{ 0, 4 },
         .y_bounds = .{ 0, 2 },
@@ -230,10 +198,8 @@ test "canvas draws lines between coordinates" {
         },
     };
 
-    _ = try canvas.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 5, 3);
+    defer screen.deinit(std.testing.allocator);
 
     // Line should have multiple points
     const start = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
@@ -241,22 +207,6 @@ test "canvas draws lines between coordinates" {
 }
 
 test "canvas draws labels at coordinates" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 6,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const canvas = Canvas{
         .x_bounds = .{ 0, 5 },
         .y_bounds = .{ 0, 2 },
@@ -265,10 +215,8 @@ test "canvas draws labels at coordinates" {
         },
     };
 
-    _ = try canvas.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(canvas.drawComponent(), 6, 3);
+    defer screen.deinit(std.testing.allocator);
 
     const label = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("A", label.char.grapheme);

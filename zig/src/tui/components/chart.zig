@@ -113,22 +113,6 @@ pub const Chart = struct {
 };
 
 test "chart renders dataset points" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 5,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const chart = Chart{
         .datasets = &[_]Dataset{
             .{
@@ -138,10 +122,8 @@ test "chart renders dataset points" {
         },
     };
 
-    _ = try chart.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(chart.drawComponent(), 10, 5);
+    defer screen.deinit(std.testing.allocator);
 
     // Bottom point (value 0.0) should be near the axis
     const bottom = screen.readCell(0, 3) orelse return error.TestUnexpectedResult;
@@ -153,22 +135,6 @@ test "chart renders dataset points" {
 }
 
 test "chart draws axis line when enabled" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 5,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const chart = Chart{
         .datasets = &[_]Dataset{
             .{ .data = &[_]f64{ 0.5 } },
@@ -176,11 +142,9 @@ test "chart draws axis line when enabled" {
         .show_axes = true,
     };
 
-    _ = try chart.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(chart.drawComponent(), 5, 3);
+    defer screen.deinit(std.testing.allocator);
 
-    const axis = screen.readCell(0, 1) orelse return error.TestUnexpectedResult;
+    const axis = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("─", axis.char.grapheme);
 }

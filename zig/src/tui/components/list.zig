@@ -158,22 +158,6 @@ pub const List = struct {
 };
 
 test "list renders items vertically" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const list = List{
         .items = &[_]ListItem{
             .{ .text = "First" },
@@ -182,10 +166,8 @@ test "list renders items vertically" {
         },
     };
 
-    _ = try list.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 10, 3);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "F", .{});
     try test_helpers.expectCell(&screen, 0, 1, "S", .{});
@@ -193,22 +175,6 @@ test "list renders items vertically" {
 }
 
 test "list bottom corner starts from the bottom" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const list = List{
         .items = &[_]ListItem{
             .{ .text = "A" },
@@ -218,10 +184,8 @@ test "list bottom corner starts from the bottom" {
         .start_corner = .bottom_left,
     };
 
-    _ = try list.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 10, 3);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "A", .{});
     try test_helpers.expectCell(&screen, 0, 1, "B", .{});
@@ -229,22 +193,6 @@ test "list bottom corner starts from the bottom" {
 }
 
 test "list scrollbar indicates overflow" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 2,
-        .cols = 6,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const list = List{
         .items = &[_]ListItem{
             .{ .text = "One" },
@@ -254,32 +202,14 @@ test "list scrollbar indicates overflow" {
         .show_scrollbar = true,
     };
 
-    _ = try list.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 6, 2);
+    defer screen.deinit(std.testing.allocator);
 
     const thumb = screen.readCell(5, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("█", thumb.char.grapheme);
 }
 
 test "list highlight symbol prefixes items" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 2,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const list = List{
         .items = &[_]ListItem{
             .{ .text = "Item" },
@@ -287,10 +217,8 @@ test "list highlight symbol prefixes items" {
         .highlight_symbol = "> ",
     };
 
-    _ = try list.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 10, 2);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, ">", .{});
     try test_helpers.expectCell(&screen, 2, 0, "I", .{});

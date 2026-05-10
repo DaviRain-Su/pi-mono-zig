@@ -106,6 +106,17 @@ pub const Clear = components.clear.Clear;
 pub const BarChart = components.bar_chart.BarChart;
 pub const BarChartBar = components.bar_chart.Bar;
 pub const LineGauge = components.line_gauge.LineGauge;
+pub const Paragraph = components.paragraph.Paragraph;
+pub const List = components.list.List;
+pub const ListItem = components.list.ListItem;
+pub const Chart = components.chart.Chart;
+pub const Dataset = components.chart.Dataset;
+pub const Canvas = components.canvas.Canvas;
+pub const Point = components.canvas.Point;
+pub const Line = components.canvas.Line;
+pub const Label = components.canvas.Label;
+pub const Split = components.split.Split;
+pub const SplitDirection = components.split.SplitDirection;
 
 test {
     _ = @import("ansi.zig");
@@ -140,6 +151,11 @@ test {
     _ = @import("components/clear.zig");
     _ = @import("components/bar_chart.zig");
     _ = @import("components/line_gauge.zig");
+    _ = @import("components/paragraph.zig");
+    _ = @import("components/list.zig");
+    _ = @import("components/chart.zig");
+    _ = @import("components/canvas.zig");
+    _ = @import("components/split.zig");
 }
 
 test "components export autocomplete module" {

@@ -154,93 +154,39 @@ fn wrapTextToLines(
 }
 
 test "paragraph renders wrapped text" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const para = Paragraph{
         .text = "Hello world this is a test",
     };
 
-    _ = try para.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(para.drawComponent(), 10, 3);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "H", .{});
-    try test_helpers.expectCell(&screen, 0, 1, "i", .{});
+    try test_helpers.expectCell(&screen, 0, 1, "d", .{});
 }
 
 test "paragraph scrolls content vertically" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 2,
-        .cols = 10,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const para = Paragraph{
         .text = "Line1\nLine2\nLine3",
         .scroll = 1,
     };
 
-    _ = try para.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(para.drawComponent(), 10, 2);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "L", .{});
     try test_helpers.expectCell(&screen, 0, 1, "L", .{});
 }
 
 test "paragraph scrollbar indicates scroll position" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 3,
-        .cols = 6,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const para = Paragraph{
-        .text = "a b c d e f g h",
+        .text = "a b c d e f g h i j",
         .show_scrollbar = true,
         .scroll = 0,
     };
 
-    _ = try para.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(para.drawComponent(), 6, 3);
+    defer screen.deinit(std.testing.allocator);
 
     const thumb = screen.readCell(5, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("█", thumb.char.grapheme);
@@ -250,31 +196,13 @@ test "paragraph scrollbar indicates scroll position" {
 }
 
 test "paragraph center alignment offsets text" {
-    const allocator = std.testing.allocator;
-
-    var screen = try vaxis.Screen.init(allocator, .{
-        .rows = 1,
-        .cols = 8,
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const window = draw_mod.rootWindow(&screen);
-    window.clear();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
     const para = Paragraph{
         .text = "Hi",
         .alignment = .center,
     };
 
-    _ = try para.draw(window, .{
-        .window = window,
-        .arena = arena.allocator(),
-    });
+    var screen = try test_helpers.renderToScreen(para.drawComponent(), 8, 1);
+    defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 3, 0, "H", .{});
     try test_helpers.expectCell(&screen, 4, 0, "i", .{});
