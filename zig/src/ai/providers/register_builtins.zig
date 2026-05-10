@@ -401,134 +401,159 @@ fn buildThinkingHandoffContext(
     };
 }
 
+const TestModelSpec = struct {
+    api: []const u8,
+    provider: []const u8,
+    model_id: []const u8,
+    name: []const u8,
+    base_url: []const u8,
+    reasoning: bool,
+    input_types: []const []const u8,
+    context_window: usize,
+    max_tokens: usize,
+};
+
+const TEST_MODEL_SPECS = [_]TestModelSpec{
+    TestModelSpec{
+        .api = "openai-completions",
+        .provider = "openai",
+        .model_id = "gpt-4.1-mini",
+        .name = "GPT-4.1 Mini",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    },
+    TestModelSpec{
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model_id = "claude-3-7-sonnet",
+        .name = "Claude 3.7 Sonnet",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    },
+    TestModelSpec{
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .model_id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .base_url = "https://api.moonshot.cn/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 256000,
+        .max_tokens = 32768,
+    },
+    TestModelSpec{
+        .api = "mistral-conversations",
+        .provider = "mistral",
+        .model_id = "mistral-medium-latest",
+        .name = "Mistral Medium",
+        .base_url = "https://api.mistral.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 131072,
+        .max_tokens = 32768,
+    },
+    TestModelSpec{
+        .api = "openai-responses",
+        .provider = "openai",
+        .model_id = "gpt-5-mini",
+        .name = "GPT-5 Mini",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    },
+    TestModelSpec{
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .model_id = "gpt-5-mini",
+        .name = "Azure GPT-5 Mini",
+        .base_url = "https://example.openai.azure.com/openai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    },
+    TestModelSpec{
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .model_id = "codex-mini-latest",
+        .name = "Codex Mini",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 16384,
+    },
+    TestModelSpec{
+        .api = "google-generative-ai",
+        .provider = "google",
+        .model_id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 1048576,
+        .max_tokens = 65536,
+    },
+    TestModelSpec{
+        .api = "google-gemini-cli",
+        .provider = "google-gemini-cli",
+        .model_id = "gemini-cli-pro",
+        .name = "Gemini CLI Pro",
+        .base_url = "https://cloudcode-pa.googleapis.com",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 1048576,
+        .max_tokens = 65536,
+    },
+    TestModelSpec{
+        .api = "google-vertex",
+        .provider = "google-vertex",
+        .model_id = "gemini-2.5-pro",
+        .name = "Vertex Gemini 2.5 Pro",
+        .base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/test/locations/us-central1/publishers/google",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 1048576,
+        .max_tokens = 65536,
+    },
+    TestModelSpec{
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .model_id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Bedrock Claude 3.7 Sonnet",
+        .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    },
+};
+
+fn testModelFromSpec(spec: TestModelSpec) types.Model {
+    return .{
+        .id = spec.model_id,
+        .name = spec.name,
+        .api = spec.api,
+        .provider = spec.provider,
+        .base_url = spec.base_url,
+        .reasoning = spec.reasoning,
+        .input_types = spec.input_types,
+        .context_window = @intCast(spec.context_window),
+        .max_tokens = @intCast(spec.max_tokens),
+    };
+}
+
 fn testModelForApi(api: []const u8) types.Model {
-    const text_input = &[_][]const u8{"text"};
-    const text_and_image_input = &[_][]const u8{ "text", "image" };
-
-    if (std.mem.eql(u8, api, "anthropic-messages")) {
-        return .{
-            .id = "claude-3-7-sonnet",
-            .name = "Claude 3.7 Sonnet",
-            .api = api,
-            .provider = "anthropic",
-            .base_url = "https://api.anthropic.com/v1",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 200000,
-            .max_tokens = 8192,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "mistral-conversations")) {
-        return .{
-            .id = "mistral-medium-latest",
-            .name = "Mistral Medium",
-            .api = api,
-            .provider = "mistral",
-            .base_url = "https://api.mistral.ai/v1",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 131072,
-            .max_tokens = 32768,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "openai-responses")) {
-        return .{
-            .id = "gpt-5-mini",
-            .name = "GPT-5 Mini",
-            .api = api,
-            .provider = "openai",
-            .base_url = "https://api.openai.com/v1",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 200000,
-            .max_tokens = 16384,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "azure-openai-responses")) {
-        return .{
-            .id = "gpt-5-mini",
-            .name = "Azure GPT-5 Mini",
-            .api = api,
-            .provider = "azure-openai-responses",
-            .base_url = "https://example.openai.azure.com/openai/v1",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 200000,
-            .max_tokens = 16384,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "openai-codex-responses")) {
-        return .{
-            .id = "codex-mini-latest",
-            .name = "Codex Mini",
-            .api = api,
-            .provider = "openai-codex",
-            .base_url = "https://chatgpt.com/backend-api",
-            .reasoning = true,
-            .input_types = text_input,
-            .context_window = 200000,
-            .max_tokens = 16384,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "google-generative-ai")) {
-        return .{
-            .id = "gemini-2.5-pro",
-            .name = "Gemini 2.5 Pro",
-            .api = api,
-            .provider = "google",
-            .base_url = "https://generativelanguage.googleapis.com/v1beta",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 1048576,
-            .max_tokens = 65536,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "google-gemini-cli")) {
-        return .{
-            .id = "gemini-cli-pro",
-            .name = "Gemini CLI Pro",
-            .api = api,
-            .provider = "google-gemini-cli",
-            .base_url = "https://cloudcode-pa.googleapis.com",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 1048576,
-            .max_tokens = 65536,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "google-vertex")) {
-        return .{
-            .id = "gemini-2.5-pro",
-            .name = "Vertex Gemini 2.5 Pro",
-            .api = api,
-            .provider = "google-vertex",
-            .base_url = "https://us-central1-aiplatform.googleapis.com/v1/projects/test/locations/us-central1/publishers/google",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 1048576,
-            .max_tokens = 65536,
-        };
-    }
-
-    if (std.mem.eql(u8, api, "bedrock-converse-stream")) {
-        return .{
-            .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
-            .name = "Bedrock Claude 3.7 Sonnet",
-            .api = api,
-            .provider = "amazon-bedrock",
-            .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com",
-            .reasoning = true,
-            .input_types = text_and_image_input,
-            .context_window = 200000,
-            .max_tokens = 8192,
-        };
+    for (TEST_MODEL_SPECS) |spec| {
+        if (std.mem.eql(u8, api, spec.api)) return testModelFromSpec(spec);
     }
 
     return .{
@@ -538,7 +563,7 @@ fn testModelForApi(api: []const u8) types.Model {
         .provider = "openai",
         .base_url = "https://api.openai.com/v1",
         .reasoning = true,
-        .input_types = text_and_image_input,
+        .input_types = &[_][]const u8{ "text", "image" },
         .context_window = 128000,
         .max_tokens = 16384,
     };

@@ -76,6 +76,61 @@ pub fn schemaProperty(
     return .{ .object = object };
 }
 
+pub const SchemaField = struct {
+    name: []const u8,
+    type_name: []const u8,
+    description: []const u8,
+    required: bool = false,
+};
+
+pub fn objectSchema(allocator: std.mem.Allocator, comptime fields: []const SchemaField) !std.json.Value {
+    var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value = std.json.Value{ .object = properties };
+        deinitJsonValue(allocator, value);
+    }
+
+    var required = std.json.Array.init(allocator);
+    errdefer required.deinit();
+
+    inline for (fields) |field| {
+        try properties.put(
+            allocator,
+            try allocator.dupe(u8, field.name),
+            try schemaProperty(allocator, field.type_name, field.description),
+        );
+        if (field.required) {
+            try required.append(.{ .string = try allocator.dupe(u8, field.name) });
+        }
+    }
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try root.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+    try root.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = properties });
+    if (required.items.len > 0) {
+        try root.put(allocator, try allocator.dupe(u8, "required"), .{ .array = required });
+    } else {
+        required.deinit();
+    }
+    return .{ .object = root };
+}
+
+pub fn schemaArrayProperty(
+    allocator: std.mem.Allocator,
+    description_text: []const u8,
+    item_schema: std.json.Value,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value = std.json.Value{ .object = object };
+        deinitJsonValue(allocator, value);
+    }
+    try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "array") });
+    try object.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, description_text) });
+    try object.put(allocator, try allocator.dupe(u8, "items"), item_schema);
+    return .{ .object = object };
+}
+
 pub fn parseRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return (try parseOptionalString(object, key)) orelse error.InvalidToolArguments;
 }
