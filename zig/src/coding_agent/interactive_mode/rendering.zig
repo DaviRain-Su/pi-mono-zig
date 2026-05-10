@@ -3289,51 +3289,6 @@ pub fn fitLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]
 fn formatTerminalBadge(allocator: std.mem.Allocator, terminal_name: []const u8) ![]u8 {
     return render_text.formatTerminalBadge(allocator, terminal_name);
 }
-pub fn renderTaskPanelLines(
-    allocator: std.mem.Allocator,
-    keybindings: ?*const keybindings_mod.Keybindings,
-    theme: ?*const resources_mod.Theme,
-    snapshot: *const RenderStateSnapshot,
-    width: usize,
-    now_ms: i64,
-    lines: *tui.LineList,
-) !void {
-    const panel_height = taskPanelHeightForWidth(width);
-    if (panel_height == 0) return;
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const scratch_allocator = arena.allocator();
-
-    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
-        .rows = @intCast(panel_height),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(scratch_allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-    const rendered = try drawTaskPanel(window, .{
-        .window = window,
-        .arena = scratch_allocator,
-        .theme = theme,
-    }, keybindings, theme, snapshot, now_ms);
-    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
-}
-
-pub fn renderPromptLines(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    editor: *tui.Editor,
-    pending_images: []const PendingEditorImage,
-    width: usize,
-    lines: *tui.LineList,
-) !void {
-    return prompt_rendering.renderLines(allocator, theme, editor, pending_images, width, lines);
-}
-
 pub fn themeChatItem(
     allocator: std.mem.Allocator,
     theme: ?*const resources_mod.Theme,

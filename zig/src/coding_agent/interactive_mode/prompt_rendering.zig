@@ -151,37 +151,6 @@ pub fn drawLines(
     };
 }
 
-pub fn renderLines(
-    allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
-    editor: *tui.Editor,
-    pending_images: []const PendingEditorImage,
-    width: usize,
-    lines: *tui.LineList,
-) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const scratch_allocator = arena.allocator();
-
-    const height = try measureHeight(scratch_allocator, theme, editor, pending_images, width);
-    var screen = try tui.vaxis.Screen.init(scratch_allocator, .{
-        .rows = @intCast(@max(height, 1)),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(scratch_allocator);
-
-    const window = tui.draw.rootWindow(&screen);
-    window.clear();
-    const rendered = try drawLines(window, .{
-        .window = window,
-        .arena = scratch_allocator,
-        .theme = theme,
-    }, theme, editor, pending_images);
-    try tui.cell_rows.appendScreenRowsAsPlainLines(allocator, &screen, width, rendered.height, lines);
-}
-
 fn pendingImagesRenderHeight(images: []const PendingEditorImage, width: usize) usize {
     var height: usize = 0;
     for (images) |image| height += pendingImageRenderHeight(image, width);

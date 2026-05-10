@@ -110,7 +110,6 @@ pub const parseGitHeadBranch = rendering.parseGitHeadBranch;
 pub const parseEnvSize = rendering.parseEnvSize;
 pub const freeLinesSafe = rendering.freeLinesSafe;
 pub const INPUT_PROMPT_PREFIX = rendering.INPUT_PROMPT_PREFIX;
-pub const renderPromptLines = rendering.renderPromptLines;
 pub const formatFooterLine = rendering.formatFooterLine;
 pub const appendFooterPart = rendering.appendFooterPart;
 pub const formatCompactTokenCount = rendering.formatCompactTokenCount;
