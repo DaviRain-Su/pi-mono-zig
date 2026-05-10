@@ -228,9 +228,6 @@ pub const PartialAssistantAccumulator = struct {
                     try content_list.append(allocator, .{ .thinking = .{ .thinking = try allocator.dupe(u8, thinking.items), .signature = null, .redacted = false } });
                 },
                 .tool_call => |tool_call| {
-                    if (tool_call.final_tool_call == null) {
-                        continue;
-                    }
                     try content_list.append(allocator, try buildPartialToolCallBlock(allocator, tool_call));
                 },
             }

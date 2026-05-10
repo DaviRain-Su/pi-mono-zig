@@ -228,7 +228,7 @@ pub const Table = struct {
 };
 
 fn renderRow(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     window: vaxis.Window,
     row: Row,
     column_rects: []const constraints_mod.Rect,
@@ -242,13 +242,15 @@ fn renderRow(
     if (is_selected and selection_width > 0) {
         const sym_style = highlight_style orelse vaxis.Cell.Style{};
         var x: u16 = 0;
-        for (highlight_symbol) |byte| {
-            if (x >= selection_width) break;
+        var byte_idx: usize = 0;
+        while (byte_idx < highlight_symbol.len and x < selection_width) {
+            const grapheme = extractGrapheme(highlight_symbol[byte_idx..]);
             window.writeCell(x, row_y, .{
-                .char = .{ .grapheme = &.{byte}, .width = 1 },
+                .char = .{ .grapheme = grapheme, .width = 1 },
                 .style = sym_style,
             });
             x += 1;
+            byte_idx += grapheme.len;
         }
     }
 
@@ -270,17 +272,8 @@ fn renderRow(
 
         const max_width = col_rect.width;
 
-        // Truncate text to fit
-        const visible_text = if (ansi.visibleWidth(cell.text) <= max_width)
-            cell.text
-        else blk: {
-            const truncated = try ansi.sliceVisibleAlloc(allocator, cell.text, 0, max_width);
-            break :blk truncated;
-        };
-        defer if (visible_text.ptr != cell.text.ptr) allocator.free(visible_text);
-
         // Compute alignment padding
-        const text_width = ansi.visibleWidth(visible_text);
+        const text_width = @min(ansi.visibleWidth(cell.text), max_width);
         const left_pad: u16 = if (text_width < max_width) switch (cell.alignment) {
             .start, .stretch => 0,
             .center => @intCast((max_width - text_width) / 2),
@@ -301,8 +294,8 @@ fn renderRow(
         // Write text
         var byte_idx: usize = 0;
         var written: u16 = 0;
-        while (byte_idx < visible_text.len and written < max_width - left_pad) {
-            const grapheme = extractGrapheme(visible_text[byte_idx..]);
+        while (byte_idx < cell.text.len and written < max_width - left_pad) {
+            const grapheme = extractGrapheme(cell.text[byte_idx..]);
             window.writeCell(x, row_y, .{
                 .char = .{ .grapheme = grapheme, .width = 1 },
                 .style = effective_style,
@@ -446,12 +439,12 @@ test "Table truncates overflowing text" {
     defer arena.deinit();
 
     const rows = &[_]Row{
-        .{ .cells = &.{ .{ .text = "verylongtext" } } },
+        .{ .cells = &.{.{ .text = "verylongtext" }} },
     };
 
     var table = Table{
         .rows = rows,
-        .widths = &.{ .{ .length = 5 } },
+        .widths = &.{.{ .length = 5 }},
     };
 
     var state = TableState{};

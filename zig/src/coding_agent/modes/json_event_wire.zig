@@ -206,6 +206,11 @@ fn validateAgentEventValue(allocator: std.mem.Allocator, value: std.json.Value, 
         _ = try requireBoolField(allocator, object, path, "isError");
         return;
     }
+    if (std.mem.eql(u8, event_type, "before_provider_request")) {
+        try validateMessagesField(allocator, object, path, "messages");
+        return;
+    }
+    if (std.mem.eql(u8, event_type, "after_provider_response")) return;
 
     try invalidValue(allocator, path, "type", event_type, "a known AgentEvent.type");
 }

@@ -5818,7 +5818,16 @@ fn expectPromptLineTypeOrder(bytes: []const u8) !void {
     }
 
     try std.testing.expect(actual.items.len >= 10);
-    const prefix = [_][]const u8{ "response", "agent_start", "turn_start", "message_start", "message_end", "message_start" };
+    const prefix = [_][]const u8{
+        "response",
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "before_provider_request",
+        "after_provider_response",
+        "message_start",
+    };
     for (prefix, 0..) |expected, index| {
         try std.testing.expectEqualStrings(expected, actual.items[index]);
     }

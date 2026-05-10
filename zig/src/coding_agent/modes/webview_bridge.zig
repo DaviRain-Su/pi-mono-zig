@@ -1550,8 +1550,10 @@ test "webview abort cancels active generation suppresses late events and support
     const ThreadResult = struct {
         response: ?[]u8 = null,
         err: ?anyerror = null,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         fn run(host: *BridgeHost, result: *@This()) void {
+            defer result.done.store(true, .seq_cst);
             result.response = host.handleRequestJson(
                 std.heap.c_allocator,
                 "{\"id\":\"abort-prompt\",\"command\":\"prompt\",\"payload\":{\"text\":\"abort me\"}}",
@@ -1565,9 +1567,13 @@ test "webview abort cancels active generation suppresses late events and support
 
     var thread_result = ThreadResult{};
     const prompt_thread = try std.Thread.spawn(.{}, ThreadResult.run, .{ &bridge, &thread_result });
-    while (!bridge.active_generation.load(.seq_cst)) {
+    var prompt_thread_joined = false;
+    defer if (!prompt_thread_joined) prompt_thread.join();
+    var spins: usize = 0;
+    while (!bridge.active_generation.load(.seq_cst) and !thread_result.done.load(.seq_cst) and spins < 5000) : (spins += 1) {
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
     }
+    try std.testing.expect(bridge.active_generation.load(.seq_cst));
     std.Io.sleep(std.testing.io, .fromMilliseconds(250), .awake) catch {};
 
     const abort = try bridge.handleRequestJson(allocator, "{\"id\":\"abort-active\",\"command\":\"abort\"}", trusted_bundle_origin);
@@ -1576,6 +1582,7 @@ test "webview abort cancels active generation suppresses late events and support
     try std.testing.expect(std.mem.indexOf(u8, abort, "\"aborted\":true") != null);
 
     prompt_thread.join();
+    prompt_thread_joined = true;
     if (thread_result.err) |err| return err;
     const aborted_prompt = thread_result.response.?;
     defer std.heap.c_allocator.free(aborted_prompt);

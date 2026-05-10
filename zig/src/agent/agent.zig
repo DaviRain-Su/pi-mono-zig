@@ -1316,12 +1316,14 @@ test "agent prompt records transcript and clears streaming state for single-turn
     try std.testing.expectEqual(types.AgentEventType.turn_start, event_types[1]);
     try std.testing.expectEqual(types.AgentEventType.message_start, event_types[2]);
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[3]);
-    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[4]);
+    try std.testing.expectEqual(types.AgentEventType.before_provider_request, event_types[4]);
+    try std.testing.expectEqual(types.AgentEventType.after_provider_response, event_types[5]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[6]);
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
     try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
     try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);
 
-    for (event_types[5 .. event_types.len - 3]) |event_type| {
+    for (event_types[7 .. event_types.len - 3]) |event_type| {
         try std.testing.expectEqual(types.AgentEventType.message_update, event_type);
     }
 }
@@ -1520,7 +1522,9 @@ test "agent prompt supports AgentMessage arrays and emits prompt events for each
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[3]);
     try std.testing.expectEqual(types.AgentEventType.message_start, event_types[4]);
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[5]);
-    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[6]);
+    try std.testing.expectEqual(types.AgentEventType.before_provider_request, event_types[6]);
+    try std.testing.expectEqual(types.AgentEventType.after_provider_response, event_types[7]);
+    try std.testing.expectEqual(types.AgentEventType.message_start, event_types[8]);
     try std.testing.expectEqual(types.AgentEventType.message_end, event_types[event_types.len - 3]);
     try std.testing.expectEqual(types.AgentEventType.turn_end, event_types[event_types.len - 2]);
     try std.testing.expectEqual(types.AgentEventType.agent_end, event_types[event_types.len - 1]);

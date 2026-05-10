@@ -217,34 +217,6 @@ fn emitPartialMessageUpdate(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    // For toolcall_end events, temporarily remove the final_tool_call so
-    // the partial message content matches TypeScript golden fixtures
-    // (empty content until message_end).
-    var saved_final_tool_call: ?ai.ToolCall = null;
-    if (assistant_message_event.event_type == .toolcall_end) {
-        const content_index = assistant_message_event.content_index orelse 0;
-        if (partial_accumulator.blocks.items.len > content_index) {
-            switch (partial_accumulator.blocks.items[content_index]) {
-                .tool_call => |*tool_call| {
-                    saved_final_tool_call = tool_call.final_tool_call;
-                    tool_call.final_tool_call = null;
-                },
-                else => {},
-            }
-        }
-    }
-    defer if (assistant_message_event.event_type == .toolcall_end) {
-        const content_index = assistant_message_event.content_index orelse 0;
-        if (partial_accumulator.blocks.items.len > content_index) {
-            switch (partial_accumulator.blocks.items[content_index]) {
-                .tool_call => |*tool_call| {
-                    tool_call.final_tool_call = saved_final_tool_call;
-                },
-                else => {},
-            }
-        }
-    };
-
     // `partial_accumulator` owns long-lived partial bytes with the parent
     // allocator, while this arena owns the callback-scoped message shape
     // (`content` slices and temporary parsed JSON). Every pointer in the

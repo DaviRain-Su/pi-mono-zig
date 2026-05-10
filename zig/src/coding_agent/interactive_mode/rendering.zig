@@ -2159,6 +2159,7 @@ pub const ScreenComponent = struct {
                 }
             }
             const owned = try builder.toOwnedSlice(allocator);
+            defer allocator.free(owned);
             try tui.component.appendOwnedLine(lines, allocator, owned);
         }
     }
@@ -2189,6 +2190,7 @@ pub const ScreenComponent = struct {
             try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
         else
             try formatFooterTextForDisplay(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
+        const extension_header_height = snapshot.extension_header_lines.len;
         const extension_above_height = extensionWidgetLineCount(snapshot.extension_widgets, .above_editor);
         const extension_editor_height: usize = if (snapshot.extension_editor_label != null) 1 else 0;
         const extension_below_height = extensionWidgetLineCount(snapshot.extension_widgets, .below_editor);
@@ -2204,7 +2206,7 @@ pub const ScreenComponent = struct {
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
         const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
-        const reserved_lines: usize = task_panel_height + prompt_height + queued_height + 1 + autocomplete_height + scroll_indicator_height;
+        const reserved_lines: usize = task_panel_height + extension_header_height + prompt_height + queued_height + 1 + autocomplete_height + scroll_indicator_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
@@ -2221,6 +2223,10 @@ pub const ScreenComponent = struct {
             }, self.keybindings, self.theme, &snapshot, self.now_ms);
         }
         row += task_panel_height;
+
+        if (extension_header_height > 0 and row < window.height) {
+            row += drawExtensionHeaderLines(window, row, snapshot.extension_header_lines, self.theme);
+        }
 
         const sel_range: ?chat_rendering.SelectionRange = if (self.state.hasSelection()) blk: {
             const sr = self.state.getSelectionRange().?;
@@ -2402,6 +2408,21 @@ fn extensionWidgetLineCount(widgets: []const ExtensionWidget, placement: Extensi
         count += @max(widget.lines.len, 1);
     }
     return count;
+}
+
+fn drawExtensionHeaderLines(
+    window: tui.vaxis.Window,
+    start_row: usize,
+    lines: []const []const u8,
+    theme: ?*const resources_mod.Theme,
+) usize {
+    var row = start_row;
+    for (lines) |line| {
+        if (row >= window.height) return row - start_row;
+        drawFittedLine(window, row, line, styleForToken(theme, .status));
+        row += 1;
+    }
+    return row - start_row;
 }
 
 fn drawExtensionWidgetLines(
