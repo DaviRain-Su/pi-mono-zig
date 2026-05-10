@@ -1211,7 +1211,7 @@ test "ISS-031 Azure request snapshot audits endpoint query and api-key semantics
         context,
         .{
             .api_key = "azure-fixture-key",
-            .azure_api_version = "2025-03-01-preview",
+            .provider = .{ .azure = .{ .api_version = "2025-03-01-preview" } },
         },
         .{
             .azure_resource_name = "semantic-resource",

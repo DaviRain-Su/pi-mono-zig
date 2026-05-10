@@ -1041,11 +1041,13 @@ test "buildRequestPayload includes contents, tools, generation config, and think
     const payload = try buildRequestPayload(allocator, model, context, .{
         .temperature = 0.5,
         .max_tokens = 2048,
-        .google_tool_choice = "any",
-        .google_thinking = .{
-            .enabled = true,
-            .budget_tokens = 8192,
-        },
+        .provider = .{ .google = .{
+            .tool_choice = "any",
+            .thinking = .{
+                .enabled = true,
+                .budget_tokens = 8192,
+            },
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -1827,7 +1829,7 @@ test "VAL-MISC-004 buildGenerationConfigValue disabled thinking emits thinkingBu
     };
 
     const gen_config = try buildGenerationConfigValue(allocator, model, .{
-        .google_thinking = .{ .enabled = false },
+        .provider = .{ .google = .{ .thinking = .{ .enabled = false } } },
     });
     defer provider_json.freeValue(allocator, gen_config);
 
@@ -1854,7 +1856,7 @@ test "VAL-MISC-004 buildGenerationConfigValue non-reasoning model omits thinking
     };
 
     const gen_config = try buildGenerationConfigValue(allocator, model, .{
-        .google_thinking = .{ .enabled = false },
+        .provider = .{ .google = .{ .thinking = .{ .enabled = false } } },
     });
     defer provider_json.freeValue(allocator, gen_config);
 

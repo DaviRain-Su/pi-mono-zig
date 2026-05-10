@@ -6,60 +6,6 @@ const provider_json = @import("shared/provider_json.zig");
 /// stream entry points, provider setup paths, and HTTP streaming setup.
 pub const abort_signal_load_order = .seq_cst;
 
-/// Known API identifiers
-pub const KnownApi = enum {
-    openai_completions,
-    mistral_conversations,
-    openai_responses,
-    azure_openai_responses,
-    openai_codex_responses,
-    anthropic_messages,
-    bedrock_converse_stream,
-    google_generative_ai,
-    google_gemini_cli,
-    google_vertex,
-    faux,
-};
-
-/// Known provider names
-pub const KnownProvider = enum {
-    amazon_bedrock,
-    anthropic,
-    google,
-    google_gemini_cli,
-    google_antigravity,
-    google_vertex,
-    openai,
-    azure_openai_responses,
-    openai_codex,
-    deepseek,
-    github_copilot,
-    xai,
-    groq,
-    cerebras,
-    openrouter,
-    vercel_ai_gateway,
-    zai,
-    mistral,
-    minimax,
-    minimax_cn,
-    moonshotai,
-    moonshotai_cn,
-    huggingface,
-    fireworks,
-    opencode,
-    opencode_go,
-    kimi_coding,
-    kimi_code_openai,
-    cloudflare_workers_ai,
-    cloudflare_ai_gateway,
-    xiaomi,
-    xiaomi_token_plan_cn,
-    xiaomi_token_plan_ams,
-    xiaomi_token_plan_sgp,
-    faux,
-};
-
 pub const Api = []const u8;
 pub const Provider = []const u8;
 
@@ -570,21 +516,23 @@ pub const ResponsesStreamOptions = struct {
     text_verbosity: ?[]const u8 = null,
 };
 
-pub const ProviderStreamOptions = union(enum) {
-    none,
-    anthropic: AnthropicStreamOptions,
-    azure: AzureStreamOptions,
-    bedrock: BedrockStreamOptions,
-    google: GoogleStreamOptions,
-    mistral: MistralStreamOptions,
-    openai: OpenAIChatStreamOptions,
-    responses: ResponsesStreamOptions,
+/// Provider-specific stream options, composable across providers.
+///
+/// Modeled as a struct of optionals (not a tagged union) because real requests
+/// can require multiple providers' configuration at once — e.g. Azure-OpenAI-
+/// Responses needs both `azure` (endpoint/deployment) and `responses`
+/// (reasoning/verbosity) configuration in the same request. Setting `null`
+/// means "no provider-specific override at this layer".
+pub const ProviderStreamOptions = struct {
+    anthropic: ?AnthropicStreamOptions = null,
+    azure: ?AzureStreamOptions = null,
+    bedrock: ?BedrockStreamOptions = null,
+    google: ?GoogleStreamOptions = null,
+    mistral: ?MistralStreamOptions = null,
+    openai: ?OpenAIChatStreamOptions = null,
+    responses: ?ResponsesStreamOptions = null,
 };
 
-// TODO(review-B11): Provider-specific fields are being migrated to
-// ProviderStreamOptions. During the transition, both flat fields and
-// the provider union are populated. Once all call sites migrate,
-// remove the flat provider-specific fields.
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
@@ -609,132 +557,37 @@ pub const StreamOptions = struct {
     max_retry_delay_ms: u32 = 60000,
     /// Optional metadata to include in API requests.
     metadata: ?std.json.Value = null,
-    /// Bedrock Converse region override.
-    bedrock_region: ?[]const u8 = null,
-    /// Bedrock Converse profile override.
-    bedrock_profile: ?[]const u8 = null,
-    /// Bedrock Converse bearer token override.
-    bedrock_bearer_token: ?[]const u8 = null,
-    /// Bedrock Converse tool choice override.
-    bedrock_tool_choice: ?BedrockToolChoice = null,
-    /// Bedrock Converse reasoning level.
-    bedrock_reasoning: ?ThinkingLevel = null,
-    /// Bedrock Converse custom thinking budgets.
-    bedrock_thinking_budgets: ?ThinkingBudgets = null,
-    /// Bedrock Converse interleaved thinking beta toggle.
-    bedrock_interleaved_thinking: ?bool = null,
-    /// Bedrock Converse thinking display mode.
-    bedrock_thinking_display: ?AnthropicThinkingDisplay = null,
-    /// Bedrock Converse request metadata.
-    bedrock_request_metadata: ?std.json.Value = null,
-    /// Google provider tool choice: "auto", "none", or "any".
-    google_tool_choice: ?[]const u8 = null,
-    /// Google provider thinking configuration.
-    google_thinking: ?GoogleThinkingOptions = null,
-    /// OpenAI Chat Completions tool_choice override.
-    openai_tool_choice: ?std.json.Value = null,
-    /// OpenAI Chat Completions reasoning effort level.
-    openai_reasoning_effort: ?[]const u8 = null,
-    /// Anthropic provider extended thinking enabled/disabled override.
-    anthropic_thinking_enabled: ?bool = null,
-    /// Anthropic provider token budget for non-adaptive thinking models.
-    anthropic_thinking_budget_tokens: ?u32 = null,
-    /// Anthropic provider thinking display mode.
-    anthropic_thinking_display: ?AnthropicThinkingDisplay = null,
-    /// Anthropic provider adaptive thinking effort.
-    anthropic_effort: ?AnthropicEffort = null,
-    /// Anthropic provider interleaved thinking beta toggle.
-    anthropic_interleaved_thinking: ?bool = null,
-    /// Anthropic provider tool choice override.
-    anthropic_tool_choice: ?AnthropicToolChoice = null,
-    /// Responses API reasoning effort level.
-    responses_reasoning_effort: ?ThinkingLevel = null,
-    /// Responses API reasoning summary level. OpenAI Responses currently accepts values such as "auto", "concise", and "detailed".
-    responses_reasoning_summary: ?[]const u8 = null,
-    /// Responses API service tier forwarded as service_tier.
-    responses_service_tier: ?[]const u8 = null,
-    /// OpenAI Codex Responses text verbosity forwarded as text.verbosity.
-    responses_text_verbosity: ?[]const u8 = null,
-    /// Azure OpenAI Responses API version override forwarded as api-version.
-    azure_api_version: ?[]const u8 = null,
-    /// Azure OpenAI resource name override used to build the default Azure base URL.
-    azure_resource_name: ?[]const u8 = null,
-    /// Azure OpenAI base URL override.
-    azure_base_url: ?[]const u8 = null,
-    /// Azure OpenAI deployment name override used as the Responses model value.
-    azure_deployment_name: ?[]const u8 = null,
-    /// Mistral prompt mode, e.g. "reasoning".
-    mistral_prompt_mode: ?[]const u8 = null,
-    /// Mistral reasoning effort, e.g. "high".
-    mistral_reasoning_effort: ?[]const u8 = null,
 
-    /// Provider-specific options. During the B11 migration, both this
-    /// union and the legacy flat fields above are populated. New code
-    /// should read from this union; the flat fields will be removed.
-    provider: ProviderStreamOptions = .none,
+    /// Provider-specific options, composable across providers (see
+    /// `ProviderStreamOptions`).
+    provider: ProviderStreamOptions = .{},
 
     pub fn anthropicOptions(self: StreamOptions) AnthropicStreamOptions {
-        var opts: AnthropicStreamOptions = if (self.provider == .anthropic) self.provider.anthropic else .{};
-        if (opts.thinking_enabled == null) opts.thinking_enabled = self.anthropic_thinking_enabled;
-        if (opts.thinking_budget_tokens == null) opts.thinking_budget_tokens = self.anthropic_thinking_budget_tokens;
-        if (opts.thinking_display == null) opts.thinking_display = self.anthropic_thinking_display;
-        if (opts.effort == null) opts.effort = self.anthropic_effort;
-        if (opts.interleaved_thinking == null) opts.interleaved_thinking = self.anthropic_interleaved_thinking;
-        if (opts.tool_choice == null) opts.tool_choice = self.anthropic_tool_choice;
-        return opts;
+        return self.provider.anthropic orelse .{};
     }
 
     pub fn azureOptions(self: StreamOptions) AzureStreamOptions {
-        var opts: AzureStreamOptions = if (self.provider == .azure) self.provider.azure else .{};
-        if (opts.api_version == null) opts.api_version = self.azure_api_version;
-        if (opts.resource_name == null) opts.resource_name = self.azure_resource_name;
-        if (opts.base_url == null) opts.base_url = self.azure_base_url;
-        if (opts.deployment_name == null) opts.deployment_name = self.azure_deployment_name;
-        return opts;
+        return self.provider.azure orelse .{};
     }
 
     pub fn bedrockOptions(self: StreamOptions) BedrockStreamOptions {
-        var opts: BedrockStreamOptions = if (self.provider == .bedrock) self.provider.bedrock else .{};
-        if (opts.region == null) opts.region = self.bedrock_region;
-        if (opts.profile == null) opts.profile = self.bedrock_profile;
-        if (opts.bearer_token == null) opts.bearer_token = self.bedrock_bearer_token;
-        if (opts.tool_choice == null) opts.tool_choice = self.bedrock_tool_choice;
-        if (opts.reasoning == null) opts.reasoning = self.bedrock_reasoning;
-        if (opts.thinking_budgets == null) opts.thinking_budgets = self.bedrock_thinking_budgets;
-        if (opts.interleaved_thinking == null) opts.interleaved_thinking = self.bedrock_interleaved_thinking;
-        if (opts.thinking_display == null) opts.thinking_display = self.bedrock_thinking_display;
-        if (opts.request_metadata == null) opts.request_metadata = self.bedrock_request_metadata;
-        return opts;
+        return self.provider.bedrock orelse .{};
     }
 
     pub fn googleOptions(self: StreamOptions) GoogleStreamOptions {
-        var opts: GoogleStreamOptions = if (self.provider == .google) self.provider.google else .{};
-        if (opts.tool_choice == null) opts.tool_choice = self.google_tool_choice;
-        if (opts.thinking == null) opts.thinking = self.google_thinking;
-        return opts;
+        return self.provider.google orelse .{};
     }
 
     pub fn mistralOptions(self: StreamOptions) MistralStreamOptions {
-        var opts: MistralStreamOptions = if (self.provider == .mistral) self.provider.mistral else .{};
-        if (opts.prompt_mode == null) opts.prompt_mode = self.mistral_prompt_mode;
-        if (opts.reasoning_effort == null) opts.reasoning_effort = self.mistral_reasoning_effort;
-        return opts;
+        return self.provider.mistral orelse .{};
     }
 
     pub fn openaiOptions(self: StreamOptions) OpenAIChatStreamOptions {
-        var opts: OpenAIChatStreamOptions = if (self.provider == .openai) self.provider.openai else .{};
-        if (opts.tool_choice == null) opts.tool_choice = self.openai_tool_choice;
-        if (opts.reasoning_effort == null) opts.reasoning_effort = self.openai_reasoning_effort;
-        return opts;
+        return self.provider.openai orelse .{};
     }
 
     pub fn responsesOptions(self: StreamOptions) ResponsesStreamOptions {
-        var opts: ResponsesStreamOptions = if (self.provider == .responses) self.provider.responses else .{};
-        if (opts.reasoning_effort == null) opts.reasoning_effort = self.responses_reasoning_effort;
-        if (opts.reasoning_summary == null) opts.reasoning_summary = self.responses_reasoning_summary;
-        if (opts.service_tier == null) opts.service_tier = self.responses_service_tier;
-        if (opts.text_verbosity == null) opts.text_verbosity = self.responses_text_verbosity;
-        return opts;
+        return self.provider.responses orelse .{};
     }
 };
 
@@ -755,23 +608,6 @@ pub const SimpleStreamOptions = struct {
     signal: ?*const std.atomic.Value(bool) = null,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
-    bedrock_region: ?[]const u8 = null,
-    bedrock_profile: ?[]const u8 = null,
-    bedrock_bearer_token: ?[]const u8 = null,
-    bedrock_tool_choice: ?BedrockToolChoice = null,
-    bedrock_interleaved_thinking: ?bool = null,
-    bedrock_thinking_display: ?AnthropicThinkingDisplay = null,
-    bedrock_request_metadata: ?std.json.Value = null,
-    google_tool_choice: ?[]const u8 = null,
-    google_thinking: ?GoogleThinkingOptions = null,
-    openai_tool_choice: ?std.json.Value = null,
-    openai_reasoning_effort: ?[]const u8 = null,
-    azure_api_version: ?[]const u8 = null,
-    azure_resource_name: ?[]const u8 = null,
-    azure_base_url: ?[]const u8 = null,
-    azure_deployment_name: ?[]const u8 = null,
-    mistral_prompt_mode: ?[]const u8 = null,
-    mistral_reasoning_effort: ?[]const u8 = null,
 
     /// Convert SimpleStreamOptions to StreamOptions.
     ///
@@ -784,41 +620,11 @@ pub const SimpleStreamOptions = struct {
                 @field(opts, field.name) = @field(self, field.name);
             }
         }
-        // Generic `reasoning` fans out to provider-specific knobs.
-        opts.bedrock_reasoning = self.reasoning;
-        opts.responses_reasoning_effort = self.reasoning;
-        opts.bedrock_thinking_budgets = self.thinking_budgets;
-        // Populate provider union (B11 migration).
-        opts.provider = .{
-            .bedrock = .{
-                .region = self.bedrock_region,
-                .profile = self.bedrock_profile,
-                .bearer_token = self.bedrock_bearer_token,
-                .tool_choice = self.bedrock_tool_choice,
-                .reasoning = self.reasoning,
-                .thinking_budgets = self.thinking_budgets,
-                .interleaved_thinking = self.bedrock_interleaved_thinking,
-                .thinking_display = self.bedrock_thinking_display,
-                .request_metadata = self.bedrock_request_metadata,
-            },
-            .google = .{
-                .tool_choice = self.google_tool_choice,
-                .thinking = self.google_thinking,
-            },
-            .openai = .{
-                .tool_choice = self.openai_tool_choice,
-                .reasoning_effort = self.openai_reasoning_effort,
-            },
-            .azure = .{
-                .api_version = self.azure_api_version,
-                .resource_name = self.azure_resource_name,
-                .base_url = self.azure_base_url,
-                .deployment_name = self.azure_deployment_name,
-            },
-            .mistral = .{
-                .prompt_mode = self.mistral_prompt_mode,
-                .reasoning_effort = self.mistral_reasoning_effort,
-            },
+        // Generic `reasoning` + `thinking_budgets` fan out to provider-specific knobs.
+        opts.provider.responses = .{ .reasoning_effort = self.reasoning };
+        opts.provider.bedrock = .{
+            .reasoning = self.reasoning,
+            .thinking_budgets = self.thinking_budgets,
         };
         return opts;
     }
@@ -887,67 +693,6 @@ test "Message union" {
         .timestamp = 1234567890,
     } };
     try std.testing.expectEqualStrings("user", user_msg.user.role);
-}
-
-test "KnownApi enum completeness" {
-    // Ensure all variants compile by switching over them
-    const api = KnownApi.openai_completions;
-    const str = switch (api) {
-        .openai_completions => "openai-completions",
-        .mistral_conversations => "mistral-conversations",
-        .openai_responses => "openai-responses",
-        .azure_openai_responses => "azure-openai-responses",
-        .openai_codex_responses => "openai-codex-responses",
-        .anthropic_messages => "anthropic-messages",
-        .bedrock_converse_stream => "bedrock-converse-stream",
-        .google_generative_ai => "google-generative-ai",
-        .google_gemini_cli => "google-gemini-cli",
-        .google_vertex => "google-vertex",
-        .faux => "faux",
-    };
-    try std.testing.expectEqualStrings("openai-completions", str);
-}
-
-test "KnownProvider enum completeness" {
-    const provider = KnownProvider.openai;
-    const str = switch (provider) {
-        .amazon_bedrock => "amazon-bedrock",
-        .anthropic => "anthropic",
-        .google => "google",
-        .google_gemini_cli => "google-gemini-cli",
-        .google_antigravity => "google-antigravity",
-        .google_vertex => "google-vertex",
-        .openai => "openai",
-        .azure_openai_responses => "azure-openai-responses",
-        .openai_codex => "openai-codex",
-        .deepseek => "deepseek",
-        .github_copilot => "github-copilot",
-        .xai => "xai",
-        .groq => "groq",
-        .cerebras => "cerebras",
-        .openrouter => "openrouter",
-        .vercel_ai_gateway => "vercel-ai-gateway",
-        .zai => "zai",
-        .mistral => "mistral",
-        .minimax => "minimax",
-        .minimax_cn => "minimax-cn",
-        .moonshotai => "moonshotai",
-        .moonshotai_cn => "moonshotai-cn",
-        .huggingface => "huggingface",
-        .fireworks => "fireworks",
-        .opencode => "opencode",
-        .opencode_go => "opencode-go",
-        .kimi_coding => "kimi-coding",
-        .kimi_code_openai => "kimi-code-openai",
-        .cloudflare_workers_ai => "cloudflare-workers-ai",
-        .cloudflare_ai_gateway => "cloudflare-ai-gateway",
-        .xiaomi => "xiaomi",
-        .xiaomi_token_plan_cn => "xiaomi-token-plan-cn",
-        .xiaomi_token_plan_ams => "xiaomi-token-plan-ams",
-        .xiaomi_token_plan_sgp => "xiaomi-token-plan-sgp",
-        .faux => "faux",
-    };
-    try std.testing.expectEqualStrings("openai", str);
 }
 
 test "ContentBlock union variants" {

@@ -2,9 +2,17 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Refactored `StreamOptions` provider-specific configuration: replaced ~30 flat per-provider fields (e.g. `bedrock_region`, `anthropic_thinking_enabled`, `responses_reasoning_effort`, `google_thinking`, `mistral_prompt_mode`, `openai_reasoning_effort`, `azure_api_version`) with a composable `provider: ProviderStreamOptions` struct of optionals. Set provider-specific options via `.provider = .{ .bedrock = .{ .region = "us-west-2" } }`. The previous `union(enum)` design couldn't represent multi-provider stacks like `azure-openai-responses` (which needs both `azure` and `responses` configuration on the same request); the new struct allows them to coexist. All seven providers (Mistral, Google, OpenAI Chat, Azure, Anthropic, Responses, Bedrock) migrated; `*Options()` helpers now read directly from the union without flat-field fallback. `SimpleStreamOptions` similarly slimmed — provider-specific flat fields removed, leaving only generic options plus `reasoning` / `thinking_budgets` which fan out to `provider.bedrock` and `provider.responses` via `toStreamOptions`.
+
 ### Changed
 
 - Replaced the Zig interactive missing stored-cwd stderr/stdin prompt with a full TUI Continue/Cancel selector that mirrors the TypeScript `ExtensionSelectorComponent` flow used by `promptForMissingSessionCwd`, with tuistory coverage for prompt rendering, cancel, escape, and continue paths. Cancel exits without mutating the session file; continue persists the launch cwd only after explicit confirmation.
+
+### Removed
+
+- Removed unused `KnownApi` and `KnownProvider` enums from `zig/src/ai/types.zig`. Both had drifted from the runtime API/provider registry (`kimi-completions` registered without an enum variant; `together` provider used in 18 model rows with no enum variant) and had no production references — all dispatch already routes through string keys via `api_registry.get([]const u8)`.
 
 ### Fixed
 

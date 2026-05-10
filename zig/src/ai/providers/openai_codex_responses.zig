@@ -2201,7 +2201,7 @@ test "buildRequestPayload preserves requested Codex reasoning effort" {
     };
 
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, .{
-        .responses_reasoning_effort = .xhigh,
+        .provider = .{ .responses = .{ .reasoning_effort = .xhigh } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -2231,12 +2231,14 @@ test "buildRequestPayload applies Codex request option parity fields" {
 
     const payload = try buildRequestPayload(allocator, model, .{ .messages = &[_]types.Message{} }, .{
         .cache_retention = .none,
-        .responses_reasoning_effort = .minimal,
-        .responses_reasoning_summary = "concise",
-        .responses_service_tier = "priority",
-        .responses_text_verbosity = "high",
         .session_id = "codex-session",
         .metadata = .{ .object = metadata },
+        .provider = .{ .responses = .{
+            .reasoning_effort = .minimal,
+            .reasoning_summary = "concise",
+            .service_tier = "priority",
+            .text_verbosity = "high",
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 

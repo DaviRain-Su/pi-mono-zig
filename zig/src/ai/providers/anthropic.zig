@@ -1740,7 +1740,7 @@ test "buildRequestPayload supports disabled thinking and temperature" {
         .messages = &[_]types.Message{},
     }, .{
         .temperature = 0.25,
-        .anthropic_thinking_enabled = false,
+        .provider = .{ .anthropic = .{ .thinking_enabled = false } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -1767,8 +1767,10 @@ test "buildRequestPayload supports adaptive thinking effort" {
     const payload = try buildRequestPayload(allocator, model, .{
         .messages = &[_]types.Message{},
     }, .{
-        .anthropic_thinking_enabled = true,
-        .anthropic_effort = .max,
+        .provider = .{ .anthropic = .{
+            .thinking_enabled = true,
+            .effort = .max,
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -1798,10 +1800,12 @@ test "buildRequestPayload supports budget thinking display and tool choice" {
     const payload = try buildRequestPayload(allocator, model, .{
         .messages = &[_]types.Message{},
     }, .{
-        .anthropic_thinking_enabled = true,
-        .anthropic_thinking_budget_tokens = 4096,
-        .anthropic_thinking_display = .omitted,
-        .anthropic_tool_choice = .{ .tool = "todoWrite" },
+        .provider = .{ .anthropic = .{
+            .thinking_enabled = true,
+            .thinking_budget_tokens = 4096,
+            .thinking_display = .omitted,
+            .tool_choice = .{ .tool = "todoWrite" },
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -1836,7 +1840,7 @@ test "applyDefaultAnthropicHeaders adds interleaved thinking beta for legacy mod
     try applyDefaultAnthropicHeaders(allocator, &headers, model, .{
         .messages = &[_]types.Message{},
     }, .{
-        .anthropic_interleaved_thinking = true,
+        .provider = .{ .anthropic = .{ .interleaved_thinking = true } },
     });
 
     try std.testing.expectEqualStrings("interleaved-thinking-2025-05-14", headers.get("anthropic-beta").?);

@@ -1689,11 +1689,13 @@ test "buildRequestPayload includes Vertex contents, tools, and thinking config" 
     const payload = try buildRequestPayload(allocator, model, context, .{
         .temperature = 0.5,
         .max_tokens = 2048,
-        .google_tool_choice = "any",
-        .google_thinking = .{
-            .enabled = true,
-            .budget_tokens = 8192,
-        },
+        .provider = .{ .google = .{
+            .tool_choice = "any",
+            .thinking = .{
+                .enabled = true,
+                .budget_tokens = 8192,
+            },
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 

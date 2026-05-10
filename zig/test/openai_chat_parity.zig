@@ -434,11 +434,13 @@ fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !types.Stre
         .headers = try parseStringMapOptional(allocator, optionalField(value, "headers")),
         .max_retries = optionalU32(value, "maxRetries"),
         .max_tokens = optionalU32(value, "maxTokens"),
-        .openai_reasoning_effort = optionalString(value, "reasoningEffort"),
-        .openai_tool_choice = optionalField(value, "toolChoice"),
         .session_id = optionalString(value, "sessionId"),
         .temperature = optionalF32(value, "temperature"),
         .timeout_ms = optionalU32(value, "timeoutMs"),
+        .provider = .{ .openai = .{
+            .reasoning_effort = optionalString(value, "reasoningEffort"),
+            .tool_choice = optionalField(value, "toolChoice"),
+        } },
     };
 
     if (optionalString(value, "onPayload")) |mode| {

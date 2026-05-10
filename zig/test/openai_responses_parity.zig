@@ -302,13 +302,19 @@ fn streamOptionsFromFixtureInput(allocator: std.mem.Allocator, model: std.json.V
         .max_retries = optionalU32(options, "maxRetries"),
         .max_tokens = optionalU32(options, "maxTokens"),
         .metadata = optionalField(options, "metadata"),
-        .responses_reasoning_summary = optionalString(options, "reasoningSummary"),
-        .responses_service_tier = optionalString(options, "serviceTier"),
-        .responses_text_verbosity = optionalString(options, "textVerbosity"),
-        .azure_api_version = optionalString(options, "azureApiVersion"),
-        .azure_resource_name = optionalString(options, "azureResourceName"),
-        .azure_base_url = optionalString(options, "azureBaseUrl"),
-        .azure_deployment_name = optionalString(options, "azureDeploymentName"),
+        .provider = .{
+            .azure = .{
+                .api_version = optionalString(options, "azureApiVersion"),
+                .resource_name = optionalString(options, "azureResourceName"),
+                .base_url = optionalString(options, "azureBaseUrl"),
+                .deployment_name = optionalString(options, "azureDeploymentName"),
+            },
+            .responses = .{
+                .reasoning_summary = optionalString(options, "reasoningSummary"),
+                .service_tier = optionalString(options, "serviceTier"),
+                .text_verbosity = optionalString(options, "textVerbosity"),
+            },
+        },
     };
 
     if (optionalNumber(options, "temperature")) |temperature| stream_options.temperature = @floatCast(temperature);
@@ -318,10 +324,12 @@ fn streamOptionsFromFixtureInput(allocator: std.mem.Allocator, model: std.json.V
             stream_options.signal = &provided_signal;
         }
     }
-    if (optionalString(options, "reasoningEffort")) |effort| stream_options.responses_reasoning_effort = try thinkingLevelFromString(effort);
+    if (optionalString(options, "reasoningEffort")) |effort| {
+        stream_options.provider.responses.?.reasoning_effort = try thinkingLevelFromString(effort);
+    }
     if (optionalString(options, "simpleReasoning")) |effort| {
         const clamped = try clampSimpleReasoning(allocator, getObjectField(model, "id").string, effort);
-        stream_options.responses_reasoning_effort = try thinkingLevelFromString(clamped);
+        stream_options.provider.responses.?.reasoning_effort = try thinkingLevelFromString(clamped);
         if (stream_options.max_tokens == null) stream_options.max_tokens = 4096;
     }
     return stream_options;

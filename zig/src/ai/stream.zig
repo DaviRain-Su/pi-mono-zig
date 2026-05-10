@@ -103,16 +103,13 @@ fn applyAnthropicSimpleOptions(
     if (!std.mem.eql(u8, model.api, "anthropic-messages")) return;
 
     if (options.reasoning == null) {
-        stream_options.anthropic_thinking_enabled = false;
-        stream_options.provider = .{ .anthropic = .{ .thinking_enabled = false } };
+        stream_options.provider.anthropic = .{ .thinking_enabled = false };
         return;
     }
 
-    stream_options.anthropic_thinking_enabled = true;
     if (supportsAdaptiveAnthropicThinking(model)) {
         const effort = mapThinkingLevelToAnthropicEffort(model, options.reasoning.?);
-        stream_options.anthropic_effort = effort;
-        stream_options.provider = .{ .anthropic = .{ .thinking_enabled = true, .effort = effort } };
+        stream_options.provider.anthropic = .{ .thinking_enabled = true, .effort = effort };
         return;
     }
 
@@ -124,8 +121,7 @@ fn applyAnthropicSimpleOptions(
         options.thinking_budgets,
     );
     stream_options.max_tokens = adjusted.max_tokens;
-    stream_options.anthropic_thinking_budget_tokens = adjusted.thinking_budget;
-    stream_options.provider = .{ .anthropic = .{ .thinking_enabled = true, .thinking_budget_tokens = adjusted.thinking_budget } };
+    stream_options.provider.anthropic = .{ .thinking_enabled = true, .thinking_budget_tokens = adjusted.thinking_budget };
 }
 
 fn applyMistralSimpleOptions(
@@ -138,11 +134,9 @@ fn applyMistralSimpleOptions(
     if (!std.mem.eql(u8, model.api, "mistral-conversations")) return;
 
     if (std.mem.eql(u8, model.id, "mistral-small-2603") or std.mem.eql(u8, model.id, "mistral-small-latest")) {
-        stream_options.mistral_reasoning_effort = "high";
-        stream_options.provider = .{ .mistral = .{ .reasoning_effort = "high" } };
+        stream_options.provider.mistral = .{ .reasoning_effort = "high" };
     } else {
-        stream_options.mistral_prompt_mode = "reasoning";
-        stream_options.provider = .{ .mistral = .{ .prompt_mode = "reasoning" } };
+        stream_options.provider.mistral = .{ .prompt_mode = "reasoning" };
     }
 }
 
@@ -164,8 +158,7 @@ fn applyResponsesSimpleOptions(
         reasoning.?
     else
         simple_options_mod.clampReasoning(reasoning).?;
-    stream_options.responses_reasoning_effort = effort;
-    stream_options.provider = .{ .responses = .{ .reasoning_effort = effort } };
+    stream_options.provider.responses = .{ .reasoning_effort = effort };
 }
 
 fn supportsAdaptiveAnthropicThinking(model: types.Model) bool {
@@ -235,14 +228,10 @@ const RecordingState = struct {
     saw_max_tokens: ?u32 = null,
     saw_temperature: ?f32 = null,
     saw_api_key: ?[]const u8 = null,
-    saw_responses_reasoning_effort: ?types.ThinkingLevel = null,
-    saw_mistral_prompt_mode: ?[]const u8 = null,
-    saw_mistral_reasoning_effort: ?[]const u8 = null,
-    saw_anthropic_thinking_enabled: ?bool = null,
-    saw_anthropic_thinking_budget_tokens: ?u32 = null,
-    saw_anthropic_effort: ?types.AnthropicEffort = null,
-    saw_bedrock_reasoning: ?types.ThinkingLevel = null,
-    saw_bedrock_thinking_budgets: ?types.ThinkingBudgets = null,
+    saw_responses_options: ?types.ResponsesStreamOptions = null,
+    saw_mistral_options: ?types.MistralStreamOptions = null,
+    saw_anthropic_options: ?types.AnthropicStreamOptions = null,
+    saw_bedrock_options: ?types.BedrockStreamOptions = null,
     response_text: []const u8 = "recorded response",
 };
 
@@ -268,14 +257,10 @@ fn recordingStream(
         recording_state.saw_max_tokens = stream_options.max_tokens;
         recording_state.saw_temperature = stream_options.temperature;
         recording_state.saw_api_key = stream_options.api_key;
-        recording_state.saw_responses_reasoning_effort = stream_options.responses_reasoning_effort;
-        recording_state.saw_mistral_prompt_mode = stream_options.mistral_prompt_mode;
-        recording_state.saw_mistral_reasoning_effort = stream_options.mistral_reasoning_effort;
-        recording_state.saw_anthropic_thinking_enabled = stream_options.anthropic_thinking_enabled;
-        recording_state.saw_anthropic_thinking_budget_tokens = stream_options.anthropic_thinking_budget_tokens;
-        recording_state.saw_anthropic_effort = stream_options.anthropic_effort;
-        recording_state.saw_bedrock_reasoning = stream_options.bedrock_reasoning;
-        recording_state.saw_bedrock_thinking_budgets = stream_options.bedrock_thinking_budgets;
+        recording_state.saw_responses_options = stream_options.responsesOptions();
+        recording_state.saw_mistral_options = stream_options.mistralOptions();
+        recording_state.saw_anthropic_options = stream_options.anthropicOptions();
+        recording_state.saw_bedrock_options = stream_options.bedrockOptions();
     }
 
     const result_allocator = std.heap.page_allocator;
@@ -604,8 +589,8 @@ test "streamSimple maps simple options and routes through provider streamSimple"
     try std.testing.expectEqual(@as(?u32, 42), recording_state.saw_max_tokens);
     try std.testing.expectEqual(@as(?f32, 0.25), recording_state.saw_temperature);
     try std.testing.expectEqualStrings("test-key", recording_state.saw_api_key.?);
-    try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
-    try std.testing.expect(recording_state.saw_mistral_reasoning_effort == null);
+    try std.testing.expect(recording_state.saw_mistral_options.?.prompt_mode == null);
+    try std.testing.expect(recording_state.saw_mistral_options.?.reasoning_effort == null);
 }
 
 test "streamSimple routes Bedrock fixed reasoning through provider adjustment" {
@@ -625,17 +610,20 @@ test "streamSimple routes Bedrock fixed reasoning through provider adjustment" {
             ) !event_stream.AssistantMessageEventStream {
                 recording_state.stream_simple_calls += 1;
                 const base = options orelse types.StreamOptions{};
+                const bedrock_opts = base.bedrockOptions();
                 const adjusted = simple_options_mod.adjustMaxTokensForThinking(
                     base.max_tokens orelse 0,
                     model.max_tokens,
-                    base.bedrock_reasoning.?,
-                    base.bedrock_thinking_budgets,
+                    bedrock_opts.reasoning.?,
+                    bedrock_opts.thinking_budgets,
                 );
                 var provider_options = base;
                 provider_options.max_tokens = adjusted.max_tokens;
-                var budgets = provider_options.bedrock_thinking_budgets orelse types.ThinkingBudgets{};
+                var budgets = bedrock_opts.thinking_budgets orelse types.ThinkingBudgets{};
                 budgets.high = adjusted.thinking_budget;
-                provider_options.bedrock_thinking_budgets = budgets;
+                var updated_bedrock = bedrock_opts;
+                updated_bedrock.thinking_budgets = budgets;
+                provider_options.provider.bedrock = updated_bedrock;
                 return recordingStream(allocator, io, model, context, provider_options);
             }
         }.f,
@@ -667,8 +655,8 @@ test "streamSimple routes Bedrock fixed reasoning through provider adjustment" {
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_calls);
     try std.testing.expectEqual(@as(usize, 1), recording_state.stream_simple_calls);
     try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_max_tokens);
-    try std.testing.expectEqual(@as(?types.ThinkingLevel, .high), recording_state.saw_bedrock_reasoning);
-    try std.testing.expectEqual(@as(u32, 3072), recording_state.saw_bedrock_thinking_budgets.?.high);
+    try std.testing.expectEqual(@as(?types.ThinkingLevel, .high), recording_state.saw_bedrock_options.?.reasoning);
+    try std.testing.expectEqual(@as(u32, 3072), recording_state.saw_bedrock_options.?.thinking_budgets.?.high);
 }
 
 test "streamSimple maps Mistral reasoning to provider options" {
@@ -704,8 +692,8 @@ test "streamSimple maps Mistral reasoning to provider options" {
     defer medium_stream.deinit();
     while (medium_stream.next()) |_| {}
 
-    try std.testing.expectEqualStrings("reasoning", recording_state.saw_mistral_prompt_mode.?);
-    try std.testing.expect(recording_state.saw_mistral_reasoning_effort == null);
+    try std.testing.expectEqualStrings("reasoning", recording_state.saw_mistral_options.?.prompt_mode.?);
+    try std.testing.expect(recording_state.saw_mistral_options.?.reasoning_effort == null);
 
     const small_model = types.Model{
         .id = "mistral-small-latest",
@@ -730,8 +718,8 @@ test "streamSimple maps Mistral reasoning to provider options" {
     defer small_stream.deinit();
     while (small_stream.next()) |_| {}
 
-    try std.testing.expect(recording_state.saw_mistral_prompt_mode == null);
-    try std.testing.expectEqualStrings("high", recording_state.saw_mistral_reasoning_effort.?);
+    try std.testing.expect(recording_state.saw_mistral_options.?.prompt_mode == null);
+    try std.testing.expectEqualStrings("high", recording_state.saw_mistral_options.?.reasoning_effort.?);
 }
 
 test "streamSimple maps Anthropic reasoning to provider options" {
@@ -767,8 +755,8 @@ test "streamSimple maps Anthropic reasoning to provider options" {
     defer no_reasoning_stream.deinit();
     while (no_reasoning_stream.next()) |_| {}
 
-    try std.testing.expectEqual(@as(?bool, false), recording_state.saw_anthropic_thinking_enabled);
-    try std.testing.expect(recording_state.saw_anthropic_effort == null);
+    try std.testing.expectEqual(@as(?bool, false), recording_state.saw_anthropic_options.?.thinking_enabled);
+    try std.testing.expect(recording_state.saw_anthropic_options.?.effort == null);
 
     resetRecordingState();
     var adaptive_stream = try streamSimple(
@@ -781,9 +769,9 @@ test "streamSimple maps Anthropic reasoning to provider options" {
     defer adaptive_stream.deinit();
     while (adaptive_stream.next()) |_| {}
 
-    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_thinking_enabled);
-    try std.testing.expectEqual(@as(?types.AnthropicEffort, .medium), recording_state.saw_anthropic_effort);
-    try std.testing.expect(recording_state.saw_anthropic_thinking_budget_tokens == null);
+    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_options.?.thinking_enabled);
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .medium), recording_state.saw_anthropic_options.?.effort);
+    try std.testing.expect(recording_state.saw_anthropic_options.?.thinking_budget_tokens == null);
 
     const opus46_model = types.Model{
         .id = "claude-opus-4-6",
@@ -808,7 +796,7 @@ test "streamSimple maps Anthropic reasoning to provider options" {
     defer opus46_stream.deinit();
     while (opus46_stream.next()) |_| {}
 
-    try std.testing.expectEqual(@as(?types.AnthropicEffort, .max), recording_state.saw_anthropic_effort);
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .max), recording_state.saw_anthropic_options.?.effort);
 
     const opus47_model = types.Model{
         .id = "claude-opus-4-7",
@@ -833,7 +821,7 @@ test "streamSimple maps Anthropic reasoning to provider options" {
     defer opus47_stream.deinit();
     while (opus47_stream.next()) |_| {}
 
-    try std.testing.expectEqual(@as(?types.AnthropicEffort, .xhigh), recording_state.saw_anthropic_effort);
+    try std.testing.expectEqual(@as(?types.AnthropicEffort, .xhigh), recording_state.saw_anthropic_options.?.effort);
 
     const legacy_model = types.Model{
         .id = "claude-3-7-sonnet-latest",
@@ -861,8 +849,8 @@ test "streamSimple maps Anthropic reasoning to provider options" {
     defer legacy_stream.deinit();
     while (legacy_stream.next()) |_| {}
 
-    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_thinking_enabled);
-    try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_anthropic_thinking_budget_tokens);
+    try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_options.?.thinking_enabled);
+    try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_anthropic_options.?.thinking_budget_tokens);
     try std.testing.expectEqual(@as(?u32, 32000 + 4096), recording_state.saw_max_tokens);
 }
 
@@ -900,7 +888,7 @@ test "streamSimple preserves xhigh reasoning for Codex GPT-5.5" {
     defer stream_instance.deinit();
 
     _ = stream_instance.next();
-    try std.testing.expectEqual(@as(?types.ThinkingLevel, .xhigh), recording_state.saw_responses_reasoning_effort);
+    try std.testing.expectEqual(@as(?types.ThinkingLevel, .xhigh), recording_state.saw_responses_options.?.reasoning_effort);
 }
 
 test "complete returns final assistant message" {

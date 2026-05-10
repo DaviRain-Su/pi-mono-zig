@@ -291,22 +291,30 @@ fn parseToolsOptional(allocator: std.mem.Allocator, value: ?std.json.Value) !?[]
 fn parseOptions(allocator: std.mem.Allocator, value: std.json.Value) !?types.StreamOptions {
     const max_field_name = [_]u8{ 'm', 'a', 'x', 'T', 'o', 'k', 'e', 'n', 's' };
     const parsed_limit = optionalU32(value, &max_field_name);
-    return .{
+    const google_tool_choice = optionalString(value, "googleToolChoice");
+    var opts: types.StreamOptions = .{
         .temperature = optionalF32(value, "temperature"),
         .max_tokens = parsed_limit,
         .cache_retention = parseCacheRetention(optionalString(value, "cacheRetention")),
-        .google_tool_choice = optionalString(value, "googleToolChoice"),
-        .bedrock_region = optionalString(value, "region"),
-        .bedrock_profile = optionalString(value, "profile"),
-        .bedrock_bearer_token = optionalString(value, "bearerToken"),
-        .bedrock_tool_choice = try parseBedrockToolChoice(allocator, optionalField(value, "toolChoice")),
-        .bedrock_reasoning = parseThinkingLevel(optionalString(value, "reasoning")),
-        .bedrock_thinking_budgets = try parseThinkingBudgets(optionalField(value, "thinkingBudgets")),
-        .bedrock_interleaved_thinking = optionalBool(value, "interleavedThinking"),
-        .bedrock_thinking_display = parseThinkingDisplay(optionalString(value, "thinkingDisplay")),
-        .bedrock_request_metadata = try cloneJsonOptional(allocator, optionalField(value, "requestMetadata")),
         .on_payload = parseOnPayload(optionalString(value, "onPayload")),
+        .provider = .{
+            .bedrock = .{
+                .region = optionalString(value, "region"),
+                .profile = optionalString(value, "profile"),
+                .bearer_token = optionalString(value, "bearerToken"),
+                .tool_choice = try parseBedrockToolChoice(allocator, optionalField(value, "toolChoice")),
+                .reasoning = parseThinkingLevel(optionalString(value, "reasoning")),
+                .thinking_budgets = try parseThinkingBudgets(optionalField(value, "thinkingBudgets")),
+                .interleaved_thinking = optionalBool(value, "interleavedThinking"),
+                .thinking_display = parseThinkingDisplay(optionalString(value, "thinkingDisplay")),
+                .request_metadata = try cloneJsonOptional(allocator, optionalField(value, "requestMetadata")),
+            },
+        },
     };
+    if (google_tool_choice) |choice| {
+        opts.provider.google = .{ .tool_choice = choice };
+    }
+    return opts;
 }
 
 fn parseFixtureEnv(value: ?std.json.Value) bedrock.FixtureEnv {

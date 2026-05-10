@@ -25,8 +25,10 @@ pub fn buildBaseOptions(
         }
         // Generic reasoning maps onto Bedrock-specific knobs at this layer;
         // anthropic / responses / mistral mappings happen later in stream.zig.
-        opts.bedrock_reasoning = value.reasoning;
-        opts.bedrock_thinking_budgets = value.thinking_budgets;
+        opts.provider.bedrock = .{
+            .reasoning = value.reasoning,
+            .thinking_budgets = value.thinking_budgets,
+        };
         opts.max_tokens = value.max_tokens orelse defaultMaxTokens(model);
     } else {
         opts.max_tokens = defaultMaxTokens(model);
@@ -95,7 +97,6 @@ test "buildBaseOptions applies defaults and explicit api key override" {
         .cache_retention = .long,
         .session_id = "session-123",
         .max_retry_delay_ms = 1234,
-        .google_tool_choice = "auto",
     };
 
     const base = buildBaseOptions(model, options, "provided-key");
@@ -105,7 +106,6 @@ test "buildBaseOptions applies defaults and explicit api key override" {
     try std.testing.expectEqual(types.CacheRetention.long, base.cache_retention);
     try std.testing.expectEqualStrings("session-123", base.session_id.?);
     try std.testing.expectEqual(@as(u32, 1234), base.max_retry_delay_ms);
-    try std.testing.expectEqualStrings("auto", base.google_tool_choice.?);
 }
 
 test "buildBaseOptions supports websocket_cached transport flag" {

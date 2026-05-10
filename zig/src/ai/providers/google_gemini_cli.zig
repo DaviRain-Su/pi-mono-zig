@@ -1078,11 +1078,13 @@ test "buildRequestPayload wraps Gemini CLI request envelope and session auth fie
         .session_id = "session-42",
         .temperature = 0.25,
         .max_tokens = 2048,
-        .google_tool_choice = "none",
-        .google_thinking = .{
-            .enabled = true,
-            .budget_tokens = 512,
-        },
+        .provider = .{ .google = .{
+            .tool_choice = "none",
+            .thinking = .{
+                .enabled = true,
+                .budget_tokens = 512,
+            },
+        } },
     });
     defer provider_json.freeValue(allocator, payload);
 

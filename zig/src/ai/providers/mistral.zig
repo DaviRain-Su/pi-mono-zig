@@ -1323,7 +1323,7 @@ test "buildRequestPayload includes tools and normalized tool ids" {
     const payload = try buildRequestPayload(allocator, model, context, .{
         .temperature = 0.4,
         .max_tokens = 2048,
-        .mistral_prompt_mode = "reasoning",
+        .provider = .{ .mistral = .{ .prompt_mode = "reasoning" } },
     });
     defer provider_json.freeValue(allocator, payload);
 
@@ -1369,7 +1369,7 @@ test "buildRequestPayload preserves reasoning_effort and unsupported image place
     };
 
     const payload = try buildRequestPayload(allocator, model, context, .{
-        .mistral_reasoning_effort = "high",
+        .provider = .{ .mistral = .{ .reasoning_effort = "high" } },
     });
     defer provider_json.freeValue(allocator, payload);
 

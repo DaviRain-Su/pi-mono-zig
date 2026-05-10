@@ -1201,9 +1201,9 @@ test "Together compat uses non-standard chat payload fields" {
 
     const payload = try buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, .{
         .max_tokens = 256,
-        .openai_reasoning_effort = "high",
         .session_id = "together-session",
         .cache_retention = .long,
+        .provider = .{ .openai = .{ .reasoning_effort = "high" } },
     }, null);
     defer provider_json.freeValue(allocator, payload);
 
@@ -1248,7 +1248,7 @@ test "Together reasoning payload preserves supported mapped effort" {
     const context = types.Context{ .messages = &[_]types.Message{} };
 
     const enabled_payload = try buildRequestPayload(allocator, model, context, .{
-        .openai_reasoning_effort = "high",
+        .provider = .{ .openai = .{ .reasoning_effort = "high" } },
     });
     defer provider_json.freeValue(allocator, enabled_payload);
     try std.testing.expectEqual(true, enabled_payload.object.get("reasoning").?.object.get("enabled").?.bool);
