@@ -15,6 +15,9 @@ pub const Viewport = struct {
     padding: layout.Insets = .{},
     show_indicators: bool = false,
     indicator_token: resources_mod.ThemeToken = .status,
+    show_scrollbar: bool = false,
+    scrollbar_thumb: []const u8 = "█",
+    scrollbar_track: []const u8 = "│",
     theme: ?*const resources_mod.Theme = null,
 
     pub fn drawComponent(self: *const Viewport) draw_mod.Component {
@@ -61,6 +64,23 @@ pub const Viewport = struct {
         const overflow_below = slice.end < rendered.line_count;
 
         blitAllocatingScreen(rendered.screen, inner_window, slice.start);
+
+        if (self.show_scrollbar and inner_height > 0 and rendered.line_count > inner_height) {
+            const thumb_height = @max(1, (inner_height * inner_height) / rendered.line_count);
+            const max_offset = rendered.line_count - inner_height;
+            const scroll_offset = slice.start;
+            const thumb_start = if (max_offset == 0) 0 else (scroll_offset * (inner_height - thumb_height)) / max_offset;
+            const scroll_col = inner_window.width -| 1;
+            for (0..inner_height) |i| {
+                const row_y: u16 = @intCast(i);
+                if (row_y >= inner_window.height) break;
+                const is_thumb = i >= thumb_start and i < thumb_start + thumb_height;
+                inner_window.writeCell(scroll_col, row_y, .{
+                    .char = .{ .grapheme = if (is_thumb) self.scrollbar_thumb else self.scrollbar_track, .width = 1 },
+                    .style = .{},
+                });
+            }
+        }
 
         if (self.show_indicators and inner_height > 0) {
             if (overflow_above) {
