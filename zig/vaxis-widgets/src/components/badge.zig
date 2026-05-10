@@ -20,7 +20,6 @@ pub const Badge = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         if (self.count == 0) {
@@ -28,11 +27,10 @@ pub const Badge = struct {
             return .{ .width = 1, .height = 1 };
         }
 
-        var buf: [8]u8 = undefined;
         const text = if (self.count > self.max_display)
-            std.fmt.bufPrint(&buf, "{d}{s}", .{ self.max_display, self.overflow_text }) catch "99+"
+            try std.fmt.allocPrint(ctx.arena, "{d}{s}", .{ self.max_display, self.overflow_text })
         else
-            std.fmt.bufPrint(&buf, "{d}", .{self.count}) catch "0";
+            try std.fmt.allocPrint(ctx.arena, "{d}", .{self.count});
 
         var col: u16 = 0;
         var idx: usize = 0;
@@ -74,7 +72,7 @@ test "badge renders count and overflow" {
     const b1 = Badge{ .count = 5 };
     var screen1 = try test_helpers.renderToScreen(b1.drawComponent(), 4, 1);
     defer screen1.deinit(std.testing.allocator);
-    try test_helpers.expectCell(&screen1, 0, 0, "5", .{ .bg = .{ .index = 196 } });
+    try test_helpers.expectCell(&screen1, 0, 0, "5", .{ .fg = .{ .index = 255 }, .bg = .{ .index = 196 } });
 
     const b2 = Badge{ .count = 0 };
     var screen2 = try test_helpers.renderToScreen(b2.drawComponent(), 4, 1);

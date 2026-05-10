@@ -92,19 +92,10 @@ pub const Radio = struct {
     fn moveSelection(self: *Radio, direction: i2) void {
         if (self.options.len == 0) return;
         const count: i32 = @intCast(self.options.len);
-        var idx: i32 = @intCast(self.selected_index);
-
-        var attempts: usize = 0;
-        while (attempts < self.options.len) : (attempts += 1) {
-            idx += direction;
-            if (idx < 0) idx = count - 1;
-            if (idx >= count) idx = 0;
-            const new_idx: usize = @intCast(idx);
-            if (!self.options[new_idx].disabled) {
-                self.selected_index = new_idx;
-                break;
-            }
-        }
+        const next = @as(i32, @intCast(self.selected_index)) + direction;
+        if (next < 0 or next >= count) return;
+        const new_idx: usize = @intCast(next);
+        if (!self.options[new_idx].disabled) self.selected_index = new_idx;
     }
 
     fn drawOpaque(

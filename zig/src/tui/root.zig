@@ -218,6 +218,17 @@ test "components export autocomplete module" {
 }
 
 test "exports migrated widget aliases" {
+    _ = BorderStyle;
+    _ = CornerStyle;
+    _ = EditorAction;
+    _ = ImageDimensions;
+    _ = LoaderStyle;
+    _ = LoaderIndicatorOptions;
+    _ = CancellableLoader;
+    _ = CancellableHandleResult;
+    _ = TruncationMode;
+    _ = ScrollbarOrientation;
+    _ = BarChartBar;
     _ = List;
     _ = Tree;
     _ = TreeState;

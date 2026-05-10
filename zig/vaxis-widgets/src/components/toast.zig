@@ -63,8 +63,9 @@ pub const ToastStack = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) ToastStack {
+        _ = allocator;
         return .{
-            .toasts = std.ArrayList(Toast).init(allocator),
+            .toasts = .empty,
         };
     }
 

@@ -57,7 +57,7 @@ pub const Dialog = struct {
             .height = @intCast(dialog_height),
         });
 
-        try self.drawFrame(dialog_window);
+        self.drawFrame(dialog_window);
 
         const inner = dialog_window.child(.{
             .x_off = 1,

@@ -27,7 +27,6 @@ pub const TerminalPanel = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         const ln_width: u16 = if (self.show_line_numbers) @intCast(self.line_number_width + 1) else 0;
@@ -43,8 +42,7 @@ pub const TerminalPanel = struct {
 
             // Line number
             if (self.show_line_numbers) {
-                var buf: [8]u8 = undefined;
-                const num = std.fmt.bufPrint(&buf, "{d: >3} ", .{line_idx + 1}) catch "";
+                const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{line_idx + 1});
                 var idx: usize = 0;
                 while (idx < num.len and idx < ln_width) {
                     row_window.writeCell(@intCast(idx), 0, .{

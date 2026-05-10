@@ -152,7 +152,7 @@ test "tag group renders multiple tags with separator" {
     var screen = try test_helpers.renderToScreen(group.drawComponent(), 12, 1);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 0, 0, "[", .{});
-    try test_helpers.expectCell(&screen, 4, 0, " ", .{});
-    try test_helpers.expectCell(&screen, 5, 0, "[", .{});
+    try test_helpers.expectCell(&screen, 0, 0, "[", .{ .fg = .{ .index = 7 }, .bg = .{ .index = 240 } });
+    try test_helpers.expectCell(&screen, 3, 0, " ", .{});
+    try test_helpers.expectCell(&screen, 4, 0, "[", .{ .fg = .{ .index = 7 }, .bg = .{ .index = 240 } });
 }

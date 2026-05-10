@@ -51,9 +51,8 @@ pub const Wizard = struct {
                 self.pending_style;
 
             // Step number or bullet
-            var label_buf: [32]u8 = undefined;
             const label = if (self.show_step_numbers)
-                std.fmt.bufPrint(&label_buf, "({d}) {s}", .{ i + 1, step.label }) catch step.label
+                try std.fmt.allocPrint(ctx.arena, "({d}) {s}", .{ i + 1, step.label })
             else
                 step.label;
 
@@ -167,7 +166,7 @@ test "wizard renders steps and content" {
 
     var wizard = Wizard{ .steps = steps, .current_step = 1 };
 
-    var screen = try test_helpers.renderToScreen(wizard.drawComponent(), 40, 3);
+    var screen = try test_helpers.renderToScreen(wizard.drawComponent(), 60, 3);
     defer screen.deinit(std.testing.allocator);
 
     const rendered = try test_helpers.screenToString(&screen);

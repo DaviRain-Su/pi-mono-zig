@@ -31,7 +31,7 @@ pub const RichText = struct {
         var total_width: usize = 0;
 
         for (self.spans) |span| {
-            const style = if (span.style.fg != null or span.style.bg != null or span.style.bold or span.style.italic or span.style.underline or span.style.dim or span.style.reverse)
+            const style = if (!span.style.eql(.{}))
                 span.style
             else
                 self.style;

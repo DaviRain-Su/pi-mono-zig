@@ -27,37 +27,36 @@ pub const Pagination = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         if (self.total_pages == 0) return .{ .width = 0, .height = 0 };
 
         const current = @min(self.current_page, self.total_pages - 1);
-        const pages = self.visiblePages(current);
+        const pages = try self.visiblePages(ctx.arena, current);
 
         // Build display elements
         var elements = std.ArrayList(Element).empty;
-        defer elements.deinit(std.heap.page_allocator);
+        defer elements.deinit(ctx.arena);
 
         // Prev button
         const prev_disabled = current == 0;
-        try elements.append(.{ .text = self.prev_label, .disabled = prev_disabled, .page = if (prev_disabled) null else current - 1 });
+        try elements.append(ctx.arena, .{ .text = self.prev_label, .disabled = prev_disabled, .page = if (prev_disabled) null else current - 1 });
 
         // Page numbers
         var prev_page: ?usize = null;
         for (pages) |page| {
             if (prev_page != null and page > prev_page.? + 1) {
-                try elements.append(.{ .text = self.ellipsis, .disabled = true, .page = null });
+                try elements.append(ctx.arena, .{ .text = self.ellipsis, .disabled = true, .page = null });
             }
             var buf: [16]u8 = undefined;
             const text = std.fmt.bufPrint(&buf, "{d}", .{page + 1}) catch unreachable;
-            try elements.append(.{ .text = try std.heap.page_allocator.dupe(u8, text), .active = page == current, .page = page });
+            try elements.append(ctx.arena, .{ .text = try ctx.arena.dupe(u8, text), .active = page == current, .page = page });
             prev_page = page;
         }
 
         // Next button
         const next_disabled = current + 1 >= self.total_pages;
-        try elements.append(.{ .text = self.next_label, .disabled = next_disabled, .page = if (next_disabled) null else current + 1 });
+        try elements.append(ctx.arena, .{ .text = self.next_label, .disabled = next_disabled, .page = if (next_disabled) null else current + 1 });
 
         // Calculate total width
         var total_width: usize = 0;
@@ -89,23 +88,18 @@ pub const Pagination = struct {
             x = col + 2;
         }
 
-        // Free allocated text
-        for (elements.items) |el| {
-            if (el.allocated) std.heap.page_allocator.free(el.text);
-        }
-
         return .{ .width = window.width, .height = 1 };
     }
 
-    fn visiblePages(self: *const Pagination, current: usize) []const usize {
+    fn visiblePages(self: *const Pagination, allocator: std.mem.Allocator, current: usize) std.mem.Allocator.Error![]usize {
+        const max_count = @min(self.total_pages, self.max_visible);
+        var result = try allocator.alloc(usize, max_count);
+        var count: usize = 0;
+
         if (self.total_pages <= self.max_visible) {
-            var result: [64]usize = undefined;
             for (0..self.total_pages) |i| result[i] = i;
             return result[0..self.total_pages];
         }
-
-        var result: [64]usize = undefined;
-        var count: usize = 0;
 
         // Always show first page
         result[count] = 0;
@@ -168,7 +162,6 @@ const Element = struct {
     active: bool = false,
     disabled: bool = false,
     page: ?usize = null,
-    allocated: bool = false,
 };
 
 test "pagination renders prev next and page numbers" {

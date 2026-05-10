@@ -40,7 +40,7 @@ pub const ResizableSplit = struct {
         }
 
         const available = total - self.handle_width;
-        var first_size = @as(usize, @intFromFloat(@as(f32, @floatFromInt(available)) * self.ratio));
+        var first_size = @as(usize, @intFromFloat(@as(f32, @floatFromInt(total)) * self.ratio));
         first_size = @max(self.min_first, @min(available - self.min_second, first_size));
         const second_size = available - first_size;
 
@@ -157,6 +157,8 @@ test "resizable split vertical" {
     const split = ResizableSplit{
         .direction = .vertical,
         .ratio = 0.5,
+        .min_first = 1,
+        .min_second = 1,
         .first = top.drawComponent(),
         .second = bottom.drawComponent(),
     };

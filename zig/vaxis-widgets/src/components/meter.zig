@@ -25,7 +25,6 @@ pub const Meter = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         const clamped = @max(-1.0, @min(1.0, self.value));
@@ -71,8 +70,7 @@ pub const Meter = struct {
 
         // Value label
         if (self.show_value) {
-            const value_text = try std.fmt.allocPrint(std.heap.page_allocator, " {d:.1}", .{clamped});
-            defer std.heap.page_allocator.free(value_text);
+            const value_text = try std.fmt.allocPrint(ctx.arena, " {d:.1}", .{clamped});
             var vcol: u16 = @intCast(meter_start + track_width + 1);
             var vidx: usize = 0;
             while (vidx < value_text.len and vcol < window.width) {

@@ -7,6 +7,7 @@ pub const VxfwWidget = vaxis.vxfw.Widget;
 pub const DrawContext = struct {
     window: vaxis.Window,
     arena: std.mem.Allocator,
+    frame_count: u64 = 0,
 };
 
 pub const Component = struct {

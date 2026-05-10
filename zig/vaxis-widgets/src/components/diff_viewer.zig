@@ -44,7 +44,6 @@ pub const DiffViewer = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         const ln_width = if (self.show_line_numbers) self.line_number_width else 0;
@@ -57,11 +56,11 @@ pub const DiffViewer = struct {
             const style, const marker = switch (line.line_type) {
                 .added => .{ self.added_style, "+" },
                 .removed => .{ self.removed_style, "-" },
-                .header => .{ self.header_style, " " },
+                .header => .{ self.header_style, "@" },
                 .context => .{ self.context_style, " " },
             };
 
-            const bg_style = switch (line.line_type) {
+            const bg_style: vaxis.Cell.Style = switch (line.line_type) {
                 .added => self.added_bg,
                 .removed => self.removed_bg,
                 else => .{},
@@ -78,15 +77,14 @@ pub const DiffViewer = struct {
             // Line numbers
             if (self.show_line_numbers and ln_width > 0) {
                 const old = if (line.old_line_no) |n|
-                    std.fmt.bufPrint(&std.mem.zeroes([16]u8), "{d: >4}", .{n}) catch "    "
+                    try std.fmt.allocPrint(ctx.arena, "{d: >4}", .{n})
                 else
                     "    ";
                 const new = if (line.new_line_no) |n|
-                    std.fmt.bufPrint(&std.mem.zeroes([16]u8), "{d: >4}", .{n}) catch "    "
+                    try std.fmt.allocPrint(ctx.arena, "{d: >4}", .{n})
                 else
                     "    ";
-                var buf: [16]u8 = undefined;
-                const nums = std.fmt.bufPrint(&buf, "{s}{s}", .{ old, new }) catch "";
+                const nums = try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ old, new });
                 var col: u16 = @intCast(self.gutter_width);
                 var idx: usize = 0;
                 while (idx < nums.len and col < content_x) {
@@ -146,7 +144,7 @@ test "diff viewer renders added removed and context lines" {
     var screen = try test_helpers.renderToScreen(viewer.drawComponent(), 40, 4);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 0, 0, "@", .{ .bold = true });
+    try test_helpers.expectCell(&screen, 0, 0, "@", .{ .bold = true, .fg = .{ .index = 7 } });
     try test_helpers.expectCell(&screen, 0, 1, "-", .{ .fg = .{ .index = 196 } });
     try test_helpers.expectCell(&screen, 0, 2, "+", .{ .fg = .{ .index = 82 } });
     try test_helpers.expectCell(&screen, 0, 3, " ", .{});

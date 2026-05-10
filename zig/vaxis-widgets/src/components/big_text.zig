@@ -37,7 +37,8 @@ pub const BigText = struct {
                 if (row >= window.height) break;
                 const row_bits = glyph[row];
                 for (0..gwidth) |c| {
-                    const bit: u4 = @intCast(gwidth - 1 - c);
+                    if (c >= 4) continue;
+                    const bit: u2 = @intCast(3 - c);
                     const is_pixel = (row_bits & (@as(u4, 1) << bit)) != 0;
                     if (is_pixel) {
                         window.writeCell(col + @as(u16, @intCast(c)), @intCast(row), .{

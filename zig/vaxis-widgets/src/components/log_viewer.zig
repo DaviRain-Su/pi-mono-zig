@@ -77,14 +77,7 @@ pub const LogViewer = struct {
             // Level badge
             if (self.show_level) {
                 const level_text = levelString(entry.level);
-                const level_pad = 7 - ansi.visibleWidth(level_text);
                 var idx: usize = 0;
-                while (idx < level_pad and col < level_width) {
-                    row_window.writeCell(col, 0, .{ .char = .{ .grapheme = " ", .width = 1 }, .style = style });
-                    col += 1;
-                    idx += 1;
-                }
-                idx = 0;
                 while (idx < level_text.len and col < level_width) {
                     row_window.writeCell(col, 0, .{
                         .char = .{ .grapheme = level_text[idx .. idx + 1], .width = 1 },

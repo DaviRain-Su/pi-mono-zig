@@ -31,7 +31,6 @@ pub const Slider = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         const clamped = @max(self.min, @min(self.max, self.value));
@@ -74,8 +73,7 @@ pub const Slider = struct {
 
         // Value label
         if (self.show_value) {
-            const value_text = try std.fmt.allocPrint(std.heap.page_allocator, " {d:.1}", .{clamped});
-            defer std.heap.page_allocator.free(value_text);
+            const value_text = try std.fmt.allocPrint(ctx.arena, " {d:.1}", .{clamped});
             const value_width = ansi.visibleWidth(value_text);
             if (col + track_width + value_width <= window.width) {
                 const value_window = window.child(.{

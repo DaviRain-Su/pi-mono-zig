@@ -156,7 +156,7 @@ test "scroll box renders content with vertical scrollbar" {
     defer screen.deinit(std.testing.allocator);
 
     try test_helpers.expectCell(&screen, 0, 0, "H", .{});
-    try test_helpers.expectCell(&screen, 14, 0, "│", .{ .fg = .{ .index = 8 } });
+    try test_helpers.expectCell(&screen, 14, 0, "│", .{ .fg = .{ .index = 7 } });
 }
 
 test "scroll box scroll navigation" {

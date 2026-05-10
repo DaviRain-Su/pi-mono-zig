@@ -7,7 +7,7 @@ const test_helpers = @import("../test_helpers.zig");
 const keys = @import("../keys.zig");
 
 pub const MenuItem = struct {
-    label: []const u8,
+    label: []const u8 = "",
     shortcut: ?[]const u8 = null,
     enabled: bool = true,
     separator: bool = false,
@@ -167,9 +167,14 @@ pub const MenuBar = struct {
                 const shortcut_width = ansi.visibleWidth(shortcut);
                 if (shortcut_width < inner.width) {
                     const shortcut_x = inner.width -| shortcut_width;
-                    _ = row_window.print(.{
-                        .{ .text = shortcut, .style = if (is_selected) self.highlight_style else self.disabled_style },
-                    }, .{ .col_offset = @intCast(shortcut_x), .wrap = .none });
+                    const shortcut_window = row_window.child(.{
+                        .x_off = @intCast(shortcut_x),
+                        .width = @intCast(shortcut_width),
+                    });
+                    _ = shortcut_window.printSegment(.{
+                        .text = shortcut,
+                        .style = if (is_selected) self.highlight_style else self.disabled_style,
+                    }, .{ .wrap = .none });
                 }
             }
         }

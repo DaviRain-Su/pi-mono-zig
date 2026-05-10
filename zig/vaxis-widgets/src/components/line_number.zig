@@ -29,7 +29,6 @@ pub const LineNumber = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         for (0..self.line_count) |i| {
@@ -57,8 +56,7 @@ pub const LineNumber = struct {
 
             // Line number
             if (self.show_line_numbers) {
-                var buf: [16]u8 = undefined;
-                const num = std.fmt.bufPrint(&buf, "{d: >4}", .{line_no}) catch "";
+                const num = try std.fmt.allocPrint(ctx.arena, "{d}", .{line_no});
                 var idx: usize = 0;
                 while (idx < num.len and col + idx < window.width) {
                     window.writeCell(@intCast(col + idx), @intCast(i), .{
@@ -118,6 +116,6 @@ test "line number with per-line colors" {
     var screen = try test_helpers.renderToScreen(ln.drawComponent(), 5, 2);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 1, 0, "1", .{ .fg = .{ .index = 82 } });
-    try test_helpers.expectCell(&screen, 1, 1, "2", .{ .fg = .{ .index = 196 } });
+    try test_helpers.expectCell(&screen, 0, 0, "1", .{ .fg = .{ .index = 82 } });
+    try test_helpers.expectCell(&screen, 0, 1, "2", .{ .fg = .{ .index = 196 } });
 }

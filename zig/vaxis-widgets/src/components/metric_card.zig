@@ -36,7 +36,6 @@ pub const MetricCard = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
-        _ = ctx;
         window.clear();
 
         const w = @min(self.width, @as(usize, window.width));
@@ -75,9 +74,8 @@ pub const MetricCard = struct {
         // Value
         if (self.value.len > 0 and inner.height >= 2) {
             const value_row = inner.child(.{ .y_off = 1, .height = 1 });
-            var buf: [64]u8 = undefined;
             const full_value = if (self.unit.len > 0)
-                std.fmt.bufPrint(&buf, "{s}{s}", .{ self.value, self.unit }) catch self.value
+                try std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ self.value, self.unit })
             else
                 self.value;
             _ = value_row.printSegment(.{ .text = full_value, .style = self.value_style }, .{ .wrap = .none });
@@ -91,8 +89,7 @@ pub const MetricCard = struct {
                 .down => .{ "↓", self.trend_down_style },
                 .neutral => .{ "→", self.trend_neutral_style },
             };
-            var buf: [32]u8 = undefined;
-            const trend_text = std.fmt.bufPrint(&buf, "{s} {s}", .{ trend_symbol, self.trend_value }) catch "";
+            const trend_text = try std.fmt.allocPrint(ctx.arena, "{s} {s}", .{ trend_symbol, self.trend_value });
             _ = trend_row.printSegment(.{ .text = trend_text, .style = trend_style }, .{ .wrap = .none });
         }
 
@@ -117,10 +114,10 @@ test "metric card renders label value and trend" {
         .trend = .up,
         .trend_value = "5%",
         .width = 10,
-        .height = 4,
+        .height = 5,
     };
 
-    var screen = try test_helpers.renderToScreen(card.drawComponent(), 12, 4);
+    var screen = try test_helpers.renderToScreen(card.drawComponent(), 12, 5);
     defer screen.deinit(std.testing.allocator);
 
     const rendered = try test_helpers.screenToString(&screen);

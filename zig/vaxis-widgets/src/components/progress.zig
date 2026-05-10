@@ -23,7 +23,7 @@ pub const IndeterminateProgress = struct {
         window.clear();
 
         const w = @min(self.width, @as(usize, window.width));
-        const head_pos = if (self.width > 0)
+        const head_pos = if (w > 0)
             @as(usize, @intCast(ctx.frame_count % @as(u64, @intCast(w))))
         else
             0;
@@ -70,13 +70,15 @@ pub const Spinner = struct {
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
         window.clear();
-        const frame_idx = if (self.frames.len > 0)
-            ctx.frame_count % @as(u64, @intCast(self.frames.len))
+        const frame_count = countFrames(self.frames);
+        const frame_idx = if (frame_count > 0)
+            ctx.frame_count % @as(u64, @intCast(frame_count))
         else
             0;
-        const cluster = @import("../ansi.zig").nextDisplayCluster(self.frames, @intCast(frame_idx * 3));
+        const start = frameStart(self.frames, @intCast(frame_idx));
+        const cluster = @import("../ansi.zig").nextDisplayCluster(self.frames, start);
         window.writeCell(0, 0, .{
-            .char = .{ .grapheme = self.frames[@intCast(frame_idx * 3)..cluster.end], .width = @intCast(cluster.width) },
+            .char = .{ .grapheme = self.frames[start..cluster.end], .width = @intCast(cluster.width) },
             .style = self.style,
         });
         return .{ .width = 1, .height = 1 };
@@ -92,9 +94,42 @@ pub const Spinner = struct {
     }
 };
 
+fn countFrames(frames: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < frames.len) {
+        const cluster = @import("../ansi.zig").nextDisplayCluster(frames, index);
+        if (cluster.end <= index) break;
+        count += 1;
+        index = cluster.end;
+    }
+    return count;
+}
+
+fn frameStart(frames: []const u8, target: usize) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < frames.len) {
+        if (count == target) return index;
+        const cluster = @import("../ansi.zig").nextDisplayCluster(frames, index);
+        if (cluster.end <= index) break;
+        count += 1;
+        index = cluster.end;
+    }
+    return 0;
+}
+
 test "indeterminate progress renders track with head" {
     const progress = IndeterminateProgress{ .width = 10 };
     var screen = try test_helpers.renderToScreen(progress.drawComponent(), 12, 1);
     defer screen.deinit(std.testing.allocator);
     try test_helpers.expectCell(&screen, 0, 0, "▶", .{ .fg = .{ .index = 39 } });
+}
+
+test "spinner renders unicode frame" {
+    const spinner = Spinner{};
+    var screen = try test_helpers.renderToScreen(spinner.drawComponent(), 2, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, "⠋", .{ .fg = .{ .index = 39 } });
 }
