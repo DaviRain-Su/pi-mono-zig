@@ -34,6 +34,8 @@ pub const SelectList = struct {
     show_scrollbar: bool = false,
     scrollbar_thumb: []const u8 = "█",
     scrollbar_track: []const u8 = "│",
+    highlight_symbol: []const u8 = "→ ",
+    unselected_symbol: []const u8 = "  ",
 
     pub fn drawComponent(self: *const SelectList) draw_mod.Component {
         return .{
@@ -153,14 +155,14 @@ pub const SelectList = struct {
     }
 
     fn drawItemRow(
-        _: *const SelectList,
+        self: *const SelectList,
         allocator: std.mem.Allocator,
         row_window: vaxis.Window,
         active_theme: ?*const resources_mod.Theme,
         item: SelectItem,
         is_selected: bool,
     ) std.mem.Allocator.Error!void {
-        const prefix = if (is_selected) "→ " else "  ";
+        const prefix = if (is_selected) self.highlight_symbol else self.unselected_symbol;
         const prefix_width = ansi.visibleWidth(prefix);
         const content_width = @as(usize, row_window.width) - @min(@as(usize, row_window.width), prefix_width);
 
