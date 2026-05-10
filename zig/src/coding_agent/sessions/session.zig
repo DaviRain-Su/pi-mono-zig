@@ -1993,10 +1993,20 @@ fn isContextOverflow(message: ai.AssistantMessage, context_window: u32) bool {
     _ = context_window;
     if (message.stop_reason != .error_reason) return false;
     const error_message = message.error_message orelse return false;
-    return std.ascii.indexOfIgnoreCase(error_message, "overflow") != null or
-        std.ascii.indexOfIgnoreCase(error_message, "context length") != null or
-        std.ascii.indexOfIgnoreCase(error_message, "context window") != null or
-        std.ascii.indexOfIgnoreCase(error_message, "too long") != null;
+    inline for ([_][]const u8{
+        "overflow",
+        "context length",
+        "context window",
+        "context limit",
+        "maximum context",
+        "max context",
+        "too long",
+        "exceeded model",
+        "exceeds model",
+    }) |needle| {
+        if (string_utils.containsIgnoreCase(error_message, needle)) return true;
+    }
+    return false;
 }
 
 fn isRetryableError(message: ai.AssistantMessage, context_window: u32) bool {
@@ -2693,6 +2703,47 @@ test "auto compaction recovers from overflow by compacting and continuing" {
     try std.testing.expect(messages.len >= 3);
     try std.testing.expect(std.mem.startsWith(u8, messages[0].user.content[0].text.text, "[compaction]\n"));
     try std.testing.expectEqualStrings("recovered after compaction", messages[messages.len - 1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), countCompactionEntries(session.session_manager.getEntries()));
+    try std.testing.expectEqual(@as(usize, 1), countAssistantMessagesWithStopReason(session.session_manager.getEntries(), .error_reason));
+}
+
+test "auto compaction treats Kimi exceeded model errors as context overflow" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("warmup reply")}, .{}) },
+        .{ .message = faux.fauxAssistantMessage(&.{}, .{ .stop_reason = .error_reason, .error_message = "HTTP 400: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid request: Your request exceeded model [REDACTED].\"}}" }) },
+        .{ .message = faux.fauxAssistantMessage(&[_]faux.FauxContentBlock{faux.fauxText("recovered after Kimi compaction")}, .{}) },
+    });
+
+    var model = registration.getModel();
+    model.context_window = 32;
+    model.provider = "kimi-coding";
+    model.id = "kimi-for-coding";
+
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/session-project",
+        .system_prompt = "system prompt",
+        .model = model,
+        .compaction = .{
+            .enabled = true,
+            .reserve_tokens = 4,
+            .keep_recent_tokens = 8,
+        },
+    });
+    defer session.deinit();
+
+    try session.prompt("warmup prompt with detail");
+    try session.prompt("second prompt that exceeds Kimi context");
+
+    const messages = session.agent.getMessages();
+    try std.testing.expect(messages.len >= 3);
+    try std.testing.expect(std.mem.startsWith(u8, messages[0].user.content[0].text.text, "[compaction]\n"));
+    try std.testing.expectEqualStrings("recovered after Kimi compaction", messages[messages.len - 1].assistant.content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), countCompactionEntries(session.session_manager.getEntries()));
     try std.testing.expectEqual(@as(usize, 1), countAssistantMessagesWithStopReason(session.session_manager.getEntries(), .error_reason));
 }
