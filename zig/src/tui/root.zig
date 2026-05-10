@@ -32,6 +32,8 @@ pub const components = struct {
     pub const gauge = @import("components/gauge.zig");
     pub const scrollbar = @import("components/scrollbar.zig");
     pub const sparkline = @import("components/sparkline.zig");
+    pub const clear = @import("components/clear.zig");
+    pub const bar_chart = @import("components/bar_chart.zig");
 };
 
 pub const DrawComponent = draw.Component;
@@ -94,6 +96,9 @@ pub const Scrollbar = components.scrollbar.Scrollbar;
 pub const ScrollbarState = components.scrollbar.State;
 pub const ScrollbarOrientation = components.scrollbar.Orientation;
 pub const Sparkline = components.sparkline.Sparkline;
+pub const Clear = components.clear.Clear;
+pub const BarChart = components.bar_chart.BarChart;
+pub const BarChartBar = components.bar_chart.Bar;
 
 test {
     _ = @import("ansi.zig");
@@ -125,6 +130,8 @@ test {
     _ = @import("components/gauge.zig");
     _ = @import("components/scrollbar.zig");
     _ = @import("components/sparkline.zig");
+    _ = @import("components/clear.zig");
+    _ = @import("components/bar_chart.zig");
 }
 
 test "components export autocomplete module" {
