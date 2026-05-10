@@ -10,6 +10,10 @@
 
 - Replaced the Zig interactive missing stored-cwd stderr/stdin prompt with a full TUI Continue/Cancel selector that mirrors the TypeScript `ExtensionSelectorComponent` flow used by `promptForMissingSessionCwd`, with tuistory coverage for prompt rendering, cancel, escape, and continue paths. Cancel exits without mutating the session file; continue persists the launch cwd only after explicit confirmation.
 
+### Added
+
+- Wired `EventOrderingGuard` into `AssistantMessageEventStream.push()` for debug builds. Every event the stream receives is validated against ISS-502 / INV-3 ordering invariants (`_start → _delta* → _end`, content_index stability, terminal event ordering). Violations panic so providers and callers surface ordering bugs in CI rather than letting them reach downstream accumulators silently. Release builds skip the guard entirely. `error_event` terminals are intentionally allowed with open blocks (stream-level provider errors like throttling/service_unavailable can fire mid-block; downstream accumulators reset state on error rather than relying on synthetic `_end` events).
+
 ### Removed
 
 - Removed unused `KnownApi` and `KnownProvider` enums from `zig/src/ai/types.zig`. Both had drifted from the runtime API/provider registry (`kimi-completions` registered without an enum variant; `together` provider used in 18 model rows with no enum variant) and had no production references — all dispatch already routes through string keys via `api_registry.get([]const u8)`.

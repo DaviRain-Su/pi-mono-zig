@@ -491,6 +491,7 @@ fn ownedDeltaStreamForAgentLoopTest(
         .delta = try allocator.dupe(u8, "response"),
         .owns_delta = true,
     });
+    stream.push(.{ .event_type = .text_end, .content_index = 0 });
     stream.push(.{
         .event_type = .done,
         .message = .{

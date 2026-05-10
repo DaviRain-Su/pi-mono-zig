@@ -1,14 +1,23 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
+const event_stream_guard = @import("event_stream_guard.zig");
 
 /// ISS-502 stream invariants for `types.AssistantMessageEvent`:
 /// - INV-2: each `content_index` is stable and never reused within a stream.
 /// - INV-3: per-block ordering is `_start -> _delta* -> _end`.
 /// - INV-4: `done` is the final event for a successful stream.
 /// - INV-5: `error_event` terminates the stream with error stop metadata.
+///
+/// In debug builds, `AssistantMessageEvent` streams enforce these invariants
+/// via `EventOrderingGuard` on every `push()`. Violations panic so providers
+/// surface ordering bugs in CI rather than reaching downstream accumulators.
+/// Release builds skip the guard entirely.
 /// Generic event stream for async iteration.
 /// T is the event type, R is the result type.
 pub fn EventStream(comptime T: type, comptime R: type) type {
+    const enable_guard = builtin.mode == .Debug and T == types.AssistantMessageEvent;
+    const GuardField = if (enable_guard) event_stream_guard.EventOrderingGuard else void;
     return struct {
         const Self = @This();
 
@@ -21,6 +30,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         io: std.Io,
         is_complete_fn: *const fn (event: T) bool,
         extract_result_fn: *const fn (event: T) R,
+        guard: GuardField,
 
         pub const IteratorResult = struct {
             value: ?T,
@@ -41,10 +51,12 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .final_result = null,
                 .is_complete_fn = is_complete,
                 .extract_result_fn = extract_result,
+                .guard = if (enable_guard) event_stream_guard.EventOrderingGuard.init(allocator) else {},
             };
         }
 
         pub fn deinit(self: *Self) void {
+            if (enable_guard) self.guard.deinit();
             self.queue.deinit(self.allocator);
         }
 
@@ -53,6 +65,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defer self.mutex.unlock(self.io);
 
             if (self.done) return;
+
+            if (enable_guard) {
+                self.guard.validate(event) catch |err| {
+                    std.debug.panic(
+                        "AssistantMessageEventStream ordering violation: {s} (event_type={s}, content_index={?})",
+                        .{ @errorName(err), @tagName(event.event_type), event.content_index },
+                    );
+                };
+            }
 
             if (self.is_complete_fn(event)) {
                 self.done = true;
@@ -157,10 +178,19 @@ test "EventStream basic operations" {
         .event_type = .start,
     });
 
-    // Push a text delta event
+    // Push a text block start, delta, end
+    stream.push(.{
+        .event_type = .text_start,
+        .content_index = 0,
+    });
     stream.push(.{
         .event_type = .text_delta,
+        .content_index = 0,
         .delta = "Hello",
+    });
+    stream.push(.{
+        .event_type = .text_end,
+        .content_index = 0,
     });
 
     // Push done event
@@ -183,9 +213,11 @@ test "EventStream basic operations" {
     const event1 = stream.next().?;
     try std.testing.expectEqual(types.EventType.start, event1.event_type);
 
+    _ = stream.next().?; // text_start
     const event2 = stream.next().?;
     try std.testing.expectEqual(types.EventType.text_delta, event2.event_type);
     try std.testing.expectEqualStrings("Hello", event2.delta.?);
+    _ = stream.next().?; // text_end
 
     const event3 = stream.next().?;
     try std.testing.expectEqual(types.EventType.done, event3.event_type);

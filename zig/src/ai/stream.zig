@@ -383,6 +383,7 @@ fn ownedDeltaStream(
         .delta = try allocator.dupe(u8, "complete"),
         .owns_delta = true,
     });
+    stream_instance.push(.{ .event_type = .text_end, .content_index = 0 });
     stream_instance.push(.{
         .event_type = .done,
         .message = .{

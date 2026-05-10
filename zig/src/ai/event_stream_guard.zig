@@ -65,7 +65,13 @@ pub const EventOrderingGuard = struct {
             .text_end => try self.validateEnd(event.content_index, .text),
             .thinking_end => try self.validateEnd(event.content_index, .thinking),
             .toolcall_end => try self.validateEnd(event.content_index, .tool_call),
-            .done, .error_event => try self.validateTerminal(),
+            .done => try self.validateSuccessTerminal(),
+            // INV-5: error_event terminates without requiring providers to
+            // first close every open block. Stream-level provider errors
+            // (throttling, service_unavailable, validation_exception, etc.)
+            // can fire mid-block; downstream accumulators reset state on
+            // error rather than relying on synthetic `_end` events.
+            .error_event => self.terminal_seen = true,
         }
     }
 
@@ -95,7 +101,7 @@ pub const EventOrderingGuard = struct {
         entry.state = .closed;
     }
 
-    fn validateTerminal(self: *EventOrderingGuard) EventOrderingError!void {
+    fn validateSuccessTerminal(self: *EventOrderingGuard) EventOrderingError!void {
         var iterator = self.blocks.valueIterator();
         while (iterator.next()) |entry| {
             if (entry.state == .open) return error.ContentBlockOpenAtTerminal;

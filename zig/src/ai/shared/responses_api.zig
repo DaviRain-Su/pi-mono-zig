@@ -391,6 +391,11 @@ test "finalizeCurrentBlock preserves text fallback and emits text_end" {
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
 
+    // Establish the open block invariant the production stream would have set
+    // up before reaching `finalizeCurrentBlock`.
+    stream.push(.{ .event_type = .text_start, .content_index = 0 });
+    _ = stream.next().?;
+
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, &stream);
 
     try std.testing.expect(current_block == null);
@@ -422,6 +427,11 @@ test "finalizeCurrentBlock stores inline tool call and emits end event" {
 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
     defer stream.deinit();
+
+    // Establish the open block invariant the production stream would have set
+    // up before reaching `finalizeCurrentBlock`.
+    stream.push(.{ .event_type = .toolcall_start, .content_index = 0 });
+    _ = stream.next().?;
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, &stream);
     defer freeToolCallOwned(allocator, content_blocks.items[0].tool_call);
