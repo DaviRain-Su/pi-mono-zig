@@ -167,22 +167,9 @@ fn measureEditorHeight(
     width: usize,
 ) !usize {
     _ = theme;
+    _ = allocator;
     const height_hint = @max(@as(usize, 1), estimateWrappedRows(editor.text(), width) + editor.padding_y * 2);
-    var screen = try tui.vaxis.Screen.init(allocator, .{
-        .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
-        .cols = @intCast(@max(width, 1)),
-        .x_pixel = 0,
-        .y_pixel = 0,
-    });
-    defer screen.deinit(allocator);
-
-    const measure_window = tui.draw.rootWindow(&screen);
-    measure_window.clear();
-    const size = try editor.draw(measure_window, .{
-        .window = measure_window,
-        .arena = allocator,
-    });
-    return @max(@as(usize, size.height), 1);
+    return @min(height_hint, @as(usize, std.math.maxInt(u16)));
 }
 
 fn drawFittedLine(

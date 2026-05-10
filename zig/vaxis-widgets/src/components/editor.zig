@@ -53,6 +53,8 @@ pub const EditorAction = enum {
 
 const DEFAULT_PAGE_LINE_COUNT: usize = 5;
 const HISTORY_LIMIT: usize = 100;
+const UNDO_STACK_LIMIT: usize = 100;
+const AUTOCOMPLETE_LARGE_CATALOG_THRESHOLD: usize = 512;
 
 const LastAction = enum {
     none,
@@ -651,6 +653,9 @@ pub const Editor = struct {
         const range = self.currentAutocompleteRange(force_show_all) orelse return;
         const prefix = self.buffer.items[range.start..range.end];
         const wants_slash_commands = prefix.len > 0 and prefix[0] == '/';
+        if (!force_show_all and !wants_slash_commands and self.autocomplete_catalog.items.len > AUTOCOMPLETE_LARGE_CATALOG_THRESHOLD and !isPathLikeAutocompletePrefix(prefix)) {
+            return;
+        }
 
         var filtered_catalog = std.ArrayList(select_list.SelectItem).empty;
         defer filtered_catalog.deinit(self.allocator);
@@ -733,6 +738,10 @@ pub const Editor = struct {
             .text = owned,
             .cursor = self.cursor,
         });
+        while (self.undo_stack.items.len > UNDO_STACK_LIMIT) {
+            const removed = self.undo_stack.orderedRemove(0);
+            self.allocator.free(removed.text);
+        }
     }
 
     fn undo(self: *Editor) void {
@@ -1308,8 +1317,9 @@ fn drawSingleRowViewport(text: []const u8, cursor_index: usize, window: vaxis.Wi
         start = previous;
     }
 
+    const visible_end = visibleEndForWidth(text, start, current_end, window.width);
     _ = window.printSegment(.{
-        .text = text[start..current_end],
+        .text = text[start..visible_end],
         .style = style,
     }, .{ .wrap = .none });
 
@@ -1351,6 +1361,35 @@ fn isPunctuationByte(byte: u8) bool {
     return std.mem.indexOfScalar(u8, "(){}[]<>.,;:'\"!?+-=*/\\|&%^$#@~`", byte) != null;
 }
 
+fn isPathLikeAutocompletePrefix(prefix: []const u8) bool {
+    if (prefix.len == 0) return false;
+    for (prefix) |byte| {
+        switch (byte) {
+            '/', '.', '~', '-', '_' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn visibleEndForWidth(text: []const u8, start: usize, end: usize, width: u16) usize {
+    if (width == 0) return start;
+    var idx = start;
+    var used_width: usize = 0;
+    while (idx < end) {
+        const cluster = ansi.nextDisplayCluster(text, idx);
+        if (cluster.end <= idx) break;
+        if (cluster.width == 0) {
+            idx = cluster.end;
+            continue;
+        }
+        if (used_width + cluster.width > width) break;
+        used_width += cluster.width;
+        idx = cluster.end;
+    }
+    return idx;
+}
+
 fn prevCodepointStart(text: []const u8, index: usize) usize {
     if (index == 0) return 0;
 
@@ -1370,6 +1409,7 @@ fn nextCodepointEnd(text: []const u8, index: usize) usize {
 fn prevGraphemeStart(text: []const u8, index: usize) usize {
     const clamped = @min(index, text.len);
     if (clamped == 0) return 0;
+    if (text[clamped - 1] < 0x80) return clamped - 1;
 
     var cursor: usize = 0;
     var previous: usize = 0;
@@ -1783,6 +1823,21 @@ test "editor undo treats spaces and newlines as separate atomic groups" {
     try std.testing.expectEqualStrings("hi", editor.text());
 }
 
+test "editor caps undo snapshots to avoid long-session growth" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    for (0..UNDO_STACK_LIMIT + 20) |index| {
+        const text_value = try std.fmt.allocPrint(allocator, "snapshot-{d}", .{index});
+        defer allocator.free(text_value);
+        try editor.setText(text_value);
+    }
+
+    try std.testing.expect(editor.undo_stack.items.len <= UNDO_STACK_LIMIT);
+}
+
 test "editor kill ring accumulates kills and yanks latest entry" {
     const allocator = std.testing.allocator;
 
@@ -1995,6 +2050,32 @@ test "editor only shows slash-command autocomplete for slash prefixes" {
     }
     try std.testing.expect(editor.isShowingAutocomplete());
     try std.testing.expectEqualStrings("session-notes", editor.selectedAutocompleteItem().?.value);
+}
+
+test "editor skips large plain-word autocomplete until explicit trigger" {
+    const allocator = std.testing.allocator;
+
+    var editor = Editor.init(allocator);
+    defer editor.deinit();
+
+    const item_count = AUTOCOMPLETE_LARGE_CATALOG_THRESHOLD + 1;
+    const items = try allocator.alloc(select_list.SelectItem, item_count);
+    defer allocator.free(items);
+    for (items, 0..) |*item, index| {
+        const value = try std.fmt.allocPrint(allocator, "item-{d}", .{index});
+        item.* = .{ .value = value, .label = value };
+    }
+    defer {
+        for (items) |item| allocator.free(item.value);
+    }
+
+    try editor.setAutocompleteItems(items);
+    _ = try editor.handleKey(.{ .printable = keys.PrintableKey.fromSlice("i") });
+
+    try std.testing.expect(!editor.isShowingAutocomplete());
+
+    try std.testing.expectEqual(HandleResult.handled, try editor.handleAction(.input_tab));
+    try std.testing.expect(editor.isShowingAutocomplete());
 }
 
 test "editor inserts bracketed paste content as a single edit" {
