@@ -3,6 +3,7 @@
 #import <dispatch/dispatch.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static char pi_webview_last_error_buffer[1024] = {0};
@@ -38,6 +39,103 @@ static const char *pi_webview_redacted_url(NSURL *URL) {
         snprintf(redacted_url_buffer, sizeof(redacted_url_buffer), "%s://[redacted]", [scheme UTF8String]);
     }
     return redacted_url_buffer;
+}
+
+static double pi_webview_monotonic_ms(void) {
+    return [[NSProcessInfo processInfo] systemUptime] * 1000.0;
+}
+
+static BOOL pi_webview_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (value == NULL) {
+        return NO;
+    }
+    return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0;
+}
+
+static NSString *pi_webview_json_string_literal(NSString *value) {
+    NSString *safeValue = value ?: @"";
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[safeValue] options:0 error:&error];
+    if (data == nil || error != nil) {
+        return @"\"\"";
+    }
+    NSString *arrayJson = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (arrayJson == nil || [arrayJson length] < 2) {
+        return @"\"\"";
+    }
+    return [arrayJson substringWithRange:NSMakeRange(1, [arrayJson length] - 2)];
+}
+
+static NSString *pi_webview_safe_telemetry_string(id value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return @"unknown";
+    }
+    NSString *text = (NSString *)value;
+    if ([text length] == 0 || [text length] > 80) {
+        return @"redacted";
+    }
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"];
+    if ([text rangeOfCharacterFromSet:[allowed invertedSet]].location != NSNotFound) {
+        return @"redacted";
+    }
+    return text;
+}
+
+static double pi_webview_telemetry_number(NSDictionary *payload, NSString *key) {
+    id value = payload[key];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value doubleValue];
+    }
+    return -1.0;
+}
+
+static const char *pi_webview_telemetry_bool(NSDictionary *payload, NSString *key) {
+    id value = payload[key];
+    if ([value isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)value boolValue] ? "true" : "false";
+    }
+    return "unknown";
+}
+
+static NSDictionary *pi_webview_json_object_from_string(NSString *json) {
+    NSData *data = [json dataUsingEncoding:NSUTF8StringEncoding];
+    if (data == nil) {
+        return nil;
+    }
+    NSError *error = nil;
+    id decoded = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+    if (error != nil || ![decoded isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+    return (NSDictionary *)decoded;
+}
+
+static void pi_webview_log_telemetry(NSDictionary *payload) {
+    NSString *name = pi_webview_safe_telemetry_string(payload[@"name"]);
+    NSString *provider = pi_webview_safe_telemetry_string(payload[@"provider"]);
+    fprintf(
+        stderr,
+        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f\n",
+        [name UTF8String],
+        getpid(),
+        pi_webview_monotonic_ms(),
+        pi_webview_telemetry_number(payload, @"perfMs"),
+        pi_webview_telemetry_number(payload, @"wallMs"),
+        pi_webview_telemetry_number(payload, @"sinceLaunchMs"),
+        pi_webview_telemetry_number(payload, @"sinceReadyMs"),
+        pi_webview_telemetry_number(payload, @"sinceHydratedMs"),
+        [provider UTF8String],
+        [provider isEqualToString:@"faux"] ? "true" : "false",
+        pi_webview_telemetry_bool(payload, @"apiKeyPresent"),
+        pi_webview_telemetry_bool(payload, @"bridgeAvailable"),
+        pi_webview_telemetry_number(payload, @"readyToFocusMs"),
+        pi_webview_telemetry_number(payload, @"readyToTypeMs"),
+        pi_webview_telemetry_number(payload, @"hydratedToFocusMs"),
+        pi_webview_telemetry_number(payload, @"hydratedToTypeMs"),
+        pi_webview_telemetry_number(payload, @"valueLength")
+    );
+    fflush(stderr);
 }
 
 const char *pi_webview_macos_last_error(void) {
@@ -95,7 +193,14 @@ static void pi_webview_stop_app(void) {
             return;
         }
 
-        if ([requestJson containsString:@"frontend_ready"]) {
+        NSDictionary *messageObject = pi_webview_json_object_from_string(requestJson);
+        NSString *messageType = [messageObject[@"type"] isKindOfClass:[NSString class]] ? (NSString *)messageObject[@"type"] : nil;
+        if ([messageType isEqualToString:@"telemetry_mark"]) {
+            pi_webview_log_telemetry(messageObject);
+            return;
+        }
+
+        if ([messageType isEqualToString:@"frontend_ready"]) {
             fprintf(stderr, "PI_WEBVIEW_BRIDGE_READY pid=%d\n", getpid());
             fflush(stderr);
             return;
@@ -293,6 +398,21 @@ int pi_webview_macos_run(
         bridgeHandler.handleRequest = handle_request;
         bridgeHandler.freeResponse = free_response;
         [configuration.userContentController addScriptMessageHandler:bridgeHandler name:@"pi"];
+        const char *smokeInputUtf8 = getenv("PI_WEBVIEW_SMOKE_INPUT_TEXT");
+        NSString *smokeInputText = smokeInputUtf8 != NULL ? [NSString stringWithUTF8String:smokeInputUtf8] : @"webview ready input smoke";
+        if (smokeInputText == nil) {
+            smokeInputText = @"webview ready input smoke";
+        }
+        NSString *bootstrapScript = [NSString stringWithFormat:
+            @"window.__PI_WEBVIEW_NATIVE_BOOTSTRAP__={launchMonotonicMs:%.3f,readyInputSmoke:%@,smokeInputText:%@};",
+            pi_webview_monotonic_ms(),
+            pi_webview_env_enabled("PI_WEBVIEW_SMOKE_READY_INPUT") ? @"true" : @"false",
+            pi_webview_json_string_literal(smokeInputText)
+        ];
+        WKUserScript *bootstrapUserScript = [[WKUserScript alloc] initWithSource:bootstrapScript
+                                                                   injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                                forMainFrameOnly:YES];
+        [configuration.userContentController addUserScript:bootstrapUserScript];
 
         NSRect frame = NSMakeRect(0, 0, 1100, 760);
         NSWindow *window = [[NSWindow alloc]

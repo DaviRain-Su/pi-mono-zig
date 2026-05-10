@@ -143,6 +143,17 @@ pub fn runWebViewMode(
             @tagName(asset.source),
         },
     );
+    try stderr.print(
+        "PI_WEBVIEW_TELEMETRY name=process_start pid={d} wall_ms={d} monotonic_ns={d} provider={s} faux_provider={s} api_key_present={s}\n",
+        .{
+            currentProcessIdForLog(),
+            currentWallMilliseconds(),
+            currentMonotonicNanoseconds(),
+            options.provider,
+            boolText(std.mem.eql(u8, options.provider, "faux")),
+            boolText(options.api_key_present),
+        },
+    );
     try stderr.flush();
 
     var smoke_faux_registration: ?ai.providers.faux.FauxProviderRegistration = null;
@@ -602,6 +613,16 @@ fn currentProcessIdForLog() u64 {
     };
 }
 
+fn currentWallMilliseconds() i64 {
+    var now: std.c.timeval = undefined;
+    _ = std.c.gettimeofday(&now, null);
+    return @as(i64, @intCast(now.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(now.usec)), std.time.us_per_ms);
+}
+
+fn currentMonotonicNanoseconds() i128 {
+    return std.Io.Clock.now(.awake, std.Io.Threaded.global_single_threaded.io()).nanoseconds;
+}
+
 fn writeLaunchContextJson(
     allocator: std.mem.Allocator,
     session: *const session_mod.AgentSession,
@@ -798,4 +819,25 @@ test "startup cleanup state clears partial resources after injected backend fail
     const output = stderr_capture.writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "PI_WEBVIEW_CLEANUP") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "bridge_registered=true") != null);
+}
+
+test "webview frontend asset includes ready input responsiveness telemetry hooks" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "telemetry_mark") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "launch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "bridge_ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "hydrated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "input_focus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "typed_input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "readyInputSmoke") != null);
 }
