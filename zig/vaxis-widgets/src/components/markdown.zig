@@ -2,53 +2,62 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
-const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
-const resources_mod = @import("../theme.zig");
-const cell_rows = @import("../cell_rows.zig");
 
 const WrapMode = @FieldType(vaxis.Window.PrintOptions, "wrap");
 const vxfw = vaxis.vxfw;
 
-const MARKDOWN_TEXT_FALLBACK_STYLE: vaxis.Cell.Style = .{};
-const LINK_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const MARKDOWN_TEXT_FALLBACK_STYLE: vaxis.Cell.Style = .{};
+pub const LINK_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 45 },
     .ul_style = .single,
 };
-const CODE_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const CODE_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 214 },
     .bg = .{ .index = 236 },
 };
-const HEADER_ONE_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const HEADER_ONE_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .bold = true,
     .ul_style = .single,
 };
-const HEADER_TWO_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const HEADER_TWO_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 39 },
     .bold = true,
 };
-const QUOTE_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const QUOTE_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 244 },
     .italic = true,
 };
-const QUOTE_BORDER_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const QUOTE_BORDER_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 244 },
 };
-const LIST_BULLET_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const LIST_BULLET_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 45 },
 };
-const RULE_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const RULE_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 240 },
 };
-const CODE_BORDER_FALLBACK_STYLE: vaxis.Cell.Style = .{
+pub const CODE_BORDER_FALLBACK_STYLE: vaxis.Cell.Style = .{
     .fg = .{ .index = 244 },
+};
+
+pub const MarkdownStyles = struct {
+    text: vaxis.Cell.Style = MARKDOWN_TEXT_FALLBACK_STYLE,
+    heading: vaxis.Cell.Style = HEADER_TWO_FALLBACK_STYLE,
+    rule: vaxis.Cell.Style = RULE_FALLBACK_STYLE,
+    quote: vaxis.Cell.Style = QUOTE_FALLBACK_STYLE,
+    quote_border: vaxis.Cell.Style = QUOTE_BORDER_FALLBACK_STYLE,
+    list_bullet: vaxis.Cell.Style = LIST_BULLET_FALLBACK_STYLE,
+    code: vaxis.Cell.Style = CODE_FALLBACK_STYLE,
+    code_border: vaxis.Cell.Style = CODE_BORDER_FALLBACK_STYLE,
+    link: vaxis.Cell.Style = LINK_FALLBACK_STYLE,
 };
 
 pub const Markdown = struct {
     text: []const u8 = "",
     padding_x: usize = 0,
     padding_y: usize = 0,
-    theme: ?*const resources_mod.Theme = null,
+    styles: MarkdownStyles = .{},
 
     pub fn drawComponent(self: *const Markdown) draw_mod.Component {
         return .{
@@ -66,8 +75,8 @@ pub const Markdown = struct {
             return .{ .width = window.width, .height = 0 };
         }
 
-        const active_theme = self.theme;
-        fillWindow(window, resolvedStyle(active_theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE));
+        // using self.styles
+        fillWindow(window, self.styles.text);
 
         const content_window = innerWindow(window, self.padding_x, self.padding_y) orelse {
             return .{
@@ -98,7 +107,7 @@ pub const Markdown = struct {
                 if (isCodeFence(trimmed)) {
                     current_row += try drawCodeBlock(
                         ctx.arena,
-                        active_theme,
+                        self.styles,
                         content_window,
                         current_row,
                         code_block_language,
@@ -115,14 +124,14 @@ pub const Markdown = struct {
             }
 
             if (trimmed.len == 0) {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
                 current_row += 1;
                 line_index += 1;
                 continue;
             }
 
             if (isCodeFence(trimmed)) {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
                 in_code_block = true;
                 code_block_language = std.mem.trim(u8, trimmed[3..], " \t");
                 code_block_lines.clearRetainingCapacity();
@@ -131,24 +140,24 @@ pub const Markdown = struct {
             }
 
             if (parseHeadingLine(line)) |heading| {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
-                current_row += try drawHeadingLine(ctx.arena, active_theme, content_window, current_row, heading);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
+                current_row += try drawHeadingLine(ctx.arena, self.styles, content_window, current_row, heading);
                 line_index += 1;
                 continue;
             }
 
             if (isHorizontalRule(trimmed)) {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
-                current_row += try drawHorizontalRule(ctx.arena, active_theme, content_window, current_row);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
+                current_row += try drawHorizontalRule(ctx.arena, self.styles, content_window, current_row);
                 line_index += 1;
                 continue;
             }
 
             if (detectTableBlock(source_lines.items, line_index)) |table_match| {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
                 current_row += try drawTableBlock(
                     ctx.arena,
-                    active_theme,
+                    self.styles,
                     content_window,
                     current_row,
                     source_lines.items[line_index],
@@ -159,17 +168,17 @@ pub const Markdown = struct {
             }
 
             if (parseBlockquoteLine(line)) |quote| {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
-                current_row += try drawQuoteLine(ctx.arena, active_theme, content_window, current_row, quote);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
+                current_row += try drawQuoteLine(ctx.arena, self.styles, content_window, current_row, quote);
                 line_index += 1;
                 continue;
             }
 
             if (parseListItem(line)) |item| {
-                current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
+                current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
                 current_row += try drawListItemBlock(
                     ctx.arena,
-                    active_theme,
+                    self.styles,
                     content_window,
                     current_row,
                     item,
@@ -183,11 +192,11 @@ pub const Markdown = struct {
             line_index += 1;
         }
 
-        current_row += try flushParagraphLines(ctx.arena, active_theme, content_window, current_row, &paragraph_lines);
+        current_row += try flushParagraphLines(ctx.arena, self.styles, content_window, current_row, &paragraph_lines);
         if (in_code_block) {
             current_row += try drawCodeBlock(
                 ctx.arena,
-                active_theme,
+                self.styles,
                 content_window,
                 current_row,
                 code_block_language,
@@ -239,7 +248,7 @@ const TableMatch = struct {
 
 fn drawListItemBlock(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     item: ListItem,
@@ -264,7 +273,7 @@ fn drawListItemBlock(
         }
         return drawListCodeBlock(
             allocator,
-            theme,
+            styles,
             window,
             start_row,
             item,
@@ -275,9 +284,9 @@ fn drawListItemBlock(
 
     line_index.* += 1;
     if (parseBlockquoteLine(item.text)) |quote| {
-        return drawListQuoteLine(allocator, theme, window, start_row, item, quote);
+        return drawListQuoteLine(allocator, styles, window, start_row, item, quote);
     }
-    return drawListItem(allocator, theme, window, start_row, item);
+    return drawListItem(allocator, styles, window, start_row, item);
 }
 
 const TableBorderPosition = enum {
@@ -288,7 +297,7 @@ const TableBorderPosition = enum {
 
 fn flushParagraphLines(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     paragraph_lines: *std.ArrayList([]const u8),
@@ -299,8 +308,7 @@ fn flushParagraphLines(
     const joined = try joinParagraphLinesAlloc(allocator, paragraph_lines.items);
     const segments = try buildInlineSegments(
         allocator,
-        theme,
-        resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE),
+        styles.text,
         joined,
         null,
     );
@@ -309,26 +317,22 @@ fn flushParagraphLines(
 
 fn drawHeadingLine(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     heading: HeadingLine,
 ) std.mem.Allocator.Error!usize {
-    var base_style = resolvedStyle(
-        theme,
-        .markdown_heading,
-        if (heading.level == 1) HEADER_ONE_FALLBACK_STYLE else HEADER_TWO_FALLBACK_STYLE,
-    );
+    var base_style = if (heading.level == 1) mergeStyles(styles.heading, .{ .ul_style = .single }) else styles.heading;
     if (heading.level == 1) {
         base_style = mergeStyles(base_style, .{ .ul_style = .single });
     }
-    const segments = try buildInlineSegments(allocator, theme, base_style, heading.text, null);
+    const segments = try buildInlineSegments(allocator, base_style, heading.text, null);
     return drawWrappedSegments(allocator, window, start_row, segments, .word, null);
 }
 
 fn drawHorizontalRule(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
 ) std.mem.Allocator.Error!usize {
@@ -338,25 +342,25 @@ fn drawHorizontalRule(
         window,
         start_row,
         text,
-        resolvedStyle(theme, .markdown_rule, RULE_FALLBACK_STYLE),
+        styles.rule,
     );
     return 1;
 }
 
 fn drawQuoteLine(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     quote: BlockquoteLine,
 ) std.mem.Allocator.Error!usize {
-    const prefix_style = resolvedStyle(theme, .markdown_quote_border, QUOTE_BORDER_FALLBACK_STYLE);
-    const body_style = resolvedStyle(theme, .markdown_quote, QUOTE_FALLBACK_STYLE);
+    const prefix_style = styles.quote_border;
+    const body_style = styles.quote;
     const prefix_segments = [_]vaxis.Segment{.{
         .text = "▍ ",
         .style = prefix_style,
     }};
-    const body_segments = try buildInlineSegments(allocator, theme, body_style, quote.text, null);
+    const body_segments = try buildInlineSegments(allocator, body_style, quote.text, null);
     return drawPrefixedSegments(
         allocator,
         window,
@@ -371,16 +375,16 @@ fn drawQuoteLine(
 
 fn drawListQuoteLine(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     item: ListItem,
     quote: BlockquoteLine,
 ) std.mem.Allocator.Error!usize {
-    const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
-    const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
-    const prefix_style = resolvedStyle(theme, .markdown_quote_border, QUOTE_BORDER_FALLBACK_STYLE);
-    const body_style = resolvedStyle(theme, .markdown_quote, QUOTE_FALLBACK_STYLE);
+    const text_style = styles.text;
+    const bullet_style = styles.list_bullet;
+    const prefix_style = styles.quote_border;
+    const body_style = styles.quote;
     const indent = try normalizedListIndentAlloc(allocator, item.depth);
     const list_prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
     const list_continuation_prefix = try spaceString(allocator, list_prefix_width);
@@ -398,7 +402,7 @@ fn drawListQuoteLine(
     }
     try continuation_prefix.append(allocator, .{ .text = "▍ ", .style = prefix_style });
 
-    const body_segments = try buildInlineSegments(allocator, theme, body_style, quote.text, null);
+    const body_segments = try buildInlineSegments(allocator, body_style, quote.text, null);
     return drawPrefixedSegments(
         allocator,
         window,
@@ -413,13 +417,13 @@ fn drawListQuoteLine(
 
 fn drawListItem(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     item: ListItem,
 ) std.mem.Allocator.Error!usize {
-    const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
-    const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
+    const text_style = styles.text;
+    const bullet_style = styles.list_bullet;
     const indent = try normalizedListIndentAlloc(allocator, item.depth);
     const prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
     const continuation_prefix = try spaceString(allocator, prefix_width);
@@ -434,7 +438,7 @@ fn drawListItem(
         .text = continuation_prefix,
         .style = text_style,
     }};
-    const body_segments = try buildInlineSegments(allocator, theme, text_style, item.text, null);
+    const body_segments = try buildInlineSegments(allocator, text_style, item.text, null);
     return drawPrefixedSegments(
         allocator,
         window,
@@ -449,7 +453,7 @@ fn drawListItem(
 
 fn drawListCodeBlock(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     item: ListItem,
@@ -458,8 +462,8 @@ fn drawListCodeBlock(
 ) std.mem.Allocator.Error!usize {
     if (window.width == 0 or start_row >= window.height) return 0;
 
-    const text_style = resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
-    const bullet_style = resolvedStyle(theme, .markdown_list_bullet, LIST_BULLET_FALLBACK_STYLE);
+    const text_style = styles.text;
+    const bullet_style = styles.list_bullet;
     const indent = try normalizedListIndentAlloc(allocator, item.depth);
     const prefix_width = ansi.visibleWidth(indent) + ansi.visibleWidth(item.bullet);
     const continuation_prefix_text = try spaceString(allocator, prefix_width);
@@ -491,7 +495,7 @@ fn drawListCodeBlock(
     });
     const row_count = @max(
         @as(usize, 1),
-        try drawCodeBlock(allocator, theme, content_window, 0, language, code_lines),
+        try drawCodeBlock(allocator, styles, content_window, 0, language, code_lines),
     );
     drawPrefixRows(prefix_window, row_count, first_prefix.items, &continuation_prefix);
     return row_count;
@@ -499,7 +503,7 @@ fn drawListCodeBlock(
 
 fn drawCodeBlock(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     language: []const u8,
@@ -511,8 +515,8 @@ fn drawCodeBlock(
         .y_off = @intCast(start_row),
         .height = window.height - @as(u16, @intCast(start_row)),
     });
-    const border_style = resolvedStyle(theme, .markdown_code_border, CODE_BORDER_FALLBACK_STYLE);
-    const code_style = resolvedStyle(theme, .markdown_code, CODE_FALLBACK_STYLE);
+    const border_style = styles.code_border;
+    const code_style = styles.code;
 
     if (block_window.width < 4) {
         const fence = if (language.len > 0)
@@ -571,7 +575,7 @@ fn drawCodeBlock(
 
 fn drawTableBlock(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     window: vaxis.Window,
     start_row: usize,
     header_line: []const u8,
@@ -587,8 +591,7 @@ fn drawTableBlock(
     if (window.width <= border_overhead) {
         const segments = try buildInlineSegments(
             allocator,
-            theme,
-            resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE),
+            styles.text,
             header_line,
             null,
         );
@@ -603,9 +606,9 @@ fn drawTableBlock(
     const column_widths = try allocator.alloc(usize, column_count);
     for (column_widths) |*column_width| column_width.* = 3;
 
-    try updateColumnWidths(allocator, theme, header_cells, column_widths, true);
+    try updateColumnWidths(allocator, styles, header_cells, column_widths, true);
     for (row_cells) |cells| {
-        try updateColumnWidths(allocator, theme, cells, column_widths, false);
+        try updateColumnWidths(allocator, styles, cells, column_widths, false);
     }
     shrinkColumnWidths(column_widths, window.width - border_overhead);
 
@@ -613,7 +616,7 @@ fn drawTableBlock(
         .y_off = @intCast(start_row),
         .height = window.height - @as(u16, @intCast(start_row)),
     });
-    const border_style = resolvedStyle(theme, .markdown_code_border, CODE_BORDER_FALLBACK_STYLE);
+    const border_style = styles.code_border;
 
     const top = try buildTableBorderTextAlloc(allocator, column_widths, .top);
     const middle = try buildTableBorderTextAlloc(allocator, column_widths, .middle);
@@ -622,12 +625,12 @@ fn drawTableBlock(
     var row_cursor: usize = 0;
     drawTextAtRow(block_window, row_cursor, top, border_style);
     row_cursor += 1;
-    row_cursor += try drawTableRow(allocator, theme, block_window, row_cursor, header_cells, column_widths, true);
+    row_cursor += try drawTableRow(allocator, styles, block_window, row_cursor, header_cells, column_widths, true);
     drawTextAtRow(block_window, row_cursor, middle, border_style);
     row_cursor += 1;
 
     for (row_cells, 0..) |cells, index| {
-        row_cursor += try drawTableRow(allocator, theme, block_window, row_cursor, cells, column_widths, false);
+        row_cursor += try drawTableRow(allocator, styles, block_window, row_cursor, cells, column_widths, false);
         if (index + 1 < row_cells.len) {
             drawTextAtRow(block_window, row_cursor, middle, border_style);
             row_cursor += 1;
@@ -640,7 +643,7 @@ fn drawTableBlock(
 
 fn drawTableRow(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     table_window: vaxis.Window,
     start_row: usize,
     cells: []const []const u8,
@@ -653,17 +656,17 @@ fn drawTableRow(
         .y_off = @intCast(start_row),
         .height = table_window.height - @as(u16, @intCast(start_row)),
     });
-    const border_style = resolvedStyle(theme, .markdown_code_border, CODE_BORDER_FALLBACK_STYLE);
+    const border_style = styles.code_border;
     const base_style = if (header)
-        resolvedStyle(theme, .markdown_heading, HEADER_TWO_FALLBACK_STYLE)
+        styles.heading
     else
-        resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
+        styles.text;
 
     const cell_segments = try allocator.alloc([]const vaxis.Segment, column_widths.len);
     var row_height: usize = 1;
     for (column_widths, 0..) |column_width, index| {
         const cell_text = if (index < cells.len) cells[index] else "";
-        cell_segments[index] = try buildInlineSegments(allocator, theme, base_style, cell_text, null);
+        cell_segments[index] = try buildInlineSegments(allocator, base_style, cell_text, null);
 
         const remaining = remainingRows(row_window, 0);
         if (remaining == 0) continue;
@@ -854,19 +857,17 @@ fn measureSegmentsHeight(window: vaxis.Window, segments: []const vaxis.Segment, 
 
 fn buildInlineSegments(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
     base_style: vaxis.Cell.Style,
     text: []const u8,
     link_url: ?[]const u8,
 ) std.mem.Allocator.Error![]const vaxis.Segment {
     var segments = std.ArrayList(vaxis.Segment).empty;
-    try appendInlineSegments(allocator, theme, base_style, text, link_url, &segments);
+    try appendInlineSegments(allocator, base_style, text, link_url, &segments);
     return segments.toOwnedSlice(allocator);
 }
 
 fn appendInlineSegments(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
     current_style: vaxis.Cell.Style,
     text: []const u8,
     link_url: ?[]const u8,
@@ -876,10 +877,9 @@ fn appendInlineSegments(
     while (index < text.len) {
         if (text[index] == '[') {
             if (findLink(text, index)) |link| {
-                const link_style = mergeStyles(current_style, resolvedStyle(theme, .markdown_link, LINK_FALLBACK_STYLE));
+                const link_style = mergeStyles(current_style, LINK_FALLBACK_STYLE);
                 try appendInlineSegments(
                     allocator,
-                    theme,
                     link_style,
                     text[index + 1 .. link.label_end],
                     text[link.label_end + 2 .. link.url_end],
@@ -894,7 +894,7 @@ fn appendInlineSegments(
             if (findClosing(text, index + 2, "**")) |end| {
                 try appendInlineSegments(
                     allocator,
-                    theme,
+                    
                     mergeStyles(current_style, .{ .bold = true }),
                     text[index + 2 .. end],
                     link_url,
@@ -909,7 +909,7 @@ fn appendInlineSegments(
             if (findClosing(text, index + 1, "*")) |end| {
                 try appendInlineSegments(
                     allocator,
-                    theme,
+                    
                     mergeStyles(current_style, .{ .italic = true }),
                     text[index + 1 .. end],
                     link_url,
@@ -926,7 +926,7 @@ fn appendInlineSegments(
                     allocator,
                     segments,
                     text[index + 1 .. end],
-                    mergeStyles(current_style, resolvedStyle(theme, .markdown_code, CODE_FALLBACK_STYLE)),
+                    mergeStyles(current_style, CODE_FALLBACK_STYLE),
                     link_url,
                 );
                 index = end + 1;
@@ -1054,19 +1054,19 @@ fn buildTableRowScaffoldTextAlloc(
 
 fn updateColumnWidths(
     allocator: std.mem.Allocator,
-    theme: ?*const resources_mod.Theme,
+    styles: MarkdownStyles,
     cells: []const []const u8,
     column_widths: []usize,
     header: bool,
 ) std.mem.Allocator.Error!void {
     const base_style = if (header)
-        resolvedStyle(theme, .markdown_heading, HEADER_TWO_FALLBACK_STYLE)
+        styles.heading
     else
-        resolvedStyle(theme, .markdown_text, MARKDOWN_TEXT_FALLBACK_STYLE);
+        styles.text;
 
     for (column_widths, 0..) |*column_width, index| {
         const cell_text = if (index < cells.len) cells[index] else "";
-        const segments = try buildInlineSegments(allocator, theme, base_style, cell_text, null);
+        const segments = try buildInlineSegments(allocator, base_style, cell_text, null);
         column_width.* = @max(column_width.*, @max(@as(usize, 3), segmentsVisibleWidth(segments)));
     }
 }
@@ -1173,14 +1173,6 @@ fn renderedLineCount(result: vaxis.Window.PrintResult, had_text: bool, max_heigh
     return @min(max_height, result.row + if (result.col > 0) @as(u16, 1) else 0);
 }
 
-fn resolvedStyle(
-    theme: ?*const resources_mod.Theme,
-    token: resources_mod.ThemeToken,
-    fallback: vaxis.Cell.Style,
-) vaxis.Cell.Style {
-    if (theme) |active_theme| return style_mod.styleFor(active_theme, token);
-    return fallback;
-}
 
 fn mergeStyles(base: vaxis.Cell.Style, overlay: vaxis.Cell.Style) vaxis.Cell.Style {
     var merged = base;
@@ -1481,7 +1473,7 @@ test "markdown renders headings lists blockquotes rules and code blocks with cel
     var screen = try test_helpers.renderToScreen(markdown.drawComponent(), 24, 8);
     defer screen.deinit(std.testing.allocator);
 
-    try test_helpers.expectCell(&screen, 0, 0, "H", mergeStyles(HEADER_ONE_FALLBACK_STYLE, .{ .ul_style = .single }));
+    try test_helpers.expectCell(&screen, 0, 0, "H", mergeStyles(HEADER_TWO_FALLBACK_STYLE, .{ .ul_style = .single }));
     try test_helpers.expectCell(&screen, 0, 1, "•", LIST_BULLET_FALLBACK_STYLE);
     try test_helpers.expectCell(&screen, 0, 2, "▍", QUOTE_BORDER_FALLBACK_STYLE);
     try test_helpers.expectCell(&screen, 0, 3, "─", RULE_FALLBACK_STYLE);

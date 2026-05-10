@@ -1,5 +1,5 @@
 const std = @import("std");
-const select_list = @import("vaxis-widgets").components.select_list;
+const select_list = @import("select_list.zig");
 
 pub const Item = select_list.SelectItem;
 

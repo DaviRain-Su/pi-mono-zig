@@ -5,7 +5,6 @@ const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const keys = @import("../keys.zig");
 const select_list = @import("select_list.zig");
-const style_mod = @import("../style.zig");
 const test_helpers = @import("../test_helpers.zig");
 
 pub const HandleResult = enum {

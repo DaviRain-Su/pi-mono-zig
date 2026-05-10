@@ -2,7 +2,7 @@ const std = @import("std");
 const ESC = "\x1b";
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
-const keys = @import("keys.zig");
+const keys = @import("vaxis-widgets").keys;
 
 pub const Size = struct {
     width: usize,

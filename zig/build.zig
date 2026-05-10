@@ -80,6 +80,13 @@ pub fn build(b: *std.Build) void {
     });
     agent_mod.addImport("ai", ai_mod);
 
+    const vaxis_widgets_mod = b.createModule(.{
+        .root_source_file = b.path("vaxis-widgets/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vaxis_widgets_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+
     const tui_mod = b.createModule(.{
         .root_source_file = b.path("src/tui/root.zig"),
         .target = target,
@@ -87,6 +94,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    tui_mod.addImport("vaxis-widgets", vaxis_widgets_mod);
 
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);

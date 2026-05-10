@@ -285,13 +285,16 @@ fn renderRow(
         var x: u16 = 0;
         var byte_idx: usize = 0;
         while (byte_idx < highlight_symbol.len and x < selection_width) {
-            const grapheme = extractGrapheme(highlight_symbol[byte_idx..]);
+            const cluster = ansi.nextDisplayCluster(highlight_symbol, byte_idx);
+            if (cluster.end <= byte_idx) break;
+            const cluster_width: u8 = @intCast(cluster.width);
+            if (x + @as(u16, cluster_width) > selection_width) break;
             window.writeCell(x, row_y, .{
-                .char = .{ .grapheme = grapheme, .width = 1 },
+                .char = .{ .grapheme = highlight_symbol[byte_idx..cluster.end], .width = cluster_width },
                 .style = sym_style,
             });
-            x += 1;
-            byte_idx += grapheme.len;
+            x += @as(u16, cluster_width);
+            byte_idx = cluster.end;
         }
     }
 
@@ -348,15 +351,19 @@ fn renderRow(
         // Write text
         var byte_idx: usize = 0;
         var written: u16 = 0;
-        while (byte_idx < visible_text.len and written < max_width - left_pad - indicator_width) {
-            const grapheme = extractGrapheme(visible_text[byte_idx..]);
+        const available_text_width = max_width - left_pad - indicator_width;
+        while (byte_idx < visible_text.len and written < available_text_width) {
+            const cluster = ansi.nextDisplayCluster(visible_text, byte_idx);
+            if (cluster.end <= byte_idx) break;
+            const cluster_width: u8 = @intCast(cluster.width);
+            if (written + @as(u16, cluster_width) > available_text_width) break;
             window.writeCell(x, row_y, .{
-                .char = .{ .grapheme = grapheme, .width = 1 },
+                .char = .{ .grapheme = visible_text[byte_idx..cluster.end], .width = cluster_width },
                 .style = effective_style,
             });
-            x += 1;
-            byte_idx += grapheme.len;
-            written += 1;
+            x += @as(u16, cluster_width);
+            byte_idx = cluster.end;
+            written += @as(u16, cluster_width);
         }
 
         // Write sort indicator
@@ -397,13 +404,6 @@ fn mergeStyle(base: vaxis.Cell.Style, overlay: vaxis.Cell.Style) vaxis.Cell.Styl
         .italic = overlay.italic or base.italic,
         .ul_style = if (overlay.ul_style != .off) overlay.ul_style else base.ul_style,
     };
-}
-
-fn extractGrapheme(text: []const u8) []const u8 {
-    if (text.len == 0) return " ";
-    if (text[0] < 0x80) return text[0..1];
-    // Conservative: return first byte, vaxis handles clustering
-    return text[0..1];
 }
 
 test "TableState select and scroll" {

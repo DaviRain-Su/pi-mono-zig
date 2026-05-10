@@ -1,6 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const draw_mod = @import("draw.zig");
+const draw_mod = @import("vaxis-widgets").draw;
 const terminal_mod = @import("terminal.zig");
 
 pub const OverlayAnchor = enum {

@@ -1,15 +1,16 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 
-const box_mod = @import("components/box.zig");
-const editor_mod = @import("components/editor.zig");
-const loader_mod = @import("components/loader.zig");
-const markdown_mod = @import("components/markdown.zig");
-const select_list_mod = @import("components/select_list.zig");
-const spacer_mod = @import("components/spacer.zig");
-const test_helpers = @import("test_helpers.zig");
-const text_mod = @import("components/text.zig");
-const draw_mod = @import("draw.zig");
+const vw = @import("vaxis-widgets");
+const box_mod = vw.components.box;
+const editor_mod = vw.components.editor;
+const loader_mod = vw.components.loader;
+const markdown_mod = vw.components.markdown;
+const select_list_mod = vw.components.select_list;
+const spacer_mod = vw.components.spacer;
+const test_helpers = vw.test_helpers;
+const text_mod = vw.components.text;
+const draw_mod = vw.draw;
 
 const M8_RENDER_BASELINE_NS_PER_FRAME: u64 = 5_000_000;
 const M8_RENDER_SANITY_NS_PER_FRAME: u64 = 250_000_000;
