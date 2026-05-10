@@ -146,6 +146,7 @@
         lastSequenceByTurn: new Map(),
         submitPerfByTurn: new Map(),
         firstDeltaSeenByTurn: new Set(),
+        locallyAbortedTurns: new Set(),
         liveAssistantByTurn: new Map(),
         statusBaseText: "bridge: initializing",
         promptEnabled: true,
@@ -367,6 +368,14 @@
         const event = frame.event || {};
         const assistant = event.assistantMessageEvent || {};
         if (assistant.delta) {
+          if (state.locallyAbortedTurns.has(frame.turnId)) {
+            markTelemetry("late_assistant_delta_suppressed", {
+              turnId: frame.turnId,
+              sequence: frame.sequence,
+              valueLength: assistant.delta.length,
+            });
+            return;
+          }
           scheduleAssistantFlush(frame.turnId, frame, assistant.delta);
         } else if (assistant.type) {
           if (assistant.type === "start" || assistant.type.endsWith("_start")) {
@@ -383,6 +392,14 @@
             appendBlock("event", `${frame.sequence} terminal`, terminalText);
           }
           stopActiveFrameMonitor(frame.turnId, frame.terminalOutcome || "done");
+          if (frame.terminalOutcome === "provider_error") {
+            promptInputEl.disabled = false;
+            setRunningState(false, { turnId: frame.turnId });
+            markTelemetry("provider_error_retry_ready", {
+              turnId: frame.turnId,
+              errorToRetryReadyMs: 0,
+            });
+          }
         } else if (isTranscriptLifecycleEvent(frame.type)) {
           markTelemetry("lifecycle_event_coalesced", {
             turnId: frame.turnId,
@@ -539,6 +556,18 @@
             turnId: result.turnId,
             submitToRunningMs: performance.now() - submitPerfMs,
           });
+          if (nativeBootstrap.autoAbortMs > 0) {
+            const abortDelayMs = Number(nativeBootstrap.autoAbortMs);
+            setTimeout(() => {
+              if (state.activeTurnId === result.turnId && !abortButtonEl.disabled) {
+                markTelemetry("auto_abort_scheduled", {
+                  turnId: result.turnId,
+                  valueLength: abortDelayMs,
+                });
+                abortButtonEl.click();
+              }
+            }, abortDelayMs);
+          }
           await pollTurnEvents(result.turnId);
           const terminalPerfMs = performance.now();
           markTelemetry("terminal_state", {
@@ -560,12 +589,24 @@
       });
 
       abortButtonEl.addEventListener("click", async () => {
+        const abortPerfMs = performance.now();
         try {
           const turnId = state.activeTurnId;
           markTelemetry("abort_action", { turnId: turnId || "none" });
-          if (turnId) statusEl.textContent = `${state.statusBaseText} · aborting`;
+          if (turnId) {
+            state.locallyAbortedTurns.add(turnId);
+            statusEl.textContent = `${state.statusBaseText} · aborting`;
+            markTelemetry("abort_visible_state", {
+              turnId,
+              abortToVisibleMs: performance.now() - abortPerfMs,
+            });
+          }
           const result = await sendBridge("abort");
           appendBlock("event", "abort", result.status);
+          markTelemetry("abort_response", {
+            turnId: turnId || "none",
+            abortToVisibleMs: performance.now() - abortPerfMs,
+          });
         } catch (error) {
           appendBlock("event", "abort error", String(error.message || error));
         }

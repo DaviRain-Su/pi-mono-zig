@@ -53,6 +53,19 @@ static BOOL pi_webview_env_enabled(const char *name) {
     return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0;
 }
 
+static long pi_webview_env_positive_long(const char *name, long default_value) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || parsed < 0) {
+        return default_value;
+    }
+    return parsed;
+}
+
 static NSString *pi_webview_json_string_literal(NSString *value) {
     NSString *safeValue = value ?: @"";
     NSError *error = nil;
@@ -116,7 +129,7 @@ static void pi_webview_log_telemetry(NSDictionary *payload) {
     NSString *provider = pi_webview_safe_telemetry_string(payload[@"provider"]);
     fprintf(
         stderr,
-        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f sequence=%.0f visible_delta_index=%.0f child_count=%.0f reused_surface=%s max_active_frame_gap_ms=%.3f stall_over_100=%s\n",
+        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f abort_to_visible_ms=%.3f error_to_retry_ready_ms=%.3f sequence=%.0f visible_delta_index=%.0f child_count=%.0f reused_surface=%s max_active_frame_gap_ms=%.3f stall_over_100=%s\n",
         [name UTF8String],
         getpid(),
         pi_webview_monotonic_ms(),
@@ -138,6 +151,8 @@ static void pi_webview_log_telemetry(NSDictionary *payload) {
         pi_webview_telemetry_number(payload, @"submitToRunningMs"),
         pi_webview_telemetry_number(payload, @"submitToFirstDeltaMs"),
         pi_webview_telemetry_number(payload, @"submitToTerminalMs"),
+        pi_webview_telemetry_number(payload, @"abortToVisibleMs"),
+        pi_webview_telemetry_number(payload, @"errorToRetryReadyMs"),
         pi_webview_telemetry_number(payload, @"sequence"),
         pi_webview_telemetry_number(payload, @"visibleDeltaIndex"),
         pi_webview_telemetry_number(payload, @"childCount"),
@@ -414,16 +429,27 @@ int pi_webview_macos_run(
             smokeInputText = @"webview ready input smoke";
         }
         const char *autoSubmitUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT");
-        NSString *autoSubmitPrompt = autoSubmitUtf8 != NULL ? [NSString stringWithUTF8String:autoSubmitUtf8] : @"";
+        const char *autoAbortUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_ABORT_PROMPT");
+        const char *autoProviderErrorUtf8 = getenv("PI_WEBVIEW_SMOKE_AUTO_PROVIDER_ERROR_PROMPT");
+        const char *selectedAutoSubmitUtf8 = autoSubmitUtf8;
+        if (selectedAutoSubmitUtf8 == NULL || selectedAutoSubmitUtf8[0] == '\0') {
+            selectedAutoSubmitUtf8 = autoAbortUtf8;
+        }
+        if (selectedAutoSubmitUtf8 == NULL || selectedAutoSubmitUtf8[0] == '\0') {
+            selectedAutoSubmitUtf8 = autoProviderErrorUtf8;
+        }
+        NSString *autoSubmitPrompt = selectedAutoSubmitUtf8 != NULL ? [NSString stringWithUTF8String:selectedAutoSubmitUtf8] : @"";
         if (autoSubmitPrompt == nil) {
             autoSubmitPrompt = @"";
         }
+        long autoAbortMs = autoAbortUtf8 != NULL ? pi_webview_env_positive_long("PI_WEBVIEW_SMOKE_AUTO_ABORT_MS", 150) : 0;
         NSString *bootstrapScript = [NSString stringWithFormat:
-            @"window.__PI_WEBVIEW_NATIVE_BOOTSTRAP__={launchMonotonicMs:%.3f,readyInputSmoke:%@,smokeInputText:%@,autoSubmitPrompt:%@};",
+            @"window.__PI_WEBVIEW_NATIVE_BOOTSTRAP__={launchMonotonicMs:%.3f,readyInputSmoke:%@,smokeInputText:%@,autoSubmitPrompt:%@,autoAbortMs:%ld};",
             pi_webview_monotonic_ms(),
             pi_webview_env_enabled("PI_WEBVIEW_SMOKE_READY_INPUT") ? @"true" : @"false",
             pi_webview_json_string_literal(smokeInputText),
-            pi_webview_json_string_literal(autoSubmitPrompt)
+            pi_webview_json_string_literal(autoSubmitPrompt),
+            autoAbortMs
         ];
         WKUserScript *bootstrapUserScript = [[WKUserScript alloc] initWithSource:bootstrapScript
                                                                    injectionTime:WKUserScriptInjectionTimeAtDocumentStart

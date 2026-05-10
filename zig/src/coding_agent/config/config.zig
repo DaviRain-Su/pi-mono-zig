@@ -893,11 +893,16 @@ fn parseResourceLimits(
     return limits;
 }
 
-const OptionalResourceLimitInteger = union(enum) {
-    absent,
-    invalid,
-    value: u64,
-};
+/// Generic tri-state for optional config fields: absent, invalid, or a parsed value.
+pub fn OptionalField(comptime T: type) type {
+    return union(enum) {
+        absent,
+        invalid,
+        value: T,
+    };
+}
+
+const OptionalResourceLimitInteger = OptionalField(u64);
 
 fn parseAndAssignResourceLimitInteger(
     allocator: std.mem.Allocator,
@@ -936,11 +941,7 @@ fn parseOptionalResourceLimitInteger(
     return .{ .value = @intCast(field.integer) };
 }
 
-const OptionalToolScopes = union(enum) {
-    absent,
-    invalid,
-    value: []const []const u8,
-};
+const OptionalToolScopes = OptionalField([]const []const u8);
 
 fn parseOptionalToolScopes(
     allocator: std.mem.Allocator,

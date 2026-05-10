@@ -279,15 +279,61 @@ pub fn isApiKeyLoginProvider(
     return true;
 }
 
+/// Compile-time OAuth provider descriptor used to dispatch browser-login
+/// start requests without a hand-maintained if-chain.
+const OAuthLoginProvider = struct {
+    id: []const u8,
+    kind: BrowserLoginKind,
+    authorize_url: []const u8,
+    redirect_uri: []const u8,
+    scope: []const u8,
+    /// Extra query-string parameters appended to the authorization URL.
+    extra_params: []const u8 = "",
+    /// When set, the initial `code=true` parameter is added.
+    has_code_param: bool = false,
+    /// When true, client_secret is required (Google).
+    require_client_secret: bool = false,
+};
+
+const OAUTH_LOGIN_PROVIDERS_REGISTRY = [_]OAuthLoginProvider{
+    .{
+        .id = "anthropic",
+        .kind = .anthropic,
+        .authorize_url = ANTHROPIC_AUTHORIZE_URL,
+        .redirect_uri = ANTHROPIC_REDIRECT_URI,
+        .scope = ANTHROPIC_SCOPES,
+        .has_code_param = true,
+    },
+    .{
+        .id = "openai-codex",
+        .kind = .openai_codex,
+        .authorize_url = OPENAI_CODEX_AUTHORIZE_URL,
+        .redirect_uri = OPENAI_CODEX_REDIRECT_URI,
+        .scope = OPENAI_CODEX_SCOPES,
+        .extra_params = "&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=" ++ OPENAI_CODEX_ORIGINATOR,
+    },
+    .{
+        .id = "google-gemini-cli",
+        .kind = .google_gemini_cli,
+        .authorize_url = GOOGLE_AUTHORIZE_URL,
+        .redirect_uri = GOOGLE_REDIRECT_URI,
+        .scope = "", // built dynamically from GOOGLE_SCOPES
+        .extra_params = "&access_type=offline&prompt=consent",
+        .require_client_secret = true,
+    },
+};
+
 pub fn startBrowserLogin(
     allocator: std.mem.Allocator,
     io: std.Io,
     env_map: *const std.process.Environ.Map,
     provider_id: []const u8,
 ) !BrowserLoginSession {
-    if (std.mem.eql(u8, provider_id, "anthropic")) return startAnthropicBrowserLogin(allocator, io, env_map);
-    if (std.mem.eql(u8, provider_id, "openai-codex")) return startOpenAICodexBrowserLogin(allocator, io, env_map);
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) return startGoogleBrowserLogin(allocator, io, env_map);
+    for (OAUTH_LOGIN_PROVIDERS_REGISTRY) |desc| {
+        if (std.mem.eql(u8, provider_id, desc.id)) {
+            return startBrowserLoginForDescriptor(allocator, io, env_map, desc);
+        }
+    }
     return error.UnsupportedProvider;
 }
 
@@ -296,48 +342,7 @@ pub fn startAnthropicBrowserLogin(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
 ) !BrowserLoginSession {
-    const provider = findSupportedProvider("anthropic").?;
-    const verifier = try generatePkceVerifier(allocator, io);
-    errdefer allocator.free(verifier);
-    const state = try allocator.dupe(u8, verifier);
-    errdefer allocator.free(state);
-    const challenge = try generatePkceChallenge(allocator, verifier);
-    defer allocator.free(challenge);
-    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
-    errdefer oauth_client.deinit(allocator);
-    const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_redirect_uri = try formEncode(allocator, ANTHROPIC_REDIRECT_URI);
-    defer allocator.free(encoded_redirect_uri);
-    const encoded_scope = try formEncode(allocator, ANTHROPIC_SCOPES);
-    defer allocator.free(encoded_scope);
-    const encoded_challenge = try formEncode(allocator, challenge);
-    defer allocator.free(encoded_challenge);
-    const encoded_state = try formEncode(allocator, state);
-    defer allocator.free(encoded_state);
-
-    const auth_url = try std.fmt.allocPrint(
-        allocator,
-        "{s}?code=true&client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}",
-        .{
-            ANTHROPIC_AUTHORIZE_URL,
-            encoded_client_id,
-            encoded_redirect_uri,
-            encoded_scope,
-            encoded_challenge,
-            encoded_state,
-        },
-    );
-
-    return .{
-        .kind = .anthropic,
-        .provider_id = provider.id,
-        .provider_name = provider.name,
-        .oauth_client = oauth_client,
-        .auth_url = auth_url,
-        .verifier = verifier,
-        .state = state,
-    };
+    return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[0]);
 }
 
 pub fn startOpenAICodexBrowserLogin(
@@ -345,51 +350,7 @@ pub fn startOpenAICodexBrowserLogin(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
 ) !BrowserLoginSession {
-    const provider = findSupportedProviderByAuthType("openai-codex", .oauth).?;
-    const verifier = try generatePkceVerifier(allocator, io);
-    errdefer allocator.free(verifier);
-    const state = try generateOpenAICodexState(allocator, io);
-    errdefer allocator.free(state);
-    const challenge = try generatePkceChallenge(allocator, verifier);
-    defer allocator.free(challenge);
-    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, false);
-    errdefer oauth_client.deinit(allocator);
-    const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
-    defer allocator.free(encoded_client_id);
-    const encoded_redirect_uri = try formEncode(allocator, OPENAI_CODEX_REDIRECT_URI);
-    defer allocator.free(encoded_redirect_uri);
-    const encoded_scope = try formEncode(allocator, OPENAI_CODEX_SCOPES);
-    defer allocator.free(encoded_scope);
-    const encoded_challenge = try formEncode(allocator, challenge);
-    defer allocator.free(encoded_challenge);
-    const encoded_state = try formEncode(allocator, state);
-    defer allocator.free(encoded_state);
-    const encoded_originator = try formEncode(allocator, OPENAI_CODEX_ORIGINATOR);
-    defer allocator.free(encoded_originator);
-
-    const auth_url = try std.fmt.allocPrint(
-        allocator,
-        "{s}?response_type=code&client_id={s}&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={s}",
-        .{
-            OPENAI_CODEX_AUTHORIZE_URL,
-            encoded_client_id,
-            encoded_redirect_uri,
-            encoded_scope,
-            encoded_challenge,
-            encoded_state,
-            encoded_originator,
-        },
-    );
-
-    return .{
-        .kind = .openai_codex,
-        .provider_id = provider.id,
-        .provider_name = provider.name,
-        .oauth_client = oauth_client,
-        .auth_url = auth_url,
-        .verifier = verifier,
-        .state = state,
-    };
+    return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[1]);
 }
 
 pub fn startGoogleBrowserLogin(
@@ -397,47 +358,75 @@ pub fn startGoogleBrowserLogin(
     io: std.Io,
     env_map: *const std.process.Environ.Map,
 ) !BrowserLoginSession {
-    const provider = findSupportedProvider("google-gemini-cli").?;
+    return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[2]);
+}
+
+fn startBrowserLoginForDescriptor(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    desc: OAuthLoginProvider,
+) !BrowserLoginSession {
+    const provider = findSupportedProvider(desc.id) orelse return error.UnsupportedProvider;
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
-    const state = try allocator.dupe(u8, verifier);
+
+    const state = if (std.mem.eql(u8, desc.id, "openai-codex"))
+        try generateOpenAICodexState(allocator, io)
+    else
+        try allocator.dupe(u8, verifier);
     errdefer allocator.free(state);
+
     const challenge = try generatePkceChallenge(allocator, verifier);
     defer allocator.free(challenge);
-    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, provider.id, true);
+
+    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, desc.id, desc.require_client_secret);
     errdefer oauth_client.deinit(allocator);
+
     const encoded_client_id = try formEncode(allocator, oauth_client.client_id);
     defer allocator.free(encoded_client_id);
-    const encoded_redirect_uri = try formEncode(allocator, GOOGLE_REDIRECT_URI);
+
+    const encoded_redirect_uri = try formEncode(allocator, desc.redirect_uri);
     defer allocator.free(encoded_redirect_uri);
-    const joined_scope = try std.mem.join(allocator, " ", &GOOGLE_SCOPES);
-    defer allocator.free(joined_scope);
-    const encoded_scope = try formEncode(allocator, joined_scope);
+
+    const scope_text = if (std.mem.eql(u8, desc.id, "google-gemini-cli"))
+        try std.mem.join(allocator, " ", &GOOGLE_SCOPES)
+    else
+        try allocator.dupe(u8, desc.scope);
+    defer allocator.free(scope_text);
+
+    const encoded_scope = try formEncode(allocator, scope_text);
     defer allocator.free(encoded_scope);
+
     const encoded_challenge = try formEncode(allocator, challenge);
     defer allocator.free(encoded_challenge);
+
     const encoded_state = try formEncode(allocator, state);
     defer allocator.free(encoded_state);
 
-    const auth_url = try std.fmt.allocPrint(
+    const code_param = if (desc.has_code_param) "code=true&" else "";
+    const base_url = try std.fmt.allocPrint(
         allocator,
-        "{s}?client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&access_type=offline&prompt=consent",
+        "{s}?{s}client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}{s}",
         .{
-            GOOGLE_AUTHORIZE_URL,
+            desc.authorize_url,
+            code_param,
             encoded_client_id,
             encoded_redirect_uri,
             encoded_scope,
             encoded_challenge,
             encoded_state,
+            desc.extra_params,
         },
     );
+    defer allocator.free(base_url);
 
     return .{
-        .kind = .google_gemini_cli,
+        .kind = desc.kind,
         .provider_id = provider.id,
         .provider_name = provider.name,
         .oauth_client = oauth_client,
-        .auth_url = auth_url,
+        .auth_url = try allocator.dupe(u8, base_url),
         .verifier = verifier,
         .state = state,
     };

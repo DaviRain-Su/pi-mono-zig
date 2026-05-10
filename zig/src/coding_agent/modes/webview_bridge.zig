@@ -229,6 +229,10 @@ pub const BridgeHost = struct {
         self.event_mutex.lockUncancelable(self.context.session.io);
         defer self.event_mutex.unlock(self.context.session.io);
         errdefer self.worker_allocator.free(frame);
+        if (self.terminal_seen) {
+            self.worker_allocator.free(frame);
+            return;
+        }
         try self.event_frames.append(self.worker_allocator, .{
             .sequence = sequence,
             .terminal = terminal,
@@ -2238,6 +2242,88 @@ test "webview abort cancels active generation suppresses late events and support
     defer allocator.free(retry_events);
     try std.testing.expect(std.mem.indexOf(u8, retry_events, "\"terminalOutcome\":\"success\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, retry_events, "retry succeeded") != null);
+}
+
+test "webview queued events ignore post-terminal assistant mutations" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.worker_allocator = allocator;
+    defer bridge.deinit();
+
+    var capture = PromptEventCapture.init(allocator, &bridge, "session", "turn");
+    defer capture.deinit();
+    try capture.appendSyntheticTerminal("abort", "Request was aborted");
+    try bridge.enqueueEventFrame(
+        try allocator.dupe(u8, "{\"sessionId\":\"session\",\"turnId\":\"turn\",\"sequence\":2,\"type\":\"message_update\",\"terminal\":false,\"event\":{\"assistantMessageEvent\":{\"delta\":\"late full content\"}}}"),
+        2,
+        false,
+        "success",
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), bridge.event_frames.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, bridge.event_frames.items[0].bytes, "Request was aborted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bridge.event_frames.items[0].bytes, "late full content") == null);
+}
+
+test "webview provider error returns retry-ready promptly" {
+    const allocator = std.testing.allocator;
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(allocator, .{});
+    defer registration.unregister();
+    const error_blocks = [_]faux.FauxContentBlock{faux.fauxText("partial before retryable error")};
+    const retry_blocks = [_]faux.FauxContentBlock{faux.fauxText("retry after provider error succeeded")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(error_blocks[0..], .{
+            .stop_reason = .error_reason,
+            .error_message = "retryable provider error",
+        }) },
+        .{ .message = faux.fauxAssistantMessage(retry_blocks[0..], .{}) },
+    });
+
+    var session = try testSessionWithModel(allocator, registration.getModel());
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    defer bridge.deinit();
+    bridge.context.model = registration.getModel();
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt-error\",\"command\":\"prompt\",\"payload\":{\"text\":\"trigger retryable error\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    const turn_id = try extractResultStringField(allocator, prompt, "turnId");
+    defer allocator.free(turn_id);
+    const events = try waitForTerminalEvents(allocator, &bridge, turn_id);
+    defer allocator.free(events);
+    try std.testing.expect(std.mem.indexOf(u8, events, "\"terminalOutcome\":\"provider_error\"") != null);
+
+    const retry_deadline_ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds + 500 * std.time.ns_per_ms;
+    var retry_response: ?[]u8 = null;
+    while (std.Io.Clock.now(.awake, std.testing.io).nanoseconds < retry_deadline_ns) {
+        const retry = try bridge.handleRequestJson(
+            allocator,
+            "{\"id\":\"retry-after-error\",\"command\":\"prompt\",\"payload\":{\"text\":\"retry after error\"}}",
+            trusted_bundle_origin,
+        );
+        if (std.mem.indexOf(u8, retry, "\"status\":\"accepted\"") != null) {
+            retry_response = retry;
+            break;
+        }
+        allocator.free(retry);
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    const accepted_retry = retry_response orelse return error.TestTimeout;
+    defer allocator.free(accepted_retry);
+    const retry_turn_id = try extractResultStringField(allocator, accepted_retry, "turnId");
+    defer allocator.free(retry_turn_id);
+    const retry_events = try waitForTerminalEvents(allocator, &bridge, retry_turn_id);
+    defer allocator.free(retry_events);
+    try std.testing.expect(std.mem.indexOf(u8, retry_events, "\"terminalOutcome\":\"success\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retry_events, "retry after provider error succeeded") != null);
 }
 
 test "webview close aborts active generation cleanup path" {

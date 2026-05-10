@@ -471,6 +471,29 @@ fn configureFauxWebViewSmokeFixtures(
     registration_out: *?ai.providers.faux.FauxProviderRegistration,
 ) !void {
     if (!std.mem.eql(u8, provider, "faux")) return;
+    if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_PROVIDER_ERROR_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{});
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewProviderErrorSmokeFactory },
+            .{ .factory = webViewRetrySmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
+    if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_ABORT_PROMPT") != null) {
+        const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
+            .tokens_per_second = 5,
+            .token_size = .{ .min = 1, .max = 1 },
+        });
+        errdefer registration.unregister();
+        try registration.setResponses(&[_]ai.providers.faux.FauxResponseStep{
+            .{ .factory = webViewSlowSmokeFactory },
+            .{ .factory = webViewRetrySmokeFactory },
+        });
+        registration_out.* = registration;
+        return;
+    }
     if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT") != null) {
         const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
             .tokens_per_second = 80,
@@ -917,4 +940,24 @@ test "webview frontend asset streams into one coalesced live assistant surface" 
     try std.testing.expect(std.mem.indexOf(u8, html, "streaming_surface_reused") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "messagesEl.childElementCount") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "transcript_refresh_skipped") != null);
+}
+
+test "webview frontend asset includes abort and provider-error responsiveness hooks" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "autoAbortMs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "locallyAbortedTurns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "abort_visible_state") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "abort_response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "late_assistant_delta_suppressed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "provider_error_retry_ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "errorToRetryReadyMs") != null);
 }
