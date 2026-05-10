@@ -139,13 +139,13 @@ pub const NormalizedManifest = struct {
         var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         errdefer common.deinitJsonValue(allocator, .{ .object = entry });
 
-        try common.putValue(allocator, &entry, "id", .{ .string = try allocator.dupe(u8, self.id) });
-        try common.putValue(allocator, &entry, "name", .{ .string = try allocator.dupe(u8, self.name) });
-        try common.putValue(allocator, &entry, "version", .{ .string = try allocator.dupe(u8, self.version) });
-        try common.putValue(allocator, &entry, "description", .{ .string = try allocator.dupe(u8, self.description) });
-        try common.putValue(allocator, &entry, "schemaVersion", .{ .string = try allocator.dupe(u8, self.schema_version) });
-        try common.putValue(allocator, &entry, "manifestPath", .{ .string = try allocator.dupe(u8, self.manifest_path) });
-        try common.putValue(allocator, &entry, "packageRoot", .{ .string = try allocator.dupe(u8, self.package_root) });
+        try common.putString(allocator, &entry, "id", self.id);
+        try common.putString(allocator, &entry, "name", self.name);
+        try common.putString(allocator, &entry, "version", self.version);
+        try common.putString(allocator, &entry, "description", self.description);
+        try common.putString(allocator, &entry, "schemaVersion", self.schema_version);
+        try common.putString(allocator, &entry, "manifestPath", self.manifest_path);
+        try common.putString(allocator, &entry, "packageRoot", self.package_root);
         try common.putBool(allocator, &entry, "active", active);
         try common.putValue(allocator, &entry, "inactiveReason", if (inactive_reason) |reason| .{ .string = try allocator.dupe(u8, reason) } else .null);
         try common.putValue(allocator, &entry, "sourceScope", if (source_scope) |scope| .{ .string = try allocator.dupe(u8, scope) } else .null);
@@ -153,8 +153,8 @@ pub const NormalizedManifest = struct {
 
         var runtime = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         errdefer common.deinitJsonValue(allocator, .{ .object = runtime });
-        try common.putValue(allocator, &runtime, "kind", .{ .string = try allocator.dupe(u8, self.runtime_kind.jsonName()) });
-        try common.putValue(allocator, &runtime, "adapter", .{ .string = try allocator.dupe(u8, self.runtime_kind.adapterName()) });
+        try common.putString(allocator, &runtime, "kind", self.runtime_kind.jsonName());
+        try common.putString(allocator, &runtime, "adapter", self.runtime_kind.adapterName());
         try common.putBool(allocator, &runtime, "executable", self.runtime_kind.executable());
         try common.putValue(allocator, &runtime, "entrypoint", try common.cloneJsonValue(allocator, self.runtime_entrypoint));
         try common.putValue(allocator, &runtime, "limits", try common.cloneJsonValue(allocator, self.runtime_limits));
@@ -784,7 +784,7 @@ fn normalizeHooks(
         errdefer common.deinitJsonValue(allocator, .{ .object = hook });
         if (hook.get("priority") == null) try common.putInt(allocator, &hook, "priority", 0);
         if (hook.get("declarationOrder") == null) try common.putInt(allocator, &hook, "declarationOrder", @intCast(index));
-        if (hook.get("errorPolicy") == null) try common.putValue(allocator, &hook, "errorPolicy", .{ .string = try allocator.dupe(u8, "continue") });
+        if (hook.get("errorPolicy") == null) try common.putString(allocator, &hook, "errorPolicy", "continue");
         try common.putInt(allocator, &hook, "chainOrder", @intCast(normalized.items.len));
         try putOwnerRuntimeMetadata(allocator, &hook, owner);
         try normalized.append(.{ .object = hook });
@@ -865,10 +865,10 @@ fn normalizeWorkflows(
 
         var workflow = (try common.cloneJsonValue(allocator, item)).object;
         errdefer common.deinitJsonValue(allocator, .{ .object = workflow });
-        if (workflow.get("description") == null) try common.putValue(allocator, &workflow, "description", .{ .string = try allocator.dupe(u8, "") });
+        if (workflow.get("description") == null) try common.putString(allocator, &workflow, "description", "");
         if (workflow.get("inputSchema") == null) try common.putValue(allocator, &workflow, "inputSchema", try emptyObjectValue(allocator));
         if (workflow.get("outputSchema") == null) try common.putValue(allocator, &workflow, "outputSchema", try emptyObjectValue(allocator));
-        if (workflow.get("executionMode") == null) try common.putValue(allocator, &workflow, "executionMode", .{ .string = try allocator.dupe(u8, "agent") });
+        if (workflow.get("executionMode") == null) try common.putString(allocator, &workflow, "executionMode", "agent");
         if (workflow.get("permissions") == null) try common.putValue(allocator, &workflow, "permissions", try emptyArrayValue(allocator));
         if (workflow.get("dependencies") == null) try common.putValue(allocator, &workflow, "dependencies", try emptyArrayValue(allocator));
         if (workflow.get("timeoutMs") == null) try common.putInt(allocator, &workflow, "timeoutMs", 30000);
@@ -881,8 +881,8 @@ fn normalizeWorkflows(
             .object => |*object| try fillWorkflowChildAgentLimitDefaults(allocator, object, workflow.get("timeoutMs").?.integer),
             else => {},
         };
-        try common.putValue(allocator, &workflow, "sourceManifest", .{ .string = try allocator.dupe(u8, owner.manifest_path) });
-        try common.putValue(allocator, &workflow, "status", .{ .string = try allocator.dupe(u8, if (entryPolicyDenied(.{ .object = workflow })) "denied" else "active") });
+        try common.putString(allocator, &workflow, "sourceManifest", owner.manifest_path);
+        try common.putString(allocator, &workflow, "status", if (entryPolicyDenied(.{ .object = workflow })) "denied" else "active");
         try common.putValue(allocator, &workflow, "commandName", try workflowSurfaceNameValue(allocator, item.object, "command", "commandName", id));
         try common.putValue(allocator, &workflow, "toolName", try workflowSurfaceNameValue(allocator, item.object, "tool", "toolName", id));
         try common.putValue(allocator, &workflow, "presetId", try workflowSurfaceNameValue(allocator, item.object, "subAgentPreset", "presetId", id));
@@ -935,7 +935,7 @@ fn workflowReplayDefault(allocator: std.mem.Allocator) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
     try common.putBool(allocator, &object, "enabled", true);
-    try common.putValue(allocator, &object, "mode", .{ .string = try allocator.dupe(u8, "recorded") });
+    try common.putString(allocator, &object, "mode", "recorded");
     return .{ .object = object };
 }
 
@@ -1054,17 +1054,17 @@ fn normalizeDeclarationDefaults(
             if (entry.get("description") == null) try common.putNull(allocator, &entry, "description");
         },
         .resources => {
-            if (entry.get("precedence") == null) try common.putValue(allocator, &entry, "precedence", .{ .string = try allocator.dupe(u8, "package") });
+            if (entry.get("precedence") == null) try common.putString(allocator, &entry, "precedence", "package");
         },
         .providers => {
             const id = entry.get("id").?.string;
-            if (entry.get("name") == null) try common.putValue(allocator, &entry, "name", .{ .string = try allocator.dupe(u8, id) });
-            if (entry.get("displayName") == null) try common.putValue(allocator, &entry, "displayName", .{ .string = try allocator.dupe(u8, id) });
+            if (entry.get("name") == null) try common.putString(allocator, &entry, "name", id);
+            if (entry.get("displayName") == null) try common.putString(allocator, &entry, "displayName", id);
             if (entry.get("models") == null) try common.putValue(allocator, &entry, "models", try emptyArrayValue(allocator));
             if (entry.get("credentialRequired") == null) try common.putBool(allocator, &entry, "credentialRequired", false);
         },
     }
-    try common.putValue(allocator, &entry, "sourceManifest", .{ .string = try allocator.dupe(u8, owner.manifest_path) });
+    try common.putString(allocator, &entry, "sourceManifest", owner.manifest_path);
 }
 
 fn putOwnerRuntimeMetadata(
@@ -1074,16 +1074,16 @@ fn putOwnerRuntimeMetadata(
 ) !void {
     var owner_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = owner_object });
-    try common.putValue(allocator, &owner_object, "id", .{ .string = try allocator.dupe(u8, owner.id) });
-    try common.putValue(allocator, &owner_object, "name", .{ .string = try allocator.dupe(u8, owner.name) });
-    try common.putValue(allocator, &owner_object, "version", .{ .string = try allocator.dupe(u8, owner.version) });
-    try common.putValue(allocator, &owner_object, "manifestPath", .{ .string = try allocator.dupe(u8, owner.manifest_path) });
-    try common.putValue(allocator, &owner_object, "packageRoot", .{ .string = try allocator.dupe(u8, owner.package_root) });
+    try common.putString(allocator, &owner_object, "id", owner.id);
+    try common.putString(allocator, &owner_object, "name", owner.name);
+    try common.putString(allocator, &owner_object, "version", owner.version);
+    try common.putString(allocator, &owner_object, "manifestPath", owner.manifest_path);
+    try common.putString(allocator, &owner_object, "packageRoot", owner.package_root);
 
     var runtime_object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = runtime_object });
-    try common.putValue(allocator, &runtime_object, "kind", .{ .string = try allocator.dupe(u8, owner.runtime_kind.jsonName()) });
-    try common.putValue(allocator, &runtime_object, "adapter", .{ .string = try allocator.dupe(u8, owner.runtime_kind.adapterName()) });
+    try common.putString(allocator, &runtime_object, "kind", owner.runtime_kind.jsonName());
+    try common.putString(allocator, &runtime_object, "adapter", owner.runtime_kind.adapterName());
     try common.putBool(allocator, &runtime_object, "executable", owner.runtime_kind.executable());
 
     try common.putValue(allocator, &entry, "owner", .{ .object = owner_object });
@@ -1177,14 +1177,14 @@ fn makeGraphDiagnostic(
 fn diagnosticJsonValue(allocator: std.mem.Allocator, diagnostic: Diagnostic) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try common.putValue(allocator, &object, "code", .{ .string = try allocator.dupe(u8, diagnostic.code) });
-    try common.putValue(allocator, &object, "severity", .{ .string = try allocator.dupe(u8, diagnostic.severity) });
-    try common.putValue(allocator, &object, "path", .{ .string = try allocator.dupe(u8, diagnostic.path) });
-    try common.putValue(allocator, &object, "message", .{ .string = try allocator.dupe(u8, diagnostic.message) });
-    try common.putValue(allocator, &object, "manifestPath", .{ .string = try allocator.dupe(u8, diagnostic.manifest_path) });
-    try common.putValue(allocator, &object, "phase", .{ .string = try allocator.dupe(u8, diagnostic.phase) });
-    try common.putValue(allocator, &object, "correlationId", .{ .string = try allocator.dupe(u8, diagnostic.correlation_id) });
-    try common.putValue(allocator, &object, "spanId", .{ .string = try allocator.dupe(u8, diagnostic.span_id) });
+    try common.putString(allocator, &object, "code", diagnostic.code);
+    try common.putString(allocator, &object, "severity", diagnostic.severity);
+    try common.putString(allocator, &object, "path", diagnostic.path);
+    try common.putString(allocator, &object, "message", diagnostic.message);
+    try common.putString(allocator, &object, "manifestPath", diagnostic.manifest_path);
+    try common.putString(allocator, &object, "phase", diagnostic.phase);
+    try common.putString(allocator, &object, "correlationId", diagnostic.correlation_id);
+    try common.putString(allocator, &object, "spanId", diagnostic.span_id);
     try common.putValue(allocator, &object, "packageId", if (diagnostic.package_id) |value| .{ .string = try allocator.dupe(u8, value) } else .null);
     try common.putValue(allocator, &object, "runtime", if (diagnostic.runtime) |value| .{ .string = try allocator.dupe(u8, value) } else .null);
     try common.putValue(allocator, &object, "capabilityId", if (diagnostic.capability_id) |value| .{ .string = try allocator.dupe(u8, value) } else .null);
@@ -1398,7 +1398,7 @@ fn workflowCommandJsonValue(allocator: std.mem.Allocator, workflow: std.json.Val
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
     try putWorkflowCommonFields(allocator, &object, workflow, source);
-    try common.putValue(allocator, &object, "name", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "commandName") orelse "") });
+    try common.putString(allocator, &object, "name", jsonEntryString(workflow, "commandName") orelse "");
     try common.putValue(allocator, &object, "argumentSchema", try common.cloneJsonValue(allocator, workflow.object.get("inputSchema") orelse .null));
     return .{ .object = object };
 }
@@ -1407,7 +1407,7 @@ fn workflowToolJsonValue(allocator: std.mem.Allocator, workflow: std.json.Value,
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
     try putWorkflowCommonFields(allocator, &object, workflow, source);
-    try common.putValue(allocator, &object, "name", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "toolName") orelse "") });
+    try common.putString(allocator, &object, "name", jsonEntryString(workflow, "toolName") orelse "");
     try common.putValue(allocator, &object, "inputSchema", try common.cloneJsonValue(allocator, workflow.object.get("inputSchema") orelse .null));
     try common.putValue(allocator, &object, "outputSchema", try common.cloneJsonValue(allocator, workflow.object.get("outputSchema") orelse .null));
     return .{ .object = object };
@@ -1417,7 +1417,7 @@ fn workflowPresetJsonValue(allocator: std.mem.Allocator, workflow: std.json.Valu
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
     try putWorkflowCommonFields(allocator, &object, workflow, source);
-    try common.putValue(allocator, &object, "id", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "presetId") orelse "") });
+    try common.putString(allocator, &object, "id", jsonEntryString(workflow, "presetId") orelse "");
     try common.putValue(allocator, &object, "childAgentLimits", try common.cloneJsonValue(allocator, workflow.object.get("childAgentLimits") orelse .null));
     try common.putValue(allocator, &object, "replay", try common.cloneJsonValue(allocator, workflow.object.get("replay") orelse .null));
     return .{ .object = object };
@@ -1429,13 +1429,13 @@ fn putWorkflowCommonFields(
     workflow: std.json.Value,
     source: WorkflowRegistrySource,
 ) !void {
-    try common.putValue(allocator, &object, "workflowId", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "id") orelse "") });
-    try common.putValue(allocator, &object, "description", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "description") orelse "") });
-    try common.putValue(allocator, &object, "executionMode", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "executionMode") orelse "agent") });
-    try common.putValue(allocator, &object, "status", .{ .string = try allocator.dupe(u8, jsonEntryString(workflow, "status") orelse "active") });
+    try common.putString(allocator, &object, "workflowId", jsonEntryString(workflow, "id") orelse "");
+    try common.putString(allocator, &object, "description", jsonEntryString(workflow, "description") orelse "");
+    try common.putString(allocator, &object, "executionMode", jsonEntryString(workflow, "executionMode") orelse "agent");
+    try common.putString(allocator, &object, "status", jsonEntryString(workflow, "status") orelse "active");
     try common.putValue(allocator, &object, "permissions", try common.cloneJsonValue(allocator, workflow.object.get("permissions") orelse .null));
     try common.putValue(allocator, &object, "timeoutMs", try common.cloneJsonValue(allocator, workflow.object.get("timeoutMs") orelse .null));
-    if (source.source_scope) |scope| try common.putValue(allocator, &object, "sourceScope", .{ .string = try allocator.dupe(u8, scope) });
+    if (source.source_scope) |scope| try common.putString(allocator, &object, "sourceScope", scope);
     if (source.precedence_rank) |rank| try common.putInt(allocator, &object, "precedenceRank", rank);
     if (workflow.object.get("owner")) |owner| try common.putValue(allocator, &object, "owner", try common.cloneJsonValue(allocator, owner));
     if (workflow.object.get("runtime")) |runtime| try common.putValue(allocator, &object, "runtime", try common.cloneJsonValue(allocator, runtime));
@@ -1498,7 +1498,7 @@ fn hookChainEntryJsonValue(
         try common.putInt(allocator, &object, "chainOrder", @intCast(event_chain_order));
     }
     if (entry.source_scope) |source_scope| {
-        try common.putValue(allocator, &object, "sourceScope", .{ .string = try allocator.dupe(u8, source_scope) });
+        try common.putString(allocator, &object, "sourceScope", source_scope);
     }
     if (entry.precedence_rank) |precedence_rank| {
         try common.putInt(allocator, &object, "precedenceRank", precedence_rank);
@@ -1595,12 +1595,12 @@ fn resourceResolutionJsonValue(
 
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try common.putValue(allocator, &object, "kind", .{ .string = try allocator.dupe(u8, kind) });
-    try common.putValue(allocator, &object, "name", .{ .string = try allocator.dupe(u8, name) });
+    try common.putString(allocator, &object, "kind", kind);
+    try common.putString(allocator, &object, "name", name);
 
     const selected_record = records[selected_record_index];
     const selected_resource = selected_record.manifest.resources.array.items[selected_resource_index];
-    try common.putValue(allocator, &object, "selectedSource", .{ .string = try allocator.dupe(u8, selected_record.source_scope) });
+    try common.putString(allocator, &object, "selectedSource", selected_record.source_scope);
     try common.putValue(allocator, &object, "selected", try resourceCandidateJsonValue(allocator, selected_record, selected_resource));
 
     var shadowed = std.json.Array.init(allocator);
@@ -1626,22 +1626,22 @@ fn resourceResolutionJsonValue(
 fn resourceCandidateJsonValue(allocator: std.mem.Allocator, record: ManifestRecord, resource: std.json.Value) !std.json.Value {
     var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try common.putValue(allocator, &object, "kind", .{ .string = try allocator.dupe(u8, resourceEntryString(resource, "kind") orelse "") });
-    try common.putValue(allocator, &object, "name", .{ .string = try allocator.dupe(u8, resourceEntryString(resource, "name") orelse "") });
-    try common.putValue(allocator, &object, "path", .{ .string = try allocator.dupe(u8, resourceEntryString(resource, "path") orelse "") });
-    try common.putValue(allocator, &object, "ownerId", .{ .string = try allocator.dupe(u8, record.manifest.id) });
-    try common.putValue(allocator, &object, "runtime", .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
-    try common.putValue(allocator, &object, "sourceScope", .{ .string = try allocator.dupe(u8, record.source_scope) });
+    try common.putString(allocator, &object, "kind", resourceEntryString(resource, "kind") orelse "");
+    try common.putString(allocator, &object, "name", resourceEntryString(resource, "name") orelse "");
+    try common.putString(allocator, &object, "path", resourceEntryString(resource, "path") orelse "");
+    try common.putString(allocator, &object, "ownerId", record.manifest.id);
+    try common.putString(allocator, &object, "runtime", record.manifest.runtime_kind.jsonName());
+    try common.putString(allocator, &object, "sourceScope", record.source_scope);
     try common.putInt(allocator, &object, "precedenceRank", record.precedence_rank);
-    try common.putValue(allocator, &object, "manifestPath", .{ .string = try allocator.dupe(u8, record.manifest.manifest_path) });
+    try common.putString(allocator, &object, "manifestPath", record.manifest.manifest_path);
     return .{ .object = object };
 }
 
 fn resourceTraceJsonValue(allocator: std.mem.Allocator, record: ManifestRecord, resource: std.json.Value, action: []const u8) !std.json.Value {
     var object = (try resourceCandidateJsonValue(allocator, record, resource)).object;
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    try common.putValue(allocator, &object, "action", .{ .string = try allocator.dupe(u8, action) });
-    try common.putValue(allocator, &object, "reason", .{ .string = try allocator.dupe(u8, if (std.mem.eql(u8, action, "selected")) "highest-precedence-candidate" else "shadowed-by-selected-source") });
+    try common.putString(allocator, &object, "action", action);
+    try common.putString(allocator, &object, "reason", if (std.mem.eql(u8, action, "selected")) "highest-precedence-candidate" else "shadowed-by-selected-source");
     return .{ .object = object };
 }
 
@@ -2062,11 +2062,11 @@ fn graphNodesJsonValue(allocator: std.mem.Allocator, records: []const ManifestRe
         if (record.active != active) continue;
         var node = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         errdefer common.deinitJsonValue(allocator, .{ .object = node });
-        try common.putValue(allocator, &node, "packageId", .{ .string = try allocator.dupe(u8, record.manifest.id) });
-        try common.putValue(allocator, &node, "version", .{ .string = try allocator.dupe(u8, record.manifest.version) });
-        try common.putValue(allocator, &node, "runtime", .{ .string = try allocator.dupe(u8, record.manifest.runtime_kind.jsonName()) });
-        try common.putValue(allocator, &node, "manifestPath", .{ .string = try allocator.dupe(u8, record.manifest.manifest_path) });
-        try common.putValue(allocator, &node, "sourceScope", .{ .string = try allocator.dupe(u8, record.source_scope) });
+        try common.putString(allocator, &node, "packageId", record.manifest.id);
+        try common.putString(allocator, &node, "version", record.manifest.version);
+        try common.putString(allocator, &node, "runtime", record.manifest.runtime_kind.jsonName());
+        try common.putString(allocator, &node, "manifestPath", record.manifest.manifest_path);
+        try common.putString(allocator, &node, "sourceScope", record.source_scope);
         try common.putInt(allocator, &node, "precedenceRank", record.precedence_rank);
         try common.putBool(allocator, &node, "active", record.active);
         try common.putValue(allocator, &node, "inactiveReason", if (record.inactive_reason) |reason| .{ .string = try allocator.dupe(u8, reason) } else .null);
@@ -2104,30 +2104,30 @@ fn graphEdgesJsonValue(allocator: std.mem.Allocator, records: []const ManifestRe
 fn packageEdgeJsonValue(allocator: std.mem.Allocator, provider: ManifestRecord, consumer: ManifestRecord, dependency: std.json.Value) !std.json.Value {
     var edge = try baseEdgeJsonValue(allocator, provider, consumer, "package_dependency");
     errdefer common.deinitJsonValue(allocator, .{ .object = edge });
-    try common.putValue(allocator, &edge, "dependencyId", .{ .string = try allocator.dupe(u8, jsonEntryString(dependency, "id") orelse "") });
+    try common.putString(allocator, &edge, "dependencyId", jsonEntryString(dependency, "id") orelse "");
     try common.putValue(allocator, &edge, "versionRange", try optionalJsonString(allocator, dependencyVersionRange(dependency)));
-    try common.putValue(allocator, &edge, "providerVersion", .{ .string = try allocator.dupe(u8, provider.manifest.version) });
+    try common.putString(allocator, &edge, "providerVersion", provider.manifest.version);
     return .{ .object = edge };
 }
 
 fn capabilityEdgeJsonValue(allocator: std.mem.Allocator, provider: ManifestRecord, consumer: ManifestRecord, import_entry: std.json.Value, export_entry: std.json.Value) !std.json.Value {
     var edge = try baseEdgeJsonValue(allocator, provider, consumer, "capability_import");
     errdefer common.deinitJsonValue(allocator, .{ .object = edge });
-    try common.putValue(allocator, &edge, "capabilityId", .{ .string = try allocator.dupe(u8, jsonEntryString(import_entry, "id") orelse "") });
+    try common.putString(allocator, &edge, "capabilityId", jsonEntryString(import_entry, "id") orelse "");
     try common.putValue(allocator, &edge, "capabilityKind", try optionalJsonString(allocator, jsonEntryString(import_entry, "kind") orelse jsonEntryString(export_entry, "kind")));
     try common.putValue(allocator, &edge, "versionRange", try optionalJsonString(allocator, importVersionRange(import_entry)));
-    try common.putValue(allocator, &edge, "providerCapabilityVersion", .{ .string = try allocator.dupe(u8, exportVersion(provider, export_entry)) });
+    try common.putString(allocator, &edge, "providerCapabilityVersion", exportVersion(provider, export_entry));
     return .{ .object = edge };
 }
 
 fn baseEdgeJsonValue(allocator: std.mem.Allocator, provider: ManifestRecord, consumer: ManifestRecord, type_name: []const u8) !std.json.ObjectMap {
     var edge = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = edge });
-    try common.putValue(allocator, &edge, "type", .{ .string = try allocator.dupe(u8, type_name) });
-    try common.putValue(allocator, &edge, "fromPackageId", .{ .string = try allocator.dupe(u8, provider.manifest.id) });
-    try common.putValue(allocator, &edge, "toPackageId", .{ .string = try allocator.dupe(u8, consumer.manifest.id) });
-    try common.putValue(allocator, &edge, "providerManifestPath", .{ .string = try allocator.dupe(u8, provider.manifest.manifest_path) });
-    try common.putValue(allocator, &edge, "consumerManifestPath", .{ .string = try allocator.dupe(u8, consumer.manifest.manifest_path) });
+    try common.putString(allocator, &edge, "type", type_name);
+    try common.putString(allocator, &edge, "fromPackageId", provider.manifest.id);
+    try common.putString(allocator, &edge, "toPackageId", consumer.manifest.id);
+    try common.putString(allocator, &edge, "providerManifestPath", provider.manifest.manifest_path);
+    try common.putString(allocator, &edge, "consumerManifestPath", consumer.manifest.manifest_path);
     return edge;
 }
 
@@ -2145,13 +2145,13 @@ fn selectedProvidersJsonValue(allocator: std.mem.Allocator, records: []const Man
             const export_entry = capabilityExports(provider.manifest).?.items[selection.export_index];
             var selected = try std.json.ObjectMap.init(allocator, &.{}, &.{});
             errdefer common.deinitJsonValue(allocator, .{ .object = selected });
-            try common.putValue(allocator, &selected, "consumerPackageId", .{ .string = try allocator.dupe(u8, consumer.manifest.id) });
-            try common.putValue(allocator, &selected, "providerPackageId", .{ .string = try allocator.dupe(u8, provider.manifest.id) });
-            try common.putValue(allocator, &selected, "providerPackageVersion", .{ .string = try allocator.dupe(u8, provider.manifest.version) });
-            try common.putValue(allocator, &selected, "capabilityId", .{ .string = try allocator.dupe(u8, jsonEntryString(import_entry, "id") orelse "") });
+            try common.putString(allocator, &selected, "consumerPackageId", consumer.manifest.id);
+            try common.putString(allocator, &selected, "providerPackageId", provider.manifest.id);
+            try common.putString(allocator, &selected, "providerPackageVersion", provider.manifest.version);
+            try common.putString(allocator, &selected, "capabilityId", jsonEntryString(import_entry, "id") orelse "");
             try common.putValue(allocator, &selected, "capabilityKind", try optionalJsonString(allocator, jsonEntryString(import_entry, "kind") orelse jsonEntryString(export_entry, "kind")));
-            try common.putValue(allocator, &selected, "providerCapabilityVersion", .{ .string = try allocator.dupe(u8, exportVersion(provider, export_entry)) });
-            try common.putValue(allocator, &selected, "providerManifestPath", .{ .string = try allocator.dupe(u8, provider.manifest.manifest_path) });
+            try common.putString(allocator, &selected, "providerCapabilityVersion", exportVersion(provider, export_entry));
+            try common.putString(allocator, &selected, "providerManifestPath", provider.manifest.manifest_path);
             try array.append(.{ .object = selected });
         }
     }
@@ -2175,11 +2175,11 @@ fn unresolvedImportsJsonValue(allocator: std.mem.Allocator, records: []const Man
             if (!unresolved) continue;
             var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
             errdefer common.deinitJsonValue(allocator, .{ .object = entry });
-            try common.putValue(allocator, &entry, "packageId", .{ .string = try allocator.dupe(u8, record.manifest.id) });
-            try common.putValue(allocator, &entry, "capabilityId", .{ .string = try allocator.dupe(u8, jsonEntryString(import_entry, "id") orelse "") });
+            try common.putString(allocator, &entry, "packageId", record.manifest.id);
+            try common.putString(allocator, &entry, "capabilityId", jsonEntryString(import_entry, "id") orelse "");
             try common.putValue(allocator, &entry, "kind", try optionalJsonString(allocator, jsonEntryString(import_entry, "kind")));
             try common.putValue(allocator, &entry, "versionRange", try optionalJsonString(allocator, importVersionRange(import_entry)));
-            try common.putValue(allocator, &entry, "manifestPath", .{ .string = try allocator.dupe(u8, record.manifest.manifest_path) });
+            try common.putString(allocator, &entry, "manifestPath", record.manifest.manifest_path);
             try common.putValue(allocator, &entry, "reason", if (record.inactive_reason) |reason| .{ .string = try allocator.dupe(u8, reason) } else .{ .string = try allocator.dupe(u8, "unresolved") });
             try array.append(.{ .object = entry });
         }

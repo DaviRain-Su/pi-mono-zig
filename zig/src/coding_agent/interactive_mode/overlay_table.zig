@@ -18,6 +18,12 @@ pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectIte
     allocator.free(items);
 }
 
+/// Frees an owned slice of allocated strings.
+pub fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
+    for (strings) |string| allocator.free(string);
+    allocator.free(strings);
+}
+
 /// Allocates a 2-column [label, description] table from select items.
 /// Cell text borrows directly from items; do not free items before the table.
 pub fn buildLabelDescriptionTable(
@@ -40,6 +46,14 @@ pub fn buildLabelDescriptionTable(
 
 test "freeTable handles empty slices" {
     freeTable(std.testing.allocator, &.{}, &.{});
+}
+
+test "freeOwnedStrings releases entries and slice" {
+    const allocator = std.testing.allocator;
+    var strings = try allocator.alloc([]u8, 2);
+    strings[0] = try allocator.dupe(u8, "hello");
+    strings[1] = try allocator.dupe(u8, "world");
+    freeOwnedStrings(allocator, strings);
 }
 
 test "buildLabelDescriptionTable maps items to two-column rows" {

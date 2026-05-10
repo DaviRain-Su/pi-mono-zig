@@ -792,10 +792,7 @@ fn freeChoices(allocator: std.mem.Allocator, choices: []Choice) void {
 
 const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
-fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
-}
+const freeOwnedStrings = overlay_table.freeOwnedStrings;
 
 fn makeTestTextMessage(allocator: std.mem.Allocator, role: []const u8, text: []const u8, timestamp: i64, model: ai.Model) !agent.AgentMessage {
     const blocks = try allocator.alloc(ai.ContentBlock, 1);

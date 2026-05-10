@@ -403,7 +403,7 @@ fn lockedNativeRuntimeDetailsJson(allocator: std.mem.Allocator, entry: *const Lo
 
     var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer tools_common.deinitJsonValue(allocator, .{ .object = root });
-    try root.put(allocator, try allocator.dupe(u8, "extensionRuntime"), .{ .object = runtime_object });
+    try tools_common.putValue(allocator, &root, "extensionRuntime", .{ .object = runtime_object });
     return .{ .object = root };
 }
 

@@ -70,22 +70,22 @@ pub const EditTool = struct {
             common.deinitJsonValue(allocator, value);
         }
 
-        try properties.put(allocator, try allocator.dupe(u8, "path"), try schemaProperty(
+        try common.putValue(allocator, &properties, "path", try schemaProperty(
             allocator,
             "string",
             "Path to the file to edit (absolute or relative to cwd)",
         ));
-        try properties.put(allocator, try allocator.dupe(u8, "edits"), try schemaArrayProperty(
+        try common.putValue(allocator, &properties, "edits", try schemaArrayProperty(
             allocator,
             "One or more exact text replacements. Each oldText is matched against the original file, not incrementally after earlier edits.",
             try editSchemaEntry(allocator),
         ));
-        try properties.put(allocator, try allocator.dupe(u8, "oldText"), try schemaProperty(
+        try common.putValue(allocator, &properties, "oldText", try schemaProperty(
             allocator,
             "string",
             "Legacy single-edit search text. It must match exactly one location in the file.",
         ));
-        try properties.put(allocator, try allocator.dupe(u8, "newText"), try schemaProperty(
+        try common.putValue(allocator, &properties, "newText", try schemaProperty(
             allocator,
             "string",
             "Legacy single-edit replacement text.",

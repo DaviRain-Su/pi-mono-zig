@@ -756,10 +756,7 @@ fn freeScopedModelChoices(allocator: std.mem.Allocator, choices: []ScopedModelCh
 
 const freeOwnedSelectItems = overlay_table.freeOwnedSelectItems;
 
-fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
-}
+const freeOwnedStrings = overlay_table.freeOwnedStrings;
 
 fn formatModelOverlayLabel(
     allocator: std.mem.Allocator,

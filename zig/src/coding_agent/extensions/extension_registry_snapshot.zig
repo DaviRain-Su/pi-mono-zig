@@ -166,10 +166,10 @@ fn putFlags(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: a
     for (registry.flags.items) |flag| {
         var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
         try common.putString(allocator, &entry, "name", flag.name);
-        try entry.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, switch (flag.type_kind) {
+        try common.putString(allocator, &entry, "type", switch (flag.type_kind) {
             .boolean => "boolean",
             .string => "string",
-        }) });
+        });
         try common.putValue(allocator, &entry, "description", try optionalStringJson(allocator, flag.description));
         try common.putValue(allocator, &entry, "default", try flagDefaultToJson(allocator, flag.default_value));
         const resolved = registry.getFlag(flag.name);
@@ -291,10 +291,10 @@ fn putWidgets(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry:
             try lines_array.append(.{ .string = try allocator.dupe(u8, line) });
         }
         try common.putValue(allocator, &entry, "lines", .{ .array = lines_array });
-        try entry.put(allocator, try allocator.dupe(u8, "placement"), .{ .string = try allocator.dupe(u8, switch (widget.placement) {
+        try common.putString(allocator, &entry, "placement", switch (widget.placement) {
             .above_editor => "aboveEditor",
             .below_editor => "belowEditor",
-        }) });
+        });
         try common.putString(allocator, &entry, "extensionPath", widget.extension_path);
         try widgets_array.append(.{ .object = entry });
     }
