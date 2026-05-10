@@ -292,8 +292,11 @@ fn drawItemFull(
     });
     const item_text = displayText(item, all_expanded);
     switch (item.kind) {
+        .user => return drawUserItem(child, theme, item_text),
         .assistant => {
-            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, styleForToken(theme, .role_assistant));
+            var prefix_style = styleForToken(theme, .task_header_accent);
+            prefix_style.bold = true;
+            var row: usize = drawWrappedText(child, 0, ASSISTANT_PREFIX, prefix_style);
             if (std.mem.trim(u8, item_text, " \t\r\n").len == 0) return row;
             const markdown_window = child.child(.{
                 .y_off = @intCast(row),
@@ -316,8 +319,35 @@ fn drawItemFull(
             return @as(usize, size.height);
         },
         .thinking => return drawThinkingItem(child, theme, item, now_ms),
+        .tool_call, .tool_result, .bash_execution => return drawToolItem(child, allocator, theme, item, now_ms, all_expanded),
         else => return drawWrappedText(child, 0, item_text, styleForToken(theme, token(item.kind))),
     }
+}
+
+fn drawUserItem(window: tui.vaxis.Window, theme: ?*const resources_mod.Theme, text: []const u8) usize {
+    const prefix = "You:";
+    if (!std.mem.startsWith(u8, text, prefix)) {
+        return drawWrappedText(window, 0, text, styleForToken(theme, .text));
+    }
+
+    var prefix_style = styleForToken(theme, .task_header_accent);
+    prefix_style.bold = true;
+    _ = window.printSegment(.{
+        .text = prefix,
+        .style = prefix_style,
+    }, .{ .wrap = .none });
+
+    const body = if (text.len > prefix.len and text[prefix.len] == ' ') text[prefix.len + 1 ..] else text[prefix.len..];
+    if (body.len == 0) return 1;
+
+    const body_window = if (window.width > prefix.len + 1)
+        window.child(.{
+            .x_off = @intCast(prefix.len + 1),
+            .width = window.width - @as(u16, @intCast(prefix.len + 1)),
+        })
+    else
+        window;
+    return @max(@as(usize, 1), drawWrappedText(body_window, 0, body, styleForToken(theme, .text)));
 }
 
 fn displayText(item: ChatItem, all_expanded: bool) []const u8 {
@@ -333,6 +363,147 @@ pub fn previewThreshold(kind: ChatKind) ?usize {
         .tool_result => 3,
         .assistant, .markdown => null,
         .welcome, .info, .@"error", .user, .tool_call, .bash_execution => null,
+    };
+}
+
+const ToolVisualState = enum {
+    pending,
+    success,
+    @"error",
+};
+
+fn drawToolItem(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    theme: ?*const resources_mod.Theme,
+    item: ChatItem,
+    now_ms: i64,
+    all_expanded: bool,
+) !usize {
+    _ = allocator;
+    _ = now_ms;
+    if (window.height == 0 or window.width == 0) return 0;
+
+    const item_text = displayText(item, all_expanded);
+    const state = toolVisualState(item.kind, item_text);
+    const split = splitFirstLine(item_text);
+
+    const marker = switch (item.kind) {
+        .bash_execution => switch (state) {
+            .pending => "*",
+            .success => "+",
+            .@"error" => "!",
+        },
+        .tool_result => if (state == .@"error") "!" else "+",
+        .tool_call => ">",
+        else => unreachable,
+    };
+
+    const title_style = toolTitleStyle(theme, item.kind, state);
+    const body_style = toolBodyStyle(theme, item.kind, state);
+
+    var row: usize = 0;
+    if (split.title.len > 0 and window.width > 2) {
+        _ = window.printSegment(.{
+            .text = marker,
+            .style = title_style,
+        }, .{
+            .wrap = .none,
+            .row_offset = @intCast(row),
+        });
+        const title_window = window.child(.{
+            .x_off = 2,
+            .width = window.width - 2,
+            .y_off = @intCast(row),
+            .height = window.height - @as(u16, @intCast(row)),
+        });
+        row += drawWrappedText(title_window, 0, split.title, title_style);
+    } else {
+        row += drawWrappedText(window, row, if (split.title.len > 0) split.title else marker, title_style);
+    }
+
+    if (split.body.len > 0 and row < window.height) {
+        const body_window = if (window.width > 2)
+            window.child(.{
+                .x_off = 2,
+                .width = window.width - 2,
+                .y_off = @intCast(row),
+                .height = window.height - @as(u16, @intCast(row)),
+            })
+        else
+            window.child(.{
+                .y_off = @intCast(row),
+                .height = window.height - @as(u16, @intCast(row)),
+            });
+        row += drawWrappedText(body_window, 0, split.body, body_style);
+    }
+
+    return @max(@as(usize, 1), row);
+}
+
+fn toolVisualState(kind: ChatKind, text: []const u8) ToolVisualState {
+    return switch (kind) {
+        .tool_call => .pending,
+        .tool_result => if (std.mem.startsWith(u8, text, "Tool error ") or
+            std.mem.startsWith(u8, text, "Gate blocked "))
+            .@"error"
+        else
+            .success,
+        .bash_execution => if (std.mem.indexOf(u8, text, "Running... (") != null)
+            .pending
+        else if (std.mem.indexOf(u8, text, "\n(cancelled)") != null or
+            std.mem.indexOf(u8, text, "\n(exit ") != null)
+            .@"error"
+        else
+            .success,
+        else => .success,
+    };
+}
+
+fn toolTitleStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ChatKind,
+    state: ToolVisualState,
+) tui.vaxis.Cell.Style {
+    var style = switch (state) {
+        .pending => styleForToken(theme, .role_tool_call),
+        .success => if (kind == .bash_execution) styleForToken(theme, .role_tool_result) else styleForToken(theme, .role_tool_result),
+        .@"error" => styleForToken(theme, .@"error"),
+    };
+    style.bold = true;
+    return style;
+}
+
+fn toolBodyStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ChatKind,
+    state: ToolVisualState,
+) tui.vaxis.Cell.Style {
+    _ = kind;
+    return switch (state) {
+        .pending => styleForToken(theme, .role_tool_call),
+        .success => styleForToken(theme, .role_tool_result),
+        .@"error" => styleForToken(theme, .@"error"),
+    };
+}
+
+const LineSplit = struct {
+    title: []const u8,
+    body: []const u8,
+};
+
+fn splitFirstLine(text: []const u8) LineSplit {
+    const newline_index = std.mem.indexOfScalar(u8, text, '\n') orelse return .{
+        .title = text,
+        .body = "",
+    };
+    var body = text[newline_index + 1 ..];
+    while (body.len > 0 and (body[0] == '\n' or body[0] == '\r')) {
+        body = body[1..];
+    }
+    return .{
+        .title = text[0..newline_index],
+        .body = body,
     };
 }
 
@@ -458,8 +629,19 @@ fn estimateItemRowsFull(item: ChatItem, width: usize, all_expanded: bool) usize 
         .assistant => 1 + estimateWrappedRows(item_text, width),
         .markdown => estimateWrappedRows(item_text, width),
         .thinking => if (width <= 2) 1 else @max(@as(usize, 1), estimateWrappedRows(item_text, width - 2)),
+        .tool_call, .tool_result, .bash_execution => estimateToolRows(item_text, width),
         else => estimateWrappedRows(item_text, width),
     };
+}
+
+fn estimateToolRows(text: []const u8, width: usize) usize {
+    if (width == 0) return 1;
+    const split = splitFirstLine(text);
+    var rows = estimateWrappedRows(split.title, @max(width -| 2, 1));
+    if (split.body.len > 0) {
+        rows += estimateWrappedRows(split.body, @max(width -| 2, 1));
+    }
+    return @max(rows, 1);
 }
 
 fn blitScreenRows(

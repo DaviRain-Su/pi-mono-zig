@@ -4364,11 +4364,19 @@ test "roles m0 drawChatItem applies role styles to representative cells" {
     const tool_call = screen.readCell(0, 4) orelse return error.TestUnexpectedResult;
     const tool_result = screen.readCell(0, 5) orelse return error.TestUnexpectedResult;
 
-    try std.testing.expectEqual(styleForToken(&theme, .role_user), user.style);
-    try std.testing.expectEqual(styleForToken(&theme, .role_assistant), assistant.style);
+    var expected_user = styleForToken(&theme, .task_header_accent);
+    expected_user.bold = true;
+    var expected_assistant = styleForToken(&theme, .task_header_accent);
+    expected_assistant.bold = true;
+    try std.testing.expectEqual(expected_user, user.style);
+    try std.testing.expectEqual(expected_assistant, assistant.style);
     try std.testing.expectEqual(styleForToken(&theme, .role_thinking), thinking.style);
-    try std.testing.expectEqual(styleForToken(&theme, .role_tool_call), tool_call.style);
-    try std.testing.expectEqual(styleForToken(&theme, .role_tool_result), tool_result.style);
+    var expected_tool_call = styleForToken(&theme, .role_tool_call);
+    expected_tool_call.bold = true;
+    var expected_tool_result = styleForToken(&theme, .role_tool_result);
+    expected_tool_result.bold = true;
+    try std.testing.expectEqual(expected_tool_call, tool_call.style);
+    try std.testing.expectEqual(expected_tool_result, tool_result.style);
 }
 
 test "collapse m2 app state defaults and snapshots all_expanded" {
