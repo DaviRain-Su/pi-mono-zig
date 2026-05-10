@@ -128,6 +128,16 @@ cd zig
 PI_WEBVIEW_SMOKE_PROMPT="hello" PI_WEBVIEW_AUTO_CLOSE_MS=1000 ./zig-out/bin/pi --webview --provider faux --no-session
 ```
 
+Responsiveness smoke runs emit `PI_WEBVIEW_TELEMETRY` / `telemetry_mark` timing output for the WebView gate: ready ≤1.5s, submit/user-message feedback ≤100ms, running state ≤200ms, first assistant delta ≤800ms, abort visible state ≤250ms, and no active UI stall >100ms.
+
+```bash
+cd zig
+PI_WEBVIEW_SMOKE_READY_INPUT=1 PI_WEBVIEW_AUTO_CLOSE_MS=1000 ./zig-out/bin/pi --webview --provider faux --no-session
+PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT="hello" PI_WEBVIEW_AUTO_CLOSE_MS=2000 ./zig-out/bin/pi --webview --provider faux --no-session
+PI_WEBVIEW_SMOKE_AUTO_ABORT_PROMPT="abort me" PI_WEBVIEW_SMOKE_AUTO_ABORT_MS=150 PI_WEBVIEW_AUTO_CLOSE_MS=2500 ./zig-out/bin/pi --webview --provider faux --no-session
+PI_WEBVIEW_SMOKE_AUTO_PROVIDER_ERROR_PROMPT="provider error" PI_WEBVIEW_AUTO_CLOSE_MS=2000 ./zig-out/bin/pi --webview --provider faux --no-session
+```
+
 Relevant validation commands:
 
 ```bash
