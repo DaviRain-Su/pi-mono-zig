@@ -1397,6 +1397,69 @@ fn thinkingLevelToString(level: agent.ThinkingLevel) []const u8 {
     };
 }
 
+/// One field in an extension event payload. Used by emitNotificationHook /
+/// emitCancellableHook to compose payloads declaratively instead of
+/// repeating the `if (hasHook) { makeObject; putString "type" ...; ... }`
+/// scaffolding in every emit helper.
+///
+/// `.json_owned` transfers ownership of `value` to the event object on
+/// success. If applyHookField fails before put, the value leaks — same
+/// failure mode as the previous hand-rolled helpers, kept for now.
+const HookField = union(enum) {
+    string: struct { key: []const u8, value: []const u8 },
+    boolean: struct { key: []const u8, value: bool },
+    optional_string: struct { key: []const u8, value: ?[]const u8 },
+    json_owned: struct { key: []const u8, value: std.json.Value },
+};
+
+fn applyHookField(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    field: HookField,
+) !void {
+    switch (field) {
+        .string => |s| try putString(allocator, object, s.key, s.value),
+        .boolean => |b| try putBool(allocator, object, b.key, b.value),
+        .optional_string => |o| if (o.value) |v| {
+            try putString(allocator, object, o.key, v);
+        } else {
+            try putValue(allocator, object, o.key, .null);
+        },
+        .json_owned => |j| try putValue(allocator, object, j.key, j.value),
+    }
+}
+
+fn emitNotificationHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    event_name: []const u8,
+    fields: []const HookField,
+) !void {
+    if (!ctx.hasHook(event_name)) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", event_name);
+    for (fields) |field| try applyHookField(allocator, &event.object, field);
+    const result = try ctx.invoke(allocator, event_name, event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn emitCancellableHook(
+    allocator: std.mem.Allocator,
+    ctx: *ExtensionHookContext,
+    event_name: []const u8,
+    fields: []const HookField,
+) !bool {
+    if (!ctx.hasHook(event_name)) return false;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", event_name);
+    for (fields) |field| try applyHookField(allocator, &event.object, field);
+    const result = try ctx.invoke(allocator, event_name, event) orelse return false;
+    defer tools_common.deinitJsonValue(allocator, result);
+    return boolField(result, "cancel") orelse false;
+}
+
 fn emitModelSelectHook(
     allocator: std.mem.Allocator,
     ctx: *ExtensionHookContext,
@@ -1404,15 +1467,11 @@ fn emitModelSelectHook(
     previous_model: ai.Model,
     source: []const u8,
 ) !void {
-    if (!ctx.hasHook("model_select")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "model_select");
-    try putValue(allocator, &event.object, "model", try modelToJsonValue(allocator, model));
-    try putValue(allocator, &event.object, "previousModel", try modelToJsonValue(allocator, previous_model));
-    try putString(allocator, &event.object, "source", source);
-    const result = try ctx.invoke(allocator, "model_select", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "model_select", &.{
+        .{ .json_owned = .{ .key = "model", .value = try modelToJsonValue(allocator, model) } },
+        .{ .json_owned = .{ .key = "previousModel", .value = try modelToJsonValue(allocator, previous_model) } },
+        .{ .string = .{ .key = "source", .value = source } },
+    });
 }
 
 fn emitThinkingLevelSelectHook(
@@ -1421,14 +1480,10 @@ fn emitThinkingLevelSelectHook(
     level: agent.ThinkingLevel,
     previous_level: agent.ThinkingLevel,
 ) !void {
-    if (!ctx.hasHook("thinking_level_select")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "thinking_level_select");
-    try putString(allocator, &event.object, "level", thinkingLevelToString(level));
-    try putString(allocator, &event.object, "previousLevel", thinkingLevelToString(previous_level));
-    const result = try ctx.invoke(allocator, "thinking_level_select", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "thinking_level_select", &.{
+        .{ .string = .{ .key = "level", .value = thinkingLevelToString(level) } },
+        .{ .string = .{ .key = "previousLevel", .value = thinkingLevelToString(previous_level) } },
+    });
 }
 
 fn emitSessionStartHook(
@@ -1436,13 +1491,9 @@ fn emitSessionStartHook(
     ctx: *ExtensionHookContext,
     reason: []const u8,
 ) !void {
-    if (!ctx.hasHook("session_start")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_start");
-    try putString(allocator, &event.object, "reason", reason);
-    const result = try ctx.invoke(allocator, "session_start", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "session_start", &.{
+        .{ .string = .{ .key = "reason", .value = reason } },
+    });
 }
 
 fn emitSessionShutdownHook(
@@ -1450,13 +1501,9 @@ fn emitSessionShutdownHook(
     ctx: *ExtensionHookContext,
     reason: []const u8,
 ) !void {
-    if (!ctx.hasHook("session_shutdown")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_shutdown");
-    try putString(allocator, &event.object, "reason", reason);
-    const result = try ctx.invoke(allocator, "session_shutdown", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "session_shutdown", &.{
+        .{ .string = .{ .key = "reason", .value = reason } },
+    });
 }
 
 fn emitSessionCompactHook(
@@ -1464,13 +1511,9 @@ fn emitSessionCompactHook(
     ctx: *ExtensionHookContext,
     from_extension: bool,
 ) !void {
-    if (!ctx.hasHook("session_compact")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_compact");
-    try putBool(allocator, &event.object, "fromExtension", from_extension);
-    const result = try ctx.invoke(allocator, "session_compact", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "session_compact", &.{
+        .{ .boolean = .{ .key = "fromExtension", .value = from_extension } },
+    });
 }
 
 fn emitUserBashHook(
@@ -1480,15 +1523,11 @@ fn emitUserBashHook(
     exclude_from_context: bool,
     cwd: []const u8,
 ) !void {
-    if (!ctx.hasHook("user_bash")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "user_bash");
-    try putString(allocator, &event.object, "command", command);
-    try putBool(allocator, &event.object, "excludeFromContext", exclude_from_context);
-    try putString(allocator, &event.object, "cwd", cwd);
-    const result = try ctx.invoke(allocator, "user_bash", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "user_bash", &.{
+        .{ .string = .{ .key = "command", .value = command } },
+        .{ .boolean = .{ .key = "excludeFromContext", .value = exclude_from_context } },
+        .{ .string = .{ .key = "cwd", .value = cwd } },
+    });
 }
 
 fn emitSessionTreeHook(
@@ -1498,23 +1537,11 @@ fn emitSessionTreeHook(
     old_leaf_id: ?[]const u8,
     from_extension: bool,
 ) !void {
-    if (!ctx.hasHook("session_tree")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_tree");
-    if (new_leaf_id) |id| {
-        try putString(allocator, &event.object, "newLeafId", id);
-    } else {
-        try putValue(allocator, &event.object, "newLeafId", .null);
-    }
-    if (old_leaf_id) |id| {
-        try putString(allocator, &event.object, "oldLeafId", id);
-    } else {
-        try putValue(allocator, &event.object, "oldLeafId", .null);
-    }
-    try putBool(allocator, &event.object, "fromExtension", from_extension);
-    const result = try ctx.invoke(allocator, "session_tree", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "session_tree", &.{
+        .{ .optional_string = .{ .key = "newLeafId", .value = new_leaf_id } },
+        .{ .optional_string = .{ .key = "oldLeafId", .value = old_leaf_id } },
+        .{ .boolean = .{ .key = "fromExtension", .value = from_extension } },
+    });
 }
 
 fn emitResourcesDiscoverHook(
@@ -1523,14 +1550,10 @@ fn emitResourcesDiscoverHook(
     cwd: []const u8,
     reason: []const u8,
 ) !void {
-    if (!ctx.hasHook("resources_discover")) return;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "resources_discover");
-    try putString(allocator, &event.object, "cwd", cwd);
-    try putString(allocator, &event.object, "reason", reason);
-    const result = try ctx.invoke(allocator, "resources_discover", event);
-    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+    return emitNotificationHook(allocator, ctx, "resources_discover", &.{
+        .{ .string = .{ .key = "cwd", .value = cwd } },
+        .{ .string = .{ .key = "reason", .value = reason } },
+    });
 }
 
 fn emitSessionBeforeCompactHook(
@@ -1538,16 +1561,15 @@ fn emitSessionBeforeCompactHook(
     ctx: *ExtensionHookContext,
     custom_instructions: ?[]const u8,
 ) !bool {
-    if (!ctx.hasHook("session_before_compact")) return false;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_before_compact");
+    // customInstructions is omitted when null (matches TS schema where the
+    // property is optional, not nullable). HookField has no "omit-if-absent"
+    // variant, so dispatch to two emit*Hook calls with different field lists.
     if (custom_instructions) |instructions| {
-        try putString(allocator, &event.object, "customInstructions", instructions);
+        return emitCancellableHook(allocator, ctx, "session_before_compact", &.{
+            .{ .string = .{ .key = "customInstructions", .value = instructions } },
+        });
     }
-    const result = try ctx.invoke(allocator, "session_before_compact", event) orelse return false;
-    defer tools_common.deinitJsonValue(allocator, result);
-    return boolField(result, "cancel") orelse false;
+    return emitCancellableHook(allocator, ctx, "session_before_compact", &.{});
 }
 
 fn emitSessionBeforeTreeHook(
@@ -1556,19 +1578,10 @@ fn emitSessionBeforeTreeHook(
     target_id: []const u8,
     old_leaf_id: ?[]const u8,
 ) !bool {
-    if (!ctx.hasHook("session_before_tree")) return false;
-    var event = try makeObject(allocator);
-    defer tools_common.deinitJsonValue(allocator, event);
-    try putString(allocator, &event.object, "type", "session_before_tree");
-    try putString(allocator, &event.object, "targetId", target_id);
-    if (old_leaf_id) |id| {
-        try putString(allocator, &event.object, "oldLeafId", id);
-    } else {
-        try putValue(allocator, &event.object, "oldLeafId", .null);
-    }
-    const result = try ctx.invoke(allocator, "session_before_tree", event) orelse return false;
-    defer tools_common.deinitJsonValue(allocator, result);
-    return boolField(result, "cancel") orelse false;
+    return emitCancellableHook(allocator, ctx, "session_before_tree", &.{
+        .{ .string = .{ .key = "targetId", .value = target_id } },
+        .{ .optional_string = .{ .key = "oldLeafId", .value = old_leaf_id } },
+    });
 }
 
 fn toolCallEvent(allocator: std.mem.Allocator, event_name: []const u8, tool_call: ai.ToolCall, args: std.json.Value) !std.json.Value {
