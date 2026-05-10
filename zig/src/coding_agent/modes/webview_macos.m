@@ -116,7 +116,7 @@ static void pi_webview_log_telemetry(NSDictionary *payload) {
     NSString *provider = pi_webview_safe_telemetry_string(payload[@"provider"]);
     fprintf(
         stderr,
-        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f sequence=%.0f\n",
+        "PI_WEBVIEW_TELEMETRY name=%s pid=%d host_monotonic_ms=%.3f perf_ms=%.3f wall_ms=%.0f since_launch_ms=%.3f since_ready_ms=%.3f since_hydrated_ms=%.3f provider=%s faux_provider=%s api_key_present=%s bridge_available=%s ready_to_focus_ms=%.3f ready_to_type_ms=%.3f hydrated_to_focus_ms=%.3f hydrated_to_type_ms=%.3f value_length=%.0f submit_to_visible_ms=%.3f submit_to_running_ms=%.3f submit_to_first_delta_ms=%.3f submit_to_terminal_ms=%.3f sequence=%.0f visible_delta_index=%.0f child_count=%.0f reused_surface=%s max_active_frame_gap_ms=%.3f stall_over_100=%s\n",
         [name UTF8String],
         getpid(),
         pi_webview_monotonic_ms(),
@@ -138,7 +138,12 @@ static void pi_webview_log_telemetry(NSDictionary *payload) {
         pi_webview_telemetry_number(payload, @"submitToRunningMs"),
         pi_webview_telemetry_number(payload, @"submitToFirstDeltaMs"),
         pi_webview_telemetry_number(payload, @"submitToTerminalMs"),
-        pi_webview_telemetry_number(payload, @"sequence")
+        pi_webview_telemetry_number(payload, @"sequence"),
+        pi_webview_telemetry_number(payload, @"visibleDeltaIndex"),
+        pi_webview_telemetry_number(payload, @"childCount"),
+        pi_webview_telemetry_bool(payload, @"reusedSurface"),
+        pi_webview_telemetry_number(payload, @"maxActiveFrameGapMs"),
+        pi_webview_telemetry_bool(payload, @"stallOver100")
     );
     fflush(stderr);
 }

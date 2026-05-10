@@ -69,6 +69,16 @@
       .message.assistant {
         background: rgba(63, 185, 80, 0.14);
       }
+      .message.assistant.streaming {
+        border-color: rgba(63, 185, 80, 0.48);
+        box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.12);
+      }
+      .message.assistant.streaming strong::after {
+        content: " streaming";
+        color: #7ee787;
+        font-size: 12px;
+        font-weight: 500;
+      }
       .event {
         color: #c9d1d9;
         font-size: 13px;
@@ -98,6 +108,10 @@
       textarea:disabled {
         opacity: 0.55;
       }
+      form[data-running="true"] #abort-button {
+        border-color: rgba(248, 81, 73, 0.7);
+        background: rgba(248, 81, 73, 0.18);
+      }
     </style>
   </head>
   <body>
@@ -109,7 +123,7 @@
       <form id="prompt-form">
         <textarea id="prompt-input" name="prompt" placeholder="Ask pi…" autocomplete="off"></textarea>
         <button id="submit-button" type="submit">Send</button>
-        <button id="abort-button" type="button">Abort</button>
+        <button id="abort-button" type="button" disabled>Abort</button>
       </form>
     </main>
     <script>
@@ -132,6 +146,10 @@
         lastSequenceByTurn: new Map(),
         submitPerfByTurn: new Map(),
         firstDeltaSeenByTurn: new Set(),
+        liveAssistantByTurn: new Map(),
+        statusBaseText: "bridge: initializing",
+        promptEnabled: true,
+        activeFrameMonitor: null,
       };
       const statusEl = document.getElementById("status");
       const messagesEl = document.getElementById("messages");
@@ -164,10 +182,19 @@
       }
 
       function setStatus(text) {
+        state.statusBaseText = text;
         statusEl.textContent = text;
       }
 
-      function appendBlock(className, label, text) {
+      function isNearMessageBottom() {
+        return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+      }
+
+      function scrollMessagesToLatest() {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      function createMessageBlock(className, label, text) {
         const block = document.createElement("article");
         block.className = className;
         const strong = document.createElement("strong");
@@ -175,16 +202,157 @@
         const body = document.createElement("div");
         body.textContent = text;
         block.append(strong, document.createTextNode("\n"), body);
-        messagesEl.append(block);
-        messagesEl.scrollTop = messagesEl.scrollHeight;
-        return block;
+        return { block, body };
+      }
+
+      function appendBlock(className, label, text) {
+        const surface = createMessageBlock(className, label, text);
+        messagesEl.append(surface.block);
+        scrollMessagesToLatest();
+        return surface.block;
       }
 
       function renderMessages(messages) {
         messagesEl.textContent = "";
+        state.liveAssistantByTurn.clear();
         for (const message of messages) {
           appendBlock(`message ${message.role}`, message.role, message.text || "");
         }
+        markTelemetry("transcript_render", {
+          messageCount: messages.length,
+          childCount: messagesEl.childElementCount,
+        });
+      }
+
+      function setRunningState(running, details = {}) {
+        formEl.dataset.running = running ? "true" : "false";
+        submitButtonEl.disabled = running || !state.promptEnabled;
+        abortButtonEl.disabled = !running;
+        statusEl.textContent = running ? `${state.statusBaseText} · streaming` : state.statusBaseText;
+        if (running) markTelemetry("controls_active", details);
+      }
+
+      function ensureLiveAssistant(turnId) {
+        let surface = state.liveAssistantByTurn.get(turnId);
+        if (surface) return surface;
+        const created = createMessageBlock("message assistant streaming", "assistant", "");
+        surface = {
+          block: created.block,
+          body: created.body,
+          text: "",
+          pendingText: "",
+          flushScheduled: false,
+          visibleDeltas: 0,
+          initialChildCount: messagesEl.childElementCount,
+        };
+        state.liveAssistantByTurn.set(turnId, surface);
+        messagesEl.append(created.block);
+        scrollMessagesToLatest();
+        markTelemetry("streaming_surface_created", {
+          turnId,
+          childCount: messagesEl.childElementCount,
+        });
+        return surface;
+      }
+
+      function recordVisibleAssistantDelta(turnId, frame, surface, appendedLength) {
+        if (!state.firstDeltaSeenByTurn.has(turnId)) {
+          state.firstDeltaSeenByTurn.add(turnId);
+          const submitPerfMs = state.submitPerfByTurn.get(turnId);
+          markTelemetry("first_assistant_delta", {
+            turnId,
+            sequence: frame.sequence,
+            submitToFirstDeltaMs: submitPerfMs === undefined ? null : performance.now() - submitPerfMs,
+          });
+        }
+        markTelemetry("visible_assistant_delta", {
+          turnId,
+          sequence: frame.sequence,
+          valueLength: appendedLength,
+          visibleDeltaIndex: surface.visibleDeltas,
+          childCount: messagesEl.childElementCount,
+          reusedSurface: messagesEl.childElementCount === surface.initialChildCount + 1,
+        });
+        if (surface.visibleDeltas > 1) {
+          markTelemetry("streaming_surface_reused", {
+            turnId,
+            sequence: frame.sequence,
+            childCount: messagesEl.childElementCount,
+            visibleDeltaIndex: surface.visibleDeltas,
+          });
+        }
+      }
+
+      function flushAssistantSurface(turnId, frame) {
+        const surface = state.liveAssistantByTurn.get(turnId);
+        if (!surface || surface.pendingText.length === 0) return;
+        const pendingText = surface.pendingText;
+        surface.pendingText = "";
+        const stickToBottom = isNearMessageBottom();
+        surface.text += pendingText;
+        surface.body.textContent = surface.text;
+        surface.visibleDeltas += 1;
+        surface.block.dataset.visibleDeltas = String(surface.visibleDeltas);
+        if (stickToBottom) scrollMessagesToLatest();
+        recordVisibleAssistantDelta(turnId, frame, surface, pendingText.length);
+      }
+
+      function scheduleAssistantFlush(turnId, frame, delta) {
+        const surface = ensureLiveAssistant(turnId);
+        surface.pendingText += delta;
+        if (surface.flushScheduled) return;
+        surface.flushScheduled = true;
+        requestAnimationFrame(() => {
+          surface.flushScheduled = false;
+          flushAssistantSurface(turnId, frame);
+        });
+      }
+
+      function startActiveFrameMonitor(turnId) {
+        state.activeFrameMonitor = {
+          turnId,
+          running: true,
+          lastPerfMs: performance.now(),
+          maxGapMs: 0,
+        };
+        const tick = (now) => {
+          const monitor = state.activeFrameMonitor;
+          if (!monitor || !monitor.running || monitor.turnId !== turnId) return;
+          const gap = now - monitor.lastPerfMs;
+          monitor.lastPerfMs = now;
+          if (gap > monitor.maxGapMs) monitor.maxGapMs = gap;
+          if (gap > 100) {
+            markTelemetry("active_ui_stall", {
+              turnId,
+              maxActiveFrameGapMs: gap,
+            });
+          }
+          requestAnimationFrame(tick);
+        };
+        requestAnimationFrame(tick);
+      }
+
+      function stopActiveFrameMonitor(turnId, outcome) {
+        const monitor = state.activeFrameMonitor;
+        if (!monitor || monitor.turnId !== turnId) return;
+        monitor.running = false;
+        markTelemetry("active_stall_summary", {
+          turnId,
+          terminalOutcome: outcome || "done",
+          maxActiveFrameGapMs: monitor.maxGapMs,
+          stallOver100: monitor.maxGapMs > 100,
+        });
+        state.activeFrameMonitor = null;
+      }
+
+      function isTranscriptLifecycleEvent(type) {
+        return type === "agent_start" ||
+          type === "turn_start" ||
+          type === "turn_end" ||
+          type === "message_start" ||
+          type === "message_end" ||
+          type === "before_provider_request" ||
+          type === "after_provider_response";
       }
 
       function renderEvent(frame) {
@@ -199,34 +367,48 @@
         const event = frame.event || {};
         const assistant = event.assistantMessageEvent || {};
         if (assistant.delta) {
-          appendBlock("event", `${frame.sequence} ${frame.type}`, assistant.delta);
-          if (!state.firstDeltaSeenByTurn.has(frame.turnId)) {
-            state.firstDeltaSeenByTurn.add(frame.turnId);
-            const submitPerfMs = state.submitPerfByTurn.get(frame.turnId);
-            markTelemetry("first_assistant_delta", {
-              turnId: frame.turnId,
-              sequence: frame.sequence,
-              submitToFirstDeltaMs: submitPerfMs === undefined ? null : performance.now() - submitPerfMs,
-            });
+          scheduleAssistantFlush(frame.turnId, frame, assistant.delta);
+        } else if (assistant.type) {
+          if (assistant.type === "start" || assistant.type.endsWith("_start")) {
+            ensureLiveAssistant(frame.turnId);
           }
         } else if (frame.terminal) {
+          flushAssistantSurface(frame.turnId, frame);
+          const surface = state.liveAssistantByTurn.get(frame.turnId);
+          if (surface) surface.block.classList.remove("streaming");
           const terminalText = frame.error
             ? `${frame.terminalOutcome || "done"}: ${frame.error}`
             : frame.terminalOutcome || "done";
-          appendBlock("event", `${frame.sequence} terminal`, terminalText);
+          if (frame.terminalOutcome && frame.terminalOutcome !== "success") {
+            appendBlock("event", `${frame.sequence} terminal`, terminalText);
+          }
+          stopActiveFrameMonitor(frame.turnId, frame.terminalOutcome || "done");
+        } else if (isTranscriptLifecycleEvent(frame.type)) {
+          markTelemetry("lifecycle_event_coalesced", {
+            turnId: frame.turnId,
+            sequence: frame.sequence,
+            childCount: messagesEl.childElementCount,
+          });
         } else {
           appendBlock("event", `${frame.sequence} ${frame.type}`, event.type || "");
         }
         if (frame.terminal) {
           state.activeTurnId = null;
           state.submitPerfByTurn.delete(frame.turnId);
-          promptInputEl.disabled = false;
-          submitButtonEl.disabled = false;
+          setRunningState(false, { turnId: frame.turnId });
         }
       }
 
       function delay(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function nextAnimationFrame() {
+        return new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+
+      function isAssistantDeltaFrame(frame) {
+        return Boolean(frame?.event?.assistantMessageEvent?.delta);
       }
 
       async function pollTurnEvents(turnId) {
@@ -235,9 +417,19 @@
           const lastSequence = state.lastSequenceByTurn.get(turnId) || 0;
           const result = await sendBridge("get_events", { turnId, afterSequence: lastSequence });
           const frames = result.events || [];
-          for (const frame of frames) renderEvent(frame);
+          let deltaFramesSinceYield = 0;
+          for (const frame of frames) {
+            renderEvent(frame);
+            if (isAssistantDeltaFrame(frame)) {
+              deltaFramesSinceYield += 1;
+              if (deltaFramesSinceYield >= 8) {
+                deltaFramesSinceYield = 0;
+                await nextAnimationFrame();
+              }
+            }
+          }
           if (result.terminal || frames.some((frame) => frame.terminal)) break;
-          idlePolls += frames.length === 0 ? 1 : 0;
+          idlePolls = frames.length === 0 ? idlePolls + 1 : 0;
           await delay(idlePolls > 2 ? 50 : 25);
         }
       }
@@ -276,6 +468,7 @@
         const authLabel = auth.statusLabel || auth.status || "unknown";
         setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId} · auth: ${authLabel}`);
         if (auth.required) {
+          state.promptEnabled = false;
           promptInputEl.disabled = true;
           submitButtonEl.disabled = true;
           promptInputEl.placeholder = "Provider credentials are required before prompts can run";
@@ -336,7 +529,12 @@
           state.activeTurnId = result.turnId;
           state.lastSequenceByTurn.set(result.turnId, 0);
           state.submitPerfByTurn.set(result.turnId, submitPerfMs);
-          appendBlock("event", "running", "streaming response…");
+          ensureLiveAssistant(result.turnId);
+          setRunningState(true, {
+            turnId: result.turnId,
+            submitToRunningMs: performance.now() - submitPerfMs,
+          });
+          startActiveFrameMonitor(result.turnId);
           markTelemetry("running_state", {
             turnId: result.turnId,
             submitToRunningMs: performance.now() - submitPerfMs,
@@ -347,20 +545,25 @@
             turnId: result.turnId,
             submitToTerminalMs: terminalPerfMs - submitPerfMs,
           });
-          const transcript = await sendBridge("get_messages");
-          renderMessages(transcript.messages || []);
+          markTelemetry("transcript_refresh_skipped", {
+            turnId: result.turnId,
+            childCount: messagesEl.childElementCount,
+          });
           promptInputEl.value = "";
         } catch (error) {
           appendBlock("event", "error", String(error.message || error));
         } finally {
           state.activeTurnId = null;
           promptInputEl.disabled = false;
-          submitButtonEl.disabled = false;
+          setRunningState(false);
         }
       });
 
       abortButtonEl.addEventListener("click", async () => {
         try {
+          const turnId = state.activeTurnId;
+          markTelemetry("abort_action", { turnId: turnId || "none" });
+          if (turnId) statusEl.textContent = `${state.statusBaseText} · aborting`;
           const result = await sendBridge("abort");
           appendBlock("event", "abort", result.status);
         } catch (error) {

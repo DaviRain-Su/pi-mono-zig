@@ -473,7 +473,7 @@ fn configureFauxWebViewSmokeFixtures(
     if (!std.mem.eql(u8, provider, "faux")) return;
     if (env_map.get("PI_WEBVIEW_SMOKE_AUTO_SUBMIT_PROMPT") != null) {
         const registration = try ai.providers.faux.registerFauxProvider(allocator, .{
-            .tokens_per_second = 200,
+            .tokens_per_second = 80,
             .token_size = .{ .min = 1, .max = 1 },
         });
         errdefer registration.unregister();
@@ -897,4 +897,24 @@ test "webview frontend asset includes ready input responsiveness telemetry hooks
     try std.testing.expect(std.mem.indexOf(u8, html, "input_focus") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "typed_input") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "readyInputSmoke") != null);
+}
+
+test "webview frontend asset streams into one coalesced live assistant surface" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "liveAssistantByTurn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "scheduleAssistantFlush") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "requestAnimationFrame") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "visible_assistant_delta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "streaming_surface_reused") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "messagesEl.childElementCount") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "transcript_refresh_skipped") != null);
 }
