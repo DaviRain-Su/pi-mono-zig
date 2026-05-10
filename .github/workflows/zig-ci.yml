@@ -270,7 +270,7 @@ jobs:
           echo "Re-enable after upgrading to a stable Zig release with ziglang/zig#26028 fixed."
 
       - name: Build
-        if: runner.os != 'Linux'
+        if: runner.os == 'Windows'
         run: zig build
 
       - name: Test
@@ -279,4 +279,20 @@ jobs:
         # process-group tests, and timeout/socket semantics). Keep Windows in
         # the build matrix while preserving macOS as the full Zig test runner.
         if: runner.os == 'macOS'
-        run: zig build test
+        run: |
+          set -euo pipefail
+          started_at="$(date +%s)"
+          status=0
+          zig build test --summary all || status=$?
+          finished_at="$(date +%s)"
+          elapsed_seconds=$((finished_at - started_at))
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "## Zig CI Test Summary"
+              echo
+              echo "| Command | Status | Duration |"
+              echo "| --- | ---: | ---: |"
+              printf '| `%s` | %s | %ss |\n' "zig build test --summary all" "$status" "$elapsed_seconds"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"

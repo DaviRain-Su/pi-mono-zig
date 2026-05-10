@@ -547,9 +547,10 @@ test "VAL-CROSS-030 CI matrix keeps aggregate native runtime boundaries explicit
     try expectContains(zig_ci, "Linux Zig smoke");
     try expectContains(zig_ci, "zig build check-external-tools --summary all");
     try expectContains(zig_ci, "Skipping Linux zig build/test because Zig 0.16.0 SIGSEGVs");
-    try expectContains(zig_ci, "if: runner.os != 'Linux'");
+    try expectContains(zig_ci, "if: runner.os == 'Windows'");
     try expectContains(zig_ci, "if: runner.os == 'macOS'");
-    try expectContains(zig_ci, "zig build test");
+    try expectContains(zig_ci, "zig build test --summary all");
+    try expectContains(zig_ci, "Zig CI Test Summary");
     try expectContains(node_ci, "npm run check");
     try expectNotContains(zig_ci, "Web Simulator");
     try expectNotContains(zig_ci, "marketplace");

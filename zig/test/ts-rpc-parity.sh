@@ -10,21 +10,129 @@ for name in "${!PI_@}"; do
 	unset "$name"
 done
 
+ts_rpc_now_ms() {
+	python3 -c 'import time; print(int(time.monotonic() * 1000))'
+}
+
+ts_rpc_format_duration() {
+	python3 - "$1" <<'PY'
+import sys
+
+milliseconds = int(sys.argv[1])
+seconds = milliseconds / 1000
+if seconds < 60:
+	print(f"{seconds:.1f}s")
+else:
+	minutes = int(seconds // 60)
+	remainder = seconds - minutes * 60
+	print(f"{minutes}m {remainder:.1f}s")
+PY
+}
+
 TS_RPC_PARITY_HOME="$(mktemp -d "${TMPDIR:-/tmp}/pi-ts-rpc-parity-home.XXXXXX")"
-trap 'rm -rf "$TS_RPC_PARITY_HOME"' EXIT
+TS_RPC_PARITY_RESULTS="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-parity-results.XXXXXX")"
+TS_RPC_PARITY_TOTAL_START_MS="$(ts_rpc_now_ms)"
+TS_RPC_PROMPT_CONCURRENCY_EXPECTED=""
+
+ts_rpc_cleanup() {
+	rm -rf "$TS_RPC_PARITY_HOME"
+	rm -f "$TS_RPC_PARITY_RESULTS"
+	if [ -n "$TS_RPC_PROMPT_CONCURRENCY_EXPECTED" ]; then
+		rm -f "$TS_RPC_PROMPT_CONCURRENCY_EXPECTED"
+	fi
+}
+
+ts_rpc_finalize_summary() {
+	local status="$1"
+	set +e
+	local total_elapsed_ms
+	local total_duration
+	local total_result
+	total_elapsed_ms=$(($(ts_rpc_now_ms) - TS_RPC_PARITY_TOTAL_START_MS))
+	total_duration="$(ts_rpc_format_duration "$total_elapsed_ms")"
+	if [ "$status" -eq 0 ]; then
+		total_result="PASS"
+	else
+		total_result="FAIL ($status)"
+	fi
+	if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+		{
+			echo "## TS-RPC Parity Build Test Summary"
+			echo
+			echo "| Section | Result | Duration |"
+			echo "| --- | ---: | ---: |"
+			if [ -r "$TS_RPC_PARITY_RESULTS" ]; then
+				while IFS=$'\t' read -r section result duration; do
+					[ -n "$section" ] || continue
+					printf '| %s | %s | %s |\n' "$section" "$result" "$duration"
+				done < "$TS_RPC_PARITY_RESULTS"
+			fi
+			printf '| **Total** | **%s** | **%s** |\n' "$total_result" "$total_duration"
+		} >> "$GITHUB_STEP_SUMMARY"
+	fi
+	ts_rpc_cleanup
+}
+
+trap 'status=$?; ts_rpc_finalize_summary "$status"; exit "$status"' EXIT
+
+ts_rpc_run_section() {
+	local section="$1"
+	shift
+	echo
+	echo "==> $section"
+	local started_ms
+	started_ms="$(ts_rpc_now_ms)"
+	local status=0
+	"$@" || status=$?
+	local elapsed_ms
+	local duration
+	local result
+	elapsed_ms=$(($(ts_rpc_now_ms) - started_ms))
+	duration="$(ts_rpc_format_duration "$elapsed_ms")"
+	if [ "$status" -eq 0 ]; then
+		result="PASS"
+		echo "PASS: $section ($duration)"
+	else
+		result="FAIL ($status)"
+		echo "FAIL: $section ($duration)" >&2
+	fi
+	printf '%s\t%s\t%s\n' "$section" "$result" "$duration" >> "$TS_RPC_PARITY_RESULTS"
+	return "$status"
+}
+
+ts_rpc_prompt_concurrency_stress_loop() {
+	echo "TS-RPC parity: generating prompt-concurrency expected fixture once"
+	TS_RPC_PROMPT_CONCURRENCY_EXPECTED="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-expected.XXXXXX")"
+	npx tsx test/generate-ts-rpc-fixtures.ts --emit-fixture=prompt-concurrency-queue-order.jsonl > "$TS_RPC_PROMPT_CONCURRENCY_EXPECTED"
+
+	local stress_started_ms
+	stress_started_ms="$(ts_rpc_now_ms)"
+	for iteration in $(seq 1 20); do
+		PI_TS_RPC_PROMPT_CONCURRENCY_EXPECTED_FIXTURE="$TS_RPC_PROMPT_CONCURRENCY_EXPECTED" \
+			bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
+		printf '  prompt-concurrency iteration %02d passed\n' "$iteration"
+	done
+	local stress_elapsed_ms
+	local stress_duration
+	stress_elapsed_ms=$(($(ts_rpc_now_ms) - stress_started_ms))
+	stress_duration="$(ts_rpc_format_duration "$stress_elapsed_ms")"
+	echo "TS-RPC parity: prompt-concurrency stress loop duration: $stress_duration"
+}
+
 export HOME="$TS_RPC_PARITY_HOME"
 export USERPROFILE="$TS_RPC_PARITY_HOME"
 export PI_CODING_AGENT_DIR="$TS_RPC_PARITY_HOME/.pi/agent"
 export npm_config_update_notifier=false
 
-echo "TS-RPC parity: checking TypeScript fixtures are current and read-only"
-npx tsx test/generate-ts-rpc-fixtures.ts --check
+ts_rpc_run_section \
+	"TypeScript fixtures current/read-only" \
+	npx tsx test/generate-ts-rpc-fixtures.ts --check
 
-echo "TS-RPC parity: prompt-concurrency queue-order exact byte diff"
-bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
+ts_rpc_run_section \
+	"Prompt-concurrency queue-order exact byte diff" \
+	bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
 
-echo "TS-RPC parity: live production scenario exact byte diffs"
-python3 <<'PY'
+ts_rpc_run_section "Live production scenario exact byte diffs" python3 <<'PY'
 import os
 import json
 import queue
@@ -640,11 +748,11 @@ if first_mode_switch != second_mode_switch:
 print("  M6 extension host configured, disabled/unconfigured, multi-request, and mode-switch parity passed")
 PY
 
-echo "TS-RPC parity: extension UI request writer exact byte coverage"
-zig build test-coding-agent -- --test-filter "TS RPC extension UI request writer matches TypeScript fixture bytes"
+ts_rpc_run_section \
+	"Extension UI request writer exact byte coverage" \
+	zig build test-coding-agent -- --test-filter "TS RPC extension UI request writer matches TypeScript fixture bytes"
 
-echo "TS-RPC parity: direct bash exact byte diff"
-python3 <<'PY'
+ts_rpc_run_section "Direct bash exact byte diff" python3 <<'PY'
 import os
 import subprocess
 import sys
@@ -755,11 +863,9 @@ if stdout != ts_expected.stdout:
 	sys.exit(1)
 PY
 
-echo "TS-RPC parity: prompt-concurrency stress loop (20/20 required)"
-for iteration in $(seq 1 20); do
-	bash test/ts-rpc-prompt-concurrency-fixture-diff.sh
-	printf '  prompt-concurrency iteration %02d passed\n' "$iteration"
-done
+ts_rpc_run_section \
+	"Prompt-concurrency stress loop (20/20 required)" \
+	ts_rpc_prompt_concurrency_stress_loop
 
 cat <<'REPORT'
 TS-RPC parity scenarios passed:

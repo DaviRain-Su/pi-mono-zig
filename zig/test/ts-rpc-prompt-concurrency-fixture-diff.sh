@@ -3,10 +3,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+precomputed_expected="${PI_TS_RPC_PROMPT_CONCURRENCY_EXPECTED_FIXTURE:-}"
 actual="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency.XXXXXX")"
-expected="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-ts.XXXXXX")"
+expected_temp=""
+if [ -n "$precomputed_expected" ]; then
+	expected="$precomputed_expected"
+else
+	expected_temp="$(mktemp "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-ts.XXXXXX")"
+	expected="$expected_temp"
+fi
 clean_home="$(mktemp -d "${TMPDIR:-/tmp}/pi-ts-rpc-prompt-concurrency-home.XXXXXX")"
-trap 'rm -f "$actual" "$expected"; rm -rf "$clean_home"' EXIT
+trap 'rm -f "$actual"; if [ -n "$expected_temp" ]; then rm -f "$expected_temp"; fi; rm -rf "$clean_home"' EXIT
 
 for name in "${!PI_@}"; do
 	unset "$name"
@@ -16,7 +23,14 @@ export USERPROFILE="$clean_home"
 export PI_CODING_AGENT_DIR="$clean_home/.pi/agent"
 export npm_config_update_notifier=false
 
-npx tsx test/generate-ts-rpc-fixtures.ts --emit-fixture=prompt-concurrency-queue-order.jsonl > "$expected"
+if [ -n "$precomputed_expected" ]; then
+	if [ ! -r "$expected" ]; then
+		echo "precomputed prompt-concurrency expected fixture is not readable: $expected" >&2
+		exit 1
+	fi
+else
+	npx tsx test/generate-ts-rpc-fixtures.ts --emit-fixture=prompt-concurrency-queue-order.jsonl > "$expected"
+fi
 
 ./zig-out/bin/pi --mode ts-rpc --provider faux --no-session \
 	< test/golden/ts-rpc/prompt-concurrency-queue-order.input.jsonl \
