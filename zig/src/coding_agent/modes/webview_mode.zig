@@ -35,6 +35,8 @@ pub const RunWebViewModeOptions = struct {
     api_key_present: bool,
     auth_status: provider_config.ProviderAuthStatus,
     available_models: []const provider_config.AvailableModel = &.{},
+    configured_credentials: provider_config.ConfiguredCredentials = .{},
+    auth_path: ?[]const u8 = null,
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
     initial_prompt: ?[]const u8 = null,
@@ -169,9 +171,18 @@ pub fn runWebViewMode(
         .api_key_present = options.api_key_present,
         .auth_status = options.auth_status,
         .available_models = options.available_models,
+        .env_map = env_map,
+        .configured_credentials = options.configured_credentials,
+        .auth_path = options.auth_path,
         .selected_tools = options.selected_tools,
         .active_tool_count = options.active_tool_count,
         .session = session,
+        .permissions = .{
+            .skeleton_chat = true,
+            .model_selection = true,
+            .session_mutation = true,
+            .auth_mutation = true,
+        },
         .initial_prompt = options.initial_prompt,
         .initial_messages = options.initial_messages,
         .initial_images_count = options.initial_images_count,
@@ -1016,4 +1027,28 @@ test "webview frontend asset renders structured chat surfaces separately" {
     try std.testing.expect(std.mem.indexOf(u8, html, "createToolCallBlock") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "createTerminalCard") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "structured_surface_rendered") != null);
+}
+
+test "webview frontend asset includes model auth and session panels" {
+    const allocator = std.testing.allocator;
+    const html = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "assets/webview/index.html",
+        allocator,
+        .unlimited,
+    );
+    defer allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "model-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "auth-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session-panel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "model_select") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "save_api_key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "remove_auth") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "switch_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "new_session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "model_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "auth_panel_rendered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "session_panel_rendered") != null);
 }

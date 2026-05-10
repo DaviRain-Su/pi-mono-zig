@@ -299,6 +299,8 @@ fn dispatchWebViewMode(
         .provider_api_keys = &prepared.runtime_config.provider_api_keys,
     });
     defer allocator.free(available_models);
+    const webview_auth_path = try std.fs.path.join(allocator, &[_][]const u8{ prepared.runtime_config.agent_dir, "auth.json" });
+    defer allocator.free(webview_auth_path);
 
     return try coding_agent.runWebViewMode(
         allocator,
@@ -313,6 +315,11 @@ fn dispatchWebViewMode(
             .api_key_present = options.api_key != null or provider_runtime.api_key != null,
             .auth_status = provider_runtime.auth_status,
             .available_models = available_models,
+            .configured_credentials = .{
+                .auth_tokens = &prepared.runtime_config.auth_tokens,
+                .provider_api_keys = &prepared.runtime_config.provider_api_keys,
+            },
+            .auth_path = webview_auth_path,
             .selected_tools = construction_selected_tools,
             .active_tool_count = built_tools.items.len,
             .initial_prompt = initial_input.prompt,

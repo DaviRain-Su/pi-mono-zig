@@ -42,11 +42,66 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
       #status,
-      #initial-input {
+      #initial-input,
+      .panel {
         padding: 12px 14px;
         border: 1px solid rgba(255, 255, 255, 0.14);
         border-radius: 12px;
         background: rgba(255, 255, 255, 0.06);
+      }
+      .panels {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .panel {
+        display: grid;
+        gap: 10px;
+        min-width: 0;
+      }
+      .panel h2 {
+        margin: 0;
+        font-size: 15px;
+      }
+      .panel-controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .panel input,
+      .panel select {
+        min-width: 0;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.08);
+        color: inherit;
+        padding: 6px 8px;
+      }
+      .panel-list {
+        display: grid;
+        gap: 8px;
+        max-height: 220px;
+        overflow: auto;
+      }
+      .panel-row {
+        display: grid;
+        gap: 4px;
+        text-align: left;
+        padding: 8px 10px;
+        height: auto;
+      }
+      .panel-row.current {
+        border-color: rgba(63, 185, 80, 0.75);
+      }
+      .panel-row .meta,
+      .panel-status {
+        color: #c9d1d9;
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      .auth-required {
+        border-color: rgba(255, 171, 0, 0.7);
+        background: rgba(255, 171, 0, 0.12);
       }
       #messages {
         overflow: auto;
@@ -163,12 +218,56 @@
         border-color: rgba(248, 81, 73, 0.7);
         background: rgba(248, 81, 73, 0.18);
       }
+      @media (max-width: 900px) {
+        .panels {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
     <main>
       <h1>pi WebView</h1>
       <p id="status"><code>bridge: initializing</code></p>
+      <section class="panels" aria-label="WebView panels">
+        <section id="model-panel" class="panel" aria-label="Model selector">
+          <h2>Model selector</h2>
+          <div class="panel-status" id="model-panel-status">Loading models…</div>
+          <div class="panel-list" id="model-list"></div>
+        </section>
+        <section id="auth-panel" class="panel" aria-label="Auth panel">
+          <h2>Auth</h2>
+          <div class="panel-status" id="auth-panel-status">Loading auth…</div>
+          <div class="panel-controls">
+            <button id="auth-start-button" type="button">Login</button>
+            <input id="auth-api-key-input" type="password" placeholder="API key" autocomplete="off" />
+            <button id="auth-save-button" type="button">Save key</button>
+            <button id="auth-remove-button" type="button">Remove</button>
+          </div>
+        </section>
+        <section id="session-panel" class="panel" aria-label="Session selector">
+          <h2>Session selector</h2>
+          <div class="panel-controls">
+            <select id="session-scope-select" aria-label="Session scope">
+              <option value="current">Current</option>
+              <option value="all">All</option>
+            </select>
+            <select id="session-sort-select" aria-label="Session sort">
+              <option value="threaded">Threaded</option>
+              <option value="recent">Recent</option>
+              <option value="relevance">Relevance</option>
+            </select>
+            <select id="session-name-filter-select" aria-label="Named filter">
+              <option value="all">All</option>
+              <option value="named">Named</option>
+            </select>
+            <label><input id="session-path-toggle" type="checkbox" /> paths</label>
+            <button id="session-new-button" type="button">New</button>
+          </div>
+          <input id="session-search-input" placeholder="Search sessions" autocomplete="off" />
+          <div class="panel-list" id="session-list"></div>
+        </section>
+      </section>
       <pre id="initial-input" hidden></pre>
       <section id="messages" aria-live="polite"></section>
       <form id="prompt-form">
@@ -201,6 +300,14 @@
         liveAssistantByTurn: new Map(),
         thinkingByTurn: new Map(),
         toolCallByTurn: new Map(),
+        bridgeState: null,
+        sessionUi: {
+          scope: "current",
+          sort: "threaded",
+          nameFilter: "all",
+          showPath: false,
+          search: "",
+        },
         statusBaseText: "bridge: initializing",
         promptEnabled: true,
         activeFrameMonitor: null,
@@ -212,6 +319,20 @@
       const promptInputEl = document.getElementById("prompt-input");
       const submitButtonEl = document.getElementById("submit-button");
       const abortButtonEl = document.getElementById("abort-button");
+      const modelPanelStatusEl = document.getElementById("model-panel-status");
+      const modelListEl = document.getElementById("model-list");
+      const authPanelStatusEl = document.getElementById("auth-panel-status");
+      const authStartButtonEl = document.getElementById("auth-start-button");
+      const authApiKeyInputEl = document.getElementById("auth-api-key-input");
+      const authSaveButtonEl = document.getElementById("auth-save-button");
+      const authRemoveButtonEl = document.getElementById("auth-remove-button");
+      const sessionScopeSelectEl = document.getElementById("session-scope-select");
+      const sessionSortSelectEl = document.getElementById("session-sort-select");
+      const sessionNameFilterSelectEl = document.getElementById("session-name-filter-select");
+      const sessionPathToggleEl = document.getElementById("session-path-toggle");
+      const sessionSearchInputEl = document.getElementById("session-search-input");
+      const sessionNewButtonEl = document.getElementById("session-new-button");
+      const sessionListEl = document.getElementById("session-list");
 
       function postNativeMessage(message) {
         if (window.webkit?.messageHandlers?.pi) {
@@ -264,6 +385,139 @@
         messagesEl.append(surface.block);
         scrollMessagesToLatest();
         return surface.block;
+      }
+
+      function setPromptAuthRequired(required, message) {
+        state.promptEnabled = !required;
+        promptInputEl.disabled = required;
+        submitButtonEl.disabled = required || Boolean(state.activeTurnId);
+        promptInputEl.placeholder = required
+          ? (message || "Provider credentials are required before prompts can run")
+          : "Ask pi…";
+        document.getElementById("auth-panel").classList.toggle("auth-required", required);
+      }
+
+      function modelCapabilities(model) {
+        const capabilities = [];
+        if (model.reasoning) capabilities.push("reasoning");
+        if (model.toolCalling) capabilities.push("tools");
+        if (model.supportsImages) capabilities.push("images");
+        if (model.contextWindow) capabilities.push(`${model.contextWindow} ctx`);
+        if (model.maxTokens) capabilities.push(`${model.maxTokens} max`);
+        return capabilities.join(" · ") || "text";
+      }
+
+      function renderModelPanel(bridgeState) {
+        const selection = bridgeState.modelSelection || {};
+        const models = selection.availableModels || [];
+        modelPanelStatusEl.textContent = `${models.length} models · active ${selection.activeProvider || bridgeState.provider}/${selection.activeModel || bridgeState.model}`;
+        modelListEl.textContent = "";
+        for (const model of models) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = `panel-row${model.current ? " current" : ""}`;
+          row.disabled = Boolean(state.activeTurnId) || !model.available;
+          const title = document.createElement("strong");
+          title.textContent = `${model.current ? "✓ " : ""}${model.displayName || model.model}`;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = `${model.provider} · ${model.model} · ${model.authStatusLabel || model.authStatus} · ${modelCapabilities(model)}`;
+          row.append(title, meta);
+          row.addEventListener("click", async () => {
+            markTelemetry("model_panel_select", { provider: model.provider, valueLength: model.model.length });
+            const result = await sendBridge("model_select", { provider: model.provider, model: model.model });
+            if (result.status === "selected" || result.status === "auth_required") {
+              await refreshStatePanels();
+            }
+            if (result.status === "auth_required") {
+              setPromptAuthRequired(true, result.message);
+            }
+          });
+          modelListEl.append(row);
+        }
+        markTelemetry("model_panel_rendered", {
+          childCount: modelListEl.childElementCount,
+          valueLength: models.length,
+        });
+      }
+
+      function renderAuthPanel(bridgeState) {
+        const auth = bridgeState.auth || {};
+        authPanelStatusEl.textContent = `${auth.displayName || bridgeState.provider}: ${auth.statusLabel || auth.status || "unknown"}`;
+        authStartButtonEl.disabled = !auth.actions?.startAuth;
+        authSaveButtonEl.disabled = !auth.actions?.saveApiKey;
+        authRemoveButtonEl.disabled = !auth.actions?.removeAuth;
+        setPromptAuthRequired(Boolean(auth.required), "Provider credentials are required before prompts can run");
+        markTelemetry("auth_panel_rendered", {
+          valueLength: auth.status ? auth.status.length : 0,
+          childCount: Number(Boolean(auth.actions?.saveApiKey)) + Number(Boolean(auth.actions?.removeAuth)),
+        });
+      }
+
+      function sessionMatchesSearch(session) {
+        const query = state.sessionUi.search.trim().toLowerCase();
+        if (!query) return true;
+        return [session.id, session.name, session.firstMessage, session.cwd, session.path]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(query));
+      }
+
+      function renderSessionPanel(bridgeState) {
+        const selection = bridgeState.sessionSelection || {};
+        let sessions = [...(selection.sessions || [])];
+        if (state.sessionUi.nameFilter === "named") {
+          sessions = sessions.filter((session) => Boolean(session.name));
+        }
+        sessions = sessions.filter(sessionMatchesSearch);
+        if (state.sessionUi.sort === "recent") {
+          sessions.sort((a, b) => String(b.modified || "").localeCompare(String(a.modified || "")));
+        } else if (state.sessionUi.sort === "relevance" && state.sessionUi.search) {
+          sessions.sort((a, b) => Number(Boolean(b.name)) - Number(Boolean(a.name)));
+        }
+        sessionListEl.textContent = "";
+        for (const session of sessions) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = `panel-row${session.current ? " current" : ""}`;
+          row.disabled = Boolean(state.activeTurnId) || session.current;
+          const title = document.createElement("strong");
+          title.textContent = `${session.current ? "✓ " : ""}${session.name || session.firstMessage || session.id}`;
+          const meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = [
+            session.messageCount === 1 ? "1 message" : `${session.messageCount || 0} messages`,
+            session.modified,
+            state.sessionUi.showPath ? session.path : session.cwd,
+          ].filter(Boolean).join(" · ");
+          row.append(title, meta);
+          row.addEventListener("click", async () => {
+            markTelemetry("session_panel_switch", { valueLength: session.path.length });
+            await sendBridge("switch_session", { sessionPath: session.path });
+            await refreshStatePanels();
+            const transcript = await sendBridge("get_messages");
+            renderMessages(transcript.messages || []);
+          });
+          sessionListEl.append(row);
+        }
+        sessionNewButtonEl.disabled = Boolean(state.activeTurnId) || selection.status !== "ready";
+        markTelemetry("session_panel_rendered", {
+          childCount: sessionListEl.childElementCount,
+          valueLength: sessions.length,
+        });
+      }
+
+      async function refreshStatePanels() {
+        const bridgeState = await sendBridge("get_state");
+        state.bridgeState = bridgeState;
+        telemetry.provider = bridgeState.provider || "unknown";
+        telemetry.apiKeyPresent = Boolean(bridgeState.apiKeyPresent);
+        const auth = bridgeState.auth || {};
+        const authLabel = auth.statusLabel || auth.status || "unknown";
+        setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId} · auth: ${authLabel}`);
+        renderModelPanel(bridgeState);
+        renderAuthPanel(bridgeState);
+        renderSessionPanel(bridgeState);
+        return bridgeState;
       }
 
       function structuredKey(turnId, contentIndex, fallback) {
@@ -811,18 +1065,8 @@
       };
 
       async function hydrate() {
-        const bridgeState = await sendBridge("get_state");
-        telemetry.provider = bridgeState.provider || "unknown";
-        telemetry.apiKeyPresent = Boolean(bridgeState.apiKeyPresent);
+        const bridgeState = await refreshStatePanels();
         const auth = bridgeState.auth || {};
-        const authLabel = auth.statusLabel || auth.status || "unknown";
-        setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId} · auth: ${authLabel}`);
-        if (auth.required) {
-          state.promptEnabled = false;
-          promptInputEl.disabled = true;
-          submitButtonEl.disabled = true;
-          promptInputEl.placeholder = "Provider credentials are required before prompts can run";
-        }
         if (bridgeState.initialInput) {
           initialInputEl.hidden = false;
           initialInputEl.textContent = `prepared input: ${bridgeState.initialInput.prompt || ""}\nmessages: ${bridgeState.initialInput.messages.length}\nimages: ${bridgeState.initialInput.imagesCount}`;
@@ -943,6 +1187,59 @@
         } catch (error) {
           createStructuredCard("terminal-card error", "terminal", "abort error", String(error.message || error));
         }
+      });
+
+      authStartButtonEl.addEventListener("click", async () => {
+        const result = await sendBridge("start_auth", { provider: state.bridgeState?.provider || telemetry.provider });
+        authPanelStatusEl.textContent = result.message || "Authentication flow ready";
+        markTelemetry("auth_panel_start", { valueLength: (result.authType || "").length });
+      });
+
+      authSaveButtonEl.addEventListener("click", async () => {
+        const apiKey = authApiKeyInputEl.value;
+        if (!apiKey.trim()) return;
+        const provider = state.bridgeState?.provider || telemetry.provider;
+        const result = await sendBridge("save_api_key", { provider, apiKey });
+        authApiKeyInputEl.value = "";
+        authPanelStatusEl.textContent = `${provider}: ${result.status}`;
+        markTelemetry("auth_panel_save", { valueLength: 0 });
+        await refreshStatePanels();
+      });
+
+      authRemoveButtonEl.addEventListener("click", async () => {
+        const provider = state.bridgeState?.provider || telemetry.provider;
+        const result = await sendBridge("remove_auth", { provider });
+        authPanelStatusEl.textContent = `${provider}: ${result.status}`;
+        markTelemetry("auth_panel_remove", { valueLength: Number(Boolean(result.removed)) });
+        await refreshStatePanels();
+      });
+
+      sessionScopeSelectEl.addEventListener("change", () => {
+        state.sessionUi.scope = sessionScopeSelectEl.value;
+        renderSessionPanel(state.bridgeState || {});
+      });
+      sessionSortSelectEl.addEventListener("change", () => {
+        state.sessionUi.sort = sessionSortSelectEl.value;
+        renderSessionPanel(state.bridgeState || {});
+      });
+      sessionNameFilterSelectEl.addEventListener("change", () => {
+        state.sessionUi.nameFilter = sessionNameFilterSelectEl.value;
+        renderSessionPanel(state.bridgeState || {});
+      });
+      sessionPathToggleEl.addEventListener("change", () => {
+        state.sessionUi.showPath = sessionPathToggleEl.checked;
+        renderSessionPanel(state.bridgeState || {});
+      });
+      sessionSearchInputEl.addEventListener("input", () => {
+        state.sessionUi.search = sessionSearchInputEl.value;
+        renderSessionPanel(state.bridgeState || {});
+      });
+      sessionNewButtonEl.addEventListener("click", async () => {
+        markTelemetry("session_panel_new", {});
+        await sendBridge("new_session", {});
+        await refreshStatePanels();
+        const transcript = await sendBridge("get_messages");
+        renderMessages(transcript.messages || []);
       });
 
       promptInputEl.addEventListener("focus", () => {
