@@ -916,8 +916,7 @@ pub fn startLockedWasmPackageRuntimes(
         const policy = runtime_config.getExtensionPolicy(policy_lookup_key) orelse {
             if (try findStaleLockedWasmPolicyKey(allocator, runtime_config, handoff)) |attempted_policy| {
                 defer allocator.free(attempted_policy);
-                const message = try std.fmt.allocPrint(
-                    allocator,
+                try appendFmtDiagnostic(allocator, &diagnostics, "policy_digest_mismatch", package.manifest.manifest_path,
                     "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactSha256={s}; attemptedPolicy={s}; requiredPolicy={s}; stale digest-bound wasm extension policy",
                     .{
                         package.manifest.tool_id,
@@ -930,11 +929,8 @@ pub fn startLockedWasmPackageRuntimes(
                         policy_lookup_key,
                     },
                 );
-                defer allocator.free(message);
-                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "policy_digest_mismatch", message, package.manifest.manifest_path));
             } else {
-                const message = try std.fmt.allocPrint(
-                    allocator,
+                try appendFmtDiagnostic(allocator, &diagnostics, "missing_policy", package.manifest.manifest_path,
                     "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactSha256={s}; requiredPolicy={s}; missing exact digest-bound wasm extension policy",
                     .{
                         package.manifest.tool_id,
@@ -946,8 +942,6 @@ pub fn startLockedWasmPackageRuntimes(
                         policy_lookup_key,
                     },
                 );
-                defer allocator.free(message);
-                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
             }
             continue;
         };
@@ -957,8 +951,7 @@ pub fn startLockedWasmPackageRuntimes(
         handoff.resource_limits = enforcementResourceLimitsFromExtensionPolicy(policy.resource_limits);
 
         if (handoff.deniedRuntimeCapability(.initialize, "runtime/handoff")) |denial| {
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, denial.category, package.manifest.manifest_path,
                 "phase={s}; category={s}; capability={s}; branch={s}; mode={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; policyDigest={s}; requiredPolicy={s}; wasm extension capability denied before runtime registration",
                 .{
                     denial.phase.jsonName(),
@@ -978,27 +971,21 @@ pub fn startLockedWasmPackageRuntimes(
                     policy_lookup_key,
                 },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, denial.category, message, package.manifest.manifest_path));
             continue;
         }
 
         const seen = try seen_tools.getOrPut(package.manifest.tool_id);
         if (seen.found_existing) {
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, "duplicate_wasm_tool", package.manifest.manifest_path,
                 "phase=registration; tool={s}; packageRoot={s}; duplicate locked wasm tool id",
                 .{ package.manifest.tool_id, package.manifest.package_root },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_wasm_tool", message, package.manifest.manifest_path));
             continue;
         }
 
         const adapter = startRuntimeAdapter(allocator, io, .{ .wasm = .{ .manifest = handoff } }) catch |err| {
             _ = seen_tools.remove(package.manifest.tool_id);
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, runtimeContractCategory(err), package.manifest.manifest_path,
                 "phase=load; category={s}; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; abi=wasm-component; contract={s}; reason={s}; wasm runtime contract failed closed before tool registration",
                 .{
                     runtimeContractCategory(err),
@@ -1015,8 +1002,6 @@ pub fn startLockedWasmPackageRuntimes(
                     @errorName(err),
                 },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, runtimeContractCategory(err), message, package.manifest.manifest_path));
             continue;
         };
         {
@@ -1077,8 +1062,7 @@ pub fn startLockedNativePackageRuntimesWithLoader(
         const policy = runtime_config.getExtensionPolicy(policy_key) orelse {
             if (try findStaleLockedNativePolicyKey(allocator, runtime_config, package.lock_entry)) |attempted_policy| {
                 defer allocator.free(attempted_policy);
-                const message = try std.fmt.allocPrint(
-                    allocator,
+                try appendFmtDiagnostic(allocator, &diagnostics, "policy_digest_mismatch", package.manifest.manifest_path,
                     "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactPath={s}; artifactSha256={s}; attemptedPolicy={s}; requiredPolicy={s}; stale digest-bound native extension policy",
                     .{
                         package.manifest.tool_name,
@@ -1092,11 +1076,8 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                         policy_key,
                     },
                 );
-                defer allocator.free(message);
-                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "policy_digest_mismatch", message, package.manifest.manifest_path));
             } else {
-                const message = try std.fmt.allocPrint(
-                    allocator,
+                try appendFmtDiagnostic(allocator, &diagnostics, "missing_policy", package.manifest.manifest_path,
                     "phase=registration; tool={s}; source={s}; scope={s}; packageRoot={s}; packageRootSha256={s}; artifactPath={s}; artifactSha256={s}; requiredPolicy={s}; missing exact digest-bound native extension policy",
                     .{
                         package.manifest.tool_name,
@@ -1109,8 +1090,6 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                         policy_key,
                     },
                 );
-                defer allocator.free(message);
-                try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "missing_policy", message, package.manifest.manifest_path));
             }
             continue;
         };
@@ -1119,8 +1098,7 @@ pub fn startLockedNativePackageRuntimesWithLoader(
         const allowed_capabilities_json = try nativeCapabilityListJson(allocator, approved_capabilities);
         defer allocator.free(allowed_capabilities_json);
         if (wasm_manifest.denyFirstUnapprovedCapability(package.manifest.requested_capabilities, approved_capabilities, .initialize, "runtime/native-loader")) |denial| {
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, denial.category, package.manifest.manifest_path,
                 "phase={s}; category={s}; capability={s}; branch={s}; mode={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; policyDigest={s}; requiredPolicy={s}; native extension capability denied before library load",
                 .{
                     denial.phase.jsonName(),
@@ -1139,28 +1117,22 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                     policy_key,
                 },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, denial.category, message, package.manifest.manifest_path));
             continue;
         }
 
         const seen = try seen_tools.getOrPut(package.manifest.tool_name);
         if (seen.found_existing) {
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, "duplicate_native_tool", package.manifest.manifest_path,
                 "phase=registration; tool={s}; packageRoot={s}; duplicate locked native tool id",
                 .{ package.manifest.tool_name, package.manifest.package_root },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "duplicate_native_tool", message, package.manifest.manifest_path));
             continue;
         }
 
         var host_api = native_sdk.HostApiV0.init(allowed_capabilities_json, null);
         const load_result = loader.load(loader.context, allocator, &package.manifest, &host_api) catch |err| {
             _ = seen_tools.remove(package.manifest.tool_name);
-            const message = try std.fmt.allocPrint(
-                allocator,
+            try appendFmtDiagnostic(allocator, &diagnostics, "native_loader_exception", package.manifest.manifest_path,
                 "phase=load; category=native_loader_exception; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; reason={s}; native loader failed closed before tool registration",
                 .{
                     package.manifest.id,
@@ -1175,8 +1147,6 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                     @errorName(err),
                 },
             );
-            defer allocator.free(message);
-            try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_loader_exception", message, package.manifest.manifest_path));
             continue;
         };
         switch (load_result) {
@@ -1192,8 +1162,7 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                     _ = seen_tools.remove(package.manifest.tool_name);
                     var loaded_for_cleanup = loaded;
                     loaded_for_cleanup.deinit(allocator);
-                    const message = try std.fmt.allocPrint(
-                        allocator,
+                    try appendFmtDiagnostic(allocator, &diagnostics, "native_metadata_invalid", package.manifest.manifest_path,
                         "phase=metadata; category=native_metadata_invalid; extension={s}; tool={s}; source={s}; scope={s}; packageRoot={s}; manifestPath={s}; artifactPath={s}; packageRootSha256={s}; artifactSha256={s}; reason={s}; native metadata failed closed before tool registration",
                         .{
                             package.manifest.id,
@@ -1208,8 +1177,6 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                             @errorName(err),
                         },
                     );
-                    defer allocator.free(message);
-                    try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_metadata_invalid", message, package.manifest.manifest_path));
                     continue;
                 };
                 defer metadata.deinit(allocator);
@@ -1217,13 +1184,10 @@ pub fn startLockedNativePackageRuntimesWithLoader(
                     _ = seen_tools.remove(package.manifest.tool_name);
                     var loaded_for_cleanup = loaded;
                     loaded_for_cleanup.deinit(allocator);
-                    const message = try std.fmt.allocPrint(
-                        allocator,
+                    try appendFmtDiagnostic(allocator, &diagnostics, "native_metadata_tool_mismatch", package.manifest.manifest_path,
                         "phase=metadata; category=native_metadata_tool_mismatch; extension={s}; tool={s}; metadataTool={s}; packageRoot={s}; manifestPath={s}; native metadata tool identity changed after ABI validation",
                         .{ package.manifest.id, package.manifest.tool_name, metadata.tool_name, package.manifest.package_root, package.manifest.manifest_path },
                     );
-                    defer allocator.free(message);
-                    try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, "native_metadata_tool_mismatch", message, package.manifest.manifest_path));
                     continue;
                 }
                 var resource_limits = try nativeManifestResourceLimitsToEnforcement(allocator, package.manifest.resource_limits);
@@ -1457,6 +1421,23 @@ fn makeResourceDiagnostic(allocator: std.mem.Allocator, kind: []const u8, messag
         .message = redacted_message,
         .path = redacted_path,
     };
+}
+
+/// Format `fmt`/`args` into a temporary message and push a Diagnostic into
+/// `diagnostics`. Replaces the recurring three-line "allocPrint -> defer
+/// free -> append makeResourceDiagnostic" pattern in startLocked* runtime
+/// loaders (~11 sites in this file).
+fn appendFmtDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(resources_mod.Diagnostic),
+    kind: []const u8,
+    path: []const u8,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const message = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(message);
+    try diagnostics.append(allocator, try makeResourceDiagnostic(allocator, kind, message, path));
 }
 
 fn runtimeContractCategory(_: anyerror) []const u8 {

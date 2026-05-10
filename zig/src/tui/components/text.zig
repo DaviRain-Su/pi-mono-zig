@@ -3,6 +3,7 @@ const vaxis = @import("vaxis");
 const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const style_mod = @import("../style.zig");
+const layout = @import("../layout.zig");
 const test_helpers = @import("../test_helpers.zig");
 const resources_mod = @import("../theme.zig");
 
@@ -17,6 +18,7 @@ pub const Text = struct {
     padding_y: usize = 1,
     theme: ?*const resources_mod.Theme = null,
     gradient: ?TextGradient = null,
+    alignment: layout.AlignItems = .start,
 
     pub fn drawComponent(self: *const Text) draw_mod.Component {
         return .{
@@ -48,7 +50,14 @@ pub const Text = struct {
         var segments = std.ArrayList(vaxis.Segment).empty;
         try self.appendSegments(ctx.arena, &segments, base_style);
 
-        const result = content_window.print(segments.items, .{ .wrap = .grapheme });
+        const max_line_width = maxLineWidth(self.text);
+        const col_offset: u16 = if (max_line_width < content_window.width) switch (self.alignment) {
+            .start, .stretch => 0,
+            .center => @intCast((content_window.width - max_line_width) / 2),
+            .end => @intCast(content_window.width - max_line_width),
+        } else 0;
+
+        const result = content_window.print(segments.items, .{ .wrap = .grapheme, .col_offset = col_offset });
         const rendered_height = renderedLineCount(result, segments.items.len > 0, content_window.height);
         const total_height = @min(
             window.height,
@@ -140,6 +149,25 @@ fn fillWindow(window: vaxis.Window, themed: bool, style: vaxis.Cell.Style) void 
     });
 }
 
+fn maxLineWidth(text: []const u8) u16 {
+    var max_width: u16 = 0;
+    var current_width: u16 = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\n') {
+            max_width = @max(max_width, current_width);
+            current_width = 0;
+            index += 1;
+            continue;
+        }
+        const cluster = ansi.nextDisplayCluster(text, index);
+        if (cluster.end <= index) break;
+        current_width += @intCast(cluster.width);
+        index = cluster.end;
+    }
+    return @max(max_width, current_width);
+}
+
 fn renderedLineCount(result: vaxis.Window.PrintResult, had_text: bool, max_height: u16) usize {
     if (!had_text or max_height == 0) return 0;
     if (result.overflow) return max_height;
@@ -218,4 +246,34 @@ test "text supports horizontal gradients with per-grapheme colors" {
 
     const middle_left = screen.readCell(1, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expect(middle_left.style.fg != .default);
+}
+
+test "text center alignment offsets content horizontally" {
+    const text = Text{
+        .text = "Hi",
+        .padding_x = 0,
+        .padding_y = 0,
+        .alignment = .center,
+    };
+
+    var screen = try test_helpers.renderToScreen(text.drawComponent(), 8, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 3, 0, "H", .{});
+    try test_helpers.expectCell(&screen, 4, 0, "i", .{});
+}
+
+test "text end alignment offsets content to the right" {
+    const text = Text{
+        .text = "Hi",
+        .padding_x = 0,
+        .padding_y = 0,
+        .alignment = .end,
+    };
+
+    var screen = try test_helpers.renderToScreen(text.drawComponent(), 6, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 4, 0, "H", .{});
+    try test_helpers.expectCell(&screen, 5, 0, "i", .{});
 }
