@@ -80,15 +80,26 @@ pub fn dispatchRunMode(
         if (preflight_result.exit_code) |exit_code| return exit_code;
     }
 
-    var provider_runtime = coding_agent.resolveProviderConfig(
-        allocator,
-        io,
-        env_map,
-        prepared.provider_name,
-        prepared.model_name,
-        options.api_key,
-        prepared.runtime_config.lookupApiKey(prepared.provider_name),
-    ) catch |err| {
+    var provider_runtime = (if (app_mode == .webview)
+        coding_agent.resolveProviderConfigAllowMissingCredentials(
+            allocator,
+            io,
+            env_map,
+            prepared.provider_name,
+            prepared.model_name,
+            options.api_key,
+            prepared.runtime_config.lookupApiKey(prepared.provider_name),
+        )
+    else
+        coding_agent.resolveProviderConfig(
+            allocator,
+            io,
+            env_map,
+            prepared.provider_name,
+            prepared.model_name,
+            options.api_key,
+            prepared.runtime_config.lookupApiKey(prepared.provider_name),
+        )) catch |err| {
         try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, prepared.provider_name)});
         return 1;
     };
@@ -300,6 +311,7 @@ fn dispatchWebViewMode(
             .backend = webview_backend,
             .no_session = options.no_session,
             .api_key_present = options.api_key != null or provider_runtime.api_key != null,
+            .auth_status = provider_runtime.auth_status,
             .available_models = available_models,
             .selected_tools = construction_selected_tools,
             .active_tool_count = built_tools.items.len,

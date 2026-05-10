@@ -105,6 +105,53 @@ pub fn resolveProviderConfig(
     api_key_override: ?[]const u8,
     configured_api_key: ?[]const u8,
 ) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
+    return resolveProviderConfigWithPolicy(
+        allocator,
+        io,
+        env_map,
+        provider,
+        model_override,
+        api_key_override,
+        configured_api_key,
+        .{},
+    );
+}
+
+pub fn resolveProviderConfigAllowMissingCredentials(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    model_override: ?[]const u8,
+    api_key_override: ?[]const u8,
+    configured_api_key: ?[]const u8,
+) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
+    return resolveProviderConfigWithPolicy(
+        allocator,
+        io,
+        env_map,
+        provider,
+        model_override,
+        api_key_override,
+        configured_api_key,
+        .{ .allow_missing_credentials = true },
+    );
+}
+
+const ResolveProviderPolicy = struct {
+    allow_missing_credentials: bool = false,
+};
+
+fn resolveProviderConfigWithPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    provider: []const u8,
+    model_override: ?[]const u8,
+    api_key_override: ?[]const u8,
+    configured_api_key: ?[]const u8,
+    policy: ResolveProviderPolicy,
+) (ResolveProviderError || std.mem.Allocator.Error || std.fmt.ParseIntError)!ResolvedProviderConfig {
     const descriptor = if (!std.mem.eql(u8, provider, "faux"))
         ai.model_registry.getProviderConfig(provider) orelse return error.UnknownProvider
     else
@@ -116,7 +163,8 @@ pub fn resolveProviderConfig(
 
     const provider_descriptor = descriptor.?;
     const resolved_api_key = try auth.resolveApiKey(allocator, io, env_map, provider, api_key_override, configured_api_key);
-    if (resolved_api_key == null and !isLocalBaseUrl(provider_descriptor.base_url)) return error.MissingApiKey;
+    const local_provider = isLocalBaseUrl(provider_descriptor.base_url);
+    if (resolved_api_key == null and !local_provider and !policy.allow_missing_credentials) return error.MissingApiKey;
 
     const model_id = model_override orelse provider_descriptor.default_model_id orelse provider;
     const model = ai.model_registry.find(provider, model_id) orelse fallbackModel(provider_descriptor, model_id);
@@ -130,7 +178,7 @@ pub fn resolveProviderConfig(
     const auth_status: ProviderAuthStatus = if (resolved_api_key) |api_key|
         authStatusFromSource(api_key.source)
     else
-        .local;
+        if (local_provider) .local else .missing;
 
     return .{
         .model = owned_model,
@@ -913,6 +961,21 @@ test "resolveProviderConfig uses configured api key when env is missing" {
 
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
     try std.testing.expectEqual(ProviderAuthStatus.stored, resolved.auth_status);
+    try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+}
+
+test "resolveProviderConfigAllowMissingCredentials returns safe missing auth state" {
+    const allocator = std.testing.allocator;
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    var resolved = try resolveProviderConfigAllowMissingCredentials(allocator, std.testing.io, &env_map, "openai", null, null, null);
+    defer resolved.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), resolved.api_key);
+    try std.testing.expectEqual(ProviderAuthStatus.missing, resolved.auth_status);
+    try std.testing.expectEqualStrings("openai", resolved.model.provider);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
 }
 

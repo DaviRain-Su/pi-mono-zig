@@ -1506,6 +1506,46 @@ test "runCli webview captures prepared launch context without leaking secrets" {
     try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
 }
 
+test "runCli webview missing credentials reaches auth-required launch context" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "project");
+
+    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
+    defer allocator.free(project_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_WEBVIEW_CAPTURE_LAUNCH_CONTEXT", "1");
+
+    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_capture.deinit();
+    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_capture.deinit();
+
+    const exit_code = try runCli(
+        allocator,
+        std.testing.io,
+        &env_map,
+        &.{ "--webview", "--provider", "openai", "--no-session" },
+        project_dir,
+        &stdout_capture.writer,
+        &stderr_capture.writer,
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    const out = stdout_capture.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"mode\":\"webview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"authStatus\":\"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"apiKeyPresent\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "OPENAI_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "auth.json") == null);
+    try std.testing.expectEqualStrings("", stderr_capture.writer.buffered());
+}
+
 test "runCli webview session flags preserve canonical session selection" {
     const allocator = std.testing.allocator;
 

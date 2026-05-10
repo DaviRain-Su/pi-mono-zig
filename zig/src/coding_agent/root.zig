@@ -103,6 +103,7 @@ pub const runWebViewMode = webview_mode.runWebViewMode;
 pub const ResolvedProviderConfig = provider_config.ResolvedProviderConfig;
 pub const ResolveProviderError = provider_config.ResolveProviderError;
 pub const resolveProviderConfig = provider_config.resolveProviderConfig;
+pub const resolveProviderConfigAllowMissingCredentials = provider_config.resolveProviderConfigAllowMissingCredentials;
 pub const resolveProviderErrorMessage = provider_config.resolveProviderErrorMessage;
 pub const RunInteractiveModeOptions = interactive_mode.RunInteractiveModeOptions;
 pub const runInteractiveMode = interactive_mode.runInteractiveMode;

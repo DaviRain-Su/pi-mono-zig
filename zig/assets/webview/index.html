@@ -207,11 +207,18 @@
 
       async function hydrate() {
         const bridgeState = await sendBridge("get_state");
-        setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId}`);
+        const auth = bridgeState.auth || {};
+        const authLabel = auth.statusLabel || auth.status || "unknown";
+        setStatus(`provider: ${bridgeState.provider} · model: ${bridgeState.model} · session: ${bridgeState.sessionId} · auth: ${authLabel}`);
+        if (auth.required) {
+          promptInputEl.disabled = true;
+          submitButtonEl.disabled = true;
+          promptInputEl.placeholder = "Provider credentials are required before prompts can run";
+        }
         if (bridgeState.initialInput) {
           initialInputEl.hidden = false;
           initialInputEl.textContent = `prepared input: ${bridgeState.initialInput.prompt || ""}\nmessages: ${bridgeState.initialInput.messages.length}\nimages: ${bridgeState.initialInput.imagesCount}`;
-          if (bridgeState.initialInput.prompt) promptInputEl.value = bridgeState.initialInput.prompt;
+          if (bridgeState.initialInput.prompt && !auth.required) promptInputEl.value = bridgeState.initialInput.prompt;
         }
         const transcript = await sendBridge("get_messages");
         renderMessages(transcript.messages || []);

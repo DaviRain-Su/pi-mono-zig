@@ -31,24 +31,31 @@ pub const Command = enum {
     new_session,
     resume_session,
     switch_session,
+    auth_status,
+    start_auth,
+    save_api_key,
+    remove_auth,
 };
 
 pub const Permission = enum {
     skeleton_chat,
     model_selection,
     session_mutation,
+    auth_mutation,
 };
 
 pub const BridgePermissions = struct {
     skeleton_chat: bool = true,
     model_selection: bool = false,
     session_mutation: bool = false,
+    auth_mutation: bool = false,
 
     fn allows(self: BridgePermissions, permission: Permission) bool {
         return switch (permission) {
             .skeleton_chat => self.skeleton_chat,
             .model_selection => self.model_selection,
             .session_mutation => self.session_mutation,
+            .auth_mutation => self.auth_mutation,
         };
     }
 };
@@ -68,6 +75,10 @@ pub const command_table = [_]CommandSpec{
     .{ .name = "new_session", .command = .new_session, .permission = .session_mutation },
     .{ .name = "resume_session", .command = .resume_session, .permission = .session_mutation },
     .{ .name = "switch_session", .command = .switch_session, .permission = .session_mutation },
+    .{ .name = "auth_status", .command = .auth_status, .permission = .skeleton_chat },
+    .{ .name = "start_auth", .command = .start_auth, .permission = .auth_mutation },
+    .{ .name = "save_api_key", .command = .save_api_key, .permission = .auth_mutation },
+    .{ .name = "remove_auth", .command = .remove_auth, .permission = .auth_mutation },
 };
 
 pub const BridgeContext = struct {
@@ -77,6 +88,7 @@ pub const BridgeContext = struct {
     model: ai.Model,
     no_session: bool,
     api_key_present: bool,
+    auth_status: provider_config.ProviderAuthStatus,
     available_models: []const provider_config.AvailableModel = &.{},
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
@@ -96,6 +108,10 @@ pub const DispatchCounters = struct {
     new_session: usize = 0,
     resume_session: usize = 0,
     switch_session: usize = 0,
+    auth_status: usize = 0,
+    start_auth: usize = 0,
+    save_api_key: usize = 0,
+    remove_auth: usize = 0,
 
     fn increment(self: *DispatchCounters, command: Command) void {
         switch (command) {
@@ -107,6 +123,10 @@ pub const DispatchCounters = struct {
             .new_session => self.new_session += 1,
             .resume_session => self.resume_session += 1,
             .switch_session => self.switch_session += 1,
+            .auth_status => self.auth_status += 1,
+            .start_auth => self.start_auth += 1,
+            .save_api_key => self.save_api_key += 1,
+            .remove_auth => self.remove_auth += 1,
         }
     }
 
@@ -118,7 +138,11 @@ pub const DispatchCounters = struct {
             self.model_select +
             self.new_session +
             self.resume_session +
-            self.switch_session;
+            self.switch_session +
+            self.auth_status +
+            self.start_auth +
+            self.save_api_key +
+            self.remove_auth;
     }
 };
 
@@ -300,6 +324,8 @@ pub const BridgeHost = struct {
             .abort => try self.writeAbortResult(&writer.writer),
             .model_select => try self.writeModelSelectResult(allocator, &writer.writer, payload.?),
             .new_session, .resume_session, .switch_session => try self.writeSessionMutationGatedResult(allocator, &writer.writer, command),
+            .auth_status => try self.writeAuthStatusResult(allocator, &writer.writer),
+            .start_auth, .save_api_key, .remove_auth => try self.writeAuthMutationGatedResult(allocator, &writer.writer, command),
         }
 
         try writer.writer.writeAll("}");
@@ -322,6 +348,8 @@ pub const BridgeHost = struct {
         try writeStringField(allocator, writer, "sessionId", self.context.session.session_manager.getSessionId(), true);
         try writeBoolField(writer, "noSession", self.context.no_session, true);
         try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
+        try writer.writeAll(",\"auth\":");
+        try self.writeAuthStatusResult(allocator, writer);
         try writeBoolField(writer, "toolsDisabled", self.context.selected_tools.disable_all, true);
         try writeUsizeField(writer, "activeToolCount", self.context.active_tool_count, true);
         try writeBoolField(writer, "busy", self.active_generation.load(.seq_cst), true);
@@ -332,6 +360,22 @@ pub const BridgeHost = struct {
             try writeUsizeField(writer, "imagesCount", self.context.initial_images_count, true);
             try writer.writeAll("}");
         }
+        try writer.writeAll("}");
+    }
+
+    fn writeAuthStatusResult(
+        self: *const BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{");
+        try writeStringField(allocator, writer, "provider", self.context.provider, false);
+        try writeStringField(allocator, writer, "displayName", provider_config.providerDisplayName(self.context.provider), true);
+        try writeStringField(allocator, writer, "status", @tagName(self.context.auth_status), true);
+        try writeStringField(allocator, writer, "statusLabel", provider_config.providerAuthStatusLabel(self.context.auth_status), true);
+        try writeBoolField(writer, "apiKeyPresent", self.context.api_key_present, true);
+        try writeBoolField(writer, "required", self.authRequired(), true);
+        try writeBoolField(writer, "promptEnabled", !self.authRequired(), true);
         try writer.writeAll("}");
     }
 
@@ -432,6 +476,14 @@ pub const BridgeHost = struct {
         payload: std.json.Value,
     ) !void {
         const text = payload.object.get("text").?.string;
+        if (self.authRequired()) {
+            try writer.writeAll("{\"status\":\"auth_required\",\"accepted\":false,\"queued\":false,\"message\":");
+            try writeJsonString(allocator, writer, "Provider credentials are required before WebView prompts can run");
+            try writer.writeAll(",\"auth\":");
+            try self.writeAuthStatusResult(allocator, writer);
+            try writer.writeAll("}");
+            return;
+        }
         if (self.active_generation.load(.seq_cst)) {
             try writer.writeAll("{\"status\":\"busy\",\"accepted\":false,\"queued\":false,\"message\":");
             try writeJsonString(allocator, writer, "Agent is already processing a WebView prompt");
@@ -542,6 +594,21 @@ pub const BridgeHost = struct {
         try writer.writeAll("}");
     }
 
+    fn writeAuthMutationGatedResult(
+        self: *BridgeHost,
+        allocator: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        command: Command,
+    ) !void {
+        try writer.writeAll("{\"status\":\"gated\",\"accepted\":false,\"command\":");
+        try writeJsonString(allocator, writer, @tagName(command));
+        try writer.writeAll(",\"message\":");
+        try writeJsonString(allocator, writer, "WebView auth mutation commands are permissioned but not implemented in this milestone");
+        try writer.writeAll(",\"auth\":");
+        try self.writeAuthStatusResult(allocator, writer);
+        try writer.writeAll("}");
+    }
+
     fn validateCommandPayloadSemantics(
         self: *BridgeHost,
         command: Command,
@@ -576,6 +643,16 @@ pub const BridgeHost = struct {
                 session_manager_mod.freeSessionHeader(self.context.session.allocator, &header);
             },
             .get_state, .get_messages, .prompt, .abort => {},
+            .auth_status => {},
+            .start_auth, .save_api_key, .remove_auth => {
+                if (payload) |value| {
+                    if (value == .object) {
+                        if (value.object.get("provider")) |provider_value| {
+                            if (provider_value != .string or !isValidProviderId(provider_value.string)) return error.InvalidModelSelection;
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -586,6 +663,10 @@ pub const BridgeHost = struct {
         self.context.session.agent.abort();
         return true;
     }
+
+    fn authRequired(self: *const BridgeHost) bool {
+        return self.context.auth_status == .missing;
+    }
 };
 
 fn permissionDeniedMessage(permission: Permission) []const u8 {
@@ -593,6 +674,7 @@ fn permissionDeniedMessage(permission: Permission) []const u8 {
         .skeleton_chat => "WebView bridge command is disabled by policy",
         .model_selection => "WebView model selection requires explicit model selection permission",
         .session_mutation => "WebView session mutation requires explicit session mutation permission",
+        .auth_mutation => "WebView auth mutation requires explicit auth mutation permission",
     };
 }
 
@@ -676,6 +758,13 @@ fn payloadShapeAllowed(command: Command, payload: ?std.json.Value) bool {
             value.object.get("model").? == .string,
         .new_session => true,
         .resume_session, .switch_session => value.object.get("sessionPath") != null and value.object.get("sessionPath").? == .string,
+        .auth_status => true,
+        .start_auth => value.object.get("provider") == null or value.object.get("provider").? == .string,
+        .save_api_key => value.object.get("provider") != null and
+            value.object.get("provider").? == .string and
+            value.object.get("apiKey") != null and
+            value.object.get("apiKey").? == .string,
+        .remove_auth => value.object.get("provider") != null and value.object.get("provider").? == .string,
     };
 }
 
@@ -701,6 +790,12 @@ fn isValidModelSelection(current_model: ai.Model, provider: []const u8, model_id
     if (std.mem.indexOfScalar(u8, provider, 0) != null or std.mem.indexOfScalar(u8, model_id, 0) != null) return false;
     if (std.mem.eql(u8, current_model.provider, provider) and std.mem.eql(u8, current_model.id, model_id)) return true;
     return ai.model_registry.find(provider, model_id) != null;
+}
+
+fn isValidProviderId(provider: []const u8) bool {
+    if (provider.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, provider, 0) != null) return false;
+    return true;
 }
 
 fn validateValueBounds(value: std.json.Value, limits: Limits, depth: usize) error{ PayloadTooDeep, StringTooLong }!void {
@@ -945,6 +1040,7 @@ fn testBridge(session: *session_mod.AgentSession) BridgeHost {
         .model = model,
         .no_session = true,
         .api_key_present = false,
+        .auth_status = .local,
         .selected_tools = .{ .disable_all = true },
         .active_tool_count = 0,
         .session = session,
@@ -1082,7 +1178,7 @@ test "bridge command table exposes approved skeleton commands first" {
 }
 
 test "bridge command table explicitly gates future session mutation commands" {
-    try std.testing.expectEqual(@as(usize, 8), command_table.len);
+    try std.testing.expectEqual(@as(usize, 12), command_table.len);
     try std.testing.expectEqualStrings("new_session", command_table[5].name);
     try std.testing.expectEqual(Command.new_session, command_table[5].command);
     try std.testing.expectEqual(Permission.session_mutation, command_table[5].permission);
@@ -1098,6 +1194,21 @@ test "bridge command table explicitly gates future model selection command" {
     try std.testing.expectEqualStrings("model_select", command_table[4].name);
     try std.testing.expectEqual(Command.model_select, command_table[4].command);
     try std.testing.expectEqual(Permission.model_selection, command_table[4].permission);
+}
+
+test "bridge command table exposes auth status and gates auth mutations" {
+    try std.testing.expectEqualStrings("auth_status", command_table[8].name);
+    try std.testing.expectEqual(Command.auth_status, command_table[8].command);
+    try std.testing.expectEqual(Permission.skeleton_chat, command_table[8].permission);
+    try std.testing.expectEqualStrings("start_auth", command_table[9].name);
+    try std.testing.expectEqual(Command.start_auth, command_table[9].command);
+    try std.testing.expectEqual(Permission.auth_mutation, command_table[9].permission);
+    try std.testing.expectEqualStrings("save_api_key", command_table[10].name);
+    try std.testing.expectEqual(Command.save_api_key, command_table[10].command);
+    try std.testing.expectEqual(Permission.auth_mutation, command_table[10].permission);
+    try std.testing.expectEqualStrings("remove_auth", command_table[11].name);
+    try std.testing.expectEqual(Command.remove_auth, command_table[11].command);
+    try std.testing.expectEqual(Permission.auth_mutation, command_table[11].permission);
 }
 
 test "bridge dispatches every approved skeleton command through command table" {
@@ -1289,6 +1400,80 @@ test "webview get_state exposes configured model choices without credential valu
     try std.testing.expect(std.mem.indexOf(u8, response, "baseUrl") == null);
 }
 
+test "webview auth status exposes minimal storage-derived state without secrets" {
+    const allocator = std.testing.allocator;
+    var secret_model = testModel();
+    secret_model.provider = "openai";
+    secret_model.id = "gpt-5.4";
+    secret_model.name = "GPT-5.4";
+    secret_model.api = "openai-responses";
+    secret_model.base_url = "https://api.openai.com/v1/sk-webview-secret";
+
+    var session = try testSessionWithModel(allocator, secret_model);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.provider = "openai";
+    bridge.context.model = secret_model;
+    bridge.context.auth_status = .stored;
+    bridge.context.api_key_present = true;
+
+    const state = try bridge.handleRequestJson(allocator, "{\"id\":\"state-auth\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"auth\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"displayName\":\"OpenAI\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"status\":\"stored\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"statusLabel\":\"saved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"apiKeyPresent\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"required\":false") != null);
+
+    const status = try bridge.handleRequestJson(allocator, "{\"id\":\"auth\",\"command\":\"auth_status\"}", trusted_bundle_origin);
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"id\":\"auth\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"status\":\"stored\"") != null);
+
+    try std.testing.expect(std.mem.indexOf(u8, state, "sk-webview-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "sk-webview-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "auth.json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "auth.json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Authorization") == null);
+}
+
+test "webview missing credentials report auth required and reject prompts before provider calls" {
+    const allocator = std.testing.allocator;
+    var session = try testSession(allocator);
+    defer session.deinit();
+    var bridge = testBridge(&session);
+    bridge.context.provider = "openai";
+    bridge.context.auth_status = .missing;
+    bridge.context.api_key_present = false;
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const state = try bridge.handleRequestJson(allocator, "{\"id\":\"state-auth-required\",\"command\":\"get_state\"}", trusted_bundle_origin);
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"status\":\"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state, "\"promptEnabled\":false") != null);
+
+    const prompt = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"prompt-auth-required\",\"command\":\"prompt\",\"payload\":{\"text\":\"do not call provider\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"status\":\"auth_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"accepted\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"events\"") == null);
+
+    const messages = try bridge.handleRequestJson(allocator, "{\"id\":\"messages-auth-required\",\"command\":\"get_messages\"}", trusted_bundle_origin);
+    defer allocator.free(messages);
+    try std.testing.expect(std.mem.indexOf(u8, messages, "\"messages\":[]") != null);
+    try std.testing.expectEqual(@as(usize, 1), counters.prompt);
+}
+
 test "webview model selection command is permission gated and preserves state" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1416,6 +1601,49 @@ test "webview session mutation commands deny without permission and preserve ses
     defer allocator.free(after);
     try std.testing.expectEqualStrings(session_id, session.session_manager.getSessionId());
     try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(@as(usize, 0), counters.total());
+}
+
+test "webview auth mutation commands deny without echoing credential payloads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions");
+    const session_dir = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", allocator);
+    defer allocator.free(session_dir);
+
+    var session = try testPersistentSessionWithModel(allocator, session_dir, testModel());
+    defer session.deinit();
+    const session_file = try allocator.dupe(u8, session.session_manager.getSessionFile().?);
+    defer allocator.free(session_file);
+
+    var bridge = testBridge(&session);
+    bridge.context.no_session = false;
+    bridge.context.provider = "openai";
+    bridge.context.auth_status = .missing;
+    var counters = DispatchCounters{};
+    bridge.dispatch_counters = &counters;
+
+    const before = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(before);
+
+    const response = try bridge.handleRequestJson(
+        allocator,
+        "{\"id\":\"save-secret\",\"command\":\"save_api_key\",\"payload\":{\"provider\":\"openai\",\"apiKey\":\"sk-webview-secret\",\"path\":\"/Users/alice/.pi/agent/auth.json\"}}",
+        trusted_bundle_origin,
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":\"save-secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"permission_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "auth mutation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "sk-webview-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "auth.json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/Users/alice") == null);
+
+    const after = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, session_file, allocator, .unlimited);
+    defer allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try std.testing.expectEqual(@as(usize, 0), counters.save_api_key);
     try std.testing.expectEqual(@as(usize, 0), counters.total());
 }
 

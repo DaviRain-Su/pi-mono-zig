@@ -33,6 +33,7 @@ pub const RunWebViewModeOptions = struct {
     backend: webview_platform.AvailableBackend,
     no_session: bool,
     api_key_present: bool,
+    auth_status: provider_config.ProviderAuthStatus,
     available_models: []const provider_config.AvailableModel = &.{},
     selected_tools: tool_selection.ToolSelection,
     active_tool_count: usize,
@@ -155,6 +156,7 @@ pub fn runWebViewMode(
         .model = options.model,
         .no_session = options.no_session,
         .api_key_present = options.api_key_present,
+        .auth_status = options.auth_status,
         .available_models = options.available_models,
         .selected_tools = options.selected_tools,
         .active_tool_count = options.active_tool_count,
@@ -618,6 +620,8 @@ fn writeLaunchContextJson(
     try writeOptionalStringField(allocator, stdout, "sessionFile", session.session_manager.getSessionFile(), true);
     try writeBoolField(stdout, "noSession", options.no_session, true);
     try writeBoolField(stdout, "apiKeyPresent", options.api_key_present, true);
+    try writeStringField(allocator, stdout, "authStatus", @tagName(options.auth_status), true);
+    try writeStringField(allocator, stdout, "authStatusLabel", provider_config.providerAuthStatusLabel(options.auth_status), true);
     try writeBoolField(stdout, "toolsDisabled", options.selected_tools.disable_all, true);
     try writeBoolField(stdout, "includeBuiltinTools", options.selected_tools.include_builtins, true);
     try writeStringArrayOrNullField(allocator, stdout, "toolAllowlist", options.selected_tools.allowlist, true);
