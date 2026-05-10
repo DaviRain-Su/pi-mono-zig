@@ -1285,47 +1285,47 @@ const cross_native_descriptor: extension_runtime.NativeDescriptor = .{
     .tools = &.{cross_native_tool},
 };
 
-fn putMessageSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, message: agent.AgentMessage) !void {
+/// Builds `{ "role": ..., "content": "first text" }` for a single AgentMessage.
+/// Shared by putMessageSummary (single message) and putMessagesSummary (array)
+/// so the per-variant role/content extraction stays in one place.
+fn messageSummaryEntry(allocator: std.mem.Allocator, message: agent.AgentMessage) !std.json.ObjectMap {
     var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer tools_common.deinitJsonValue(allocator, .{ .object = entry });
-    switch (message) {
-        .user => |user| {
-            try putString(allocator, &entry, "role", "user");
-            try putString(allocator, &entry, "content", firstText(user.content) orelse "");
-        },
-        .assistant => |assistant| {
-            try putString(allocator, &entry, "role", "assistant");
-            try putString(allocator, &entry, "content", firstText(assistant.content) orelse "");
-        },
-        .tool_result => |tool| {
-            try putString(allocator, &entry, "role", "tool");
-            try putString(allocator, &entry, "content", firstText(tool.content) orelse "");
-        },
-    }
+    const role: []const u8, const content: []const u8 = switch (message) {
+        .user => |user| .{ "user", firstText(user.content) orelse "" },
+        .assistant => |assistant| .{ "assistant", firstText(assistant.content) orelse "" },
+        .tool_result => |tool| .{ "tool", firstText(tool.content) orelse "" },
+    };
+    try putString(allocator, &entry, "role", role);
+    try putString(allocator, &entry, "content", content);
+    return entry;
+}
+
+fn putMessageSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, message: agent.AgentMessage) !void {
+    const entry = try messageSummaryEntry(allocator, message);
     try putValue(allocator, object, "message", .{ .object = entry });
 }
 
 fn putMessagesSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, messages: []const agent.AgentMessage) !void {
     var array = std.json.Array.init(allocator);
     for (messages) |message| {
-        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-        switch (message) {
-            .user => |user| {
-                try putString(allocator, &entry, "role", "user");
-                try putString(allocator, &entry, "content", firstText(user.content) orelse "");
-            },
-            .assistant => |assistant| {
-                try putString(allocator, &entry, "role", "assistant");
-                try putString(allocator, &entry, "content", firstText(assistant.content) orelse "");
-            },
-            .tool_result => |tool| {
-                try putString(allocator, &entry, "role", "tool");
-                try putString(allocator, &entry, "content", firstText(tool.content) orelse "");
-            },
-        }
+        const entry = try messageSummaryEntry(allocator, message);
         try array.append(.{ .object = entry });
     }
     try putValue(allocator, object, "messages", .{ .array = array });
+}
+
+/// Builds `{ toolCallId, toolName, content, isError }` for an
+/// agent.types.ToolResultMessage; used inside lifecycle events that carry a
+/// `toolResults` array.
+fn toolResultMessageEntry(allocator: std.mem.Allocator, tool_result: agent.types.ToolResultMessage) !std.json.ObjectMap {
+    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer tools_common.deinitJsonValue(allocator, .{ .object = entry });
+    try putString(allocator, &entry, "toolCallId", tool_result.tool_call_id);
+    try putString(allocator, &entry, "toolName", tool_result.tool_name);
+    try putString(allocator, &entry, "content", firstText(tool_result.content) orelse "");
+    try putBool(allocator, &entry, "isError", tool_result.is_error);
+    return entry;
 }
 
 fn makeLifecycleEventObject(
@@ -1346,11 +1346,7 @@ fn makeLifecycleEventObject(
     if (event.tool_results) |tool_results| {
         var array = std.json.Array.init(allocator);
         for (tool_results) |tool_result| {
-            var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-            try putString(allocator, &entry, "toolCallId", tool_result.tool_call_id);
-            try putString(allocator, &entry, "toolName", tool_result.tool_name);
-            try putString(allocator, &entry, "content", firstText(tool_result.content) orelse "");
-            try putBool(allocator, &entry, "isError", tool_result.is_error);
+            const entry = try toolResultMessageEntry(allocator, tool_result);
             try array.append(.{ .object = entry });
         }
         try putValue(allocator, &payload.object, "toolResults", .{ .array = array });
