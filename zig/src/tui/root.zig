@@ -197,6 +197,10 @@ pub const MetricCard = vw.MetricCard;
 pub const TrendDirection = vw.TrendDirection;
 pub const Fill = vw.Fill;
 pub const BigText = vw.BigText;
+pub const ScrollBox = vw.ScrollBox;
+pub const LineNumber = vw.LineNumber;
+pub const Span = vw.Span;
+pub const RichText = vw.RichText;
 
 test {
     _ = @import("cell_rows.zig");
@@ -211,6 +215,12 @@ test {
 test "components export autocomplete module" {
     _ = components.autocomplete;
     _ = components.autocomplete.Item;
+}
+
+test "exports migrated widget aliases" {
+    _ = List;
+    _ = Tree;
+    _ = TreeState;
 }
 
 test "exports vaxis module" {

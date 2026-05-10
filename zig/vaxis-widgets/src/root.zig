@@ -29,7 +29,8 @@ pub const BarChart = @import("components/bar_chart.zig").BarChart;
 pub const Scrollbar = @import("components/scrollbar.zig").Scrollbar;
 pub const ScrollbarState = @import("components/scrollbar.zig").ScrollbarState;
 pub const Paragraph = @import("components/paragraph.zig").Paragraph;
-pub const ListWidget = @import("components/list.zig").List;
+pub const List = @import("components/list.zig").List;
+pub const ListWidget = List;
 pub const ListItem = @import("components/list.zig").ListItem;
 pub const Chart = @import("components/chart.zig").Chart;
 pub const Dataset = @import("components/chart.zig").Dataset;
@@ -45,8 +46,10 @@ pub const Placeholder = @import("components/placeholder.zig").Placeholder;
 pub const StatusBar = @import("components/status_bar.zig").StatusBar;
 pub const StatusBarSection = @import("components/status_bar.zig").StatusBarSection;
 pub const Calendar = @import("components/calendar.zig").Calendar;
-pub const TreeWidget = @import("components/tree.zig").Tree;
+pub const Tree = @import("components/tree.zig").Tree;
+pub const TreeWidget = Tree;
 pub const TreeNode = @import("components/tree.zig").TreeNode;
+pub const TreeState = @import("components/tree.zig").TreeState;
 pub const Input = @import("components/input.zig").Input;
 pub const Popup = @import("components/popup.zig").Popup;
 pub const SelectList = @import("components/select_list.zig").SelectList;
@@ -88,6 +91,16 @@ pub const Pagination = @import("components/pagination.zig").Pagination;
 
 // Drawing primitives
 pub const Fill = @import("components/fill.zig").Fill;
+
+// Containers
+pub const ScrollBox = @import("components/scroll_box.zig").ScrollBox;
+
+// Gutter / line numbers
+pub const LineNumber = @import("components/line_number.zig").LineNumber;
+
+// Inline text
+pub const Span = @import("components/span.zig").Span;
+pub const RichText = @import("components/span.zig").RichText;
 pub const BigText = @import("components/big_text.zig").BigText;
 
 // Specialized viewers
@@ -172,6 +185,9 @@ pub const components = struct {
     pub const metric_card = @import("components/metric_card.zig");
     pub const fill = @import("components/fill.zig");
     pub const big_text = @import("components/big_text.zig");
+    pub const scroll_box = @import("components/scroll_box.zig");
+    pub const line_number = @import("components/line_number.zig");
+    pub const span = @import("components/span.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;
