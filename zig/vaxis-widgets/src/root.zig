@@ -69,6 +69,14 @@ pub const Toast = @import("components/toast.zig").Toast;
 pub const ToastLevel = @import("components/toast.zig").ToastLevel;
 pub const ToastStack = @import("components/toast.zig").ToastStack;
 
+// Form controls
+pub const Checkbox = @import("components/checkbox.zig").Checkbox;
+pub const Radio = @import("components/radio.zig").Radio;
+pub const RadioOption = @import("components/radio.zig").RadioOption;
+pub const Toggle = @import("components/toggle.zig").Toggle;
+pub const Accordion = @import("components/accordion.zig").Accordion;
+pub const AccordionItem = @import("components/accordion.zig").AccordionItem;
+
 pub const components = struct {
     pub const autocomplete = @import("components/autocomplete.zig");
     pub const text = @import("components/text.zig");
@@ -104,6 +112,10 @@ pub const components = struct {
     pub const dialog = @import("components/dialog.zig");
     pub const menu = @import("components/menu.zig");
     pub const toast = @import("components/toast.zig");
+    pub const checkbox = @import("components/checkbox.zig");
+    pub const radio = @import("components/radio.zig");
+    pub const toggle = @import("components/toggle.zig");
+    pub const accordion = @import("components/accordion.zig");
 };
 pub const Image = @import("components/image.zig").Image;
 pub const Loader = @import("components/loader.zig").Loader;

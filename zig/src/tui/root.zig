@@ -158,6 +158,12 @@ pub const ContextMenu = vw.ContextMenu;
 pub const Toast = vw.Toast;
 pub const ToastLevel = vw.ToastLevel;
 pub const ToastStack = vw.ToastStack;
+pub const Checkbox = vw.Checkbox;
+pub const Radio = vw.Radio;
+pub const RadioOption = vw.RadioOption;
+pub const Toggle = vw.Toggle;
+pub const Accordion = vw.Accordion;
+pub const AccordionItem = vw.AccordionItem;
 
 test {
     _ = @import("cell_rows.zig");
