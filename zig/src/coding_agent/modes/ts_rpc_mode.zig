@@ -2083,82 +2083,108 @@ const TsRpcServer = struct {
     // Session lifecycle extension event helpers
     // -------------------------------------------------------------------------
 
+    /// One field in a session-lifecycle extension event payload sent through
+    /// host.sendExtensionEventFrame. Used by writeTsRpcEvent so each
+    /// emitSession*Event helper stays a small declarative wrapper instead of
+    /// repeating the `Allocating writer / writeAll braces / catch return`
+    /// scaffolding for every event.
+    const TsRpcEventField = union(enum) {
+        /// Always emit `"key": "value"`.
+        string: struct { key: []const u8, value: []const u8 },
+        /// Emit `"key": "value"` when present, `"key": null` when absent.
+        nullable_string: struct { key: []const u8, value: ?[]const u8 },
+        /// Emit `"key": "value"` when present; omit the property entirely when absent.
+        optional_string: struct { key: []const u8, value: ?[]const u8 },
+        /// Always emit `"key": true|false`.
+        boolean_literal: struct { key: []const u8, value: bool },
+    };
+
+    fn writeTsRpcEvent(
+        self: *TsRpcServer,
+        host: extension_runtime.RuntimeAdapter,
+        event_type: []const u8,
+        fields: []const TsRpcEventField,
+    ) void {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        out.writer.writeAll("{\"type\":") catch return;
+        writeJsonString(self.allocator, &out.writer, event_type) catch return;
+        for (fields) |field| switch (field) {
+            .string => |s| {
+                out.writer.writeAll(",") catch return;
+                writeJsonString(self.allocator, &out.writer, s.key) catch return;
+                out.writer.writeAll(":") catch return;
+                writeJsonString(self.allocator, &out.writer, s.value) catch return;
+            },
+            .nullable_string => |o| {
+                out.writer.writeAll(",") catch return;
+                writeJsonString(self.allocator, &out.writer, o.key) catch return;
+                out.writer.writeAll(":") catch return;
+                if (o.value) |v| {
+                    writeJsonString(self.allocator, &out.writer, v) catch return;
+                } else {
+                    out.writer.writeAll("null") catch return;
+                }
+            },
+            .optional_string => |o| if (o.value) |v| {
+                out.writer.writeAll(",") catch return;
+                writeJsonString(self.allocator, &out.writer, o.key) catch return;
+                out.writer.writeAll(":") catch return;
+                writeJsonString(self.allocator, &out.writer, v) catch return;
+            },
+            .boolean_literal => |b| {
+                out.writer.writeAll(",") catch return;
+                writeJsonString(self.allocator, &out.writer, b.key) catch return;
+                out.writer.writeAll(":") catch return;
+                out.writer.writeAll(if (b.value) "true" else "false") catch return;
+            },
+        };
+        out.writer.writeAll("}") catch return;
+        host.sendExtensionEventFrame(out.written());
+    }
+
     /// Emit session_before_switch to extension host.
     /// reason: "new" | "resume"
     fn emitSessionBeforeSwitchEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, target_file: ?[]const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_before_switch\",\"reason\":") catch return;
-        writeJsonString(self.allocator, &out.writer, reason) catch return;
-        if (target_file) |file| {
-            out.writer.writeAll(",\"targetSessionFile\":") catch return;
-            writeJsonString(self.allocator, &out.writer, file) catch return;
-        }
-        out.writer.writeAll("}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_before_switch", &.{
+            .{ .string = .{ .key = "reason", .value = reason } },
+            .{ .optional_string = .{ .key = "targetSessionFile", .value = target_file } },
+        });
     }
 
     /// Emit session_start to extension host after the new session is active.
     /// reason: "startup" | "reload" | "new" | "resume" | "fork"
     fn emitSessionStartEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, previous_file: ?[]const u8, target_file: ?[]const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_start\",\"reason\":") catch return;
-        writeJsonString(self.allocator, &out.writer, reason) catch return;
-        if (previous_file) |file| {
-            out.writer.writeAll(",\"previousSessionFile\":") catch return;
-            writeJsonString(self.allocator, &out.writer, file) catch return;
-        }
-        if (target_file) |file| {
-            out.writer.writeAll(",\"targetSessionFile\":") catch return;
-            writeJsonString(self.allocator, &out.writer, file) catch return;
-        }
-        out.writer.writeAll("}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_start", &.{
+            .{ .string = .{ .key = "reason", .value = reason } },
+            .{ .optional_string = .{ .key = "previousSessionFile", .value = previous_file } },
+            .{ .optional_string = .{ .key = "targetSessionFile", .value = target_file } },
+        });
     }
 
     /// Emit session_shutdown to extension host.
     /// reason: "quit" | "reload" | "new" | "resume" | "fork"
     fn emitSessionShutdownEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, reason: []const u8, previous_file: ?[]const u8, target_file: ?[]const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_shutdown\",\"reason\":") catch return;
-        writeJsonString(self.allocator, &out.writer, reason) catch return;
-        if (previous_file) |file| {
-            out.writer.writeAll(",\"previousSessionFile\":") catch return;
-            writeJsonString(self.allocator, &out.writer, file) catch return;
-        }
-        if (target_file) |file| {
-            out.writer.writeAll(",\"targetSessionFile\":") catch return;
-            writeJsonString(self.allocator, &out.writer, file) catch return;
-        }
-        out.writer.writeAll("}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_shutdown", &.{
+            .{ .string = .{ .key = "reason", .value = reason } },
+            .{ .optional_string = .{ .key = "previousSessionFile", .value = previous_file } },
+            .{ .optional_string = .{ .key = "targetSessionFile", .value = target_file } },
+        });
     }
 
     /// Emit session_before_fork to extension host.
     fn emitSessionBeforeForkEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, entry_id: []const u8, position: []const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_before_fork\",\"entryId\":") catch return;
-        writeJsonString(self.allocator, &out.writer, entry_id) catch return;
-        out.writer.writeAll(",\"position\":") catch return;
-        writeJsonString(self.allocator, &out.writer, position) catch return;
-        out.writer.writeAll("}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_before_fork", &.{
+            .{ .string = .{ .key = "entryId", .value = entry_id } },
+            .{ .string = .{ .key = "position", .value = position } },
+        });
     }
 
     /// Emit session_before_compact to extension host.
     fn emitSessionBeforeCompactEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, custom_instructions: ?[]const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_before_compact\"") catch return;
-        if (custom_instructions) |instructions| {
-            out.writer.writeAll(",\"customInstructions\":") catch return;
-            writeJsonString(self.allocator, &out.writer, instructions) catch return;
-        }
-        out.writer.writeAll("}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_before_compact", &.{
+            .{ .optional_string = .{ .key = "customInstructions", .value = custom_instructions } },
+        });
     }
 
     /// Emit session_compact to extension host after compaction completes.
@@ -2168,6 +2194,8 @@ const TsRpcServer = struct {
     }
 
     /// Emit session_before_tree to extension host before navigating the session tree.
+    /// `preparation` is a nested object so this stays explicit instead of using
+    /// writeTsRpcEvent — TsRpcEventField has no nested-object variant.
     fn emitSessionBeforeTreeEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, target_id: []const u8) void {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
@@ -2179,22 +2207,11 @@ const TsRpcServer = struct {
 
     /// Emit session_tree to extension host after tree navigation completes.
     fn emitSessionTreeEvent(self: *TsRpcServer, host: extension_runtime.RuntimeAdapter, new_leaf_id: ?[]const u8, old_leaf_id: ?[]const u8) void {
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-        out.writer.writeAll("{\"type\":\"session_tree\",\"newLeafId\":") catch return;
-        if (new_leaf_id) |nid| {
-            writeJsonString(self.allocator, &out.writer, nid) catch return;
-        } else {
-            out.writer.writeAll("null") catch return;
-        }
-        out.writer.writeAll(",\"oldLeafId\":") catch return;
-        if (old_leaf_id) |oid| {
-            writeJsonString(self.allocator, &out.writer, oid) catch return;
-        } else {
-            out.writer.writeAll("null") catch return;
-        }
-        out.writer.writeAll(",\"fromExtension\":false}") catch return;
-        host.sendExtensionEventFrame(out.written());
+        self.writeTsRpcEvent(host, "session_tree", &.{
+            .{ .nullable_string = .{ .key = "newLeafId", .value = new_leaf_id } },
+            .{ .nullable_string = .{ .key = "oldLeafId", .value = old_leaf_id } },
+            .{ .boolean_literal = .{ .key = "fromExtension", .value = false } },
+        });
     }
 
     fn writeQueueUpdate(self: *TsRpcServer) !void {
