@@ -299,21 +299,19 @@ fn drawItemFull(
                 .y_off = @intCast(row),
                 .height = child.height - @as(u16, @intCast(row)),
             });
-            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
+            const markdown = tui.Markdown{ .text = item_text, .styles = if (theme) |t| tui.markdownStylesFor(t) else .{} };
             const size = try markdown.draw(markdown_window, .{
                 .window = markdown_window,
                 .arena = allocator,
-                .theme = theme,
             });
             row += @as(usize, size.height);
             return row;
         },
         .markdown => {
-            const markdown = tui.Markdown{ .text = item_text, .theme = theme };
+            const markdown = tui.Markdown{ .text = item_text, .styles = if (theme) |t| tui.markdownStylesFor(t) else .{} };
             const size = try markdown.draw(child, .{
                 .window = child,
                 .arena = allocator,
-                .theme = theme,
             });
             return @as(usize, size.height);
         },

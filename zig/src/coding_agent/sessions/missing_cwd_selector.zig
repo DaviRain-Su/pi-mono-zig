@@ -233,7 +233,6 @@ pub const MissingCwdScreen = struct {
             const list_size = try self.list.draw(list_window, .{
                 .window = list_window,
                 .arena = ctx.arena,
-                .theme = self.theme,
             });
             row += list_size.height;
         }

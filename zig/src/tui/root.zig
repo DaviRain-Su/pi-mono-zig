@@ -78,6 +78,7 @@ pub const ThemeToken = theme.ThemeToken;
 pub const StyleSpec = theme.StyleSpec;
 pub const PaletteTemplate = theme.PaletteTemplate;
 pub const styleFor = style.styleFor;
+pub const markdownStylesFor = style.markdownStylesFor;
 pub const OverlayAnchor = tui.OverlayAnchor;
 pub const OverlayMargin = tui.OverlayMargin;
 pub const OverlayAnimation = tui.OverlayAnimation;

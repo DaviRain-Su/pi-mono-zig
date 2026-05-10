@@ -403,7 +403,7 @@ pub fn loadSettingsEditorOverlay(
     errdefer editor.deinit();
     editor.padding_x = 1;
     editor.autocomplete_max_visible = 8;
-    editor.setTheme(theme);
+    editor.setEditorStyle(if (theme) |t| tui.styleFor(t, .editor) else .{});
     _ = try editor.handlePaste(initial_content);
 
     return .{

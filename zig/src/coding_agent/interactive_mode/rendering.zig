@@ -2133,7 +2133,7 @@ pub const ScreenComponent = struct {
         window: tui.vaxis.Window,
         ctx: tui.DrawContext,
     ) std.mem.Allocator.Error!tui.DrawSize {
-        self.editor.setTheme(self.theme);
+        self.editor.setEditorStyle(if (self.theme) |t| tui.styleFor(t, .editor) else .{});
         window.clear();
 
         var snapshot = try self.state.snapshotForRender(ctx.arena);
@@ -2174,7 +2174,6 @@ pub const ScreenComponent = struct {
             _ = try drawTaskPanel(panel_window, .{
                 .window = panel_window,
                 .arena = ctx.arena,
-                .theme = self.theme,
             }, self.keybindings, self.theme, &snapshot, self.now_ms);
         }
         row += task_panel_height;
@@ -2246,7 +2245,6 @@ pub const ScreenComponent = struct {
             _ = try drawQueuedMessages(queued_window, .{
                 .window = queued_window,
                 .arena = ctx.arena,
-                .theme = self.theme,
             }, self.keybindings, self.theme, &snapshot);
         }
         row += queued_height;
@@ -2269,7 +2267,7 @@ pub const ScreenComponent = struct {
             });
             _ = try drawPromptLines(
                 prompt_window,
-                .{ .window = prompt_window, .arena = ctx.arena, .theme = self.theme },
+                .{ .window = prompt_window, .arena = ctx.arena },
                 self.theme,
                 self.editor,
                 snapshot.pending_editor_images,
@@ -2293,7 +2291,6 @@ pub const ScreenComponent = struct {
             _ = try self.editor.draw(editor_window, .{
                 .window = editor_window,
                 .arena = ctx.arena,
-                .theme = self.theme,
             });
         }
 
@@ -2307,7 +2304,6 @@ pub const ScreenComponent = struct {
             _ = try self.editor.drawAutocomplete(autocomplete_window, .{
                 .window = autocomplete_window,
                 .arena = ctx.arena,
-                .theme = self.theme,
             });
         }
         row += autocomplete_height;
@@ -2341,7 +2337,6 @@ pub fn renderScreenToLines(allocator: std.mem.Allocator, screen: *const ScreenCo
     _ = try screen.draw(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = screen.theme,
     });
 
     var lines = std.ArrayList([]const u8).empty;
@@ -2607,6 +2602,7 @@ fn measureAutocompleteHeight(
     editor: *tui.Editor,
     width: usize,
 ) !usize {
+    _ = theme;
     if (!editor.isShowingAutocomplete()) return 0;
     const height_hint = @max(@as(usize, 1), editor.autocomplete_max_visible);
     var screen = try tui.vaxis.Screen.init(allocator, .{
@@ -2622,7 +2618,6 @@ fn measureAutocompleteHeight(
     const size = try editor.drawAutocomplete(measure_window, .{
         .window = measure_window,
         .arena = allocator,
-        .theme = theme,
     });
     return @as(usize, size.height);
 }
@@ -2649,7 +2644,6 @@ fn measureQueuedMessagesHeight(
     const size = try drawQueuedMessages(measure_window, .{
         .window = measure_window,
         .arena = allocator,
-        .theme = theme,
     }, keybindings, theme, snapshot);
     return @as(usize, size.height);
 }
@@ -2856,6 +2850,7 @@ pub const OverlayPanelComponent = struct {
         theme: ?*const resources_mod.Theme,
         highlight_style: tui.vaxis.Cell.Style,
     ) std.mem.Allocator.Error!tui.DrawSize {
+        _ = theme;
         overlay.table_state.selected_index = overlay.list.selectedIndex();
         var table = tui.Table{
             .rows = overlay.table_rows,
@@ -2866,7 +2861,6 @@ pub const OverlayPanelComponent = struct {
         return try table.draw(list_window, .{
             .window = list_window,
             .arena = ctx.arena,
-            .theme = theme,
         }, &overlay.table_state);
     }
 
@@ -2904,7 +2898,7 @@ pub const OverlayPanelComponent = struct {
 
         switch (self.overlay.*) {
             .settings_editor => |*settings_editor| {
-                settings_editor.editor.setTheme(self.theme);
+                settings_editor.editor.setEditorStyle(if (self.theme) |t| tui.styleFor(t, .editor) else .{});
                 drawFittedLine(content_window, row, settings_editor.path, styleForToken(self.theme, .overlay_hint));
                 row += 2;
                 if (row < content_window.height) {
@@ -2915,7 +2909,6 @@ pub const OverlayPanelComponent = struct {
                     const size = try settings_editor.editor.draw(editor_window, .{
                         .window = editor_window,
                         .arena = ctx.arena,
-                        .theme = self.theme,
                     });
                     row += @as(usize, size.height);
                 }
@@ -2928,7 +2921,6 @@ pub const OverlayPanelComponent = struct {
                 if (row < content_window.height) {
                     switch (dialog.kind) {
                         .select, .confirm => {
-                            dialog.list.theme = self.theme;
                             dialog.list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
                             dialog.list.show_scrollbar = true;
                             const list_window = content_window.child(.{
@@ -2938,12 +2930,11 @@ pub const OverlayPanelComponent = struct {
                             const size = try dialog.list.draw(list_window, .{
                                 .window = list_window,
                                 .arena = ctx.arena,
-                                .theme = self.theme,
                             });
                             row += @as(usize, size.height);
                         },
                         .input, .editor => {
-                            dialog.editor.setTheme(self.theme);
+                            dialog.editor.setEditorStyle(if (self.theme) |t| tui.styleFor(t, .editor) else .{});
                             const editor_window = content_window.child(.{
                                 .y_off = @intCast(row),
                                 .height = content_window.height - @as(u16, @intCast(row)),
@@ -2951,7 +2942,6 @@ pub const OverlayPanelComponent = struct {
                             const size = try dialog.editor.draw(editor_window, .{
                                 .window = editor_window,
                                 .arena = ctx.arena,
-                                .theme = self.theme,
                             });
                             row += @as(usize, size.height);
                         },
@@ -3003,12 +2993,11 @@ pub const OverlayPanelComponent = struct {
                             .auth => |*auth_overlay| &auth_overlay.list,
                             else => unreachable,
                         };
-                        overlay_list.theme = self.theme;
+                        
                         overlay_list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
                         const size = try overlay_list.draw(list_window, .{
                             .window = list_window,
                             .arena = ctx.arena,
-                            .theme = self.theme,
                         });
                         row += @as(usize, size.height);
                     }
@@ -3822,7 +3811,6 @@ pub fn renderScreenWithMockBackendAndOverlay(
 
     const panel = OverlayPanelComponent{
         .overlay = overlay,
-        .theme = screen.theme,
         .max_height = overlayPanelMaxHeight(screen.height),
     };
     _ = try renderer.showDrawOverlay(panel.drawComponent(), overlayPanelOptions(backend.size, 1.0));

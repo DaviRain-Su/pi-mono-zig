@@ -89,7 +89,6 @@ pub fn drawLines(
         _ = try editor.draw(editor_window, .{
             .window = editor_window,
             .arena = ctx.arena,
-            .theme = theme,
         });
     }
 
@@ -136,7 +135,6 @@ pub fn drawLines(
             _ = try image_component.drawComponent().draw(image_window, .{
                 .window = image_window,
                 .arena = ctx.arena,
-                .theme = theme,
             });
         } else {
             const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
@@ -168,6 +166,7 @@ fn measureEditorHeight(
     editor: *tui.Editor,
     width: usize,
 ) !usize {
+    _ = theme;
     const height_hint = @max(@as(usize, 1), estimateWrappedRows(editor.text(), width) + editor.padding_y * 2);
     var screen = try tui.vaxis.Screen.init(allocator, .{
         .rows = @intCast(@min(height_hint, @as(usize, std.math.maxInt(u16)))),
@@ -182,7 +181,6 @@ fn measureEditorHeight(
     const size = try editor.draw(measure_window, .{
         .window = measure_window,
         .arena = allocator,
-        .theme = theme,
     });
     return @max(@as(usize, size.height), 1);
 }
@@ -292,7 +290,6 @@ test "drawLines renders bordered prompt with glyph prefix" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-        .theme = &theme,
     }, &theme, &editor, &.{});
 
     const top_left = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;

@@ -11,6 +11,20 @@ pub fn styleFor(theme: *const theme_mod.Theme, token: theme_mod.ThemeToken) vaxi
     return styleFromSpec(theme.styles[@intFromEnum(token)]);
 }
 
+pub fn markdownStylesFor(theme: *const theme_mod.Theme) @import("vaxis-widgets").MarkdownStyles {
+    return .{
+        .text = styleFor(theme, .markdown_text),
+        .heading = styleFor(theme, .markdown_heading),
+        .rule = styleFor(theme, .markdown_rule),
+        .quote = styleFor(theme, .markdown_quote),
+        .quote_border = styleFor(theme, .markdown_quote_border),
+        .list_bullet = styleFor(theme, .markdown_list_bullet),
+        .code = styleFor(theme, .markdown_code),
+        .code_border = styleFor(theme, .markdown_code_border),
+        .link = styleFor(theme, .markdown_link),
+    };
+}
+
 pub fn styleForWithColorMode(theme: *const theme_mod.Theme, token: theme_mod.ThemeToken, mode: ColorMode) vaxis.Cell.Style {
     return styleFromSpecWithColorMode(theme.styles[@intFromEnum(token)], mode);
 }
