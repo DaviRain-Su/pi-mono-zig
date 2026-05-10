@@ -42,17 +42,23 @@ pub const TreeState = struct {
 
     pub fn selectNext(self: *TreeState, visible_count: usize) void {
         self.selected_index = @min(self.selected_index + 1, visible_count -| 1);
-        self.scrollToSelected();
+        self.scrollToSelected(visible_count);
     }
 
     pub fn selectPrevious(self: *TreeState) void {
         self.selected_index = if (self.selected_index == 0) 0 else self.selected_index - 1;
-        self.scrollToSelected();
     }
 
-    fn scrollToSelected(self: *TreeState) void {
-        // Simplified: offset tracks selected for now
-        self.offset = self.selected_index;
+    pub fn scrollToSelected(self: *TreeState, visible_rows: usize) void {
+        if (visible_rows == 0) {
+            self.offset = 0;
+            return;
+        }
+        if (self.selected_index < self.offset) {
+            self.offset = self.selected_index;
+        } else if (self.selected_index >= self.offset + visible_rows) {
+            self.offset = self.selected_index - visible_rows + 1;
+        }
     }
 };
 
@@ -81,6 +87,16 @@ pub const Tree = struct {
         window: vaxis.Window,
         ctx: draw_mod.DrawContext,
     ) std.mem.Allocator.Error!draw_mod.Size {
+        var state = TreeState{};
+        return self.drawWithState(window, ctx, &state);
+    }
+
+    pub fn drawWithState(
+        self: *const Tree,
+        window: vaxis.Window,
+        ctx: draw_mod.DrawContext,
+        state: *TreeState,
+    ) std.mem.Allocator.Error!draw_mod.Size {
         if (window.width == 0 or window.height == 0 or self.nodes.len == 0) {
             return .{ .width = window.width, .height = 0 };
         }
@@ -96,11 +112,17 @@ pub const Tree = struct {
 
         const total_rows = visible.items.len;
         const visible_rows = @min(total_rows, window.height);
+        if (total_rows == 0 or visible_rows == 0) return .{ .width = window.width, .height = 0 };
+        state.selected_index = @min(state.selected_index, total_rows - 1);
+        const max_offset = total_rows - visible_rows;
+        state.offset = @min(state.offset, max_offset);
+        state.scrollToSelected(visible_rows);
 
         for (0..visible_rows) |i| {
             const row: u16 = @intCast(i);
-            const entry = visible.items[i];
-            const is_selected = i == 0; // simplified: first item selected
+            const visible_index = state.offset + i;
+            const entry = visible.items[visible_index];
+            const is_selected = visible_index == state.selected_index;
             const row_style = if (is_selected) self.selected_style else self.style;
 
             const indent: u16 = @intCast(entry.depth * self.indent_width);
@@ -159,7 +181,8 @@ pub const Tree = struct {
         // Draw scrollbar
         if (self.show_scrollbar and scrollbar_width > 0 and total_rows > window.height) {
             const thumb_height = @max(1, (window.height * window.height) / total_rows);
-            const thumb_start = 0;
+            const max_scroll = total_rows - visible_rows;
+            const thumb_start = if (max_scroll == 0) 0 else (state.offset * (window.height - thumb_height)) / max_scroll;
             const scroll_col = window.width - 1;
             for (0..window.height) |row| {
                 const is_thumb = row >= thumb_start and row < thumb_start + thumb_height;
@@ -241,4 +264,42 @@ test "tree shows expand icon for collapsed parent" {
 
     try test_helpers.expectCell(&screen, 0, 0, "▶", .{ .reverse = true });
     try test_helpers.expectCell(&screen, 2, 0, "R", .{ .reverse = true });
+}
+
+test "tree state controls selection and scroll offset" {
+    var nodes = [_]TreeNode{
+        .{ .label = "One" },
+        .{ .label = "Two" },
+        .{ .label = "Three" },
+        .{ .label = "Four" },
+    };
+
+    const tree = Tree{
+        .nodes = &nodes,
+        .show_scrollbar = true,
+    };
+    var state = TreeState{ .selected_index = 3 };
+
+    var screen = try vaxis.Screen.init(std.testing.allocator, .{
+        .rows = 2,
+        .cols = 12,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(std.testing.allocator);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+    _ = try tree.drawWithState(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, &state);
+
+    try std.testing.expectEqual(@as(usize, 2), state.offset);
+    const cell = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("F", cell.char.grapheme);
+    try std.testing.expect(cell.style.reverse);
 }

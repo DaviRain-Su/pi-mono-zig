@@ -103,8 +103,12 @@ pub const SelectList = struct {
                 row += 1;
             }
         } else {
-            const visible_count = @max(self.max_visible, 1);
-            const start_index = self.visibleStartIndex();
+            const available_rows = @as(usize, window.height - top_padding);
+            var visible_count = @min(@min(@max(self.max_visible, 1), self.items.len), available_rows);
+            if (!self.show_scrollbar and self.items.len > visible_count and visible_count > 1) {
+                visible_count -= 1;
+            }
+            const start_index = self.visibleStartIndexFor(visible_count);
             const end_index = @min(start_index + visible_count, self.items.len);
             const scrollbar_width: u16 = if (self.show_scrollbar and self.items.len > visible_count and visible_count > 0) 1 else 0;
             const content_width = if (window.width > scrollbar_width) window.width - scrollbar_width else 0;
@@ -207,7 +211,10 @@ pub const SelectList = struct {
     }
 
     pub fn visibleStartIndex(self: *const SelectList) usize {
-        const visible_count = @min(@max(self.max_visible, 1), self.items.len);
+        return self.visibleStartIndexFor(@min(@max(self.max_visible, 1), self.items.len));
+    }
+
+    fn visibleStartIndexFor(self: *const SelectList, visible_count: usize) usize {
         if (visible_count == 0 or self.selectedIndex() < visible_count / 2) return 0;
 
         const centered = self.selectedIndex() - visible_count / 2;
@@ -356,4 +363,30 @@ test "select list render keeps unicode labels within requested width" {
     defer std.testing.allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "你好世界🙂") == null);
+}
+
+test "select list keeps selected item visible in short windows" {
+    var list = SelectList{
+        .items = &[_]SelectItem{
+            .{ .value = "zero" },
+            .{ .value = "one" },
+            .{ .value = "two" },
+            .{ .value = "three" },
+            .{ .value = "four" },
+        },
+        .selected_index = 4,
+        .max_visible = 5,
+        .selected_style = .{ .reverse = true },
+        .show_scrollbar = true,
+    };
+
+    var screen = try test_helpers.renderToScreen(list.drawComponent(), 12, 2);
+    defer screen.deinit(std.testing.allocator);
+
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "four") != null);
+    const selected = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(selected.style.reverse);
 }

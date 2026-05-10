@@ -175,11 +175,16 @@ pub const Table = struct {
             area.height - fixed_height
         else
             0;
+        const data_rows_available = if (self.row_separator)
+            @as(usize, (rows_available + 1) / 2)
+        else
+            @as(usize, rows_available);
+        const visible_data_rows = @min(self.rows.len, data_rows_available);
 
-        const scrollbar_width: u16 = if (self.show_scrollbar and self.rows.len > rows_available and rows_available > 0) 1 else 0;
+        const scrollbar_width: u16 = if (self.show_scrollbar and self.rows.len > visible_data_rows and visible_data_rows > 0) 1 else 0;
         const content_width = if (area.width > selection_width + scrollbar_width) area.width - selection_width - scrollbar_width else 0;
         const content_area = constraints_mod.Rect{
-            .x = 0,
+            .x = selection_width,
             .y = 0,
             .width = content_width,
             .height = area.height,
@@ -192,12 +197,7 @@ pub const Table = struct {
             self.column_spacing,
         );
 
-        const row_count_with_seps = if (self.row_separator and self.rows.len > 0)
-            self.rows.len + self.rows.len - 1
-        else
-            self.rows.len;
-        const visible_rows = @min(row_count_with_seps, rows_available);
-        state.scrollToSelected(visible_rows, self.rows.len);
+        state.scrollToSelected(visible_data_rows, self.rows.len);
 
         var y: u16 = 0;
 
@@ -220,7 +220,7 @@ pub const Table = struct {
 
         // Render visible rows
         const start_index = state.offset;
-        const end_index = @min(start_index + rows_available, self.rows.len);
+        const end_index = @min(start_index + visible_data_rows, self.rows.len);
 
         for (self.rows[start_index..end_index], start_index..) |row, index| {
             if (y >= area.height) break;
@@ -236,10 +236,10 @@ pub const Table = struct {
         }
 
         // Render scrollbar
-        if (scrollbar_width > 0 and rows_available > 0) {
+        if (scrollbar_width > 0 and rows_available > 0 and visible_data_rows > 0) {
             const scroll_col = area.width - 1;
             const thumb_height = @max(1, (rows_available * rows_available) / self.rows.len);
-            const max_offset = self.rows.len - rows_available;
+            const max_offset = self.rows.len - visible_data_rows;
             const thumb_start = if (max_offset == 0) 0 else (state.offset * (rows_available - thumb_height)) / max_offset;
 
             for (0..rows_available) |row_idx| {
@@ -479,7 +479,7 @@ test "Table renders cells into window" {
     try std.testing.expect(size.height > 0);
 
     // Verify header content
-    const header_cell = window.readCell(0, 0) orelse return error.TestUnexpectedResult;
+    const header_cell = window.readCell(1, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("P", header_cell.char.grapheme);
 }
 
@@ -609,4 +609,46 @@ test "Table renders sort indicator on header" {
 
     const indicator = screen.readCell(4, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("↑", indicator.char.grapheme);
+}
+
+test "Table row separators keep selected row visible" {
+    const allocator = std.testing.allocator;
+
+    var screen = try vaxis.Screen.init(allocator, .{
+        .rows = 3,
+        .cols = 16,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = draw_mod.rootWindow(&screen);
+    window.clear();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const rows = &[_]Row{
+        .{ .cells = &.{.{ .text = "row0" }} },
+        .{ .cells = &.{.{ .text = "row1" }} },
+        .{ .cells = &.{.{ .text = "row2" }} },
+        .{ .cells = &.{.{ .text = "row3" }} },
+    };
+
+    const table = Table{
+        .rows = rows,
+        .widths = &.{.{ .length = 8 }},
+        .row_separator = true,
+        .row_highlight_style = .{ .reverse = true },
+    };
+
+    var state = TableState{ .selected_index = 2 };
+    _ = try table.draw(window, .{
+        .window = window,
+        .arena = arena.allocator(),
+    }, &state);
+
+    try std.testing.expectEqual(@as(usize, 1), state.offset);
+    const selected = screen.readCell(0, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(">", selected.char.grapheme);
 }

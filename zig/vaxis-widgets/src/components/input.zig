@@ -4,6 +4,12 @@ const ansi = @import("../ansi.zig");
 const draw_mod = @import("../draw.zig");
 const test_helpers = @import("../test_helpers.zig");
 
+const InputGrapheme = struct {
+    byte_start: usize,
+    byte_end: usize,
+    width: usize,
+};
+
 pub const Input = struct {
     text: []const u8 = "",
     placeholder: []const u8 = "",
@@ -49,7 +55,7 @@ pub const Input = struct {
         const use_placeholder = self.text.len == 0;
         const text_style = if (use_placeholder) self.placeholder_style else self.style;
 
-        var graphemes = std.ArrayList(struct { byte_start: usize, byte_end: usize, width: usize }).empty;
+        var graphemes = std.ArrayList(InputGrapheme).empty;
         defer graphemes.deinit(ctx.arena);
 
         var cursor_grapheme_index: usize = 0;
@@ -73,16 +79,12 @@ pub const Input = struct {
         if (self.mask) |mask_char| {
             // Simple mask: all chars show as mask_char
             const mask_width = ansi.visibleWidth(&[_]u8{mask_char});
-            const total_mask_width = graphemes.items.len * mask_width;
-            if (total_mask_width > effective_width and cursor_grapheme_index > 0) {
-                // Center cursor
-                const before_width = cursor_grapheme_index * mask_width;
-                _ = before_width;
-            }
+            const start_grapheme = visibleStartForCursor(graphemes.items, cursor_grapheme_index, effective_width, mask_width);
 
             var col: u16 = 0;
-            var i: usize = 0;
+            var i: usize = start_grapheme;
             while (i < graphemes.items.len and col < effective_width) : (i += 1) {
+                if (col + @as(u16, @intCast(mask_width)) > effective_width) break;
                 if (i == cursor_grapheme_index and self.show_cursor and !use_placeholder) {
                     cursor_col = col;
                 }
@@ -96,7 +98,9 @@ pub const Input = struct {
                 });
                 col += @intCast(mask_width);
             }
-            if (cursor_grapheme_index == graphemes.items.len) cursor_col = col;
+            if (cursor_grapheme_index == graphemes.items.len) {
+                cursor_col = @intCast(prefixWidth(graphemes.items, cursor_grapheme_index, mask_width) - prefixWidth(graphemes.items, start_grapheme, mask_width));
+            }
 
             if (self.show_cursor and !use_placeholder and cursor_col < effective_width) {
                 window.writeCell(cursor_col, row, .{
@@ -109,20 +113,11 @@ pub const Input = struct {
             var col: u16 = 0;
 
             // Find start grapheme for scrolling
-            var start_grapheme: usize = 0;
-            if (graphemes.items.len > 0 and cursor_grapheme_index > 0) {
-                var width_before: usize = 0;
-                for (graphemes.items[0..cursor_grapheme_index], 0..) |g, i| {
-                    width_before += g.width;
-                    if (width_before > effective_width / 2) {
-                        start_grapheme = i;
-                        break;
-                    }
-                }
-            }
+            const start_grapheme = visibleStartForCursor(graphemes.items, cursor_grapheme_index, effective_width, null);
 
             for (graphemes.items[start_grapheme..], start_grapheme..) |g, gi| {
                 if (col >= effective_width) break;
+                if (col + @as(u16, @intCast(g.width)) > effective_width) break;
                 const is_cursor = gi == cursor_grapheme_index and self.show_cursor and !use_placeholder;
                 if (is_cursor) cursor_col = col;
                 window.writeCell(col, row, .{
@@ -131,7 +126,9 @@ pub const Input = struct {
                 });
                 col += @intCast(g.width);
             }
-            if (cursor_grapheme_index == graphemes.items.len) cursor_col = col;
+            if (cursor_grapheme_index == graphemes.items.len) {
+                cursor_col = @intCast(prefixWidth(graphemes.items, cursor_grapheme_index, null) - prefixWidth(graphemes.items, start_grapheme, null));
+            }
 
             if (self.show_cursor and !use_placeholder and cursor_col < effective_width) {
                 const g = if (cursor_grapheme_index < graphemes.items.len)
@@ -141,8 +138,13 @@ pub const Input = struct {
                 else
                     null;
                 if (g) |grapheme| {
+                    const available = effective_width - cursor_col;
+                    const fits = cursor_grapheme_index >= graphemes.items.len or grapheme.width <= available;
                     window.writeCell(cursor_col, row, .{
-                        .char = .{ .grapheme = if (cursor_grapheme_index < graphemes.items.len) display_text[grapheme.byte_start..grapheme.byte_end] else " ", .width = if (cursor_grapheme_index < graphemes.items.len) @intCast(grapheme.width) else 1 },
+                        .char = .{
+                            .grapheme = if (cursor_grapheme_index < graphemes.items.len and fits) display_text[grapheme.byte_start..grapheme.byte_end] else " ",
+                            .width = if (cursor_grapheme_index < graphemes.items.len and fits) @intCast(grapheme.width) else 1,
+                        },
                         .style = self.cursor_style,
                     });
                 }
@@ -161,6 +163,35 @@ pub const Input = struct {
         return self.draw(window, ctx);
     }
 };
+
+fn prefixWidth(graphemes: []const InputGrapheme, end: usize, mask_width: ?usize) usize {
+    if (mask_width) |width| return @min(end, graphemes.len) * width;
+    var width: usize = 0;
+    for (graphemes[0..@min(end, graphemes.len)]) |g| {
+        width += g.width;
+    }
+    return width;
+}
+
+fn visibleStartForCursor(
+    graphemes: []const InputGrapheme,
+    cursor_grapheme_index: usize,
+    effective_width: usize,
+    mask_width: ?usize,
+) usize {
+    if (effective_width == 0 or graphemes.len == 0) return 0;
+
+    const cursor_width = prefixWidth(graphemes, cursor_grapheme_index, mask_width);
+    var start: usize = 0;
+    var start_width: usize = 0;
+
+    while (start < cursor_grapheme_index and cursor_width - start_width >= effective_width) {
+        start_width += mask_width orelse graphemes[start].width;
+        start += 1;
+    }
+
+    return start;
+}
 
 test "input renders text" {
     const input = Input{
@@ -231,4 +262,32 @@ test "input handles multibyte cursor offsets" {
     try test_helpers.expectCell(&screen, 2, 0, "🙂", .{});
     try test_helpers.expectCell(&screen, 4, 0, "x", .{});
     try test_helpers.expectCell(&screen, 5, 0, " ", .{ .reverse = true });
+}
+
+test "input scrolls long unicode text to keep cursor visible" {
+    const input = Input{
+        .text = "abcdef🙂",
+        .cursor = "abcdef🙂".len,
+    };
+
+    var screen = try test_helpers.renderToScreen(input.drawComponent(), 4, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    const rendered = try test_helpers.screenToString(&screen);
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "a") == null);
+    try test_helpers.expectCell(&screen, 3, 0, " ", .{ .reverse = true });
+}
+
+test "input does not draw wide grapheme past narrow window" {
+    const input = Input{
+        .text = "🙂x",
+        .cursor = 0,
+    };
+
+    var screen = try test_helpers.renderToScreen(input.drawComponent(), 1, 1);
+    defer screen.deinit(std.testing.allocator);
+
+    try test_helpers.expectCell(&screen, 0, 0, " ", .{ .reverse = true });
 }

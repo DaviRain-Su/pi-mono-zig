@@ -2143,6 +2143,8 @@ pub const ScreenComponent = struct {
         const width = @max(@as(usize, window.width), 1);
         const footer_text = if (snapshot.extension_footer_lines.len > 0)
             try formatExtensionFooterLineWithTerminal(ctx.arena, null, &snapshot, self.terminal_name, width)
+        else if (showExecutionPanel(&snapshot))
+            try formatFooterText(ctx.arena, &snapshot, width)
         else
             try formatFooterTextForDisplay(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
         const extension_header_height = snapshot.extension_header_lines.len;
@@ -2158,10 +2160,11 @@ pub const ScreenComponent = struct {
         );
         const prompt_height = core_prompt_height + extension_above_height + extension_editor_height + extension_below_height;
         const queued_height = try measureQueuedMessagesHeight(ctx.arena, self.keybindings, self.theme, &snapshot, width);
+        const execution_height = try measureExecutionPanelHeight(ctx.arena, self.keybindings, &snapshot, width, self.now_ms);
         const autocomplete_height = try measureAutocompleteHeight(ctx.arena, self.theme, self.editor, width);
         const task_panel_height = taskPanelHeightForWidth(width);
         const scroll_indicator_height: usize = if (snapshot.chat_scroll_offset > 0) 1 else 0;
-        const reserved_lines: usize = task_panel_height + extension_header_height + prompt_height + queued_height + 1 + autocomplete_height + scroll_indicator_height;
+        const reserved_lines: usize = task_panel_height + extension_header_height + prompt_height + queued_height + execution_height + 1 + autocomplete_height + scroll_indicator_height;
         const window_height: usize = @max(@as(usize, window.height), 1);
         const chat_capacity = if (window_height > reserved_lines) window_height - reserved_lines else 1;
 
@@ -2248,6 +2251,21 @@ pub const ScreenComponent = struct {
             }, self.keybindings, self.theme, &snapshot);
         }
         row += queued_height;
+
+        if (execution_height > 0 and row < window.height) {
+            const execution_window = window.child(.{
+                .y_off = @intCast(row),
+                .height = @intCast(@min(execution_height, @as(usize, window.height) - row)),
+            });
+            row += try drawExecutionPanel(
+                execution_window,
+                ctx.arena,
+                self.keybindings,
+                self.theme,
+                &snapshot,
+                self.now_ms,
+            );
+        }
 
         const prompt_start_row = row + extension_above_height + extension_editor_height;
         if (extension_above_height > 0 and row < window.height) {
@@ -2484,6 +2502,116 @@ fn drawFooterWithTerminal(
     }
 }
 
+fn showExecutionPanel(snapshot: *const RenderStateSnapshot) bool {
+    return snapshot.active_operation != null;
+}
+
+fn measureExecutionPanelHeight(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    now_ms: i64,
+) !usize {
+    if (!showExecutionPanel(snapshot)) return 0;
+    const text = (try formatExecutionPanelText(allocator, keybindings, snapshot, width, now_ms)) orelse return 0;
+    defer allocator.free(text);
+    return if (text.len > 0) 1 else 0;
+}
+
+fn formatExecutionPanelText(
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    snapshot: *const RenderStateSnapshot,
+    width: usize,
+    now_ms: i64,
+) !?[]u8 {
+    const active_status = try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse return null;
+    defer allocator.free(active_status);
+
+    const badge_width = tui.ansi.visibleWidth(executionPanelBadgeText(snapshot.active_operation.?.kind));
+    const label_width = tui.ansi.visibleWidth(if (layoutMode(width) == .compact) "Run" else "Execution");
+    const available_width = if (layoutMode(width) == .compact)
+        width -| label_width -| 1
+    else
+        width -| label_width -| badge_width -| 3;
+    return try fitLine(allocator, active_status, @max(@as(usize, 1), available_width));
+}
+
+fn drawExecutionPanel(
+    window: tui.vaxis.Window,
+    allocator: std.mem.Allocator,
+    keybindings: ?*const keybindings_mod.Keybindings,
+    theme: ?*const resources_mod.Theme,
+    snapshot: *const RenderStateSnapshot,
+    now_ms: i64,
+) !usize {
+    if (window.height == 0 or window.width == 0) return 0;
+    const operation = snapshot.active_operation orelse return 0;
+    const text = (try formatExecutionPanelText(allocator, keybindings, snapshot, window.width, now_ms)) orelse return 0;
+    const fill_style = executionPanelFillStyle(theme, operation.kind);
+    const label_style = executionPanelLabelStyle(theme, operation.kind);
+    const badge_style = executionPanelBadgeStyle(theme, operation.kind);
+    const label_text = if (layoutMode(window.width) == .compact) "Run" else "Execution";
+
+    const bar = tui.StatusBar{
+        .left = &.{
+            .{ .text = label_text, .style = label_style },
+            .{ .text = text, .style = fill_style },
+        },
+        .right = if (layoutMode(window.width) == .compact) &.{} else &.{
+            .{ .text = executionPanelBadgeText(operation.kind), .style = badge_style },
+        },
+        .fill_style = fill_style,
+        .separator = " ",
+    };
+    _ = try bar.draw(window.child(.{ .height = 1 }), .{
+        .window = window,
+        .arena = allocator,
+    });
+    return 1;
+}
+
+fn executionPanelFillStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ActiveOperationKind,
+) tui.vaxis.Cell.Style {
+    return switch (kind) {
+        .retry, .agent_wait, .bash_execution, .tool_execution => styleForToken(theme, .role_tool_call),
+        .compaction => styleForToken(theme, .role_tool_result),
+    };
+}
+
+fn executionPanelLabelStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ActiveOperationKind,
+) tui.vaxis.Cell.Style {
+    var style = executionPanelFillStyle(theme, kind);
+    const accent = styleForToken(theme, .task_header_accent);
+    if (accent.fg != .default) style.fg = accent.fg;
+    style.bold = true;
+    return style;
+}
+
+fn executionPanelBadgeStyle(
+    theme: ?*const resources_mod.Theme,
+    kind: ActiveOperationKind,
+) tui.vaxis.Cell.Style {
+    var style = executionPanelFillStyle(theme, kind);
+    style.bold = true;
+    return style;
+}
+
+fn executionPanelBadgeText(kind: ActiveOperationKind) []const u8 {
+    return switch (kind) {
+        .retry => "RETRY",
+        .compaction => "COMPACT",
+        .bash_execution => "BASH",
+        .tool_execution => "TOOL",
+        .agent_wait => "RUN",
+    };
+}
+
 fn drawTaskPanel(
     window: tui.vaxis.Window,
     ctx: tui.DrawContext,
@@ -2519,15 +2647,22 @@ fn drawTaskPanel(
 
     if (panel_inner.width > 0 and panel_inner.height > 0) {
         const content_width = @as(usize, panel_inner.width);
-        const content = try formatTaskHeaderTextForDisplay(
-            ctx.arena,
-            keybindings,
-            snapshot,
-            content_width,
-            layoutMode(outer_width),
-
-            now_ms,
-        );
+        const content = if (showExecutionPanel(snapshot))
+            try formatTaskHeaderTextForMode(
+                ctx.arena,
+                snapshot,
+                content_width,
+                layoutMode(outer_width),
+            )
+        else
+            try formatTaskHeaderTextForDisplay(
+                ctx.arena,
+                keybindings,
+                snapshot,
+                content_width,
+                layoutMode(outer_width),
+                now_ms,
+            );
         _ = panel_inner.printSegment(.{
             .text = content,
             .style = content_style,

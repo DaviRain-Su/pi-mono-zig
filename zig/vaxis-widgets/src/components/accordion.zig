@@ -21,6 +21,7 @@ pub const Accordion = struct {
     expanded_symbol: []const u8 = "▼",
     collapsed_symbol: []const u8 = "▶",
     content_height: usize = 3,
+    expanded_overrides: ?[]bool = null,
 
     pub fn drawComponent(self: *const Accordion) draw_mod.Component {
         return .{
@@ -42,7 +43,8 @@ pub const Accordion = struct {
 
             const is_selected = i == self.selected_index;
             const header_style = if (item.disabled) self.disabled_style else if (is_selected) self.selected_header_style else self.header_style;
-            const symbol = if (item.expanded) self.expanded_symbol else self.collapsed_symbol;
+            const item_expanded = self.isExpanded(i);
+            const symbol = if (item_expanded) self.expanded_symbol else self.collapsed_symbol;
 
             // Header row
             const header_window = window.child(.{ .y_off = row, .height = 1 });
@@ -76,7 +78,7 @@ pub const Accordion = struct {
             row += 1;
 
             // Content (if expanded)
-            if (item.expanded and row < window.height and !item.disabled) {
+            if (item_expanded and row < window.height and !item.disabled) {
                 const content_height: u16 = @intCast(@min(self.content_height, @as(usize, window.height) - row));
                 if (content_height > 0) {
                     const content_window = window.child(.{
@@ -97,13 +99,18 @@ pub const Accordion = struct {
     pub fn toggle(self: *Accordion, index: usize) void {
         if (index < self.items.len and !self.items[index].disabled) {
             self.selected_index = index;
-            // Mutable access needed for toggling expansion
+            if (self.expanded_overrides) |expanded| {
+                if (index < expanded.len) expanded[index] = !expanded[index];
+            }
         }
     }
 
     pub fn expand(self: *Accordion, index: usize) void {
         if (index < self.items.len and !self.items[index].disabled) {
             self.selected_index = index;
+            if (self.expanded_overrides) |expanded| {
+                if (index < expanded.len) expanded[index] = true;
+            }
         }
     }
 
@@ -119,11 +126,18 @@ pub const Accordion = struct {
                     self.selected_index += 1;
                 }
             },
-            .enter, .space => {
-                // Toggle expansion on selected
+            .enter => {
+                self.toggle(self.selected_index);
             },
             else => {},
         }
+    }
+
+    fn isExpanded(self: *const Accordion, index: usize) bool {
+        if (self.expanded_overrides) |expanded| {
+            if (index < expanded.len) return expanded[index];
+        }
+        return self.items[index].expanded;
     }
 
     fn drawOpaque(
@@ -167,4 +181,36 @@ test "accordion renders headers with expand symbols" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "▶") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "First") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "content") != null);
+}
+
+test "accordion toggles external expansion state" {
+    const StaticText = struct {
+        text: []const u8,
+        fn drawComponent(self: *const @This()) draw_mod.Component {
+            return .{ .ptr = self, .drawFn = draw };
+        }
+        fn draw(ptr: *const anyopaque, w: vaxis.Window, _: draw_mod.DrawContext) std.mem.Allocator.Error!draw_mod.Size {
+            const s: *const @This() = @ptrCast(@alignCast(ptr));
+            _ = w.printSegment(.{ .text = s.text }, .{ .wrap = .none });
+            return .{ .width = w.width, .height = 1 };
+        }
+    };
+
+    const text = StaticText{ .text = "content" };
+    const items = &[_]AccordionItem{
+        .{ .label = "First", .content = text.drawComponent() },
+        .{ .label = "Second", .content = text.drawComponent() },
+    };
+    var expanded = [_]bool{ false, false };
+    var accordion = Accordion{
+        .items = items,
+        .expanded_overrides = &expanded,
+        .content_height = 1,
+    };
+
+    accordion.handleKey(.enter);
+    try std.testing.expect(expanded[0]);
+    accordion.handleKey(.down);
+    accordion.expand(1);
+    try std.testing.expect(expanded[1]);
 }

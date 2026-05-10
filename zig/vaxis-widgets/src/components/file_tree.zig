@@ -145,13 +145,24 @@ pub const FileTree = struct {
                 if (self.selected_index > 0) self.selected_index -= 1;
             },
             .down => {
-                self.selected_index += 1;
+                const visible_count = self.visibleCount();
+                if (visible_count > 0 and self.selected_index + 1 < visible_count) {
+                    self.selected_index += 1;
+                }
             },
-            .enter, .space => {
+            .enter => {
                 // toggle expansion on selected
             },
             else => {},
         }
+    }
+
+    pub fn visibleCount(self: *const FileTree) usize {
+        var count: usize = 0;
+        for (self.nodes) |node| {
+            count += countVisibleNode(&node);
+        }
+        return count;
     }
 
     fn drawOpaque(
@@ -163,6 +174,16 @@ pub const FileTree = struct {
         return self.draw(window, ctx);
     }
 };
+
+fn countVisibleNode(node: *const FileTreeNode) usize {
+    var count: usize = 1;
+    if (node.expanded and node.children != null) {
+        for (node.children.?) |child| {
+            count += countVisibleNode(&child);
+        }
+    }
+    return count;
+}
 
 test "file tree renders directories and files" {
     const children = &[_]FileTreeNode{
@@ -187,4 +208,23 @@ test "file tree renders directories and files" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "src") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "main.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "README.md") != null);
+}
+
+test "file tree down navigation clamps to visible nodes" {
+    const children = &[_]FileTreeNode{
+        .{ .name = "main.zig", .file_type = .file },
+    };
+    const nodes = &[_]FileTreeNode{
+        .{ .name = "src", .file_type = .directory, .expanded = true, .children = children },
+        .{ .name = "README.md", .file_type = .file },
+    };
+
+    var tree = FileTree{ .nodes = nodes };
+    tree.handleKey(.down);
+    tree.handleKey(.down);
+    tree.handleKey(.down);
+    tree.handleKey(.down);
+
+    try std.testing.expectEqual(@as(usize, 2), tree.selected_index);
+    try std.testing.expectEqual(@as(usize, 3), tree.visibleCount());
 }
