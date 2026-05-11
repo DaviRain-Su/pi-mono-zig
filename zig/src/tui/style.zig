@@ -156,7 +156,7 @@ const named_colors = std.StaticStringMap(u8).initComptime(.{
     .{ "white", 7 },
 });
 
-fn parseNamedColor(value: []const u8) ?u8 {
+pub fn parseNamedColor(value: []const u8) ?u8 {
     return named_colors.get(value);
 }
 

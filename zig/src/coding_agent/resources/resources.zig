@@ -2864,7 +2864,7 @@ fn appendJoinedArgs(
 }
 
 fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), value: []const u8, foreground: bool) !void {
-    if (parseNamedColor(value)) |named| {
+    if (tui.style.parseNamedColor(value)) |named| {
         const prefix = if (foreground) "\x1b[3" else "\x1b[4";
         const color_text = try std.fmt.allocPrint(allocator, "{s}{d}m", .{ prefix, named });
         defer allocator.free(color_text);
@@ -2882,18 +2882,6 @@ fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), va
         defer allocator.free(ansi_text);
         try builder.appendSlice(allocator, ansi_text);
     }
-}
-
-fn parseNamedColor(value: []const u8) ?u8 {
-    if (std.mem.eql(u8, value, "black")) return 0;
-    if (std.mem.eql(u8, value, "red")) return 1;
-    if (std.mem.eql(u8, value, "green")) return 2;
-    if (std.mem.eql(u8, value, "yellow")) return 3;
-    if (std.mem.eql(u8, value, "blue")) return 4;
-    if (std.mem.eql(u8, value, "magenta")) return 5;
-    if (std.mem.eql(u8, value, "cyan")) return 6;
-    if (std.mem.eql(u8, value, "white")) return 7;
-    return null;
 }
 
 fn escapeXmlAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
