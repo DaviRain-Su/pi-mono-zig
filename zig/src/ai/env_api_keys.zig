@@ -123,39 +123,42 @@ fn pathExists(_: std.mem.Allocator, path: []const u8) bool {
     return true;
 }
 
+const PROVIDER_ENV_VARS = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "openai", "OPENAI_API_KEY" },
+    .{ "openai-responses", "OPENAI_API_KEY" },
+    .{ "openai-codex", "OPENAI_API_KEY" },
+    .{ "azure-openai-responses", "AZURE_OPENAI_API_KEY" },
+    .{ "deepseek", "DEEPSEEK_API_KEY" },
+    .{ "google", "GEMINI_API_KEY" },
+    .{ "groq", "GROQ_API_KEY" },
+    .{ "cerebras", "CEREBRAS_API_KEY" },
+    .{ "xai", "XAI_API_KEY" },
+    .{ "openrouter", "OPENROUTER_API_KEY" },
+    .{ "vercel-ai-gateway", "AI_GATEWAY_API_KEY" },
+    .{ "zai", "ZAI_API_KEY" },
+    .{ "mistral", "MISTRAL_API_KEY" },
+    .{ "minimax", "MINIMAX_API_KEY" },
+    .{ "minimax-cn", "MINIMAX_CN_API_KEY" },
+    .{ "moonshotai", "MOONSHOT_API_KEY" },
+    .{ "moonshotai-cn", "MOONSHOT_API_KEY" },
+    .{ "huggingface", "HF_TOKEN" },
+    .{ "fireworks", "FIREWORKS_API_KEY" },
+    .{ "together", "TOGETHER_API_KEY" },
+    .{ "opencode", "OPENCODE_API_KEY" },
+    .{ "opencode-go", "OPENCODE_API_KEY" },
+    .{ "kimi", "MOONSHOT_API_KEY" },
+    .{ "kimi-coding", "KIMI_API_KEY" },
+    .{ "kimi-code-openai", "KIMI_API_KEY" },
+    .{ "cloudflare-workers-ai", "CLOUDFLARE_API_KEY" },
+    .{ "cloudflare-ai-gateway", "CLOUDFLARE_API_KEY" },
+    .{ "xiaomi", "XIAOMI_API_KEY" },
+    .{ "xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY" },
+    .{ "xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
+    .{ "xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY" },
+});
+
 fn resolveEnvVar(provider: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, provider, "openai")) return "OPENAI_API_KEY";
-    if (std.mem.eql(u8, provider, "openai-responses")) return "OPENAI_API_KEY";
-    if (std.mem.eql(u8, provider, "openai-codex")) return "OPENAI_API_KEY";
-    if (std.mem.eql(u8, provider, "azure-openai-responses")) return "AZURE_OPENAI_API_KEY";
-    if (std.mem.eql(u8, provider, "deepseek")) return "DEEPSEEK_API_KEY";
-    if (std.mem.eql(u8, provider, "google")) return "GEMINI_API_KEY";
-    if (std.mem.eql(u8, provider, "groq")) return "GROQ_API_KEY";
-    if (std.mem.eql(u8, provider, "cerebras")) return "CEREBRAS_API_KEY";
-    if (std.mem.eql(u8, provider, "xai")) return "XAI_API_KEY";
-    if (std.mem.eql(u8, provider, "openrouter")) return "OPENROUTER_API_KEY";
-    if (std.mem.eql(u8, provider, "vercel-ai-gateway")) return "AI_GATEWAY_API_KEY";
-    if (std.mem.eql(u8, provider, "zai")) return "ZAI_API_KEY";
-    if (std.mem.eql(u8, provider, "mistral")) return "MISTRAL_API_KEY";
-    if (std.mem.eql(u8, provider, "minimax")) return "MINIMAX_API_KEY";
-    if (std.mem.eql(u8, provider, "minimax-cn")) return "MINIMAX_CN_API_KEY";
-    if (std.mem.eql(u8, provider, "moonshotai")) return "MOONSHOT_API_KEY";
-    if (std.mem.eql(u8, provider, "moonshotai-cn")) return "MOONSHOT_API_KEY";
-    if (std.mem.eql(u8, provider, "huggingface")) return "HF_TOKEN";
-    if (std.mem.eql(u8, provider, "fireworks")) return "FIREWORKS_API_KEY";
-    if (std.mem.eql(u8, provider, "together")) return "TOGETHER_API_KEY";
-    if (std.mem.eql(u8, provider, "opencode")) return "OPENCODE_API_KEY";
-    if (std.mem.eql(u8, provider, "opencode-go")) return "OPENCODE_API_KEY";
-    if (std.mem.eql(u8, provider, "kimi")) return "MOONSHOT_API_KEY";
-    if (std.mem.eql(u8, provider, "kimi-coding")) return "KIMI_API_KEY";
-    if (std.mem.eql(u8, provider, "kimi-code-openai")) return "KIMI_API_KEY";
-    if (std.mem.eql(u8, provider, "cloudflare-workers-ai")) return "CLOUDFLARE_API_KEY";
-    if (std.mem.eql(u8, provider, "cloudflare-ai-gateway")) return "CLOUDFLARE_API_KEY";
-    if (std.mem.eql(u8, provider, "xiaomi")) return "XIAOMI_API_KEY";
-    if (std.mem.eql(u8, provider, "xiaomi-token-plan-cn")) return "XIAOMI_TOKEN_PLAN_CN_API_KEY";
-    if (std.mem.eql(u8, provider, "xiaomi-token-plan-ams")) return "XIAOMI_TOKEN_PLAN_AMS_API_KEY";
-    if (std.mem.eql(u8, provider, "xiaomi-token-plan-sgp")) return "XIAOMI_TOKEN_PLAN_SGP_API_KEY";
-    return null;
+    return PROVIDER_ENV_VARS.get(provider);
 }
 
 test "getEnvApiKey resolves known providers and returns null when missing" {
