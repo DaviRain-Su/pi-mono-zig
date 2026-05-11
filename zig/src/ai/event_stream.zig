@@ -15,7 +15,15 @@ const event_stream_guard = @import("event_stream_guard.zig");
 /// Release builds skip the guard entirely.
 /// Generic event stream for async iteration.
 /// T is the event type, R is the result type.
-pub fn EventStream(comptime T: type, comptime R: type) type {
+/// `is_complete_fn` and `extract_result_fn` are comptime function parameters
+/// so the streaming hot path can inline them and avoid an indirect call per
+/// `push()` / result extraction.
+pub fn EventStream(
+    comptime T: type,
+    comptime R: type,
+    comptime is_complete_fn: fn (event: T) bool,
+    comptime extract_result_fn: fn (event: T) R,
+) type {
     const enable_guard = builtin.mode == .Debug and T == types.AssistantMessageEvent;
     const GuardField = if (enable_guard) event_stream_guard.EventOrderingGuard else void;
     return struct {
@@ -29,8 +37,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         mutex: std.Io.Mutex = .init,
         condition: std.Io.Condition = .init,
         io: std.Io,
-        is_complete_fn: *const fn (event: T) bool,
-        extract_result_fn: *const fn (event: T) R,
         guard: GuardField,
 
         pub const IteratorResult = struct {
@@ -41,8 +47,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         pub fn init(
             allocator: std.mem.Allocator,
             io: std.Io,
-            is_complete: *const fn (event: T) bool,
-            extract_result: *const fn (event: T) R,
         ) Self {
             return .{
                 .allocator = allocator,
@@ -50,8 +54,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .queue = std.ArrayList(T).empty,
                 .done = false,
                 .final_result = null,
-                .is_complete_fn = is_complete,
-                .extract_result_fn = extract_result,
                 .guard = if (enable_guard) event_stream_guard.EventOrderingGuard.init(allocator) else {},
             };
         }
@@ -76,9 +78,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 };
             }
 
-            if (self.is_complete_fn(event)) {
+            if (is_complete_fn(event)) {
                 self.done = true;
-                self.final_result = self.extract_result_fn(event);
+                self.final_result = extract_result_fn(event);
             }
 
             self.queue.append(self.allocator, event) catch {
@@ -154,26 +156,21 @@ fn extractResult(event: types.AssistantMessageEvent) types.AssistantMessage {
     unreachable;
 }
 
-pub const AssistantMessageEventStream = EventStream(types.AssistantMessageEvent, types.AssistantMessage);
+pub const AssistantMessageEventStream = EventStream(
+    types.AssistantMessageEvent,
+    types.AssistantMessage,
+    isCompleteEvent,
+    extractResult,
+);
 
 pub fn createAssistantMessageEventStream(allocator: std.mem.Allocator, io: std.Io) AssistantMessageEventStream {
-    return AssistantMessageEventStream.init(
-        allocator,
-        io,
-        isCompleteEvent,
-        extractResult,
-    );
+    return AssistantMessageEventStream.init(allocator, io);
 }
 
 test "EventStream basic operations" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
-    var stream = AssistantMessageEventStream.init(
-        allocator,
-        io,
-        isCompleteEvent,
-        extractResult,
-    );
+    var stream = AssistantMessageEventStream.init(allocator, io);
     defer stream.deinit();
 
     // Push a start event
@@ -330,12 +327,7 @@ test "AssistantMessageEventStream ignores events after terminal error" {
 test "EventStream end without events" {
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
-    var stream = AssistantMessageEventStream.init(
-        allocator,
-        io,
-        isCompleteEvent,
-        extractResult,
-    );
+    var stream = AssistantMessageEventStream.init(allocator, io);
     defer stream.deinit();
 
     const msg = types.AssistantMessage{
@@ -359,12 +351,7 @@ test "EventStream end without events" {
 test "EventStream next blocks until producer pushes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var stream = AssistantMessageEventStream.init(
-        allocator,
-        io,
-        isCompleteEvent,
-        extractResult,
-    );
+    var stream = AssistantMessageEventStream.init(allocator, io);
     defer stream.deinit();
 
     const TestContext = struct {
@@ -392,7 +379,6 @@ test "EventStream supports single-producer single-consumer concurrency" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const IntStream = EventStream(u32, u32);
     const intIsComplete = struct {
         fn f(_: u32) bool {
             return false;
@@ -403,13 +389,9 @@ test "EventStream supports single-producer single-consumer concurrency" {
             return event;
         }
     }.f;
+    const IntStream = EventStream(u32, u32, intIsComplete, intExtractResult);
 
-    var stream = IntStream.init(
-        allocator,
-        io,
-        intIsComplete,
-        intExtractResult,
-    );
+    var stream = IntStream.init(allocator, io);
     defer stream.deinit();
 
     const TestContext = struct {
