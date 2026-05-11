@@ -1947,7 +1947,7 @@ pub const BridgeHost = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.writeAll("{\"builtins\":[");
-        for (command_router.BUILTIN_SLASH_COMMANDS, 0..) |command, index| {
+        for (command_router.VISIBLE_BUILTIN_SLASH_COMMANDS, 0..) |command, index| {
             if (index > 0) try writer.writeAll(",");
             try writer.writeAll("{");
             try writeStringField(allocator, writer, "name", command.name, false);

@@ -55,32 +55,88 @@ pub const BuiltinSlashCommand = struct {
     name: []const u8,
     description: []const u8,
     argument_hint: ?[]const u8 = null,
+    kind: SlashCommandKind,
+    /// Hidden entries participate in parsing and dispatch but are excluded from
+    /// the autocomplete matrix, the `/help` listing, and the webview catalog
+    /// "builtins" array. They exist so the table can remain the single source of
+    /// truth for every `SlashCommandKind` variant while preserving the historical
+    /// behavior of not advertising certain commands in primary UI surfaces.
+    hidden: bool = false,
 };
 
 pub const BUILTIN_SLASH_COMMANDS = [_]BuiltinSlashCommand{
-    .{ .name = "help", .description = "Show slash commands and keyboard shortcuts" },
-    .{ .name = "settings", .description = "Open settings menu" },
-    .{ .name = "model", .description = "Select model (opens selector UI)" },
-    .{ .name = "theme", .description = "Switch color theme", .argument_hint = "[night|day]" },
-    .{ .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling" },
-    .{ .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl)" },
-    .{ .name = "import", .description = "Import and resume a session from a JSONL file" },
-    .{ .name = "share", .description = "Share session as a secret GitHub gist" },
-    .{ .name = "copy", .description = "Copy transcript content to clipboard", .argument_hint = "[last|all|visible]" },
-    .{ .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
-    .{ .name = "session", .description = "Show session info and stats" },
-    .{ .name = "changelog", .description = "Show changelog entries" },
-    .{ .name = "hotkeys", .description = "Show all keyboard shortcuts" },
-    .{ .name = "fork", .description = "Create a new fork from a previous user message" },
-    .{ .name = "clone", .description = "Duplicate the current session at the current position" },
-    .{ .name = "tree", .description = "Navigate session tree (switch branches)" },
-    .{ .name = "login", .description = "Configure provider authentication" },
-    .{ .name = "logout", .description = "Remove provider authentication" },
-    .{ .name = "new", .description = "Start a new session" },
-    .{ .name = "compact", .description = "Manually compact the session context" },
-    .{ .name = "resume", .description = "Resume a different session" },
-    .{ .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes" },
-    .{ .name = "quit", .description = "Quit pi" },
+    .{ .kind = .help, .name = "help", .description = "Show slash commands and keyboard shortcuts" },
+    .{ .kind = .settings, .name = "settings", .description = "Open settings menu" },
+    .{ .kind = .model, .name = "model", .description = "Select model (opens selector UI)" },
+    .{ .kind = .theme, .name = "theme", .description = "Switch color theme", .argument_hint = "[night|day]" },
+    .{ .kind = .scoped_models, .name = "scoped-models", .description = "Enable/disable models for Ctrl+P cycling" },
+    .{ .kind = .@"export", .name = "export", .description = "Export session (HTML default, or specify path: .html/.jsonl)" },
+    .{ .kind = .import, .name = "import", .description = "Import and resume a session from a JSONL file" },
+    .{ .kind = .share, .name = "share", .description = "Share session as a secret GitHub gist" },
+    .{ .kind = .copy, .name = "copy", .description = "Copy transcript content to clipboard", .argument_hint = "[last|all|visible]" },
+    .{ .kind = .name, .name = "name", .description = "Set session display name", .argument_hint = "<name>" },
+    .{ .kind = .session, .name = "session", .description = "Show session info and stats" },
+    .{ .kind = .changelog, .name = "changelog", .description = "Show changelog entries" },
+    .{ .kind = .hotkeys, .name = "hotkeys", .description = "Show all keyboard shortcuts" },
+    .{ .kind = .fork, .name = "fork", .description = "Create a new fork from a previous user message" },
+    .{ .kind = .clone, .name = "clone", .description = "Duplicate the current session at the current position" },
+    .{ .kind = .tree, .name = "tree", .description = "Navigate session tree (switch branches)" },
+    .{ .kind = .login, .name = "login", .description = "Configure provider authentication" },
+    .{ .kind = .logout, .name = "logout", .description = "Remove provider authentication" },
+    .{ .kind = .new, .name = "new", .description = "Start a new session" },
+    .{ .kind = .compact, .name = "compact", .description = "Manually compact the session context" },
+    .{ .kind = .@"resume", .name = "resume", .description = "Resume a different session" },
+    .{ .kind = .reload, .name = "reload", .description = "Reload keybindings, extensions, skills, prompts, and themes" },
+    .{ .kind = .quit, .name = "quit", .description = "Quit pi" },
+    // Hidden: dispatched via the parser/router but not advertised in autocomplete or /help.
+    .{ .kind = .label, .name = "label", .description = "Label the current session entry", .hidden = true },
+};
+
+comptime {
+    // Guarantee every SlashCommandKind variant appears in BUILTIN_SLASH_COMMANDS
+    // exactly once. Prevents drift between the enum and the table.
+    const fields = @typeInfo(SlashCommandKind).@"enum".fields;
+    var seen = [_]bool{false} ** fields.len;
+    for (BUILTIN_SLASH_COMMANDS) |entry| {
+        const idx = @intFromEnum(entry.kind);
+        if (seen[idx]) @compileError("duplicate BUILTIN_SLASH_COMMANDS entry for kind " ++ @tagName(entry.kind));
+        seen[idx] = true;
+    }
+    for (fields, 0..) |field, idx| {
+        if (!seen[idx]) @compileError("missing BUILTIN_SLASH_COMMANDS entry for SlashCommandKind." ++ field.name);
+    }
+}
+
+const VISIBLE_BUILTIN_SLASH_COMMANDS_COUNT = blk: {
+    var count: usize = 0;
+    for (BUILTIN_SLASH_COMMANDS) |entry| {
+        if (!entry.hidden) count += 1;
+    }
+    break :blk count;
+};
+
+/// Subset of BUILTIN_SLASH_COMMANDS without `.hidden` entries, in declaration
+/// order. Used by autocomplete, `/help`, and the webview catalog "builtins"
+/// array so hidden commands stay reachable via the parser without appearing in
+/// primary UI surfaces.
+pub const VISIBLE_BUILTIN_SLASH_COMMANDS: [VISIBLE_BUILTIN_SLASH_COMMANDS_COUNT]BuiltinSlashCommand = blk: {
+    var visible: [VISIBLE_BUILTIN_SLASH_COMMANDS_COUNT]BuiltinSlashCommand = undefined;
+    var idx: usize = 0;
+    for (BUILTIN_SLASH_COMMANDS) |entry| {
+        if (entry.hidden) continue;
+        visible[idx] = entry;
+        idx += 1;
+    }
+    break :blk visible;
+};
+
+const SLASH_COMMAND_NAME_MAP = blk: {
+    const KV = struct { []const u8, SlashCommandKind };
+    var entries: [BUILTIN_SLASH_COMMANDS.len]KV = undefined;
+    for (BUILTIN_SLASH_COMMANDS, 0..) |entry, i| {
+        entries[i] = .{ entry.name, entry.kind };
+    }
+    break :blk std.StaticStringMap(SlashCommandKind).initComptime(entries);
 };
 
 pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
@@ -94,31 +150,8 @@ pub fn parseSlashCommand(text: []const u8) ?SlashCommand {
         "";
     const argument = if (raw_argument.len == 0) null else raw_argument;
 
-    if (std.mem.eql(u8, command_name, "help")) return .{ .kind = .help, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "settings")) return .{ .kind = .settings, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "model")) return .{ .kind = .model, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "theme")) return .{ .kind = .theme, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "scoped-models")) return .{ .kind = .scoped_models, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "import")) return .{ .kind = .import, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "share")) return .{ .kind = .share, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "copy")) return .{ .kind = .copy, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "name")) return .{ .kind = .name, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "hotkeys")) return .{ .kind = .hotkeys, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "label")) return .{ .kind = .label, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "session")) return .{ .kind = .session, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "changelog")) return .{ .kind = .changelog, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "tree")) return .{ .kind = .tree, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "fork")) return .{ .kind = .fork, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "clone")) return .{ .kind = .clone, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "compact")) return .{ .kind = .compact, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "login")) return .{ .kind = .login, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "logout")) return .{ .kind = .logout, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "new")) return .{ .kind = .new, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "resume")) return .{ .kind = .@"resume", .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "reload")) return .{ .kind = .reload, .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "export")) return .{ .kind = .@"export", .argument = argument, .raw = text };
-    if (std.mem.eql(u8, command_name, "quit")) return .{ .kind = .quit, .argument = argument, .raw = text };
-    return null;
+    const kind = SLASH_COMMAND_NAME_MAP.get(command_name) orelse return null;
+    return .{ .kind = kind, .argument = argument, .raw = text };
 }
 
 pub fn handleSlashCommand(
@@ -269,9 +302,9 @@ fn handleImmediateSlashCommand(
 ) !bool {
     switch (command.kind) {
         .help => {
-            const help_commands = try allocator.alloc(slash_commands.HelpSlashCommand, BUILTIN_SLASH_COMMANDS.len);
+            const help_commands = try allocator.alloc(slash_commands.HelpSlashCommand, VISIBLE_BUILTIN_SLASH_COMMANDS.len);
             defer allocator.free(help_commands);
-            for (BUILTIN_SLASH_COMMANDS, 0..) |builtin, index| {
+            for (VISIBLE_BUILTIN_SLASH_COMMANDS, 0..) |builtin, index| {
                 help_commands[index] = .{
                     .name = builtin.name,
                     .description = builtin.description,
@@ -337,11 +370,13 @@ test "built-in slash command autocomplete matrix keeps help before TypeScript or
         "quit",
     };
 
-    try std.testing.expectEqual(expected.len, BUILTIN_SLASH_COMMANDS.len);
+    try std.testing.expectEqual(expected.len, VISIBLE_BUILTIN_SLASH_COMMANDS.len);
     for (expected, 0..) |name, index| {
-        try std.testing.expectEqualStrings(name, BUILTIN_SLASH_COMMANDS[index].name);
+        try std.testing.expectEqualStrings(name, VISIBLE_BUILTIN_SLASH_COMMANDS[index].name);
         var buffer: [64]u8 = undefined;
         const text = try std.fmt.bufPrint(&buffer, "/{s}", .{name});
         try std.testing.expect(parseSlashCommand(text) != null);
     }
+    // Hidden entries are dispatched by the parser but excluded from the visible matrix.
+    try std.testing.expect(parseSlashCommand("/label bookmark") != null);
 }

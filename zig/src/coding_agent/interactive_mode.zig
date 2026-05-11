@@ -150,6 +150,7 @@ pub const SlashCommandKind = command_router.SlashCommandKind;
 pub const SlashCommand = command_router.SlashCommand;
 pub const BuiltinSlashCommand = command_router.BuiltinSlashCommand;
 pub const BUILTIN_SLASH_COMMANDS = command_router.BUILTIN_SLASH_COMMANDS;
+pub const VISIBLE_BUILTIN_SLASH_COMMANDS = command_router.VISIBLE_BUILTIN_SLASH_COMMANDS;
 pub const createSeededSession = session_lifecycle.createSeededSession;
 pub const parseSlashCommand = command_router.parseSlashCommand;
 pub const handleSlashCommand = command_router.handleSlashCommand;

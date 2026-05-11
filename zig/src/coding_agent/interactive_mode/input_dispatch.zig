@@ -44,7 +44,7 @@ const beginLoginFlow = auth_flow_mod.beginLoginFlow;
 const logoutProviderById = auth_flow_mod.logoutProviderById;
 const cancelAuthFlow = auth_flow_mod.cancelAuthFlow;
 const submitAuthFlowInput = auth_flow_mod.submitAuthFlowInput;
-const BUILTIN_SLASH_COMMANDS = command_router.BUILTIN_SLASH_COMMANDS;
+const BUILTIN_SLASH_COMMANDS = command_router.VISIBLE_BUILTIN_SLASH_COMMANDS;
 const AppContext = shared.AppContext;
 const ResolvedInputKey = input_resolution.ResolvedInputKey;
 
