@@ -202,6 +202,23 @@ pub const WorkflowSurfaceDiagnostic = struct {
     }
 };
 
+pub const RegistryCollisionDiagnostic = struct {
+    surface: []u8,
+    id: []u8,
+    incumbent_extension_path: []u8,
+    rejected_extension_path: []u8,
+    message: []u8,
+
+    pub fn deinit(self: *RegistryCollisionDiagnostic, allocator: std.mem.Allocator) void {
+        allocator.free(self.surface);
+        allocator.free(self.id);
+        allocator.free(self.incumbent_extension_path);
+        allocator.free(self.rejected_extension_path);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
 pub const BuiltinShortcutBinding = struct {
     shortcut: []const u8,
     keybinding: []const u8,
@@ -493,6 +510,7 @@ pub const Registry = struct {
     capabilities: std.ArrayList(ExtensionCapability) = .empty,
     workflows: std.ArrayList(ExtensionWorkflow) = .empty,
     workflow_surface_diagnostics: std.ArrayList(WorkflowSurfaceDiagnostic) = .empty,
+    collision_diagnostics: std.ArrayList(RegistryCollisionDiagnostic) = .empty,
     providers: std.ArrayList(ExtensionProvider) = .empty,
     /// Captured `extension_ui_request` ids in arrival order. Mirrors the
     /// host-side bridge log so UI bridge correlation can be asserted by
@@ -548,6 +566,8 @@ pub const Registry = struct {
         self.workflows.deinit(self.allocator);
         for (self.workflow_surface_diagnostics.items) |*diagnostic| diagnostic.deinit(self.allocator);
         self.workflow_surface_diagnostics.deinit(self.allocator);
+        for (self.collision_diagnostics.items) |*diagnostic| diagnostic.deinit(self.allocator);
+        self.collision_diagnostics.deinit(self.allocator);
         for (self.providers.items) |*p| p.deinit(self.allocator);
         self.providers.deinit(self.allocator);
         for (self.ui_request_ids.items) |id| self.allocator.free(id);
@@ -638,6 +658,52 @@ pub const Registry = struct {
             const diagnostic = self.workflow_surface_diagnostics.items[index];
             if (std.mem.eql(u8, diagnostic.workflow_id, id) and std.mem.eql(u8, diagnostic.extension_path, extension_path)) {
                 var removed = self.workflow_surface_diagnostics.orderedRemove(index);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
+    fn appendCollisionDiagnostic(
+        self: *Registry,
+        surface: []const u8,
+        id: []const u8,
+        incumbent_extension_path: []const u8,
+        rejected_extension_path: []const u8,
+    ) !void {
+        const surface_dup = try self.allocator.dupe(u8, surface);
+        errdefer self.allocator.free(surface_dup);
+        const id_dup = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_dup);
+        const incumbent_dup = try self.allocator.dupe(u8, incumbent_extension_path);
+        errdefer self.allocator.free(incumbent_dup);
+        const rejected_dup = try self.allocator.dupe(u8, rejected_extension_path);
+        errdefer self.allocator.free(rejected_dup);
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "Extension {s} registration '{s}' from {s} conflicts with incumbent registration from {s}; keeping incumbent.",
+            .{ surface, id, rejected_extension_path, incumbent_extension_path },
+        );
+        errdefer self.allocator.free(message);
+
+        const diagnostic = RegistryCollisionDiagnostic{
+            .surface = surface_dup,
+            .id = id_dup,
+            .incumbent_extension_path = incumbent_dup,
+            .rejected_extension_path = rejected_dup,
+            .message = message,
+        };
+        try self.collision_diagnostics.append(self.allocator, diagnostic);
+    }
+
+    fn removeCollisionDiagnosticsForExtension(self: *Registry, extension_path: []const u8) void {
+        var index = self.collision_diagnostics.items.len;
+        while (index > 0) {
+            index -= 1;
+            const diagnostic = self.collision_diagnostics.items[index];
+            if (std.mem.eql(u8, diagnostic.incumbent_extension_path, extension_path) or
+                std.mem.eql(u8, diagnostic.rejected_extension_path, extension_path))
+            {
+                var removed = self.collision_diagnostics.orderedRemove(index);
                 removed.deinit(self.allocator);
             }
         }
@@ -765,6 +831,10 @@ pub const Registry = struct {
     ) !void {
         if (isSubAgentReservedName(custom_type)) return error.ReservedSubAgentName;
         if (self.findMessageRendererIndex(custom_type)) |idx| {
+            if (!std.mem.eql(u8, self.message_renderers.items[idx].extension_path, extension_path)) {
+                try self.appendCollisionDiagnostic("message_renderer", custom_type, self.message_renderers.items[idx].extension_path, extension_path);
+                return;
+            }
             self.message_renderers.items[idx].deinit(self.allocator);
             self.message_renderers.items[idx] = try makeMessageRenderer(self.allocator, custom_type, extension_path);
             return;
@@ -813,9 +883,11 @@ pub const Registry = struct {
         extension_path: []const u8,
     ) !void {
         if (isSubAgentReservedName(name)) return error.ReservedSubAgentName;
-        // TS behavior: re-registering the same tool replaces the existing
-        // entry. Mirrors the loader+runner overwrite contract.
         if (self.findToolIndex(name)) |idx| {
+            if (!std.mem.eql(u8, self.tools.items[idx].extension_path, extension_path)) {
+                try self.appendCollisionDiagnostic("tool", name, self.tools.items[idx].extension_path, extension_path);
+                return;
+            }
             self.tools.items[idx].deinit(self.allocator);
             self.tools.items[idx] = try makeTool(self.allocator, name, label, description, parameters, execution_mode, render_shell, extension_path);
             return;
@@ -840,13 +912,13 @@ pub const Registry = struct {
         extension_path: []const u8,
     ) !void {
         if (isSubAgentReservedName(name)) return error.ReservedSubAgentName;
-        // TypeScript stores commands in a per-extension map. A repeated
-        // command in the same extension refreshes that entry, while the
-        // same command name from another extension remains registered and
-        // is resolved later with a deterministic invocation suffix.
         if (self.findCommandForExtensionIndex(name, extension_path)) |idx| {
             self.commands.items[idx].deinit(self.allocator);
             self.commands.items[idx] = try makeCommand(self.allocator, name, description, extension_path);
+            return;
+        }
+        if (self.findCommandIndex(name)) |idx| {
+            try self.appendCollisionDiagnostic("command", name, self.commands.items[idx].extension_path, extension_path);
             return;
         }
         const cmd = try makeCommand(self.allocator, name, description, extension_path);
@@ -1015,6 +1087,10 @@ pub const Registry = struct {
     ) !void {
         if (isSubAgentReservedName(id) or (command != null and isSubAgentReservedName(command.?)) or (resource_path != null and isSubAgentReservedName(resource_path.?))) return error.ReservedSubAgentName;
         if (self.findCapabilityIndex(id)) |idx| {
+            if (!std.mem.eql(u8, self.capabilities.items[idx].extension_path, extension_path)) {
+                try self.appendCollisionDiagnostic("capability", id, self.capabilities.items[idx].extension_path, extension_path);
+                return;
+            }
             self.capabilities.items[idx].deinit(self.allocator);
             self.capabilities.items[idx] = try makeCapability(self.allocator, id, kind, title, description, command, resource_path, extension_path);
             return;
@@ -1143,6 +1219,10 @@ pub const Registry = struct {
         extension_path: []const u8,
     ) !void {
         if (self.findFlagIndex(name)) |idx| {
+            if (!std.mem.eql(u8, self.flags.items[idx].extension_path, extension_path)) {
+                try self.appendCollisionDiagnostic("flag", name, self.flags.items[idx].extension_path, extension_path);
+                return;
+            }
             self.flags.items[idx].deinit(self.allocator);
             self.flags.items[idx] = try makeFlag(self.allocator, name, type_kind, description, default_value, extension_path);
             return;
@@ -1191,8 +1271,11 @@ pub const Registry = struct {
         auth_header: bool,
         api_key_configured: bool,
     ) !void {
-        // Mirror TS: re-registering replaces all existing models.
         if (self.findProviderIndex(name)) |idx| {
+            if (!std.mem.eql(u8, self.providers.items[idx].extension_path, extension_path)) {
+                try self.appendCollisionDiagnostic("provider", name, self.providers.items[idx].extension_path, extension_path);
+                return;
+            }
             var removed = self.providers.orderedRemove(idx);
             removed.deinit(self.allocator);
         }
@@ -1287,6 +1370,8 @@ pub const Registry = struct {
                 removed.deinit(self.allocator);
             }
         }
+
+        self.removeCollisionDiagnosticsForExtension(extension_path);
     }
 
     /// Set the parsed CLI value for a registered flag. Mirrors the TS
@@ -1977,6 +2062,7 @@ pub const FrameOutcome = enum {
     unregistered_message_renderer,
     ignored_unsupported,
     ignored_malformed,
+    ignored_collision,
 };
 
 /// Apply a single JSONL host frame (already JSON-decoded) to the
@@ -2036,7 +2122,9 @@ fn applyRegisterToolFrame(registry: *Registry, object: std.json.ObjectMap, exten
     const parameters = object.get("parameters") orelse .null;
     const execution_mode = optionalString(object, "executionMode");
     const render_shell = optionalString(object, "renderShell");
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerToolFull(name, label, description, parameters, execution_mode, render_shell, extension_path);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     try applyToolRenderHook(registry, object, name, extension_path);
     return .registered_tool;
 }
@@ -2068,7 +2156,9 @@ fn applyRegisterCommandFrame(registry: *Registry, object: std.json.ObjectMap, ex
     const name = optionalString(object, "name") orelse return .ignored_malformed;
     if (isSubAgentReservedName(name)) return .ignored_malformed;
     const description = optionalString(object, "description");
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerCommand(name, description, extension_path);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     return .registered_command;
 }
 
@@ -2085,7 +2175,9 @@ fn applyRegisterFlagFrame(registry: *Registry, object: std.json.ObjectMap, exten
     const type_kind = parseFlagKind(optionalString(object, "valueType") orelse optionalString(object, "type") orelse "boolean") orelse return .ignored_malformed;
     const description = optionalString(object, "description");
     const default_value = parseFlagDefault(object);
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerFlag(name, type_kind, description, default_value, extension_path);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     return .registered_flag;
 }
 
@@ -2111,7 +2203,9 @@ fn applyRegisterProviderFrame(registry: *Registry, object: std.json.ObjectMap, e
     const auth_header = optionalBool(object, "authHeader") orelse false;
     const api_key_configured = (optionalBool(object, "apiKeyConfigured") orelse false) or object.get("apiKey") != null;
 
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerProviderFullWithAuthState(name, display_name, base_url, api, inputs.items, extension_path, null, null, auth_header, api_key_configured);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     try applyProviderOAuthFrame(registry, object, name);
     return .registered_provider;
 }
@@ -2156,7 +2250,9 @@ fn applyRegisterCapabilityFrame(registry: *Registry, object: std.json.ObjectMap,
     if (command != null and isSubAgentReservedName(command.?)) return .ignored_malformed;
     const resource_path = optionalString(object, "resourcePath");
     if (resource_path != null and isSubAgentReservedName(resource_path.?)) return .ignored_malformed;
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerCapability(id, kind, title, description, command, resource_path, extension_path);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     return .registered_capability;
 }
 
@@ -2358,7 +2454,9 @@ fn applyClearExtensionRegistrationsFrame(registry: *Registry, object: std.json.O
 fn applyRegisterMessageRendererFrame(registry: *Registry, object: std.json.ObjectMap, extension_path: []const u8) !FrameOutcome {
     const custom_type = optionalString(object, "customType") orelse return .ignored_malformed;
     if (isSubAgentReservedName(custom_type)) return .ignored_malformed;
+    const collision_count_before = registry.collision_diagnostics.items.len;
     try registry.registerMessageRenderer(custom_type, extension_path);
+    if (registry.collision_diagnostics.items.len != collision_count_before) return .ignored_collision;
     return .registered_message_renderer;
 }
 
@@ -2659,7 +2757,7 @@ pub fn applyHostFrameStream(
         defer parsed.deinit();
         const outcome = try applyHostFrame(registry, parsed.value);
         switch (outcome) {
-            .none, .ignored_unsupported, .ignored_malformed => {},
+            .none, .ignored_unsupported, .ignored_malformed, .ignored_collision => {},
             else => applied += 1,
         }
     }
@@ -2806,7 +2904,7 @@ test "registry registers tools/commands/shortcuts/flags/providers and round-trip
     try std.testing.expect(!registry.unregisterProvider("fake-provider"));
 }
 
-test "extension command conflict parity suffixes duplicate commands in insertion order" {
+test "extension command collisions preserve incumbent command in insertion order" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
     defer registry.deinit();
@@ -2817,32 +2915,31 @@ test "extension command conflict parity suffixes duplicate commands in insertion
     try registry.registerCommand("same-extension", "old", "/tmp/cmd-a.ts");
     try registry.registerCommand("same-extension", "new", "/tmp/cmd-a.ts");
 
-    try std.testing.expectEqual(@as(usize, 4), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 3), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.collision_diagnostics.items.len);
 
     const commands = try registry.resolveCommands(allocator);
     defer deinitResolvedCommands(allocator, commands);
 
-    try std.testing.expectEqual(@as(usize, 4), commands.len);
+    try std.testing.expectEqual(@as(usize, 3), commands.len);
     try std.testing.expectEqualStrings("shared-cmd", commands[0].name);
-    try std.testing.expectEqualStrings("shared-cmd:1", commands[0].invocation_name);
+    try std.testing.expectEqualStrings("shared-cmd", commands[0].invocation_name);
     try std.testing.expectEqualStrings("First command", commands[0].description.?);
     try std.testing.expectEqualStrings("solo-cmd", commands[1].invocation_name);
-    try std.testing.expectEqualStrings("shared-cmd:2", commands[2].invocation_name);
-    try std.testing.expectEqualStrings("Second command", commands[2].description.?);
-    try std.testing.expectEqualStrings("same-extension", commands[3].invocation_name);
-    try std.testing.expectEqualStrings("new", commands[3].description.?);
+    try std.testing.expectEqualStrings("same-extension", commands[2].invocation_name);
+    try std.testing.expectEqualStrings("new", commands[2].description.?);
 
-    try std.testing.expect(registry.hasCommandInvocation("shared-cmd:1"));
-    try std.testing.expect(registry.hasCommandInvocation("shared-cmd:2"));
-    try std.testing.expect(!registry.hasCommandInvocation("shared-cmd"));
+    try std.testing.expect(registry.hasCommandInvocation("shared-cmd"));
+    try std.testing.expect(!registry.hasCommandInvocation("shared-cmd:1"));
+    try std.testing.expectEqualStrings("command", registry.collision_diagnostics.items[0].surface);
+    try std.testing.expectEqualStrings("shared-cmd", registry.collision_diagnostics.items[0].id);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
     const snapshot = out.written();
-    const first_idx = std.mem.indexOf(u8, snapshot, "\"invocationName\":\"shared-cmd:1\"") orelse return error.MissingFirstCommandInvocation;
-    const second_idx = std.mem.indexOf(u8, snapshot, "\"invocationName\":\"shared-cmd:2\"") orelse return error.MissingSecondCommandInvocation;
-    try std.testing.expect(first_idx < second_idx);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"invocationName\":\"shared-cmd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"collisionDiagnostics\":[{\"surface\":\"command\",\"id\":\"shared-cmd\"") != null);
 }
 
 test "extension shortcut conflict parity resolves built-in and extension collisions" {
@@ -2907,7 +3004,7 @@ test "applyHostFrame supports register and unregister surfaces with malformed fr
         \\{ "type": "register_flag", "name": "plan", "valueType": "boolean", "default": true, "description": "Plan mode", "extensionPath": "/tmp/ext.ts" }
         \\{ "type": "register_flag", "name": "alias", "valueType": "string", "default": "claude", "extensionPath": "/tmp/ext.ts" }
         \\{ "type": "register_provider", "name": "fake-provider", "displayName": "Fake", "api": "openai-completions", "baseUrl": "http://localhost:0", "models": [{ "id": "fake-1", "name": "Fake 1" }, { "id": "fake-2", "name": "Fake 2" }], "extensionPath": "/tmp/ext.ts" }
-        \\{ "type": "register_tool", "name": "say" }
+        \\{ "type": "register_tool", "name": "say", "extensionPath": "/tmp/ext.ts" }
         \\{ "type": "unsupported_frame" }
         \\{ "type": "unregister_provider", "name": "fake-provider" }
         \\
@@ -3499,7 +3596,7 @@ test "unregister provider capability and message renderer frames are targeted no
     try std.testing.expectEqualStrings("message-b", registry.message_renderers.items[0].custom_type);
 }
 
-test "cross-extension replacements keep latest provenance for cleanup" {
+test "cross-extension collisions keep incumbent provenance for cleanup" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
     defer registry.deinit();
@@ -3521,25 +3618,18 @@ test "cross-extension replacements keep latest provenance for cleanup" {
         \\{ "type": "register_message_renderer", "customType": "same-message", "extensionPath": "/tmp/other.ts" }
         \\
     ;
-    try std.testing.expectEqual(@as(usize, 14), try applyHostFrameStream(&registry, frames));
+    try std.testing.expectEqual(@as(usize, 8), try applyHostFrameStream(&registry, frames));
 
     registry.clearStaticRegistrationsForExtension("/tmp/target.ts");
-    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
-    try std.testing.expectEqualStrings("/tmp/other.ts", registry.tools.items[0].extension_path);
-    try std.testing.expectEqualStrings("Other Tool", registry.tools.items[0].label);
-    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
-    try std.testing.expectEqualStrings("/tmp/other.ts", registry.commands.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
     try std.testing.expectEqual(@as(usize, 1), registry.shortcuts.items.len);
     try std.testing.expectEqualStrings("new", registry.shortcuts.items[0].command.?);
-    try std.testing.expectEqual(@as(usize, 1), registry.flags.items.len);
-    try std.testing.expectEqualStrings("/tmp/other.ts", registry.flags.items[0].extension_path);
-    try std.testing.expect(registry.flags.items[0].type_kind == .string);
-    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
-    try std.testing.expectEqualStrings("new", registry.providers.items[0].models[0].id);
-    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
-    try std.testing.expectEqualStrings("New", registry.capabilities.items[0].title);
-    try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
-    try std.testing.expectEqualStrings("/tmp/other.ts", registry.message_renderers.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 0), registry.flags.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.collision_diagnostics.items.len);
 
     registry.clearStaticRegistrationsForExtension("/tmp/other.ts");
     try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
@@ -3549,6 +3639,60 @@ test "cross-extension replacements keep latest provenance for cleanup" {
     try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
     try std.testing.expectEqual(@as(usize, 0), registry.message_renderers.items.len);
+}
+
+test "cross-extension registry collisions preserve incumbent and diagnose deterministically" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    const frames =
+        \\{ "type": "register_tool", "name": "same-tool", "label": "Target Tool", "description": "first", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_tool", "name": "same-tool", "label": "Other Tool", "description": "second", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_command", "name": "same-command", "description": "first", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_command", "name": "same-command", "description": "second", "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_provider", "name": "same-provider", "models": [{ "id": "first" }], "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_provider", "name": "same-provider", "models": [{ "id": "second" }], "extensionPath": "/tmp/other.ts" }
+        \\{ "type": "register_capability", "id": "same-capability", "kind": "workflow", "title": "First", "extensionPath": "/tmp/target.ts" }
+        \\{ "type": "register_capability", "id": "same-capability", "kind": "workflow", "title": "Second", "extensionPath": "/tmp/other.ts" }
+        \\
+    ;
+    try std.testing.expectEqual(@as(usize, 4), try applyHostFrameStream(&registry, frames));
+
+    try std.testing.expectEqual(@as(usize, 1), registry.tools.items.len);
+    try std.testing.expectEqualStrings("Target Tool", registry.tools.items[0].label);
+    try std.testing.expectEqualStrings("/tmp/target.ts", registry.tools.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 1), registry.commands.items.len);
+    try std.testing.expectEqualStrings("first", registry.commands.items[0].description.?);
+    try std.testing.expectEqualStrings("/tmp/target.ts", registry.commands.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 1), registry.providers.items.len);
+    try std.testing.expectEqualStrings("first", registry.providers.items[0].models[0].id);
+    try std.testing.expectEqualStrings("/tmp/target.ts", registry.providers.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 1), registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("First", registry.capabilities.items[0].title);
+    try std.testing.expectEqualStrings("/tmp/target.ts", registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 4), registry.collision_diagnostics.items.len);
+
+    try std.testing.expectEqualStrings("tool", registry.collision_diagnostics.items[0].surface);
+    try std.testing.expectEqualStrings("same-tool", registry.collision_diagnostics.items[0].id);
+    try std.testing.expectEqualStrings("/tmp/target.ts", registry.collision_diagnostics.items[0].incumbent_extension_path);
+    try std.testing.expectEqualStrings("/tmp/other.ts", registry.collision_diagnostics.items[0].rejected_extension_path);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeRegistrySnapshotJson(allocator, &registry, &out.writer);
+    const snapshot = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"collisionDiagnostics\":[{\"surface\":\"tool\",\"id\":\"same-tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"surface\":\"command\",\"id\":\"same-command\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"surface\":\"provider\",\"id\":\"same-provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"surface\":\"capability\",\"id\":\"same-capability\"") != null);
+
+    registry.clearStaticRegistrationsForExtension("/tmp/target.ts");
+    try std.testing.expectEqual(@as(usize, 0), registry.tools.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.commands.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.collision_diagnostics.items.len);
 }
 
 test "missing or non-string extensionPath has deterministic empty provenance" {
@@ -4121,14 +4265,14 @@ test "registry can register capability" {
     try std.testing.expectEqual(@as(?usize, 0), registry.findCapabilityIndex("cap-wiki"));
 }
 
-test "duplicate capability id replaces old metadata" {
+test "same-extension duplicate capability id replaces old metadata" {
     const allocator = std.testing.allocator;
     var registry = Registry.init(allocator);
     defer registry.deinit();
 
     try registry.registerCapability("cap-1", "workflow", "Old", "old description", "old", "old/path", "/tmp/old.ts");
     try registry.registerCapability("cap-2", "qa", "QA", null, null, null, "/tmp/qa.ts");
-    try registry.registerCapability("cap-1", "review", "New", "new description", "new", "new/path", "/tmp/new.ts");
+    try registry.registerCapability("cap-1", "review", "New", "new description", "new", "new/path", "/tmp/old.ts");
 
     try std.testing.expectEqual(@as(usize, 2), registry.capabilities.items.len);
     try std.testing.expectEqualStrings("cap-1", registry.capabilities.items[0].id);
@@ -4137,7 +4281,7 @@ test "duplicate capability id replaces old metadata" {
     try std.testing.expectEqualStrings("new description", registry.capabilities.items[0].description);
     try std.testing.expectEqualStrings("new", registry.capabilities.items[0].command.?);
     try std.testing.expectEqualStrings("new/path", registry.capabilities.items[0].resource_path.?);
-    try std.testing.expectEqualStrings("/tmp/new.ts", registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqualStrings("/tmp/old.ts", registry.capabilities.items[0].extension_path);
     try std.testing.expectEqualStrings("cap-2", registry.capabilities.items[1].id);
 }
 
@@ -4227,9 +4371,9 @@ test "registerMessageRenderer stores renderer keyed by customType" {
     try std.testing.expectEqualStrings("/tmp/ext.ts", registry.message_renderers.items[0].extension_path);
 
     // Re-registering the same customType replaces the existing entry.
-    try registry.registerMessageRenderer("my-type", "/tmp/ext2.ts");
+    try registry.registerMessageRenderer("my-type", "/tmp/ext.ts");
     try std.testing.expectEqual(@as(usize, 1), registry.message_renderers.items.len);
-    try std.testing.expectEqualStrings("/tmp/ext2.ts", registry.message_renderers.items[0].extension_path);
+    try std.testing.expectEqualStrings("/tmp/ext.ts", registry.message_renderers.items[0].extension_path);
 
     // Registering a different customType adds a new entry.
     try registry.registerMessageRenderer("other-type", "/tmp/ext3.ts");

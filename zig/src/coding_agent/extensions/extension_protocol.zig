@@ -459,7 +459,7 @@ pub const ProtocolState = struct {
                     .registered_message_renderer,
                     .unregistered_message_renderer,
                     => self.registry_frames_applied += 1,
-                    .none, .ignored_unsupported, .ignored_malformed => {},
+                    .none, .ignored_unsupported, .ignored_malformed, .ignored_collision => {},
                 }
             },
         }
@@ -498,9 +498,32 @@ pub const ProtocolState = struct {
         switch (outcome) {
             .ignored_unsupported => try self.addUnsupportedRegistryFrameDiagnostic(type_name),
             .ignored_malformed => try self.addMalformedRegistryFrameDiagnostic(type_name),
+            .ignored_collision => try self.addRegistryCollisionDiagnostic(),
             else => {},
         }
         return outcome;
+    }
+
+    fn addRegistryCollisionDiagnostic(self: *ProtocolState) !void {
+        if (self.registry.collision_diagnostics.items.len == 0) {
+            try self.addDiagnostic(.host_error, .warning, "registry collision rejected");
+            return;
+        }
+        const diagnostic = self.registry.collision_diagnostics.items[self.registry.collision_diagnostics.items.len - 1];
+        var message_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        defer message_buf.deinit();
+        var object = try std.json.ObjectMap.init(self.allocator, &.{}, &.{});
+        errdefer common.deinitJsonValue(self.allocator, .{ .object = object });
+        try common.putString(self.allocator, &object, "category", "registry_collision");
+        try common.putString(self.allocator, &object, "surface", diagnostic.surface);
+        try common.putString(self.allocator, &object, "id", diagnostic.id);
+        try common.putString(self.allocator, &object, "incumbentExtensionPath", diagnostic.incumbent_extension_path);
+        try common.putString(self.allocator, &object, "rejectedExtensionPath", diagnostic.rejected_extension_path);
+        try common.putString(self.allocator, &object, "message", diagnostic.message);
+        const value: std.json.Value = .{ .object = object };
+        defer common.deinitJsonValue(self.allocator, value);
+        try std.json.Stringify.value(value, .{}, &message_buf.writer);
+        try self.addDiagnostic(.host_error, .warning, message_buf.written());
     }
 
     pub fn onDiagnostic(self: *ProtocolState, diagnostic: Diagnostic) !void {
@@ -1402,6 +1425,32 @@ test "process_jsonl registry frames mutate only with matching grants" {
     try std.testing.expectEqualStrings("allowed-provider", state.registry.providers.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), state.registry.resource_discoveries.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.diagnostics.items.len);
+}
+
+test "process_jsonl registry collisions preserve incumbent and emit structured diagnostics" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = protocolStateWithAllRegistryGrants(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"shared-capability\",\"kind\":\"workflow\",\"title\":\"First\",\"extensionPath\":\"fixture/first.ts\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"shared-capability\",\"kind\":\"workflow\",\"title\":\"Second\",\"extensionPath\":\"fixture/second.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 1), state.registry_frames_applied);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.capabilities.items.len);
+    try std.testing.expectEqualStrings("First", state.registry.capabilities.items[0].title);
+    try std.testing.expectEqualStrings("fixture/first.ts", state.registry.capabilities.items[0].extension_path);
+    try std.testing.expectEqual(@as(usize, 1), state.registry.collision_diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.diagnosticCategoryCount(.host_error));
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[0].message, "\"category\":\"registry_collision\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[0].message, "\"surface\":\"capability\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[0].message, "\"incumbentExtensionPath\":\"fixture/first.ts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[0].message, "\"rejectedExtensionPath\":\"fixture/second.ts\"") != null);
 }
 
 test "process_jsonl unsupported registry frames are diagnostics without mutation" {

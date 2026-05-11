@@ -27,6 +27,7 @@ pub fn buildRegistryJsonValue(allocator: std.mem.Allocator, registry: anytype) !
     try putCapabilities(allocator, &root, registry);
     try putWorkflows(allocator, &root, registry);
     try putWorkflowDiagnostics(allocator, &root, registry);
+    try putCollisionDiagnostics(allocator, &root, registry);
     try putSubAgentPresets(allocator, &root, registry);
     try putFlags(allocator, &root, registry);
     try putProviders(allocator, &root, registry);
@@ -159,6 +160,20 @@ fn putWorkflowDiagnostics(allocator: std.mem.Allocator, root: *std.json.ObjectMa
         try diagnostics_array.append(.{ .object = entry });
     }
     try common.putValue(allocator, &root, "workflowDiagnostics", .{ .array = diagnostics_array });
+}
+
+fn putCollisionDiagnostics(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
+    var diagnostics_array = std.json.Array.init(allocator);
+    for (registry.collision_diagnostics.items) |diagnostic| {
+        var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+        try common.putString(allocator, &entry, "surface", diagnostic.surface);
+        try common.putString(allocator, &entry, "id", diagnostic.id);
+        try common.putString(allocator, &entry, "incumbentExtensionPath", diagnostic.incumbent_extension_path);
+        try common.putString(allocator, &entry, "rejectedExtensionPath", diagnostic.rejected_extension_path);
+        try common.putString(allocator, &entry, "message", diagnostic.message);
+        try diagnostics_array.append(.{ .object = entry });
+    }
+    try common.putValue(allocator, &root, "collisionDiagnostics", .{ .array = diagnostics_array });
 }
 
 fn putFlags(allocator: std.mem.Allocator, root: *std.json.ObjectMap, registry: anytype) !void {
