@@ -39,10 +39,6 @@ const DispatchMode = enum {
     stream_simple,
 };
 
-const LazyProviderState = struct {
-    provider: ?ProviderFns = null,
-};
-
 const ProviderMetadata = struct {
     api: types.Api,
     default_provider: ProviderFns,
@@ -133,8 +129,8 @@ const PROVIDER_METADATA = [_]ProviderMetadata{
     },
 };
 
-var lazy_states = [_]LazyProviderState{.{}} ** PROVIDER_METADATA.len;
-var test_overrides = [_]?ProviderFns{null} ** PROVIDER_METADATA.len;
+const test_overrides_len = if (builtin.is_test) PROVIDER_METADATA.len else 0;
+var test_overrides = [_]?ProviderFns{null} ** test_overrides_len;
 
 const BUILT_IN_APIS = buildBuiltInApis();
 const BUILT_IN_PROVIDERS = buildBuiltInProviders();
@@ -151,15 +147,10 @@ pub fn builtInProviders() []const BuiltInProvider {
     return BUILT_IN_PROVIDERS[0..];
 }
 
-pub fn resetLazyState() void {
-    lazy_states = [_]LazyProviderState{.{}} ** PROVIDER_METADATA.len;
-}
-
 pub fn clearProviderOverrides() void {
     if (builtin.is_test) {
         test_overrides = [_]?ProviderFns{null} ** PROVIDER_METADATA.len;
     }
-    resetLazyState();
 }
 
 pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProviderError!void {
@@ -167,12 +158,6 @@ pub fn setProviderOverride(api: types.Api, provider: ProviderFns) BuiltInProvide
 
     const index = providerIndexForApi(api) orelse return BuiltInProviderError.UnknownBuiltInApi;
     test_overrides[index] = provider;
-    resetLazyState();
-}
-
-pub fn isLoaded(api: types.Api) bool {
-    const index = providerIndexForApi(api) orelse return false;
-    return lazy_states[index].provider != null;
 }
 
 fn buildBuiltInApis() [PROVIDER_METADATA.len]types.Api {
@@ -211,37 +196,17 @@ fn streamWrapper(comptime index: usize, comptime mode: DispatchMode) StreamFunct
             context: types.Context,
             options: ?types.StreamOptions,
         ) anyerror!event_stream.AssistantMessageEventStream {
-            return dispatchLazy(index, mode, allocator, io, model, context, options);
+            const provider = if (builtin.is_test) blk: {
+                if (test_overrides[index]) |override| break :blk override;
+                break :blk PROVIDER_METADATA[index].default_provider;
+            } else PROVIDER_METADATA[index].default_provider;
+
+            return switch (mode) {
+                .stream => try provider.stream(allocator, io, model, context, options),
+                .stream_simple => try provider.stream_simple(allocator, io, model, context, options),
+            };
         }
     }.call;
-}
-
-fn dispatchLazy(
-    comptime index: usize,
-    comptime mode: DispatchMode,
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: types.Model,
-    context: types.Context,
-    options: ?types.StreamOptions,
-) !event_stream.AssistantMessageEventStream {
-    const state = &lazy_states[index];
-    if (state.provider == null) {
-        state.provider = loadProvider(index);
-    }
-
-    const provider = state.provider.?;
-    return switch (mode) {
-        .stream => try provider.stream(allocator, io, model, context, options),
-        .stream_simple => try provider.stream_simple(allocator, io, model, context, options),
-    };
-}
-
-fn loadProvider(comptime index: usize) ProviderFns {
-    if (builtin.is_test) {
-        if (test_overrides[index]) |provider| return provider;
-    }
-    return PROVIDER_METADATA[index].default_provider;
 }
 
 fn testOverrideForApi(api: types.Api) ?ProviderFns {
@@ -635,7 +600,7 @@ test "built-in api list matches TypeScript registry count" {
     }
 }
 
-test "lazy wrapper loads provider on first stream call" {
+test "override routes stream call through test fixture" {
     clearProviderOverrides();
     defer clearProviderOverrides();
 
@@ -643,8 +608,6 @@ test "lazy wrapper loads provider on first stream call" {
         .stream = dummyLazyStream,
         .stream_simple = dummyLazyStream,
     });
-
-    try std.testing.expect(!isLoaded("openai-completions"));
 
     const model = testModelForApi("openai-completions");
     const provider = builtInProviders()[providerIndexForApi("openai-completions").?];
@@ -659,10 +622,8 @@ test "lazy wrapper loads provider on first stream call" {
 
     while (stream_instance.next()) |_| {}
 
-    try std.testing.expect(isLoaded("openai-completions"));
     const result = stream_instance.result().?;
     try std.testing.expectEqualStrings("lazy provider response", result.content[0].text.text);
-    try std.testing.expect(!isLoaded("anthropic-messages"));
 }
 
 test "provider override fixture clears between same-process uses" {
@@ -678,7 +639,6 @@ test "provider override fixture clears between same-process uses" {
 
     clearProviderOverrides();
     try std.testing.expect(testOverrideForApi("openai-completions") == null);
-    try std.testing.expect(!isLoaded("openai-completions"));
 
     try setProviderOverride("kimi-completions", .{
         .stream = dummyLazyStream,
@@ -697,7 +657,6 @@ test "metadata dispatch wrappers cover every built-in provider" {
             .stream = dummyLazyStream,
             .stream_simple = dummyLazyStream,
         });
-        try std.testing.expect(!isLoaded(provider.api));
 
         const model = testModelForApi(provider.api);
         var stream_instance = try provider.stream(
@@ -709,12 +668,9 @@ test "metadata dispatch wrappers cover every built-in provider" {
         );
         defer stream_instance.deinit();
         while (stream_instance.next()) |_| {}
-        try std.testing.expect(isLoaded(provider.api));
         const result = stream_instance.result().?;
         try std.testing.expectEqualStrings("lazy provider response", result.content[0].text.text);
 
-        resetLazyState();
-        try std.testing.expect(!isLoaded(provider.api));
         var simple_stream_instance = try provider.stream_simple(
             std.testing.allocator,
             std.Io.failing,
@@ -724,7 +680,6 @@ test "metadata dispatch wrappers cover every built-in provider" {
         );
         defer simple_stream_instance.deinit();
         while (simple_stream_instance.next()) |_| {}
-        try std.testing.expect(isLoaded(provider.api));
         const simple_result = simple_stream_instance.result().?;
         try std.testing.expectEqualStrings("lazy provider response", simple_result.content[0].text.text);
     }
