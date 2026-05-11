@@ -619,6 +619,45 @@ fn crossPartialUpdateStreamForAgentLoopTest(
     return stream;
 }
 
+fn iss400OutOfOrderStreamForAgentLoopTest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    _: ?ai.types.SimpleStreamOptions,
+    _: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+    errdefer stream.deinit();
+
+    // Append directly so this agent-layer regression can exercise defensive
+    // accumulator cleanup without the debug EventOrderingGuard panicking first.
+    try stream.queue.append(allocator, .{ .event_type = .start, .message = template });
+    try stream.queue.append(allocator, .{ .event_type = .text_start, .content_index = 0 });
+    try stream.queue.append(allocator, .{
+        .event_type = .text_delta,
+        .content_index = 0,
+        .delta = "partial text",
+    });
+    try stream.queue.append(allocator, .{
+        .event_type = .thinking_delta,
+        .content_index = 0,
+        .delta = "wrong kind",
+    });
+    try stream.queue.append(allocator, .{ .event_type = .done, .message = template });
+    return stream;
+}
+
 const PartialUpdateCrossCapture = struct {
     saw_thinking_delta: bool = false,
     saw_thinking_end: bool = false,
@@ -2356,6 +2395,26 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
             .delta = "{\"value\":\"orphan\"}",
         }),
     );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{
+            .event_type = .text_end,
+            .content_index = 0,
+            .content = "orphan text",
+        }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{
+            .event_type = .thinking_end,
+            .content_index = 1,
+            .content = "orphan thinking",
+        }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .toolcall_end, .content_index = 2 }),
+    );
 
     // Sparse starts remain valid: the policy rejects non-start events for an
     // unmapped explicit provider index, not sparse provider content indices.
@@ -2385,6 +2444,223 @@ test "ISS-400 partial accumulator rejects explicit deltas before start" {
     const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
     try std.testing.expectEqual(@as(usize, 1), partial_message.content.len);
     try std.testing.expectEqualStrings("mapped text", partial_message.content[0].text.text);
+}
+
+test "ISS-400 sparse explicit starts preserve start order without placeholders" {
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
+
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 8 });
+    try partial_accumulator.applyEvent(.{
+        .event_type = .text_end,
+        .content_index = 8,
+        .content = "first sparse text",
+    });
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 2 });
+    try partial_accumulator.applyEvent(.{
+        .event_type = .thinking_end,
+        .content_index = 2,
+        .content = "second sparse thinking",
+    });
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-sparse-order",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 2), partial_message.content.len);
+    try std.testing.expect(partial_message.content[0] == .text);
+    try std.testing.expectEqualStrings("first sparse text", partial_message.content[0].text.text);
+    try std.testing.expect(partial_message.content[1] == .thinking);
+    try std.testing.expectEqualStrings("second sparse thinking", partial_message.content[1].thinking.thinking);
+}
+
+test "ISS-400 explicit content indexes reject kind mismatches without dropping partial content" {
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
+
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try partial_accumulator.applyEvent(.{ .event_type = .text_delta, .content_index = 0, .delta = "kept text" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .thinking_delta, .content_index = 0, .delta = "wrong kind" }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 5 });
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_delta, .content_index = 5, .delta = "kept thinking" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .toolcall_end, .content_index = 5 }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_start, .content_index = 9 });
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_delta, .content_index = 9, .delta = "{\"query\":\"kept\"}" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .text_delta, .content_index = 9, .delta = "wrong kind" }),
+    );
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-kind-mismatch",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 3), partial_message.content.len);
+    try std.testing.expectEqualStrings("kept text", partial_message.content[0].text.text);
+    try std.testing.expectEqualStrings("kept thinking", partial_message.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("kept", partial_message.content[2].tool_call.arguments.object.get("query").?.string);
+}
+
+test "ISS-400 duplicate explicit starts are rejected without resetting partial content" {
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
+
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try partial_accumulator.applyEvent(.{ .event_type = .text_delta, .content_index = 0, .delta = "text survives" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 2 });
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_delta, .content_index = 2, .delta = "thinking survives" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 2 }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_start, .content_index = 4 });
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_delta, .content_index = 4, .delta = "{\"query\":\"survives\"}" });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        partial_accumulator.applyEvent(.{ .event_type = .toolcall_start, .content_index = 4 }),
+    );
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-duplicate-start",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 3), partial_message.content.len);
+    try std.testing.expectEqualStrings("text survives", partial_message.content[0].text.text);
+    try std.testing.expectEqualStrings("thinking survives", partial_message.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("survives", partial_message.content[2].tool_call.arguments.object.get("query").?.string);
+}
+
+test "ISS-400 ended explicit indexes cannot be reused and finalized content remains intact" {
+    var partial_accumulator = accumulator.PartialAssistantAccumulator.init(std.testing.allocator);
+    defer partial_accumulator.deinit();
+
+    try partial_accumulator.applyEvent(.{ .event_type = .text_start, .content_index = 0 });
+    try partial_accumulator.applyEvent(.{
+        .event_type = .text_end,
+        .content_index = 0,
+        .content = "final text",
+    });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        partial_accumulator.applyEvent(.{ .event_type = .text_delta, .content_index = 0, .delta = "late text" }),
+    );
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 0 }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .thinking_start, .content_index = 4 });
+    try partial_accumulator.applyEvent(.{
+        .event_type = .thinking_end,
+        .content_index = 4,
+        .content = "final thinking",
+    });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        partial_accumulator.applyEvent(.{ .event_type = .thinking_delta, .content_index = 4, .delta = "late thinking" }),
+    );
+
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_start, .content_index = 7 });
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_delta, .content_index = 7, .delta = "{\"query\":\"final\"}" });
+    try partial_accumulator.applyEvent(.{ .event_type = .toolcall_end, .content_index = 7 });
+    try std.testing.expectError(
+        AgentLoopError.PartialContentIndexReused,
+        partial_accumulator.applyEvent(.{ .event_type = .toolcall_start, .content_index = 7 }),
+    );
+
+    const template = ai.AssistantMessage{
+        .content = &[_]ai.ContentBlock{},
+        .api = "recording:test:partial-ended-reuse",
+        .provider = "recording",
+        .model = "recording-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const partial_message = try partial_accumulator.buildMessage(arena.allocator(), template);
+    try std.testing.expectEqual(@as(usize, 3), partial_message.content.len);
+    try std.testing.expectEqualStrings("final text", partial_message.content[0].text.text);
+    try std.testing.expectEqualStrings("final thinking", partial_message.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("final", partial_message.content[2].tool_call.arguments.object.get("query").?.string);
+}
+
+test "ISS-400 stream rejection cleans partial accumulator state without terminal emissions" {
+    const model = ai.Model{
+        .id = "recording-model",
+        .name = "Recording Model",
+        .api = "recording",
+        .provider = "recording",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const config = types.AgentLoopConfig{
+        .model = model,
+        .convert_to_llm = passthroughConvertToLlmForTest,
+    };
+    const context = types.AgentContext{
+        .system_prompt = "",
+        .messages = &[_]types.AgentMessage{},
+        .tools = &.{},
+    };
+    var capture = MessageUpdateCountCapture{};
+
+    try std.testing.expectError(
+        AgentLoopError.PartialContentOutOfOrder,
+        streaming.streamAssistantResponse(
+            std.testing.allocator,
+            std.Io.failing,
+            context,
+            config,
+            &capture,
+            countMessageUpdateEvent,
+            null,
+            iss400OutOfOrderStreamForAgentLoopTest,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 2), capture.message_update_count);
+    try std.testing.expectEqual(@as(usize, 0), capture.message_end_count);
 }
 
 test "VAL-REVIEW-M7-001 finalized tool call rejects double finalization" {
