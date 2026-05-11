@@ -79,10 +79,13 @@ pub fn resolveCloudflareBaseUrl(
     return resolveCloudflareBaseUrlFromMap(allocator, model, &env_map);
 }
 
+const ERROR_MAP = std.StaticStringMap(anyerror).initComptime(.{
+    .{ "CLOUDFLARE_ACCOUNT_ID", error.MissingCloudflareAccountId },
+    .{ "CLOUDFLARE_GATEWAY_ID", error.MissingCloudflareGatewayId },
+});
+
 fn missingCloudflarePlaceholderError(var_name: []const u8) anyerror {
-    if (std.mem.eql(u8, var_name, "CLOUDFLARE_ACCOUNT_ID")) return error.MissingCloudflareAccountId;
-    if (std.mem.eql(u8, var_name, "CLOUDFLARE_GATEWAY_ID")) return error.MissingCloudflareGatewayId;
-    return error.EnvironmentVariableNotFound;
+    return ERROR_MAP.get(var_name) orelse error.EnvironmentVariableNotFound;
 }
 
 fn currentProcessEnviron() std.process.Environ {
