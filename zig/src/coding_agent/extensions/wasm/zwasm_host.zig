@@ -2,6 +2,7 @@ const std = @import("std");
 const zwasm = @import("zwasm");
 const extension_registry = @import("../extension_registry.zig");
 const truncate_tool = @import("../../tools/truncate.zig");
+const wasm_manifest = @import("wasm_manifest.zig");
 
 pub const MAX_EXECUTE_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WASM_STRING_BYTES: usize = 64 * 1024;
@@ -11,6 +12,99 @@ const INVALID_INPUT_DIAGNOSTIC_JSON = "{\"ok\":false,\"error\":{\"category\":\"i
 pub const WasmArtifactAbiFlavor = enum {
     pi_tool_core_v0,
 };
+
+pub const RuntimeDependencyKind = enum {
+    zwasm,
+
+    pub fn jsonName(self: RuntimeDependencyKind) []const u8 {
+        return switch (self) {
+            .zwasm => "zwasm",
+        };
+    }
+};
+
+pub const RuntimeDependencyProbe = struct {
+    runtime_name: []u8,
+    available: bool,
+    disabled_load_path: bool,
+    missing_reason: ?[]u8,
+    diagnostic: []u8,
+
+    pub fn deinit(self: *RuntimeDependencyProbe, allocator: std.mem.Allocator) void {
+        allocator.free(self.runtime_name);
+        if (self.missing_reason) |reason| allocator.free(reason);
+        allocator.free(self.diagnostic);
+        self.* = undefined;
+    }
+};
+
+pub fn probeRuntimeDependency(allocator: std.mem.Allocator, kind: RuntimeDependencyKind) !RuntimeDependencyProbe {
+    return switch (kind) {
+        .zwasm => try makeRuntimeDependencyProbe(
+            allocator,
+            kind.jsonName(),
+            true,
+            false,
+            null,
+            "repo-local vendored zwasm runtime available",
+        ),
+    };
+}
+
+pub fn probeExternalRuntimeDependency(
+    allocator: std.mem.Allocator,
+    runtime_name: []const u8,
+    runtime_path: ?[]const u8,
+) !RuntimeDependencyProbe {
+    if (runtime_path) |path| {
+        _ = std.Io.Dir.statFile(.cwd(), std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| {
+            const reason = try std.fmt.allocPrint(allocator, "external runtime dependency path is unavailable: {s}", .{@errorName(err)});
+            defer allocator.free(reason);
+            const diagnostic = try std.fmt.allocPrint(
+                allocator,
+                "runtime={s}; missingReason={s}; disabledLoadPath=true; external wasm runtime dependency unavailable",
+                .{ runtime_name, reason },
+            );
+            defer allocator.free(diagnostic);
+            return try makeRuntimeDependencyProbe(allocator, runtime_name, false, true, reason, diagnostic);
+        };
+        const diagnostic = try std.fmt.allocPrint(allocator, "runtime={s}; disabledLoadPath=false; external runtime dependency path is available", .{runtime_name});
+        defer allocator.free(diagnostic);
+        return try makeRuntimeDependencyProbe(allocator, runtime_name, true, false, null, diagnostic);
+    }
+
+    const reason = "external runtime dependency path is not configured";
+    const diagnostic = try std.fmt.allocPrint(
+        allocator,
+        "runtime={s}; missingReason={s}; disabledLoadPath=true; external wasm runtime dependency unavailable",
+        .{ runtime_name, reason },
+    );
+    defer allocator.free(diagnostic);
+    return try makeRuntimeDependencyProbe(allocator, runtime_name, false, true, reason, diagnostic);
+}
+
+fn makeRuntimeDependencyProbe(
+    allocator: std.mem.Allocator,
+    runtime_name: []const u8,
+    available: bool,
+    disabled_load_path: bool,
+    missing_reason: ?[]const u8,
+    diagnostic: []const u8,
+) !RuntimeDependencyProbe {
+    const owned_runtime_name = try allocator.dupe(u8, runtime_name);
+    errdefer allocator.free(owned_runtime_name);
+    const owned_missing_reason = if (missing_reason) |reason| try allocator.dupe(u8, reason) else null;
+    errdefer if (owned_missing_reason) |reason| allocator.free(reason);
+    const owned_diagnostic = try allocator.dupe(u8, diagnostic);
+    errdefer allocator.free(owned_diagnostic);
+    return .{
+        .runtime_name = owned_runtime_name,
+        .available = available,
+        .disabled_load_path = disabled_load_path,
+        .missing_reason = owned_missing_reason,
+        .diagnostic = owned_diagnostic,
+    };
+}
 
 pub const Host = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +121,7 @@ pub const Host = struct {
     }
 
     pub fn loadFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !Host {
+        try validateNoImports(allocator, bytes);
         const module = try zwasm.WasmModule.loadWithFuel(allocator, bytes, 10_000_000);
         errdefer module.deinit();
         module.owned_wasm_bytes = bytes;
@@ -283,8 +378,53 @@ fn validateExport(module: *zwasm.WasmModule, name: []const u8, expected_params: 
     }
 }
 
+fn validateNoImports(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var module = zwasm.runtime.Module.init(allocator, bytes);
+    defer module.deinit();
+    try module.decode();
+    if (module.imports.items.len == 0) return;
+
+    const first_import = module.imports.items[0];
+    _ = wasm_manifest.denyRuntimeImport(first_import.module, first_import.name, .load, "runtime/import");
+    return error.DeniedWasmImportCapability;
+}
+
 fn expectJsonObject(allocator: std.mem.Allocator, input: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch return error.InvalidJsonInput;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidJsonInput;
+}
+
+test "wasm runtime dependency probe reports missing external runtime deterministically" {
+    const allocator = std.testing.allocator;
+
+    var available = try probeRuntimeDependency(allocator, .zwasm);
+    defer available.deinit(allocator);
+    try std.testing.expectEqualStrings("zwasm", available.runtime_name);
+    try std.testing.expect(available.available);
+    try std.testing.expect(!available.disabled_load_path);
+    try std.testing.expectEqualStrings("repo-local vendored zwasm runtime available", available.diagnostic);
+
+    var missing = try probeExternalRuntimeDependency(allocator, "wasmtime", null);
+    defer missing.deinit(allocator);
+    try std.testing.expectEqualStrings("wasmtime", missing.runtime_name);
+    try std.testing.expect(!missing.available);
+    try std.testing.expect(missing.disabled_load_path);
+    try std.testing.expectEqualStrings("external runtime dependency path is not configured", missing.missing_reason.?);
+    try std.testing.expect(std.mem.indexOf(u8, missing.diagnostic, "runtime=wasmtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing.diagnostic, "disabledLoadPath=true") != null);
+}
+
+test "wasm v0 host denies imports before export validation" {
+    const allocator = std.testing.allocator;
+    const import_fixture = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        "vendor/zwasm/src/testdata/04_imports.wasm",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(import_fixture);
+
+    try std.testing.expectError(error.DeniedWasmImportCapability, Host.loadFromBytes(allocator, import_fixture));
 }
