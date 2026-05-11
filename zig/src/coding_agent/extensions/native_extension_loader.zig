@@ -20,6 +20,11 @@ pub fn loadNativeFromManifest(
     var descriptor_value_owned = true;
     errdefer if (descriptor_value_owned) freeOwnedDescriptor(allocator, &descriptor_value);
 
+    // The dynamic library path is loader-internal bookkeeping; it never
+    // crosses the descriptor boundary. Free it once the library handle has
+    // been opened (or once we know it could not be opened).
+    if (build_result.dynamic_library_path) |p| allocator.free(p);
+
     const descriptor = try allocator.create(native_runtime.NativeDescriptor);
     errdefer allocator.destroy(descriptor);
     descriptor.* = descriptor_value;
@@ -49,6 +54,11 @@ pub fn loadNativeFromManifest(
 const DescriptorBuildResult = struct {
     descriptor: native_runtime.NativeDescriptor,
     dyn_lib: ?native_loader.DynamicLibraryHandle,
+    /// Absolute path of the dynamic library, when the manifest selected one.
+    /// Tracked here (rather than on the descriptor) because the descriptor
+    /// boundary forbids dynamic_library_path; this is purely an artifact of
+    /// the loader's own bookkeeping and is freed via `freeOwnedDescriptor`.
+    dynamic_library_path: ?[]const u8 = null,
 };
 
 fn buildNativeDescriptor(
@@ -105,10 +115,10 @@ fn buildNativeDescriptor(
                             .hooks = hooks,
                             .requested_capabilities = caps,
                             .resource_limits = limits,
-                            .dynamic_library_path = dynamic_library_path,
                             .start = start_fn,
                         },
                         .dyn_lib = null,
+                        .dynamic_library_path = dynamic_library_path,
                     };
                 };
                 errdefer lib.close();
@@ -134,10 +144,10 @@ fn buildNativeDescriptor(
             .hooks = hooks,
             .requested_capabilities = caps,
             .resource_limits = limits,
-            .dynamic_library_path = dynamic_library_path,
             .start = start_fn,
         },
         .dyn_lib = dyn_lib,
+        .dynamic_library_path = dynamic_library_path,
     };
 }
 
@@ -322,9 +332,11 @@ test "buildNativeDescriptor with missing dynamic_library_path falls back gracefu
     var build_result = try buildNativeDescriptor(allocator, result.valid);
     defer freeOwnedDescriptor(allocator, &build_result.descriptor);
     if (build_result.dyn_lib) |*lib| lib.close();
+    defer if (build_result.dynamic_library_path) |p| allocator.free(p);
 
     try std.testing.expectEqualStrings("com.pi.native-dl", build_result.descriptor.id);
-    try std.testing.expect(build_result.descriptor.dynamic_library_path != null);
-    try std.testing.expectEqualStrings("/tmp/pkg/libnonexistent.dylib", build_result.descriptor.dynamic_library_path.?);
+    try std.testing.expect(build_result.descriptor.dynamic_library_path == null);
+    try std.testing.expect(build_result.dynamic_library_path != null);
+    try std.testing.expectEqualStrings("/tmp/pkg/libnonexistent.dylib", build_result.dynamic_library_path.?);
     try std.testing.expect(build_result.dyn_lib == null);
 }

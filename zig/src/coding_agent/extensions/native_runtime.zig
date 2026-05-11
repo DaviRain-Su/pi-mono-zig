@@ -137,6 +137,7 @@ pub const NativeDescriptor = struct {
 
     const forbidden_fields = &[_][]const u8{
         "library_path",
+        "dynamic_library_path",
         "executable_command",
         "process_command",
         "remote_url",
@@ -188,19 +189,19 @@ pub const NativeHostEffects = struct {
     agent_delegations: u64 = 0,
     extension_event_invocations: u64 = 0,
 
-    fn ensureSandboxPath(self: NativeHostEffects, path: []const u8) !void {
+    fn ensureSandboxPath(self: NativeHostEffects, io: std.Io, path: []const u8) !void {
         const root = self.sandbox_root orelse return;
-        if (sandbox.isPathWithinSandbox(root, path)) return;
-        return error.NativeHostSandboxDenied;
+        if (!sandbox.isPathWithinSandbox(root, path)) return error.NativeHostSandboxDenied;
+        if (!sandbox.isCanonicalPathWithinSandbox(io, root, path)) return error.NativeHostSandboxDenied;
     }
 
-    fn recordFileRead(self: *NativeHostEffects, path: []const u8) !void {
-        try self.ensureSandboxPath(path);
+    fn recordFileRead(self: *NativeHostEffects, io: std.Io, path: []const u8) !void {
+        try self.ensureSandboxPath(io, path);
         self.file_reads += 1;
     }
 
-    fn recordFileWrite(self: *NativeHostEffects, path: []const u8) !void {
-        try self.ensureSandboxPath(path);
+    fn recordFileWrite(self: *NativeHostEffects, io: std.Io, path: []const u8) !void {
+        try self.ensureSandboxPath(io, path);
         self.file_writes += 1;
     }
 
@@ -317,7 +318,7 @@ pub const NativeHostApi = struct {
     pub fn readFile(self: *NativeHostApi, path: []const u8) ![]u8 {
         try self.enforceOperation(.file_read, .{ .id = path }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| {
-            effects.recordFileRead(path) catch |err| switch (err) {
+            effects.recordFileRead(self.runtime.io, path) catch |err| switch (err) {
                 error.NativeHostSandboxDenied => {
                     self.runtime.accounting.recordDenied();
                     try self.addSandboxDenialDiagnostic(.file_read, path, effects.sandbox_root);
@@ -333,7 +334,7 @@ pub const NativeHostApi = struct {
     pub fn writeFile(self: *NativeHostApi, path: []const u8, contents: []const u8) !void {
         try self.enforceOperation(.file_write, .{ .id = path }, .initialize, "native/host-api", .{});
         if (self.runtime.host_effects) |effects| {
-            effects.recordFileWrite(path) catch |err| switch (err) {
+            effects.recordFileWrite(self.runtime.io, path) catch |err| switch (err) {
                 error.NativeHostSandboxDenied => {
                     self.runtime.accounting.recordDenied();
                     try self.addSandboxDenialDiagnostic(.file_write, path, effects.sandbox_root);
@@ -1152,6 +1153,30 @@ const native_sandbox_denial_descriptor: NativeDescriptor = .{
     .start = nativeSandboxDenialStart,
 };
 
+fn nativeSandboxCanonicalDenialStart(api: *NativeHostApi) !void {
+    try api.ready();
+    try api.registerTool(native_enforcement_matrix_tool);
+
+    const sandbox_root = (api.runtime.host_effects orelse return error.NativeHostSandboxDenied).sandbox_root orelse return error.NativeHostSandboxDenied;
+    const read_symlink_path = try std.fs.path.join(api.runtime.allocator, &.{ sandbox_root, "read-link.txt" });
+    defer api.runtime.allocator.free(read_symlink_path);
+    const linked_dir_write_path = try std.fs.path.join(api.runtime.allocator, &.{ sandbox_root, "linked-dir", "write.txt" });
+    defer api.runtime.allocator.free(linked_dir_write_path);
+
+    try std.testing.expectError(error.NativeHostSandboxDenied, api.readFile(read_symlink_path));
+    try std.testing.expectError(error.NativeHostSandboxDenied, api.writeFile(linked_dir_write_path, "blocked"));
+}
+
+const native_sandbox_canonical_denial_descriptor: NativeDescriptor = .{
+    .id = "com.pi.native-sandbox-canonical-denial",
+    .name = "Native Sandbox Canonical Denial",
+    .version = "0.1.0",
+    .description = "Exercises approved native filesystem operations denied after canonical path resolution.",
+    .tools = &.{native_enforcement_matrix_tool},
+    .requested_capabilities = &.{ .file_read, .file_write },
+    .start = nativeSandboxCanonicalDenialStart,
+};
+
 const native_agent_limit_boundary_descriptor: NativeDescriptor = .{
     .id = "com.pi.native-agent-limit-boundaries",
     .name = "Native Agent Limit Boundaries",
@@ -1180,9 +1205,26 @@ fn makeNativeAbsoluteTestPath(allocator: std.mem.Allocator, tmp: anytype, relati
 
 test "native sandbox boundary rejects lexical escapes and sibling prefixes" {
     var effects = NativeHostEffects{ .sandbox_root = "/tmp/native-sandbox" };
-    try effects.recordFileRead("/tmp/native-sandbox/read.txt");
-    try std.testing.expectError(error.NativeHostSandboxDenied, effects.recordFileRead("/tmp/native-sandbox/../outside.txt"));
+    try effects.recordFileRead(std.testing.io, "/tmp/native-sandbox/read.txt");
+    try std.testing.expectError(error.NativeHostSandboxDenied, effects.recordFileRead(std.testing.io, "/tmp/native-sandbox/../outside.txt"));
     try std.testing.expectEqual(@as(u64, 1), effects.file_reads);
+}
+
+test "native descriptor rejects dynamic library path at static descriptor boundary" {
+    const allocator = std.testing.allocator;
+    const descriptor: NativeDescriptor = .{
+        .id = "com.pi.native-dynamic-field",
+        .name = "Native Dynamic Field",
+        .version = "0.1.0",
+        .description = "Static descriptor must not smuggle dynamic library internals.",
+        .tools = &.{native_enforcement_matrix_tool},
+        .dynamic_library_path = "/tmp/native-plugin.dylib",
+    };
+
+    try std.testing.expectEqualStrings("dynamic_library_path", descriptor.firstForbiddenField().?);
+    try std.testing.expectError(error.ForbiddenNativeDescriptorField, NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &descriptor,
+    }));
 }
 
 test "native host operation gates deny side effects through enforcement matrix" {
@@ -1342,6 +1384,46 @@ test "native sandbox path denials emit auditable diagnostics" {
         }
         try std.testing.expect(found);
     }
+}
+
+test "native sandbox path denials reject canonical symlink escapes before side effects" {
+    if (@import("builtin").os.tag == .windows) return;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sandbox");
+    try tmp.dir.createDirPath(std.testing.io, "outside");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside/secret.txt", .data = "outside" });
+
+    const sandbox_root = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox");
+    defer allocator.free(sandbox_root);
+    const outside_file = try makeNativeAbsoluteTestPath(allocator, tmp, "outside/secret.txt");
+    defer allocator.free(outside_file);
+    const read_link = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox/read-link.txt");
+    defer allocator.free(read_link);
+    try std.Io.Dir.symLinkAbsolute(std.testing.io, outside_file, read_link, .{});
+    const outside_dir = try makeNativeAbsoluteTestPath(allocator, tmp, "outside");
+    defer allocator.free(outside_dir);
+    const linked_dir = try makeNativeAbsoluteTestPath(allocator, tmp, "sandbox/linked-dir");
+    defer allocator.free(linked_dir);
+    try std.Io.Dir.symLinkAbsolute(std.testing.io, outside_dir, linked_dir, .{});
+
+    var effects = NativeHostEffects{ .sandbox_root = sandbox_root };
+    const runtime = try NativeRuntime.start(allocator, std.testing.io, .{
+        .descriptor = &native_sandbox_canonical_denial_descriptor,
+        .approved_capabilities = &.{ .file_read, .file_write },
+        .policy_lookup_key = "native:test-policy:canonical-sandbox",
+        .host_effects = &effects,
+    });
+    defer runtime.deinit();
+
+    try runtime.waitForReady(0);
+    try std.testing.expectEqual(@as(usize, 1), runtime.registryFramesApplied());
+    try std.testing.expectEqual(@as(usize, 2), runtime.diagnosticCount());
+    try std.testing.expectEqual(@as(u64, 0), effects.file_reads);
+    try std.testing.expectEqual(@as(u64, 0), effects.file_writes);
+    try std.testing.expectEqual(@as(u64, 2), runtime.accounting.denied_operations);
 }
 
 test "native agent host operation gates enforce exact and exceeded resource boundaries" {
