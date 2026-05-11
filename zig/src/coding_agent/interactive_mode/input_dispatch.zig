@@ -1501,37 +1501,28 @@ pub fn consumeInputBytes(buffer: *std.ArrayList(u8), consumed: usize) void {
 }
 
 fn toTuiEditorAction(action: keybindings_mod.EditorAction) ?tui.components.editor.EditorAction {
+    // Compile-time exhaustiveness: every keybindings_mod.EditorAction variant
+    // (modulo the explicit opt-outs below) must have a matching tag in
+    // tui.components.editor.EditorAction.
+    comptime {
+        const opt_outs = [_][]const u8{ "input_submit", "input_copy" };
+        for (@typeInfo(keybindings_mod.EditorAction).@"enum".fields) |f| {
+            var is_opt_out = false;
+            for (opt_outs) |name| {
+                if (std.mem.eql(u8, f.name, name)) {
+                    is_opt_out = true;
+                    break;
+                }
+            }
+            if (!is_opt_out and !@hasField(tui.components.editor.EditorAction, f.name)) {
+                @compileError("keybindings_mod.EditorAction." ++ f.name ++
+                    " has no matching tui.components.editor.EditorAction tag");
+            }
+        }
+    }
     return switch (action) {
-        .cursor_up => .cursor_up,
-        .cursor_down => .cursor_down,
-        .cursor_left => .cursor_left,
-        .cursor_right => .cursor_right,
-        .cursor_word_left => .cursor_word_left,
-        .cursor_word_right => .cursor_word_right,
-        .cursor_line_start => .cursor_line_start,
-        .cursor_line_end => .cursor_line_end,
-        .jump_forward => .jump_forward,
-        .jump_backward => .jump_backward,
-        .page_up => .page_up,
-        .page_down => .page_down,
-        .delete_char_backward => .delete_char_backward,
-        .delete_char_forward => .delete_char_forward,
-        .delete_word_backward => .delete_word_backward,
-        .delete_word_forward => .delete_word_forward,
-        .delete_to_line_start => .delete_to_line_start,
-        .delete_to_line_end => .delete_to_line_end,
-        .yank => .yank,
-        .yank_pop => .yank_pop,
-        .undo => .undo,
-        .input_new_line => .input_new_line,
-        .input_tab => .input_tab,
-        .select_cancel => .select_cancel,
-        .select_up => .select_up,
-        .select_down => .select_down,
-        .select_page_up => .select_page_up,
-        .select_page_down => .select_page_down,
-        .select_confirm => .select_confirm,
         .input_submit, .input_copy => null,
+        inline else => |a| @field(tui.components.editor.EditorAction, @tagName(a)),
     };
 }
 
