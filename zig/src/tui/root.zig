@@ -245,6 +245,7 @@ test {
     _ = @import("undo_stack.zig");
     _ = @import("utils.zig");
     _ = @import("components/autocomplete.zig");
+    _ = @import("index.zig");
 }
 
 test "components export autocomplete module" {

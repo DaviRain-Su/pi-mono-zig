@@ -51,6 +51,7 @@ const known_test_roots = [_][]const u8{
     "src/coding_agent/root.zig",
     "src/coding_agent/tests/interactive_mode_rendering_test_root.zig",
     "src/tui/root.zig",
+    "src/web_ui/root.zig",
     "test/tidy.zig",
 };
 

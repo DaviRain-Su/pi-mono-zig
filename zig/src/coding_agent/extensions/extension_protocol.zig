@@ -1056,7 +1056,7 @@ fn extensionUiPayloadJson(allocator: std.mem.Allocator, object: std.json.ObjectM
         {
             continue;
         }
-        try payload.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), try common.cloneJsonValue(allocator, entry.value_ptr.*));
+        try common.putValue(allocator, &payload, entry.key_ptr.*, try common.cloneJsonValue(allocator, entry.value_ptr.*));
     }
     const payload_value = std.json.Value{ .object = payload };
     defer {

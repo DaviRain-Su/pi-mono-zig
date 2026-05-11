@@ -56,13 +56,9 @@ pub fn dispatchRunMode(
 
     var resolved_webview_backend = dispatch_options.webview_backend;
     if (app_mode == .webview and resolved_webview_backend == null) {
-        switch (coding_agent.webview_platform.preflightHostBackend()) {
-            .available => |backend| resolved_webview_backend = backend,
-            .unavailable => |diagnostic| {
-                try writeWebViewBackendDiagnostic(stderr, diagnostic);
-                return 1;
-            },
-        }
+        if (try resolveWebViewBackendOrDiagnose(stderr)) |backend| {
+            resolved_webview_backend = backend;
+        } else return 1;
     }
 
     if (app_mode != .interactive) {
@@ -80,26 +76,7 @@ pub fn dispatchRunMode(
         if (preflight_result.exit_code) |exit_code| return exit_code;
     }
 
-    var provider_runtime = (if (app_mode == .webview)
-        coding_agent.resolveProviderConfigAllowMissingCredentials(
-            allocator,
-            io,
-            env_map,
-            prepared.provider_name,
-            prepared.model_name,
-            options.api_key,
-            prepared.runtime_config.lookupApiKey(prepared.provider_name),
-        )
-    else
-        coding_agent.resolveProviderConfig(
-            allocator,
-            io,
-            env_map,
-            prepared.provider_name,
-            prepared.model_name,
-            options.api_key,
-            prepared.runtime_config.lookupApiKey(prepared.provider_name),
-        )) catch |err| {
+    var provider_runtime = resolveProviderRuntime(allocator, io, env_map, options, prepared, app_mode) catch |err| {
         try stderr.print("Error: {s}\n", .{coding_agent.resolveProviderErrorMessage(err, prepared.provider_name)});
         return 1;
     };
@@ -497,6 +474,48 @@ fn writeWebViewBackendDiagnostic(
         "Error: WebView mode unavailable on {s}: {s}. Requirements: {s}\n",
         .{ @tagName(diagnostic.platform), diagnostic.message, diagnostic.requirements },
     );
+}
+
+fn resolveWebViewBackendOrDiagnose(
+    stderr: *std.Io.Writer,
+) !?coding_agent.webview_platform.AvailableBackend {
+    switch (coding_agent.webview_platform.preflightHostBackend()) {
+        .available => |backend| return backend,
+        .unavailable => |diagnostic| {
+            try writeWebViewBackendDiagnostic(stderr, diagnostic);
+            return null;
+        },
+    }
+}
+
+fn resolveProviderRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    options: *const cli.Args,
+    prepared: *runtime_prep.PreparedCliRuntime,
+    app_mode: bootstrap.AppMode,
+) !coding_agent.ResolvedProviderConfig {
+    return if (app_mode == .webview)
+        coding_agent.resolveProviderConfigAllowMissingCredentials(
+            allocator,
+            io,
+            env_map,
+            prepared.provider_name,
+            prepared.model_name,
+            options.api_key,
+            prepared.runtime_config.lookupApiKey(prepared.provider_name),
+        )
+    else
+        coding_agent.resolveProviderConfig(
+            allocator,
+            io,
+            env_map,
+            prepared.provider_name,
+            prepared.model_name,
+            options.api_key,
+            prepared.runtime_config.lookupApiKey(prepared.provider_name),
+        );
 }
 
 fn includeBuiltinTools(options: *const cli.Args) bool {

@@ -201,4 +201,6 @@ test {
     _ = @import("providers/faux.zig");
     _ = @import("providers/images/register_builtins.zig");
     _ = @import("providers/images/openrouter.zig");
+    _ = @import("cli.zig");
+    _ = @import("index.zig");
 }

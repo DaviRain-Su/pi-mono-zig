@@ -113,7 +113,7 @@ pub const ArtifactStore = struct {
     }
 
     fn deleteArtifact(self: *ArtifactStore, params: ArtifactParams) ![]u8 {
-        var removed = self.artifacts.fetchRemove(params.filename) orelse return self.missingFileError(params.filename);
+        const removed = self.artifacts.fetchRemove(params.filename) orelse return self.missingFileError(params.filename);
         self.allocator.free(removed.value.filename);
         self.allocator.free(removed.value.content);
         if (self.active_filename) |active| {

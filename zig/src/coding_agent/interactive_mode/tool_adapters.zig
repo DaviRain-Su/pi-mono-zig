@@ -577,6 +577,85 @@ fn tryLoadNativeExtension(
     return host;
 }
 
+fn awaitHostReadyOrDiagnose(
+    allocator: std.mem.Allocator,
+    host: extension_runtime.RuntimeAdapter,
+    startup_diagnostics: *std.ArrayList(ExtensionStartupDiagnostic),
+    required_startup_failed: *bool,
+    extension: resources_mod.LoadedExtension,
+    policy: ExtensionStartupPolicy,
+    message_prefix: []const u8,
+) !bool {
+    host.waitForReady(policy.startup_timeout_ms) catch |err| {
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "{s}startup timed out or failed before ready after {d}ms: {s}",
+            .{ message_prefix, policy.startup_timeout_ms, @errorName(err) },
+        );
+        defer allocator.free(message);
+        try appendExtensionStartupDiagnostic(
+            allocator,
+            startup_diagnostics,
+            .@"error",
+            "startup",
+            extension,
+            policy.policy_key,
+            policy.required,
+            message,
+        );
+        if (policy.required) required_startup_failed.* = true;
+        return false;
+    };
+    return true;
+}
+
+fn collectExtensionToolsIntoItems(
+    allocator: std.mem.Allocator,
+    host: extension_runtime.RuntimeAdapter,
+    items: *std.ArrayList(agent.AgentTool),
+    startup_diagnostics: *std.ArrayList(ExtensionStartupDiagnostic),
+    selection: tool_selection_mod.ToolSelection,
+    options: ExtensionToolHostOptions,
+    extension: resources_mod.LoadedExtension,
+    policy: ExtensionStartupPolicy,
+) !void {
+    drainExtensionRegistryFrames(host, options.env_map, options.io.?);
+    try appendHostDiagnostics(
+        allocator,
+        startup_diagnostics,
+        host,
+        extension,
+        policy.policy_key,
+        policy.required,
+    );
+
+    var names = ToolNameCollector{ .allocator = allocator };
+    defer names.deinit();
+    try host.withRegistry(&names, collectToolNames);
+
+    for (names.items.items) |name| {
+        if (!selection.allowsExtension(name)) continue;
+        if (hasActiveExtensionToolName(items.items, name)) {
+            const message = try std.fmt.allocPrint(allocator, "duplicate extension tool name skipped: {s}", .{name});
+            defer allocator.free(message);
+            try appendExtensionStartupDiagnostic(
+                allocator,
+                startup_diagnostics,
+                .warning,
+                "registry",
+                extension,
+                policy.policy_key,
+                policy.required,
+                message,
+            );
+            continue;
+        }
+        if (try host.agentTool(allocator, name)) |tool| {
+            try items.append(allocator, tool);
+        }
+    }
+}
+
 fn appendSingleExtensionTools(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(agent.AgentTool),
@@ -614,64 +693,31 @@ fn appendSingleExtensionTools(
         var host_owned = true;
         errdefer if (host_owned) host.deinit();
 
-        host.waitForReady(policy.startup_timeout_ms) catch |err| {
-            const message = try std.fmt.allocPrint(
-                allocator,
-                "native extension startup timed out or failed before ready after {d}ms: {s}",
-                .{ policy.startup_timeout_ms, @errorName(err) },
-            );
-            defer allocator.free(message);
-            try appendExtensionStartupDiagnostic(
-                allocator,
-                startup_diagnostics,
-                .@"error",
-                "startup",
-                extension,
-                policy.policy_key,
-                policy.required,
-                message,
-            );
+        const ready = try awaitHostReadyOrDiagnose(
+            allocator,
+            host,
+            startup_diagnostics,
+            required_startup_failed,
+            extension,
+            policy,
+            "native extension ",
+        );
+        if (!ready) {
             host.deinit();
             host_owned = false;
-            if (policy.required) required_startup_failed.* = true;
             return;
-        };
-
-        drainExtensionRegistryFrames(host, options.env_map, options.io.?);
-        try appendHostDiagnostics(
-            allocator,
-            startup_diagnostics,
-            host,
-            extension,
-            policy.policy_key,
-            policy.required,
-        );
-
-        var names = ToolNameCollector{ .allocator = allocator };
-        defer names.deinit();
-        try host.withRegistry(&names, collectToolNames);
-
-        for (names.items.items) |name| {
-            if (!selection.allowsExtension(name)) continue;
-            if (hasActiveExtensionToolName(items.items, name)) {
-                const message = try std.fmt.allocPrint(allocator, "duplicate extension tool name skipped: {s}", .{name});
-                defer allocator.free(message);
-                try appendExtensionStartupDiagnostic(
-                    allocator,
-                    startup_diagnostics,
-                    .warning,
-                    "registry",
-                    extension,
-                    policy.policy_key,
-                    policy.required,
-                    message,
-                );
-                continue;
-            }
-            if (try host.agentTool(allocator, name)) |tool| {
-                try items.append(allocator, tool);
-            }
         }
+
+        try collectExtensionToolsIntoItems(
+            allocator,
+            host,
+            items,
+            startup_diagnostics,
+            selection,
+            options,
+            extension,
+            policy,
+        );
 
         try extension_hosts.append(allocator, host);
         host_owned = false;
@@ -697,64 +743,31 @@ fn appendSingleExtensionTools(
     var host_owned = true;
     errdefer if (host_owned) host.deinit();
 
-    host.waitForReady(policy.startup_timeout_ms) catch |err| {
-        const message = try std.fmt.allocPrint(
-            allocator,
-            "extension startup timed out or failed before ready after {d}ms: {s}",
-            .{ policy.startup_timeout_ms, @errorName(err) },
-        );
-        defer allocator.free(message);
-        try appendExtensionStartupDiagnostic(
-            allocator,
-            startup_diagnostics,
-            .@"error",
-            "startup",
-            extension,
-            policy.policy_key,
-            policy.required,
-            message,
-        );
+    const ready = try awaitHostReadyOrDiagnose(
+        allocator,
+        host,
+        startup_diagnostics,
+        required_startup_failed,
+        extension,
+        policy,
+        "extension ",
+    );
+    if (!ready) {
         host.deinit();
         host_owned = false;
-        if (policy.required) required_startup_failed.* = true;
         return;
-    };
-
-    drainExtensionRegistryFrames(host, options.env_map, options.io.?);
-    try appendHostDiagnostics(
-        allocator,
-        startup_diagnostics,
-        host,
-        extension,
-        policy.policy_key,
-        policy.required,
-    );
-
-    var names = ToolNameCollector{ .allocator = allocator };
-    defer names.deinit();
-    try host.withRegistry(&names, collectToolNames);
-
-    for (names.items.items) |name| {
-        if (!selection.allowsExtension(name)) continue;
-        if (hasActiveExtensionToolName(items.items, name)) {
-            const message = try std.fmt.allocPrint(allocator, "duplicate extension tool name skipped: {s}", .{name});
-            defer allocator.free(message);
-            try appendExtensionStartupDiagnostic(
-                allocator,
-                startup_diagnostics,
-                .warning,
-                "registry",
-                extension,
-                policy.policy_key,
-                policy.required,
-                message,
-            );
-            continue;
-        }
-        if (try host.agentTool(allocator, name)) |tool| {
-            try items.append(allocator, tool);
-        }
     }
+
+    try collectExtensionToolsIntoItems(
+        allocator,
+        host,
+        items,
+        startup_diagnostics,
+        selection,
+        options,
+        extension,
+        policy,
+    );
 
     try extension_hosts.append(allocator, host);
     host_owned = false;

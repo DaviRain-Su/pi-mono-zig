@@ -189,6 +189,7 @@ pub const runInteractiveMode = interactive_mode.runInteractiveMode;
 
 test {
     _ = @import("tools/root.zig");
+    _ = @import("tools/index.zig");
     _ = @import("json_utils.zig");
     _ = @import("slice_utils.zig");
     _ = @import("utils/changelog.zig");
