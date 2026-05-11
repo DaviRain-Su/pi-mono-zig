@@ -10,6 +10,28 @@ const streaming = @import("streaming.zig");
 
 pub const AgentLoopError = types.AgentLoopError;
 
+/// Returns the assistant payload of `event.message` when both the message and
+/// its role are assistant. Returns null otherwise. Used to collapse the
+/// recurring `if (event.message) |m| switch (m) { .assistant => |a| ..., else => {} }`
+/// boilerplate in event-callback code.
+inline fn assistantOfEvent(event: types.AgentEvent) ?ai.AssistantMessage {
+    const message = event.message orelse return null;
+    return switch (message) {
+        .assistant => |assistant| assistant,
+        else => null,
+    };
+}
+
+/// Returns the tool_result payload of `event.message` when both the message
+/// and its role are tool_result. Returns null otherwise. Mirrors
+/// `assistantOfEvent` for the tool_result branch.
+inline fn toolResultOfEvent(event: types.AgentEvent) ?types.ToolResultMessage {
+    const message = event.message orelse return null;
+    return switch (message) {
+        .tool_result => |tool_result| tool_result,
+        else => null,
+    };
+}
 
 pub fn runAgentLoop(
     allocator: std.mem.Allocator,
@@ -426,12 +448,8 @@ fn captureParallelHookOrderingEvent(context: ?*anyopaque, event: types.AgentEven
         .tool_execution_end => {
             try capture.tool_end_order.append(capture.allocator, event.tool_call_id orelse return error.MissingToolCallId);
         },
-        .message_end => {
-            const message = event.message orelse return;
-            switch (message) {
-                .tool_result => |tool_result| try capture.tool_message_order.append(capture.allocator, tool_result.tool_call_id),
-                else => {},
-            }
+        .message_end => if (toolResultOfEvent(event)) |tool_result| {
+            try capture.tool_message_order.append(capture.allocator, tool_result.tool_call_id);
         },
         else => {},
     }
@@ -1756,30 +1774,24 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
         switch (event.event_type) {
             .message_update => last_update_index = index,
             .message_start => {
-                if (event.message) |message| switch (message) {
-                    .assistant => |assistant| {
-                        if (assistant.stop_reason == .tool_use and assistant_start_index == null) {
-                            assistant_start_index = index;
-                        }
-                    },
-                    .tool_result => if (tool_result_message_start_index == null) {
-                        tool_result_message_start_index = index;
-                    },
-                    else => {},
-                };
+                if (assistantOfEvent(event)) |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_start_index == null) {
+                        assistant_start_index = index;
+                    }
+                }
+                if (toolResultOfEvent(event)) |_| {
+                    if (tool_result_message_start_index == null) tool_result_message_start_index = index;
+                }
             },
             .message_end => {
-                if (event.message) |message| switch (message) {
-                    .assistant => |assistant| {
-                        if (assistant.stop_reason == .tool_use and assistant_end_index == null) {
-                            assistant_end_index = index;
-                        }
-                    },
-                    .tool_result => if (tool_result_message_index == null) {
-                        tool_result_message_index = index;
-                    },
-                    else => {},
-                };
+                if (assistantOfEvent(event)) |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_end_index == null) {
+                        assistant_end_index = index;
+                    }
+                }
+                if (toolResultOfEvent(event)) |_| {
+                    if (tool_result_message_index == null) tool_result_message_index = index;
+                }
             },
             .tool_execution_start => {
                 if (tool_start_index == null) tool_start_index = index;
@@ -1805,12 +1817,7 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
     for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
         switch (event.event_type) {
             .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ToolLifecycleInterleavedInAssistantWindow,
-            .message_start, .message_end => {
-                if (event.message) |message| switch (message) {
-                    .tool_result => return error.ToolResultInterleavedInAssistantWindow,
-                    else => {},
-                };
-            },
+            .message_start, .message_end => if (toolResultOfEvent(event)) |_| return error.ToolResultInterleavedInAssistantWindow,
             else => {},
         }
     }
@@ -1876,23 +1883,21 @@ test "ISS-405 immediate tool outcomes follow assistant message_end and precede r
 
     for (capture.events.items, 0..) |event, index| {
         switch (event.event_type) {
-            .message_start => if (event.message) |message| switch (message) {
-                .assistant => |assistant| {
+            .message_start => {
+                if (assistantOfEvent(event)) |assistant| {
                     if (assistant.stop_reason == .tool_use and assistant_start_index == null) assistant_start_index = index;
-                },
-                .tool_result => if (tool_result_start_index == null) {
-                    tool_result_start_index = index;
-                },
-                else => {},
+                }
+                if (toolResultOfEvent(event)) |_| {
+                    if (tool_result_start_index == null) tool_result_start_index = index;
+                }
             },
-            .message_end => if (event.message) |message| switch (message) {
-                .assistant => |assistant| {
+            .message_end => {
+                if (assistantOfEvent(event)) |assistant| {
                     if (assistant.stop_reason == .tool_use and assistant_end_index == null) assistant_end_index = index;
-                },
-                .tool_result => if (tool_result_end_index == null) {
-                    tool_result_end_index = index;
-                },
-                else => {},
+                }
+                if (toolResultOfEvent(event)) |_| {
+                    if (tool_result_end_index == null) tool_result_end_index = index;
+                }
             },
             .tool_execution_start => if (tool_start_index == null) {
                 tool_start_index = index;
@@ -1917,10 +1922,7 @@ test "ISS-405 immediate tool outcomes follow assistant message_end and precede r
     for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
         switch (event.event_type) {
             .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ImmediateToolOutcomeInterleavedInAssistantWindow,
-            .message_start, .message_end => if (event.message) |message| switch (message) {
-                .tool_result => return error.ImmediateToolResultInterleavedInAssistantWindow,
-                else => {},
-            },
+            .message_start, .message_end => if (toolResultOfEvent(event)) |_| return error.ImmediateToolResultInterleavedInAssistantWindow,
             else => {},
         }
     }
@@ -2003,18 +2005,16 @@ test "ISS-405 parallel tool completions keep transcript and turn_end source orde
 
     for (capture.events.items, 0..) |event, index| {
         switch (event.event_type) {
-            .message_start => if (event.message) |message| switch (message) {
-                .assistant => |assistant| {
-                    if (assistant.stop_reason == .tool_use and assistant_start_index == null) assistant_start_index = index;
-                },
-                else => {},
+            .message_start => if (assistantOfEvent(event)) |assistant| {
+                if (assistant.stop_reason == .tool_use and assistant_start_index == null) assistant_start_index = index;
             },
-            .message_end => if (event.message) |message| switch (message) {
-                .assistant => |assistant| {
+            .message_end => {
+                if (assistantOfEvent(event)) |assistant| {
                     if (assistant.stop_reason == .tool_use and assistant_end_index == null) assistant_end_index = index;
-                },
-                .tool_result => |tool_result| try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id),
-                else => {},
+                }
+                if (toolResultOfEvent(event)) |tool_result| {
+                    try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id);
+                }
             },
             .tool_execution_start => if (first_tool_start_index == null) {
                 first_tool_start_index = index;
@@ -2034,10 +2034,7 @@ test "ISS-405 parallel tool completions keep transcript and turn_end source orde
     for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
         switch (event.event_type) {
             .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ParallelToolLifecycleInterleavedInAssistantWindow,
-            .message_start, .message_end => if (event.message) |message| switch (message) {
-                .tool_result => return error.ParallelToolResultInterleavedInAssistantWindow,
-                else => {},
-            },
+            .message_start, .message_end => if (toolResultOfEvent(event)) |_| return error.ParallelToolResultInterleavedInAssistantWindow,
             else => {},
         }
     }
@@ -2505,11 +2502,8 @@ test "ISS-401 runtime error stream cleans partial tool state and skips terminal 
         try std.testing.expect(event.event_type != .tool_execution_start);
         try std.testing.expect(event.event_type != .tool_execution_end);
         switch (event.event_type) {
-            .message_end => if (event.message) |message| switch (message) {
-                .assistant => |assistant| {
-                    if (assistant.stop_reason == .error_reason) terminal_assistant_messages += 1;
-                },
-                else => {},
+            .message_end => if (assistantOfEvent(event)) |assistant| {
+                if (assistant.stop_reason == .error_reason) terminal_assistant_messages += 1;
             },
             .turn_end => turn_end_count += 1,
             .agent_end => agent_end_count += 1,
@@ -3993,13 +3987,10 @@ test "ISS-409 before_tool_call error skips execution and emits cleanup result" {
                 try std.testing.expectEqual(true, event.is_error.?);
                 try std.testing.expectEqualStrings("BeforeToolCallFailed", event.result.?.content[0].text.text);
             },
-            .message_end => if (event.message) |message| switch (message) {
-                .tool_result => |tool_result| {
-                    tool_result_message_count += 1;
-                    try std.testing.expect(tool_result.is_error);
-                    try std.testing.expectEqualStrings("BeforeToolCallFailed", tool_result.content[0].text.text);
-                },
-                else => {},
+            .message_end => if (toolResultOfEvent(event)) |tool_result| {
+                tool_result_message_count += 1;
+                try std.testing.expect(tool_result.is_error);
+                try std.testing.expectEqualStrings("BeforeToolCallFailed", tool_result.content[0].text.text);
             },
             else => {},
         }
@@ -4106,9 +4097,8 @@ test "ISS-409 parallel mixed before_tool_call outcomes preserve lifecycle and tr
                     try std.testing.expectEqual(true, event.is_error.?);
                 }
             },
-            .message_end => if (event.message) |message| switch (message) {
-                .tool_result => |tool_result| try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id),
-                else => {},
+            .message_end => if (toolResultOfEvent(event)) |tool_result| {
+                try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id);
             },
             else => {},
         }
