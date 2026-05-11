@@ -358,15 +358,19 @@ fn yieldForIterations(iterations: usize) void {
 const ToolExecutionCapture = struct {
     allocator: std.mem.Allocator,
     events: std.ArrayList(types.AgentEvent),
+    turn_tool_result_ids: std.ArrayList([]const u8),
 
     fn init(allocator: std.mem.Allocator) ToolExecutionCapture {
         return .{
             .allocator = allocator,
             .events = .empty,
+            .turn_tool_result_ids = .empty,
         };
     }
 
     fn deinit(self: *ToolExecutionCapture) void {
+        for (self.turn_tool_result_ids.items) |tool_call_id| self.allocator.free(tool_call_id);
+        self.turn_tool_result_ids.deinit(self.allocator);
         self.events.deinit(self.allocator);
     }
 };
@@ -403,6 +407,16 @@ const ParallelHookOrderingCapture = struct {
 
 fn captureToolEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
     const capture: *ToolExecutionCapture = @ptrCast(@alignCast(context.?));
+    if (event.event_type == .turn_end) {
+        if (event.tool_results) |tool_results| {
+            for (tool_results) |tool_result| {
+                try capture.turn_tool_result_ids.append(
+                    capture.allocator,
+                    try capture.allocator.dupe(u8, tool_result.tool_call_id),
+                );
+            }
+        }
+    }
     try capture.events.append(capture.allocator, event);
 }
 
@@ -1655,15 +1669,31 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
     try std.testing.expectEqualStrings("tool-1", result[2].tool_result.tool_call_id);
     try std.testing.expectEqualStrings("streamed response", result[3].assistant.content[0].text.text);
 
+    var assistant_start_index: ?usize = null;
     var assistant_end_index: ?usize = null;
     var last_update_index: ?usize = null;
     var tool_start_index: ?usize = null;
     var tool_end_index: ?usize = null;
+    var tool_result_message_start_index: ?usize = null;
     var tool_result_message_index: ?usize = null;
+    var turn_end_index: ?usize = null;
 
     for (capture.events.items, 0..) |event, index| {
         switch (event.event_type) {
             .message_update => last_update_index = index,
+            .message_start => {
+                if (event.message) |message| switch (message) {
+                    .assistant => |assistant| {
+                        if (assistant.stop_reason == .tool_use and assistant_start_index == null) {
+                            assistant_start_index = index;
+                        }
+                    },
+                    .tool_result => if (tool_result_message_start_index == null) {
+                        tool_result_message_start_index = index;
+                    },
+                    else => {},
+                };
+            },
             .message_end => {
                 if (event.message) |message| switch (message) {
                     .assistant => |assistant| {
@@ -1683,19 +1713,271 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
             .tool_execution_end => {
                 if (tool_end_index == null) tool_end_index = index;
             },
+            .turn_end => if (turn_end_index == null) {
+                turn_end_index = index;
+            },
             else => {},
         }
     }
 
+    try std.testing.expect(assistant_start_index != null);
     try std.testing.expect(last_update_index != null);
     try std.testing.expect(assistant_end_index != null);
     try std.testing.expect(tool_start_index != null);
     try std.testing.expect(tool_end_index != null);
+    try std.testing.expect(tool_result_message_start_index != null);
     try std.testing.expect(tool_result_message_index != null);
+    try std.testing.expect(turn_end_index != null);
+    for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
+        switch (event.event_type) {
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ToolLifecycleInterleavedInAssistantWindow,
+            .message_start, .message_end => {
+                if (event.message) |message| switch (message) {
+                    .tool_result => return error.ToolResultInterleavedInAssistantWindow,
+                    else => {},
+                };
+            },
+            else => {},
+        }
+    }
     try std.testing.expect(last_update_index.? < assistant_end_index.?);
     try std.testing.expect(assistant_end_index.? < tool_start_index.?);
     try std.testing.expect(tool_start_index.? < tool_end_index.?);
+    try std.testing.expect(tool_end_index.? < tool_result_message_start_index.?);
     try std.testing.expect(tool_end_index.? < tool_result_message_index.?);
+    try std.testing.expect(tool_result_message_index.? < turn_end_index.?);
+    try std.testing.expectEqual(@as(usize, 1), capture.turn_tool_result_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", capture.turn_tool_result_ids.items[0]);
+}
+
+test "ISS-405 immediate tool outcomes follow assistant message_end and precede result messages" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("continued after missing tool")};
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = try buildToolCallAssistantMessage(arena.allocator(), "missing-tool", "missing", "hello") },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = registration.getModel(),
+            .tool_execution = .parallel,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("missing-tool", result[2].tool_result.tool_call_id);
+    try std.testing.expect(result[2].tool_result.is_error);
+
+    var assistant_start_index: ?usize = null;
+    var assistant_end_index: ?usize = null;
+    var tool_start_index: ?usize = null;
+    var tool_end_index: ?usize = null;
+    var tool_result_start_index: ?usize = null;
+    var tool_result_end_index: ?usize = null;
+    var turn_end_index: ?usize = null;
+
+    for (capture.events.items, 0..) |event, index| {
+        switch (event.event_type) {
+            .message_start => if (event.message) |message| switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_start_index == null) assistant_start_index = index;
+                },
+                .tool_result => if (tool_result_start_index == null) {
+                    tool_result_start_index = index;
+                },
+                else => {},
+            },
+            .message_end => if (event.message) |message| switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_end_index == null) assistant_end_index = index;
+                },
+                .tool_result => if (tool_result_end_index == null) {
+                    tool_result_end_index = index;
+                },
+                else => {},
+            },
+            .tool_execution_start => if (tool_start_index == null) {
+                tool_start_index = index;
+            },
+            .tool_execution_end => if (tool_end_index == null) {
+                tool_end_index = index;
+            },
+            .turn_end => if (turn_end_index == null) {
+                turn_end_index = index;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(assistant_start_index != null);
+    try std.testing.expect(assistant_end_index != null);
+    try std.testing.expect(tool_start_index != null);
+    try std.testing.expect(tool_end_index != null);
+    try std.testing.expect(tool_result_start_index != null);
+    try std.testing.expect(tool_result_end_index != null);
+    try std.testing.expect(turn_end_index != null);
+    for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
+        switch (event.event_type) {
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ImmediateToolOutcomeInterleavedInAssistantWindow,
+            .message_start, .message_end => if (event.message) |message| switch (message) {
+                .tool_result => return error.ImmediateToolResultInterleavedInAssistantWindow,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(assistant_end_index.? < tool_start_index.?);
+    try std.testing.expect(tool_start_index.? < tool_end_index.?);
+    try std.testing.expect(tool_end_index.? < tool_result_start_index.?);
+    try std.testing.expect(tool_result_start_index.? < tool_result_end_index.?);
+    try std.testing.expect(tool_result_end_index.? < turn_end_index.?);
+    try std.testing.expectEqual(@as(usize, 1), capture.turn_tool_result_ids.items.len);
+    try std.testing.expectEqualStrings("missing-tool", capture.turn_tool_result_ids.items[0]);
+}
+
+test "ISS-405 parallel tool completions keep transcript and turn_end source ordered" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first_args = try jsonStringObject(arena.allocator(), "value", "first");
+    const second_args = try jsonStringObject(arena.allocator(), "value", "second");
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 2);
+    blocks[0] = try faux.fauxToolCall(arena.allocator(), "echo", first_args, .{ .id = "tool-1" });
+    blocks[1] = try faux.fauxToolCall(arena.allocator(), "echo", second_args, .{ .id = "tool-2" });
+    const final_blocks = [_]faux.FauxContentBlock{faux.fauxText("done")};
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use }) },
+        .{ .message = faux.fauxAssistantMessage(final_blocks[0..], .{}) },
+    });
+
+    var ordering = ParallelHookOrderingCapture.init(std.testing.allocator);
+    defer ordering.deinit();
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = &ordering,
+        .execute = hookOrderingToolExecute,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.testing.io,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .tool_execution = .parallel,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expect(ordering.second_observed_before_first_finished.load(.seq_cst));
+    try std.testing.expectEqualStrings("tool-1", result[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-2", result[3].tool_result.tool_call_id);
+
+    var assistant_start_index: ?usize = null;
+    var assistant_end_index: ?usize = null;
+    var first_tool_start_index: ?usize = null;
+    var tool_end_ids = std.ArrayList([]const u8).empty;
+    defer tool_end_ids.deinit(std.testing.allocator);
+    var tool_result_message_ids = std.ArrayList([]const u8).empty;
+    defer tool_result_message_ids.deinit(std.testing.allocator);
+    var first_turn_end_index: ?usize = null;
+
+    for (capture.events.items, 0..) |event, index| {
+        switch (event.event_type) {
+            .message_start => if (event.message) |message| switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_start_index == null) assistant_start_index = index;
+                },
+                else => {},
+            },
+            .message_end => if (event.message) |message| switch (message) {
+                .assistant => |assistant| {
+                    if (assistant.stop_reason == .tool_use and assistant_end_index == null) assistant_end_index = index;
+                },
+                .tool_result => |tool_result| try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id),
+                else => {},
+            },
+            .tool_execution_start => if (first_tool_start_index == null) {
+                first_tool_start_index = index;
+            },
+            .tool_execution_end => try tool_end_ids.append(std.testing.allocator, event.tool_call_id orelse return error.MissingToolCallId),
+            .turn_end => if (event.tool_results) |tool_results| {
+                if (tool_results.len > 0 and first_turn_end_index == null) first_turn_end_index = index;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(assistant_start_index != null);
+    try std.testing.expect(assistant_end_index != null);
+    try std.testing.expect(first_tool_start_index != null);
+    try std.testing.expect(first_turn_end_index != null);
+    for (capture.events.items[assistant_start_index.? + 1 .. assistant_end_index.?]) |event| {
+        switch (event.event_type) {
+            .tool_execution_start, .tool_execution_update, .tool_execution_end => return error.ParallelToolLifecycleInterleavedInAssistantWindow,
+            .message_start, .message_end => if (event.message) |message| switch (message) {
+                .tool_result => return error.ParallelToolResultInterleavedInAssistantWindow,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(assistant_end_index.? < first_tool_start_index.?);
+    try std.testing.expectEqual(@as(usize, 2), tool_end_ids.items.len);
+    try std.testing.expectEqualStrings("tool-2", tool_end_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-1", tool_end_ids.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), tool_result_message_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", tool_result_message_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-2", tool_result_message_ids.items[1]);
+
+    try std.testing.expectEqual(@as(usize, 2), capture.turn_tool_result_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", capture.turn_tool_result_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-2", capture.turn_tool_result_ids.items[1]);
 }
 
 test "ISS-408 nested agent loop does not corrupt outer streaming state" {
