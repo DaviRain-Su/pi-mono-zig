@@ -322,51 +322,29 @@ pub const Theme = struct {
         for (&self.styles) |*style| style.deinit(allocator);
         self.styles = defaultThemeStyles();
 
-        const selected_bg = self.colors.get(.selected_bg) orelse self.colors.get(.primary);
-        const user_message_bg = self.colors.get(.user_message_bg);
-        const tool_pending_bg = self.colors.get(.tool_pending_bg);
-        const tool_success_bg = self.colors.get(.tool_success_bg);
+        inline for (DERIVED_STYLE_TABLE) |spec| {
+            try self.setDerivedStyle(allocator, spec.token, .{
+                .fg = self.resolveDerivedColor(spec.fg, spec.fg_fallback),
+                .bg = self.resolveDerivedColor(spec.bg, spec.bg_fallback),
+                .bold = spec.bold,
+                .italic = spec.italic,
+                .underline = spec.underline,
+            });
+        }
+    }
 
-        try self.setDerivedStyle(allocator, .welcome, .{ .fg = self.colors.get(.success), .bold = true });
-        try self.setDerivedStyle(allocator, .user, .{ .bg = user_message_bg });
-        try self.setDerivedStyle(allocator, .assistant, .{});
-        try self.setDerivedStyle(allocator, .tool_call, .{ .bg = tool_pending_bg });
-        try self.setDerivedStyle(allocator, .tool_result, .{ .fg = self.colors.get(.tool_output) orelse self.colors.get(.muted), .bg = tool_success_bg });
-        try self.setDerivedStyle(allocator, .@"error", .{ .fg = self.colors.get(.@"error"), .bold = true });
-        try self.setDerivedStyle(allocator, .status, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .footer, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .prompt, .{ .fg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .box_border, .{ .fg = self.colors.get(.border) });
-        try self.setDerivedStyle(allocator, .text, .{});
-        try self.setDerivedStyle(allocator, .editor, .{});
-        try self.setDerivedStyle(allocator, .editor_cursor, .{ .fg = self.colors.get(.background), .bg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .select_selected, .{ .bg = selected_bg, .bold = true });
-        try self.setDerivedStyle(allocator, .select_description, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .select_scroll, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .select_empty, .{ .fg = self.colors.get(.muted), .italic = true });
-        try self.setDerivedStyle(allocator, .markdown_text, .{});
-        try self.setDerivedStyle(allocator, .markdown_heading, .{ .fg = self.colors.get(.markdown_heading) orelse self.colors.get(.warning), .bold = true });
-        try self.setDerivedStyle(allocator, .markdown_link, .{ .fg = self.colors.get(.markdown_link) orelse self.colors.get(.secondary), .underline = true });
-        try self.setDerivedStyle(allocator, .markdown_code, .{ .fg = self.colors.get(.markdown_code) orelse self.colors.get(.primary) });
-        try self.setDerivedStyle(allocator, .markdown_code_border, .{ .fg = self.colors.get(.markdown_code_border) orelse self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .markdown_quote, .{ .fg = self.colors.get(.markdown_quote) orelse self.colors.get(.muted), .italic = true });
-        try self.setDerivedStyle(allocator, .markdown_quote_border, .{ .fg = self.colors.get(.markdown_quote_border) orelse self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .markdown_list_bullet, .{ .fg = self.colors.get(.markdown_list_bullet) orelse self.colors.get(.primary) });
-        try self.setDerivedStyle(allocator, .markdown_rule, .{ .fg = self.colors.get(.markdown_rule) orelse self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .overlay_title, .{ .fg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .overlay_hint, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .prompt_glyph, .{ .fg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .prompt_border, .{ .fg = self.colors.get(.border) });
-        try self.setDerivedStyle(allocator, .task_header, .{ .fg = self.colors.get(.muted) });
-        try self.setDerivedStyle(allocator, .task_header_accent, .{ .fg = self.colors.get(.primary), .bold = true });
-        try self.setDerivedStyle(allocator, .task_header_separator, .{ .fg = self.colors.get(.border_muted) orelse self.colors.get(.border) });
-        try self.setDerivedStyle(allocator, .role_user, .{ .bg = user_message_bg });
-        try self.setDerivedStyle(allocator, .role_assistant, .{});
-        try self.setDerivedStyle(allocator, .role_thinking, .{ .fg = self.colors.get(.thinking_text) orelse self.colors.get(.muted), .italic = true });
-        try self.setDerivedStyle(allocator, .role_tool_call, .{ .bg = tool_pending_bg });
-        try self.setDerivedStyle(allocator, .role_tool_result, .{ .fg = self.colors.get(.tool_output) orelse self.colors.get(.muted), .bg = tool_success_bg });
-        try self.setDerivedStyle(allocator, .role_thinking_glyph, .{ .fg = self.colors.get(.thinking_text) orelse self.colors.get(.muted), .italic = true });
-        try self.setDerivedStyle(allocator, .terminal_badge, .{ .fg = self.colors.get(.muted) });
+    fn resolveDerivedColor(
+        self: *const Theme,
+        comptime primary: ?ThemeColor,
+        comptime fallback: ?ThemeColor,
+    ) ?[]const u8 {
+        if (primary) |color| {
+            if (self.colors.get(color)) |value| return value;
+        }
+        if (fallback) |color| {
+            if (self.colors.get(color)) |value| return value;
+        }
+        return null;
     }
 
     fn setDerivedStyle(self: *Theme, allocator: std.mem.Allocator, token: ThemeToken, style: StyleTemplate) !void {
@@ -375,6 +353,71 @@ pub const Theme = struct {
         self.styles[index] = try style.owned(allocator);
     }
 };
+
+const DerivedStyleSpec = struct {
+    token: ThemeToken,
+    fg: ?ThemeColor = null,
+    fg_fallback: ?ThemeColor = null,
+    bg: ?ThemeColor = null,
+    bg_fallback: ?ThemeColor = null,
+    bold: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+};
+
+const DERIVED_STYLE_TABLE: []const DerivedStyleSpec = &.{
+    .{ .token = .welcome, .fg = .success, .bold = true },
+    .{ .token = .user, .bg = .user_message_bg },
+    .{ .token = .assistant },
+    .{ .token = .tool_call, .bg = .tool_pending_bg },
+    .{ .token = .tool_result, .fg = .tool_output, .fg_fallback = .muted, .bg = .tool_success_bg },
+    .{ .token = .@"error", .fg = .@"error", .bold = true },
+    .{ .token = .status, .fg = .muted },
+    .{ .token = .footer, .fg = .muted },
+    .{ .token = .prompt, .fg = .primary, .bold = true },
+    .{ .token = .box_border, .fg = .border },
+    .{ .token = .text },
+    .{ .token = .editor },
+    .{ .token = .editor_cursor, .fg = .background, .bg = .primary, .bold = true },
+    .{ .token = .select_selected, .bg = .selected_bg, .bg_fallback = .primary, .bold = true },
+    .{ .token = .select_description, .fg = .muted },
+    .{ .token = .select_scroll, .fg = .muted },
+    .{ .token = .select_empty, .fg = .muted, .italic = true },
+    .{ .token = .markdown_text },
+    .{ .token = .markdown_heading, .fg = .markdown_heading, .fg_fallback = .warning, .bold = true },
+    .{ .token = .markdown_link, .fg = .markdown_link, .fg_fallback = .secondary, .underline = true },
+    .{ .token = .markdown_code, .fg = .markdown_code, .fg_fallback = .primary },
+    .{ .token = .markdown_code_border, .fg = .markdown_code_border, .fg_fallback = .muted },
+    .{ .token = .markdown_quote, .fg = .markdown_quote, .fg_fallback = .muted, .italic = true },
+    .{ .token = .markdown_quote_border, .fg = .markdown_quote_border, .fg_fallback = .muted },
+    .{ .token = .markdown_list_bullet, .fg = .markdown_list_bullet, .fg_fallback = .primary },
+    .{ .token = .markdown_rule, .fg = .markdown_rule, .fg_fallback = .muted },
+    .{ .token = .overlay_title, .fg = .primary, .bold = true },
+    .{ .token = .overlay_hint, .fg = .muted },
+    .{ .token = .prompt_glyph, .fg = .primary, .bold = true },
+    .{ .token = .prompt_border, .fg = .border },
+    .{ .token = .task_header, .fg = .muted },
+    .{ .token = .task_header_accent, .fg = .primary, .bold = true },
+    .{ .token = .task_header_separator, .fg = .border_muted, .fg_fallback = .border },
+    .{ .token = .role_user, .bg = .user_message_bg },
+    .{ .token = .role_assistant },
+    .{ .token = .role_thinking, .fg = .thinking_text, .fg_fallback = .muted, .italic = true },
+    .{ .token = .role_tool_call, .bg = .tool_pending_bg },
+    .{ .token = .role_tool_result, .fg = .tool_output, .fg_fallback = .muted, .bg = .tool_success_bg },
+    .{ .token = .role_thinking_glyph, .fg = .thinking_text, .fg_fallback = .muted, .italic = true },
+    .{ .token = .terminal_badge, .fg = .muted },
+};
+
+comptime {
+    const fields = @typeInfo(ThemeToken).@"enum".fields;
+    std.debug.assert(DERIVED_STYLE_TABLE.len == fields.len);
+    var seen = [_]bool{false} ** fields.len;
+    for (DERIVED_STYLE_TABLE) |spec| {
+        const idx = @intFromEnum(spec.token);
+        std.debug.assert(!seen[idx]);
+        seen[idx] = true;
+    }
+}
 
 fn defaultThemeStyles() [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec {
     var styles: [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec = undefined;
