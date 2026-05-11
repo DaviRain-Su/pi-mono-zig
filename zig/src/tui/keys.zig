@@ -450,23 +450,35 @@ fn rawCtrlChar(key: u8) ?u8 {
     return null;
 }
 
+const FUNCTIONAL_CODEPOINTS = std.StaticStringMap(i32).initComptime(.{
+    .{ "delete", @as(i32, -10) },
+    .{ "insert", @as(i32, -11) },
+    .{ "pageup", @as(i32, -12) },
+    .{ "pagedown", @as(i32, -13) },
+    .{ "home", @as(i32, -14) },
+    .{ "end", @as(i32, -15) },
+});
+
+const ARROW_CODEPOINTS = std.StaticStringMap(i32).initComptime(.{
+    .{ "up", @as(i32, -1) },
+    .{ "down", @as(i32, -2) },
+    .{ "right", @as(i32, -3) },
+    .{ "left", @as(i32, -4) },
+});
+
+fn lowercaseLookupI32(map: std.StaticStringMap(i32), key: []const u8) ?i32 {
+    var buf: [32]u8 = undefined;
+    if (key.len == 0 or key.len > buf.len) return null;
+    for (key, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return map.get(buf[0..key.len]);
+}
+
 fn functionalCodepoint(key: []const u8) ?i32 {
-    if (eqlKey(key, "delete")) return -10;
-    if (eqlKey(key, "insert")) return -11;
-    if (eqlKey(key, "pageUp") or eqlKey(key, "pageup")) return -12;
-    if (eqlKey(key, "pageDown") or eqlKey(key, "pagedown")) return -13;
-    if (eqlKey(key, "home")) return -14;
-    if (eqlKey(key, "end")) return -15;
-    if (eqlKey(key, "clear")) return null;
-    return null;
+    return lowercaseLookupI32(FUNCTIONAL_CODEPOINTS, key);
 }
 
 fn arrowCodepoint(key: []const u8) ?i32 {
-    if (eqlKey(key, "up")) return -1;
-    if (eqlKey(key, "down")) return -2;
-    if (eqlKey(key, "right")) return -3;
-    if (eqlKey(key, "left")) return -4;
-    return null;
+    return lowercaseLookupI32(ARROW_CODEPOINTS, key);
 }
 
 fn keyNameForCodepoint(codepoint: i32) ?[]const u8 {
@@ -490,101 +502,81 @@ fn keyNameForCodepoint(codepoint: i32) ?[]const u8 {
     };
 }
 
+const ONE_BYTE_KEY_NAMES: [128][]const u8 = blk: {
+    @setEvalBranchQuota(4096);
+    var table: [128][]const u8 = undefined;
+    for (&table, 0..) |*slot, byte| {
+        const b: u8 = @intCast(byte);
+        const is_digit = b >= '0' and b <= '9';
+        const is_lower = b >= 'a' and b <= 'z';
+        const is_symbol = switch (b) {
+            '`', '-', '=', '[', ']', '\\', ';', '\'', ',', '.', '/', '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '|', '~', '{', '}', ':', '<', '>', '?' => true,
+            else => false,
+        };
+        slot.* = if (is_digit or is_lower or is_symbol) &[_]u8{b} else "";
+    }
+    break :blk table;
+};
+
 fn oneByteKeyName(byte: u8) []const u8 {
-    return switch (byte) {
-        '0' => "0",
-        '1' => "1",
-        '2' => "2",
-        '3' => "3",
-        '4' => "4",
-        '5' => "5",
-        '6' => "6",
-        '7' => "7",
-        '8' => "8",
-        '9' => "9",
-        'a' => "a",
-        'b' => "b",
-        'c' => "c",
-        'd' => "d",
-        'e' => "e",
-        'f' => "f",
-        'g' => "g",
-        'h' => "h",
-        'i' => "i",
-        'j' => "j",
-        'k' => "k",
-        'l' => "l",
-        'm' => "m",
-        'n' => "n",
-        'o' => "o",
-        'p' => "p",
-        'q' => "q",
-        'r' => "r",
-        's' => "s",
-        't' => "t",
-        'u' => "u",
-        'v' => "v",
-        'w' => "w",
-        'x' => "x",
-        'y' => "y",
-        'z' => "z",
-        '`' => "`",
-        '-' => "-",
-        '=' => "=",
-        '[' => "[",
-        ']' => "]",
-        '\\' => "\\",
-        ';' => ";",
-        '\'' => "'",
-        ',' => ",",
-        '.' => ".",
-        '/' => "/",
-        '!' => "!",
-        '@' => "@",
-        '#' => "#",
-        '$' => "$",
-        '%' => "%",
-        '^' => "^",
-        '&' => "&",
-        '*' => "*",
-        '(' => "(",
-        ')' => ")",
-        '_' => "_",
-        '+' => "+",
-        '|' => "|",
-        '~' => "~",
-        '{' => "{",
-        '}' => "}",
-        ':' => ":",
-        '<' => "<",
-        '>' => ">",
-        '?' => "?",
-        else => "",
-    };
+    if (byte >= ONE_BYTE_KEY_NAMES.len) return "";
+    return ONE_BYTE_KEY_NAMES[byte];
 }
 
-fn legacySequenceKeyId(data: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, data, "\x1bOA")) return "up";
-    if (std.mem.eql(u8, data, "\x1bOB")) return "down";
-    if (std.mem.eql(u8, data, "\x1bOC")) return "right";
-    if (std.mem.eql(u8, data, "\x1bOD")) return "left";
-    if (std.mem.eql(u8, data, "\x1bOH")) return "home";
-    if (std.mem.eql(u8, data, "\x1bOF")) return "end";
-    if (std.mem.eql(u8, data, "\x1b[E") or std.mem.eql(u8, data, "\x1bOE")) return "clear";
-    if (std.mem.eql(u8, data, "\x1bOe")) return "ctrl+clear";
-    if (std.mem.eql(u8, data, "\x1b[e")) return "shift+clear";
-    if (std.mem.eql(u8, data, "\x1b[2~")) return "insert";
-    if (std.mem.eql(u8, data, "\x1b[3~")) return "delete";
-    if (std.mem.eql(u8, data, "\x1b[5~") or std.mem.eql(u8, data, "\x1b[[5~")) return "pageUp";
-    if (std.mem.eql(u8, data, "\x1b[6~") or std.mem.eql(u8, data, "\x1b[[6~")) return "pageDown";
-    if (std.mem.eql(u8, data, "\x1bb")) return "alt+left";
-    if (std.mem.eql(u8, data, "\x1bf")) return "alt+right";
-    if (std.mem.eql(u8, data, "\x1bp")) return "alt+up";
-    if (std.mem.eql(u8, data, "\x1bn")) return "alt+down";
-    inline for (1..13) |i| {
-        if (matchesLegacyFunction(data, i)) return functionKeyName(i);
+const FUNCTION_KEY_TABLE = [_]struct { name: []const u8, sequences: []const []const u8 }{
+    .{ .name = "f1", .sequences = &.{ "\x1bOP", "\x1b[11~", "\x1b[[A" } },
+    .{ .name = "f2", .sequences = &.{ "\x1bOQ", "\x1b[12~", "\x1b[[B" } },
+    .{ .name = "f3", .sequences = &.{ "\x1bOR", "\x1b[13~", "\x1b[[C" } },
+    .{ .name = "f4", .sequences = &.{ "\x1bOS", "\x1b[14~", "\x1b[[D" } },
+    .{ .name = "f5", .sequences = &.{ "\x1b[15~", "\x1b[[E" } },
+    .{ .name = "f6", .sequences = &.{"\x1b[17~"} },
+    .{ .name = "f7", .sequences = &.{"\x1b[18~"} },
+    .{ .name = "f8", .sequences = &.{"\x1b[19~"} },
+    .{ .name = "f9", .sequences = &.{"\x1b[20~"} },
+    .{ .name = "f10", .sequences = &.{"\x1b[21~"} },
+    .{ .name = "f11", .sequences = &.{"\x1b[23~"} },
+    .{ .name = "f12", .sequences = &.{"\x1b[24~"} },
+};
+
+const LEGACY_SEQUENCE_KEY_IDS = blk: {
+    const base = [_]struct { []const u8, []const u8 }{
+        .{ "\x1bOA", "up" },
+        .{ "\x1bOB", "down" },
+        .{ "\x1bOC", "right" },
+        .{ "\x1bOD", "left" },
+        .{ "\x1bOH", "home" },
+        .{ "\x1bOF", "end" },
+        .{ "\x1b[E", "clear" },
+        .{ "\x1bOE", "clear" },
+        .{ "\x1bOe", "ctrl+clear" },
+        .{ "\x1b[e", "shift+clear" },
+        .{ "\x1b[2~", "insert" },
+        .{ "\x1b[3~", "delete" },
+        .{ "\x1b[5~", "pageUp" },
+        .{ "\x1b[[5~", "pageUp" },
+        .{ "\x1b[6~", "pageDown" },
+        .{ "\x1b[[6~", "pageDown" },
+        .{ "\x1bb", "alt+left" },
+        .{ "\x1bf", "alt+right" },
+        .{ "\x1bp", "alt+up" },
+        .{ "\x1bn", "alt+down" },
+    };
+    var function_count: usize = 0;
+    for (FUNCTION_KEY_TABLE) |entry| function_count += entry.sequences.len;
+    var entries: [base.len + function_count]struct { []const u8, []const u8 } = undefined;
+    for (base, 0..) |entry, i| entries[i] = entry;
+    var index: usize = base.len;
+    for (FUNCTION_KEY_TABLE) |entry| {
+        for (entry.sequences) |seq| {
+            entries[index] = .{ seq, entry.name };
+            index += 1;
+        }
     }
-    return null;
+    break :blk std.StaticStringMap([]const u8).initComptime(entries);
+};
+
+fn legacySequenceKeyId(data: []const u8) ?[]const u8 {
+    return LEGACY_SEQUENCE_KEY_IDS.get(data);
 }
 
 fn matchesLegacyKey(data: []const u8, key: []const u8) bool {
@@ -636,39 +628,13 @@ fn functionKeyIndex(key: []const u8) ?usize {
 }
 
 fn matchesLegacyFunction(data: []const u8, index: usize) bool {
-    return switch (index) {
-        1 => containsSequence(data, &.{ "\x1bOP", "\x1b[11~", "\x1b[[A" }),
-        2 => containsSequence(data, &.{ "\x1bOQ", "\x1b[12~", "\x1b[[B" }),
-        3 => containsSequence(data, &.{ "\x1bOR", "\x1b[13~", "\x1b[[C" }),
-        4 => containsSequence(data, &.{ "\x1bOS", "\x1b[14~", "\x1b[[D" }),
-        5 => containsSequence(data, &.{ "\x1b[15~", "\x1b[[E" }),
-        6 => std.mem.eql(u8, data, "\x1b[17~"),
-        7 => std.mem.eql(u8, data, "\x1b[18~"),
-        8 => std.mem.eql(u8, data, "\x1b[19~"),
-        9 => std.mem.eql(u8, data, "\x1b[20~"),
-        10 => std.mem.eql(u8, data, "\x1b[21~"),
-        11 => std.mem.eql(u8, data, "\x1b[23~"),
-        12 => std.mem.eql(u8, data, "\x1b[24~"),
-        else => false,
-    };
+    if (index < 1 or index > FUNCTION_KEY_TABLE.len) return false;
+    return containsSequence(data, FUNCTION_KEY_TABLE[index - 1].sequences);
 }
 
 fn functionKeyName(index: usize) []const u8 {
-    return switch (index) {
-        1 => "f1",
-        2 => "f2",
-        3 => "f3",
-        4 => "f4",
-        5 => "f5",
-        6 => "f6",
-        7 => "f7",
-        8 => "f8",
-        9 => "f9",
-        10 => "f10",
-        11 => "f11",
-        12 => "f12",
-        else => "",
-    };
+    if (index < 1 or index > FUNCTION_KEY_TABLE.len) return "";
+    return FUNCTION_KEY_TABLE[index - 1].name;
 }
 
 fn isPrintableKey(byte: u8) bool {
