@@ -145,16 +145,19 @@ fn colorDistance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) f64 {
     return dr * dr * 0.299 + dg * dg * 0.587 + db * db * 0.114;
 }
 
+const named_colors = std.StaticStringMap(u8).initComptime(.{
+    .{ "black", 0 },
+    .{ "red", 1 },
+    .{ "green", 2 },
+    .{ "yellow", 3 },
+    .{ "blue", 4 },
+    .{ "magenta", 5 },
+    .{ "cyan", 6 },
+    .{ "white", 7 },
+});
+
 fn parseNamedColor(value: []const u8) ?u8 {
-    if (std.mem.eql(u8, value, "black")) return 0;
-    if (std.mem.eql(u8, value, "red")) return 1;
-    if (std.mem.eql(u8, value, "green")) return 2;
-    if (std.mem.eql(u8, value, "yellow")) return 3;
-    if (std.mem.eql(u8, value, "blue")) return 4;
-    if (std.mem.eql(u8, value, "magenta")) return 5;
-    if (std.mem.eql(u8, value, "cyan")) return 6;
-    if (std.mem.eql(u8, value, "white")) return 7;
-    return null;
+    return named_colors.get(value);
 }
 
 test "styleFor maps representative theme tokens to vaxis styles" {
