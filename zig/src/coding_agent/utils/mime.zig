@@ -7,11 +7,37 @@ pub fn detectSupportedImageMimeTypeFromFile(allocator: std.mem.Allocator, io: st
     return try allocator.dupe(u8, mime);
 }
 
+const MagicEntry = struct {
+    prefix: []const u8,
+    mime: []const u8,
+    // Optional secondary anchor (e.g. RIFF/WEBP container marker at offset 8).
+    secondary: ?Secondary = null,
+
+    const Secondary = struct {
+        offset: usize,
+        bytes: []const u8,
+    };
+};
+
+const MAGIC_TABLE: []const MagicEntry = &.{
+    .{ .prefix = "\x89PNG\r\n\x1a\n", .mime = "image/png" },
+    .{ .prefix = "\xff\xd8\xff", .mime = "image/jpeg" },
+    .{ .prefix = "GIF87a", .mime = "image/gif" },
+    .{ .prefix = "GIF89a", .mime = "image/gif" },
+    .{ .prefix = "RIFF", .mime = "image/webp", .secondary = .{ .offset = 8, .bytes = "WEBP" } },
+};
+
 pub fn detectSupportedImageMimeType(bytes: []const u8) ?[]const u8 {
-    if (bytes.len >= 8 and std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return "image/png";
-    if (bytes.len >= 3 and bytes[0] == 0xff and bytes[1] == 0xd8 and bytes[2] == 0xff) return "image/jpeg";
-    if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a"))) return "image/gif";
-    if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+    inline for (MAGIC_TABLE) |entry| {
+        if (bytes.len >= entry.prefix.len and std.mem.eql(u8, bytes[0..entry.prefix.len], entry.prefix)) {
+            if (entry.secondary) |sec| {
+                const end = sec.offset + sec.bytes.len;
+                if (bytes.len >= end and std.mem.eql(u8, bytes[sec.offset..end], sec.bytes)) return entry.mime;
+            } else {
+                return entry.mime;
+            }
+        }
+    }
     return null;
 }
 
