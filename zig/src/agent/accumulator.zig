@@ -124,114 +124,90 @@ pub const PartialAssistantAccumulator = struct {
         }
     }
 
-    fn ensureText(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .text => |*text| return text,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .text = .empty };
-                return &self.blocks.items[index].text;
-            },
-        }
+    fn FieldPayload(comptime tag: std.meta.Tag(PartialContentBlock)) type {
+        return @FieldType(PartialContentBlock, @tagName(tag));
     }
 
-    fn ensureThinking(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .thinking => |*thinking| return thinking,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .thinking = .empty };
-                return &self.blocks.items[index].thinking;
-            },
-        }
-    }
-
-    fn ensureToolCall(self: *PartialAssistantAccumulator, index: usize) !*PartialToolCallBlock {
-        try self.ensureIndex(index);
-        switch (self.blocks.items[index]) {
-            .tool_call => |*tool_call| return tool_call,
-            else => {
-                self.blocks.items[index].deinit(self.allocator);
-                self.blocks.items[index] = .{ .tool_call = .{} };
-                return &self.blocks.items[index].tool_call;
-            },
-        }
-    }
-
-    fn requireText(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
-        try self.ensureIndex(index);
-        return switch (self.blocks.items[index]) {
-            .text => |*text| text,
-            else => types.AgentLoopError.PartialContentOutOfOrder,
+    fn defaultPayload(comptime tag: std.meta.Tag(PartialContentBlock)) FieldPayload(tag) {
+        return switch (tag) {
+            .text, .thinking => .empty,
+            .tool_call => .{},
         };
     }
 
-    fn requireThinking(self: *PartialAssistantAccumulator, index: usize) !*std.ArrayList(u8) {
+    fn ensureKind(
+        self: *PartialAssistantAccumulator,
+        comptime tag: std.meta.Tag(PartialContentBlock),
+        index: usize,
+    ) !*FieldPayload(tag) {
         try self.ensureIndex(index);
-        return switch (self.blocks.items[index]) {
-            .thinking => |*thinking| thinking,
-            else => types.AgentLoopError.PartialContentOutOfOrder,
-        };
+        if (self.blocks.items[index] != tag) {
+            self.blocks.items[index].deinit(self.allocator);
+            self.blocks.items[index] = @unionInit(PartialContentBlock, @tagName(tag), defaultPayload(tag));
+        }
+        return &@field(self.blocks.items[index], @tagName(tag));
     }
 
-    fn requireToolCall(self: *PartialAssistantAccumulator, index: usize) !*PartialToolCallBlock {
+    fn requireKind(
+        self: *PartialAssistantAccumulator,
+        comptime tag: std.meta.Tag(PartialContentBlock),
+        index: usize,
+    ) !*FieldPayload(tag) {
         try self.ensureIndex(index);
-        return switch (self.blocks.items[index]) {
-            .tool_call => |*tool_call| tool_call,
-            else => types.AgentLoopError.PartialContentOutOfOrder,
-        };
+        if (self.blocks.items[index] != tag) {
+            return types.AgentLoopError.PartialContentOutOfOrder;
+        }
+        return &@field(self.blocks.items[index], @tagName(tag));
     }
 
     pub fn applyEvent(self: *PartialAssistantAccumulator, event: ai.AssistantMessageEvent) !void {
         switch (event.event_type) {
             .text_start => {
                 const index = try self.startIndex(event);
-                const text = try self.ensureText(index);
+                const text = try self.ensureKind(.text, index);
                 text.clearRetainingCapacity();
             },
             .text_delta => {
                 const index = try self.indexFor(event, false);
-                const text = try self.requireText(index);
+                const text = try self.requireKind(.text, index);
                 if (event.delta) |delta| try text.appendSlice(self.allocator, delta);
             },
             .text_end => {
                 const index = try self.indexFor(event, false);
-                const text = try self.requireText(index);
+                const text = try self.requireKind(.text, index);
                 text.clearRetainingCapacity();
                 if (event.content) |content| try text.appendSlice(self.allocator, content);
                 self.markEnded(index);
             },
             .thinking_start => {
                 const index = try self.startIndex(event);
-                const thinking = try self.ensureThinking(index);
+                const thinking = try self.ensureKind(.thinking, index);
                 thinking.clearRetainingCapacity();
             },
             .thinking_delta => {
                 const index = try self.indexFor(event, false);
-                const thinking = try self.requireThinking(index);
+                const thinking = try self.requireKind(.thinking, index);
                 if (event.delta) |delta| try thinking.appendSlice(self.allocator, delta);
             },
             .thinking_end => {
                 const index = try self.indexFor(event, false);
-                const thinking = try self.requireThinking(index);
+                const thinking = try self.requireKind(.thinking, index);
                 thinking.clearRetainingCapacity();
                 if (event.content) |content| try thinking.appendSlice(self.allocator, content);
                 self.markEnded(index);
             },
             .toolcall_start => {
                 const index = try self.startIndex(event);
-                _ = try self.ensureToolCall(index);
+                _ = try self.ensureKind(.tool_call, index);
             },
             .toolcall_delta => {
                 const index = try self.indexFor(event, false);
-                const tool_call = try self.requireToolCall(index);
+                const tool_call = try self.requireKind(.tool_call, index);
                 if (event.delta) |delta| try tool_call.appendDelta(self.allocator, delta);
             },
             .toolcall_end => {
                 const index = try self.indexFor(event, false);
-                const tool_call = try self.requireToolCall(index);
+                const tool_call = try self.requireKind(.tool_call, index);
                 if (event.tool_call) |final_tool_call| try tool_call.setFinal(self.allocator, final_tool_call);
                 self.markEnded(index);
             },
