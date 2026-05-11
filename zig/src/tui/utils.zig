@@ -100,42 +100,22 @@ pub fn isWhitespaceChar(char: u21) bool {
     return char == ' ' or char == '\t' or char == '\n' or char == '\r';
 }
 
+const punctuation_table: [128]bool = blk: {
+    var t = [_]bool{false} ** 128;
+    for ([_]u8{
+        '(', ')', '{',  '}', '[', ']', '<', '>',
+        '.', ',', ';',  ':', '\'', '"', '!', '?',
+        '+', '-', '=',  '*', '/', '\\', '|', '&',
+        '%', '^', '$',  '#', '@', '~', '`',
+    }) |c| {
+        t[c] = true;
+    }
+    break :blk t;
+};
+
 pub fn isPunctuationChar(char: u21) bool {
-    return switch (char) {
-        '(',
-        ')',
-        '{',
-        '}',
-        '[',
-        ']',
-        '<',
-        '>',
-        '.',
-        ',',
-        ';',
-        ':',
-        '\'',
-        '"',
-        '!',
-        '?',
-        '+',
-        '-',
-        '=',
-        '*',
-        '/',
-        '\\',
-        '|',
-        '&',
-        '%',
-        '^',
-        '$',
-        '#',
-        '@',
-        '~',
-        '`',
-        => true,
-        else => false,
-    };
+    if (char >= 128) return false;
+    return punctuation_table[@intCast(char)];
 }
 
 fn wrapSingleLine(allocator: std.mem.Allocator, lines: *std.ArrayList([]const u8), line: []const u8, width: usize) !void {
@@ -164,8 +144,17 @@ fn appendSpaces(allocator: std.mem.Allocator, original: []u8, count: usize) ![]u
     return out.toOwnedSlice(allocator);
 }
 
+const csi_final_table: [128]bool = blk: {
+    var t = [_]bool{false} ** 128;
+    for ([_]u8{ 'm', 'G', 'K', 'H', 'J' }) |c| {
+        t[c] = true;
+    }
+    break :blk t;
+};
+
 fn isCsiFinal(byte: u8) bool {
-    return byte == 'm' or byte == 'G' or byte == 'K' or byte == 'H' or byte == 'J';
+    if (byte >= 128) return false;
+    return csi_final_table[byte];
 }
 
 test "utils wraps and truncates visible text" {
