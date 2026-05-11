@@ -17,29 +17,68 @@ pub fn deinitJsonArrayItems(allocator: std.mem.Allocator, array: *std.json.Array
     array.deinit();
 }
 
+const CANONICAL_TOOL_NAMES = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "read", "Read" },
+    .{ "write", "Write" },
+    .{ "edit", "Edit" },
+    .{ "bash", "Bash" },
+    .{ "grep", "Grep" },
+    .{ "glob", "Glob" },
+    .{ "askuserquestion", "AskUserQuestion" },
+    .{ "enterplanmode", "EnterPlanMode" },
+    .{ "exitplanmode", "ExitPlanMode" },
+    .{ "killshell", "KillShell" },
+    .{ "notebookedit", "NotebookEdit" },
+    .{ "skill", "Skill" },
+    .{ "task", "Task" },
+    .{ "taskoutput", "TaskOutput" },
+    .{ "todowrite", "TodoWrite" },
+    .{ "webfetch", "WebFetch" },
+    .{ "websearch", "WebSearch" },
+});
+
+const CANONICAL_TOOL_NAME_BUF_LEN: usize = 64;
+
 pub fn canonicalClaudeCodeToolName(name: []const u8) []const u8 {
-    inline for ([_]struct { lower: []const u8, canonical: []const u8 }{
-        .{ .lower = "read", .canonical = "Read" },
-        .{ .lower = "write", .canonical = "Write" },
-        .{ .lower = "edit", .canonical = "Edit" },
-        .{ .lower = "bash", .canonical = "Bash" },
-        .{ .lower = "grep", .canonical = "Grep" },
-        .{ .lower = "glob", .canonical = "Glob" },
-        .{ .lower = "askuserquestion", .canonical = "AskUserQuestion" },
-        .{ .lower = "enterplanmode", .canonical = "EnterPlanMode" },
-        .{ .lower = "exitplanmode", .canonical = "ExitPlanMode" },
-        .{ .lower = "killshell", .canonical = "KillShell" },
-        .{ .lower = "notebookedit", .canonical = "NotebookEdit" },
-        .{ .lower = "skill", .canonical = "Skill" },
-        .{ .lower = "task", .canonical = "Task" },
-        .{ .lower = "taskoutput", .canonical = "TaskOutput" },
-        .{ .lower = "todowrite", .canonical = "TodoWrite" },
-        .{ .lower = "webfetch", .canonical = "WebFetch" },
-        .{ .lower = "websearch", .canonical = "WebSearch" },
-    }) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.lower, name)) return entry.canonical;
+    if (name.len == 0 or name.len > CANONICAL_TOOL_NAME_BUF_LEN) return name;
+    var buf: [CANONICAL_TOOL_NAME_BUF_LEN]u8 = undefined;
+    for (name, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return CANONICAL_TOOL_NAMES.get(buf[0..name.len]) orelse name;
+}
+
+test "canonicalClaudeCodeToolName maps every entry case-insensitively" {
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "read", .expected = "Read" },
+        .{ .input = "READ", .expected = "Read" },
+        .{ .input = "Read", .expected = "Read" },
+        .{ .input = "write", .expected = "Write" },
+        .{ .input = "edit", .expected = "Edit" },
+        .{ .input = "bash", .expected = "Bash" },
+        .{ .input = "grep", .expected = "Grep" },
+        .{ .input = "glob", .expected = "Glob" },
+        .{ .input = "askuserquestion", .expected = "AskUserQuestion" },
+        .{ .input = "AskUserQuestion", .expected = "AskUserQuestion" },
+        .{ .input = "enterplanmode", .expected = "EnterPlanMode" },
+        .{ .input = "exitplanmode", .expected = "ExitPlanMode" },
+        .{ .input = "killshell", .expected = "KillShell" },
+        .{ .input = "notebookedit", .expected = "NotebookEdit" },
+        .{ .input = "skill", .expected = "Skill" },
+        .{ .input = "task", .expected = "Task" },
+        .{ .input = "taskoutput", .expected = "TaskOutput" },
+        .{ .input = "todowrite", .expected = "TodoWrite" },
+        .{ .input = "webfetch", .expected = "WebFetch" },
+        .{ .input = "websearch", .expected = "WebSearch" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.expected, canonicalClaudeCodeToolName(case.input));
     }
-    return name;
+}
+
+test "canonicalClaudeCodeToolName returns input for unknown or oversized names" {
+    try std.testing.expectEqualStrings("unknown_tool", canonicalClaudeCodeToolName("unknown_tool"));
+    try std.testing.expectEqualStrings("", canonicalClaudeCodeToolName(""));
+    const long_name = "a" ** (CANONICAL_TOOL_NAME_BUF_LEN + 1);
+    try std.testing.expectEqualStrings(long_name, canonicalClaudeCodeToolName(long_name));
 }
 
 fn buildTextBlockObject(allocator: std.mem.Allocator, text: []const u8, cache_control: ?std.json.Value) !std.json.Value {
