@@ -573,27 +573,139 @@ pub const OpenAICompat = struct {
     supports_long_cache_retention: bool = true,
 };
 
+/// Comptime-known descriptor for an OpenAI-compatible provider flavor. Each row
+/// declares the (provider id, base_url substring) signals that identify the
+/// flavor and any per-field overrides that flavor applies on top of the
+/// default OpenAI behavior. `getCompat` iterates `FLAVORS` once via `inline for`
+/// and uses first-match-wins semantics per optional field — adding a new
+/// OpenAI-compatible provider is one row.
+const OpenAICompatFlavor = struct {
+    providers: []const []const u8 = &.{},
+    base_url_substrings: []const []const u8 = &.{},
+    is_non_standard: bool = false,
+    supports_reasoning_effort: ?bool = null,
+    max_tokens_field: ?[]const u8 = null,
+    requires_reasoning_content_on_assistant_messages: ?bool = null,
+    thinking_format: ?[]const u8 = null,
+    supports_strict_mode: ?bool = null,
+    supports_long_cache_retention: ?bool = null,
+};
+
+/// Precedence-ordered flavor table. Order only matters for fields where
+/// distinct flavors set different non-null values; in practice that is just
+/// `thinking_format` (deepseek > zai > together > openrouter). Every other
+/// field is either set by at most one flavor or set to the same value by all
+/// flavors that override it.
+const FLAVORS: []const OpenAICompatFlavor = &.{
+    // DeepSeek matched by provider id only — note: provider="deepseek" does
+    // NOT mark the model non-standard; only the deepseek.com URL does. This
+    // mirrors TypeScript's `detectCompat` in `openai-completions.ts`.
+    .{
+        .providers = &.{"deepseek"},
+        .requires_reasoning_content_on_assistant_messages = true,
+        .thinking_format = "deepseek",
+    },
+    .{
+        .base_url_substrings = &.{"deepseek.com"},
+        .is_non_standard = true,
+        .requires_reasoning_content_on_assistant_messages = true,
+        .thinking_format = "deepseek",
+    },
+    .{
+        .providers = &.{"zai"},
+        .base_url_substrings = &.{ "api.z.ai", "open.bigmodel.cn" },
+        .is_non_standard = true,
+        .supports_reasoning_effort = false,
+        .thinking_format = "zai",
+    },
+    .{
+        .providers = &.{"xai"},
+        .base_url_substrings = &.{"api.x.ai"},
+        .is_non_standard = true,
+        .supports_reasoning_effort = false,
+    },
+    .{
+        .providers = &.{"together"},
+        .base_url_substrings = &.{ "api.together.ai", "api.together.xyz" },
+        .is_non_standard = true,
+        .supports_reasoning_effort = false,
+        .max_tokens_field = "max_tokens",
+        .thinking_format = "together",
+        .supports_strict_mode = false,
+        .supports_long_cache_retention = false,
+    },
+    .{
+        .base_url_substrings = &.{"chutes.ai"},
+        .is_non_standard = true,
+        .max_tokens_field = "max_tokens",
+    },
+    .{
+        .providers = &.{"cerebras"},
+        .base_url_substrings = &.{"cerebras.ai"},
+        .is_non_standard = true,
+    },
+    .{
+        .providers = &.{"opencode"},
+        .base_url_substrings = &.{"opencode.ai"},
+        .is_non_standard = true,
+    },
+    .{
+        .providers = &.{"cloudflare-workers-ai"},
+        .base_url_substrings = &.{"api.cloudflare.com"},
+        .is_non_standard = true,
+        .supports_long_cache_retention = false,
+    },
+    .{
+        .providers = &.{"cloudflare-ai-gateway"},
+        .base_url_substrings = &.{"gateway.ai.cloudflare.com"},
+        .is_non_standard = true,
+        .supports_reasoning_effort = false,
+        .max_tokens_field = "max_tokens",
+        .supports_strict_mode = false,
+        .supports_long_cache_retention = false,
+    },
+    .{
+        .providers = &.{"openrouter"},
+        .base_url_substrings = &.{"openrouter.ai"},
+        .thinking_format = "openrouter",
+    },
+};
+
+fn flavorMatches(model: types.Model, comptime flavor: OpenAICompatFlavor) bool {
+    inline for (flavor.providers) |p| {
+        if (std.mem.eql(u8, model.provider, p)) return true;
+    }
+    inline for (flavor.base_url_substrings) |s| {
+        if (std.mem.indexOf(u8, model.base_url, s) != null) return true;
+    }
+    return false;
+}
+
 pub fn getCompat(model: types.Model) OpenAICompat {
-    const is_non_standard = isNonStandardProvider(model);
-    const is_chutes = std.mem.indexOf(u8, model.base_url, "chutes.ai") != null;
-    const is_zai = std.mem.eql(u8, model.provider, "zai") or std.mem.indexOf(u8, model.base_url, "api.z.ai") != null or std.mem.indexOf(u8, model.base_url, "open.bigmodel.cn") != null;
-    const is_grok = std.mem.eql(u8, model.provider, "xai") or std.mem.indexOf(u8, model.base_url, "api.x.ai") != null;
-    const is_deepseek = std.mem.eql(u8, model.provider, "deepseek") or std.mem.indexOf(u8, model.base_url, "deepseek.com") != null;
-    const is_together = std.mem.eql(u8, model.provider, "together") or
-        std.mem.indexOf(u8, model.base_url, "api.together.ai") != null or
-        std.mem.indexOf(u8, model.base_url, "api.together.xyz") != null;
-    const is_cloudflare_workers_ai = std.mem.eql(u8, model.provider, "cloudflare-workers-ai") or std.mem.indexOf(u8, model.base_url, "api.cloudflare.com") != null;
-    const is_cloudflare_ai_gateway = std.mem.eql(u8, model.provider, "cloudflare-ai-gateway") or std.mem.indexOf(u8, model.base_url, "gateway.ai.cloudflare.com") != null;
-    const detected_thinking_format = if (is_deepseek)
-        "deepseek"
-    else if (is_zai)
-        "zai"
-    else if (is_together)
-        "together"
-    else if (std.mem.eql(u8, model.provider, "openrouter") or std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null)
-        "openrouter"
-    else
-        "openai";
+    var is_non_standard: bool = false;
+    var supports_reasoning_effort: ?bool = null;
+    var max_tokens_field: ?[]const u8 = null;
+    var requires_reasoning_content: ?bool = null;
+    var thinking_format: ?[]const u8 = null;
+    var supports_strict_mode: ?bool = null;
+    var supports_long_cache_retention: ?bool = null;
+
+    inline for (FLAVORS) |flavor| {
+        if (flavorMatches(model, flavor)) {
+            if (flavor.is_non_standard) is_non_standard = true;
+            if (supports_reasoning_effort == null) supports_reasoning_effort = flavor.supports_reasoning_effort;
+            if (max_tokens_field == null) max_tokens_field = flavor.max_tokens_field;
+            if (requires_reasoning_content == null) requires_reasoning_content = flavor.requires_reasoning_content_on_assistant_messages;
+            if (thinking_format == null) thinking_format = flavor.thinking_format;
+            if (supports_strict_mode == null) supports_strict_mode = flavor.supports_strict_mode;
+            if (supports_long_cache_retention == null) supports_long_cache_retention = flavor.supports_long_cache_retention;
+        }
+    }
+
+    // Non-tabular: OpenRouter routes anthropic/* models to Anthropic's API,
+    // which needs the anthropic cache_control breadcrumb on messages/tools.
+    // This is provider+id specific so it doesn't fit a (provider, base_url)
+    // flavor row.
     const detected_cache_control_format: ?[]const u8 = if (std.mem.eql(u8, model.provider, "openrouter") and std.mem.startsWith(u8, model.id, "anthropic/"))
         "anthropic"
     else
@@ -602,21 +714,21 @@ pub fn getCompat(model: types.Model) OpenAICompat {
     return .{
         .supports_store = compatBoolField(model.compat, "supportsStore") orelse !is_non_standard,
         .supports_developer_role = compatBoolField(model.compat, "supportsDeveloperRole") orelse !is_non_standard,
-        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (!is_grok and !is_zai and !is_together and !is_cloudflare_ai_gateway),
+        .supports_reasoning_effort = compatBoolField(model.compat, "supportsReasoningEffort") orelse (supports_reasoning_effort orelse true),
         .supports_usage_in_streaming = compatBoolField(model.compat, "supportsUsageInStreaming") orelse true,
-        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse if (is_chutes or is_together or is_cloudflare_ai_gateway) "max_tokens" else "max_completion_tokens",
+        .max_tokens_field = compatStringField(model.compat, "maxTokensField") orelse (max_tokens_field orelse "max_completion_tokens"),
         .requires_tool_result_name = compatBoolField(model.compat, "requiresToolResultName") orelse false,
         .requires_assistant_after_tool_result = compatBoolField(model.compat, "requiresAssistantAfterToolResult") orelse false,
         .requires_thinking_as_text = compatBoolField(model.compat, "requiresThinkingAsText") orelse false,
-        .requires_reasoning_content_on_assistant_messages = compatBoolField(model.compat, "requiresReasoningContentOnAssistantMessages") orelse is_deepseek,
-        .thinking_format = compatStringField(model.compat, "thinkingFormat") orelse detected_thinking_format,
+        .requires_reasoning_content_on_assistant_messages = compatBoolField(model.compat, "requiresReasoningContentOnAssistantMessages") orelse (requires_reasoning_content orelse false),
+        .thinking_format = compatStringField(model.compat, "thinkingFormat") orelse (thinking_format orelse "openai"),
         .open_router_routing = compatObjectValueField(model.compat, "openRouterRouting") orelse null,
         .vercel_gateway_routing = compatObjectValueField(model.compat, "vercelGatewayRouting") orelse null,
         .zai_tool_stream = compatBoolField(model.compat, "zaiToolStream") orelse false,
-        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse !(is_together or is_cloudflare_ai_gateway),
+        .supports_strict_mode = compatBoolField(model.compat, "supportsStrictMode") orelse (supports_strict_mode orelse true),
         .cache_control_format = compatStringField(model.compat, "cacheControlFormat") orelse detected_cache_control_format,
         .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse false,
-        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !(is_together or is_cloudflare_workers_ai or is_cloudflare_ai_gateway),
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse (supports_long_cache_retention orelse true),
     };
 }
 
@@ -645,35 +757,9 @@ fn compatObjectValueField(compat: ?std.json.Value, key: []const u8) ?std.json.Va
 }
 
 fn isNonStandardProvider(model: types.Model) bool {
-    const provider = model.provider;
-    const base_url = model.base_url;
-
-    if (std.mem.eql(u8, provider, "cerebras") or
-        std.mem.eql(u8, provider, "xai") or
-        std.mem.eql(u8, provider, "zai") or
-        std.mem.eql(u8, provider, "together") or
-        std.mem.eql(u8, provider, "opencode") or
-        std.mem.eql(u8, provider, "cloudflare-workers-ai") or
-        std.mem.eql(u8, provider, "cloudflare-ai-gateway"))
-    {
-        return true;
+    inline for (FLAVORS) |flavor| {
+        if (flavor.is_non_standard and flavorMatches(model, flavor)) return true;
     }
-
-    if (std.mem.indexOf(u8, base_url, "cerebras.ai") != null or
-        std.mem.indexOf(u8, base_url, "api.x.ai") != null or
-        std.mem.indexOf(u8, base_url, "chutes.ai") != null or
-        std.mem.indexOf(u8, base_url, "deepseek.com") != null or
-        std.mem.indexOf(u8, base_url, "api.z.ai") != null or
-        std.mem.indexOf(u8, base_url, "open.bigmodel.cn") != null or
-        std.mem.indexOf(u8, base_url, "api.together.ai") != null or
-        std.mem.indexOf(u8, base_url, "api.together.xyz") != null or
-        std.mem.indexOf(u8, base_url, "opencode.ai") != null or
-        std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null or
-        std.mem.indexOf(u8, base_url, "gateway.ai.cloudflare.com") != null)
-    {
-        return true;
-    }
-
     return false;
 }
 
