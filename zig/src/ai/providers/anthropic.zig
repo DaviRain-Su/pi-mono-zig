@@ -1064,7 +1064,7 @@ test "parse anthropic stream coerces end_turn to tool_use when tool calls are pr
     try std.testing.expect(stream_instance.next() == null);
 }
 
-test "parse kimi anthropic-compatible stream repairs malformed json and ignores unknown events" {
+test "ISS-003 kimi anthropic-compatible stream repairs malformed json and ignores unknown events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
@@ -1160,7 +1160,7 @@ test "parse kimi anthropic-compatible stream repairs malformed json and ignores 
     try std.testing.expectEqual(types.StopReason.tool_use, done_message.?.stop_reason);
 }
 
-test "parse kimi anthropic-compatible stream tolerates noncanonical chunk shapes" {
+test "ISS-003 kimi anthropic-compatible stream tolerates noncanonical chunk shapes" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
@@ -1355,7 +1355,7 @@ test "parse kimi anthropic-compatible stream ignores orphan tool input deltas af
     try std.testing.expect(done_message.?.tool_calls == null);
 }
 
-test "parse kimi anthropic-compatible stream finalizes recoverable partial EOF" {
+test "ISS-003 kimi anthropic-compatible stream finalizes recoverable partial EOF" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
@@ -1412,7 +1412,7 @@ test "parse kimi anthropic-compatible stream finalizes recoverable partial EOF" 
     try std.testing.expect(stream_instance.next() == null);
 }
 
-test "parse first-party anthropic unmatched lifecycle remains strict" {
+test "ISS-003 first-party anthropic unmatched lifecycle remains strict" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
@@ -1454,6 +1454,66 @@ test "parse first-party anthropic unmatched lifecycle remains strict" {
     try std.testing.expectEqualStrings("InvalidAnthropicChunk", error_event.error_message.?);
     try std.testing.expectEqualStrings("anthropic", error_event.message.?.provider);
     try std.testing.expectEqualStrings("claude-3-7-sonnet-latest", error_event.message.?.model);
+    try std.testing.expect(stream_instance.next() == null);
+}
+
+test "ISS-003 first-party anthropic malformed json remains strict" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_anthropic_strict_json\"}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"before strict failure\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"repair \\_blocked\"}}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream_instance.next().?.event_type);
+    const delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("before strict failure", delta.delta.?);
+    const text_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("before strict failure", text_end.content.?);
+    const error_event = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("anthropic", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("claude-3-7-sonnet-latest", error_event.message.?.model);
+    try std.testing.expectEqual(@as(usize, 1), error_event.message.?.content.len);
+    try std.testing.expectEqualStrings("before strict failure", error_event.message.?.content[0].text.text);
     try std.testing.expect(stream_instance.next() == null);
 }
 
@@ -2188,7 +2248,7 @@ fn processAnthropicSseEvent(
         return false;
     }
 
-    var parsed = json_parse.parseJsonWithRepair(allocator, data) catch |err| {
+    var parsed = parseAnthropicSseJson(allocator, data, tolerate_noncanonical) catch |err| {
         if (std.mem.eql(u8, sse_event, "error")) {
             try emitAnthropicStreamError(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, model, data);
             return true;
@@ -2277,6 +2337,18 @@ fn processAnthropicSseEvent(
     }
 
     return false;
+}
+
+fn parseAnthropicSseJson(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    tolerate_noncanonical: bool,
+) !std.json.Parsed(std.json.Value) {
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    if (tolerate_noncanonical) {
+        return json_parse.parseJsonWithRepair(allocator, trimmed);
+    }
+    return std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{ .allocate = .alloc_always });
 }
 
 fn emitAnthropicStreamError(
