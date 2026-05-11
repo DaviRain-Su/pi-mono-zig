@@ -56,6 +56,11 @@ pub const EditTool = struct {
     pub const description =
         "Edit a single file using one or more exact text replacements. Each search text must match exactly one location in the original file, and edits must not overlap.";
 
+    /// Edit args contain a nested edits slice that must be allocated by the
+    /// caller-provided `parseArguments`, so it cannot use the reflection-only
+    /// generic adapter.
+    pub const use_default_adapter = false;
+
     pub fn init(cwd: []const u8, io: std.Io) EditTool {
         return .{
             .cwd = cwd,

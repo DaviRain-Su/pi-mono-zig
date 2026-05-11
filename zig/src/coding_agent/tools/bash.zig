@@ -139,6 +139,10 @@ pub const BashTool = struct {
         "Execute a shell command in the configured working directory. " ++
         "Combined stdout/stderr output is truncated to the last 2000 lines or 50KB, supports timeouts, and kills the entire process group on timeout.";
 
+    /// Bash uses `executeWithUpdates` plus a custom forwarding context to
+    /// expose streaming output, so the generic adapter cannot wire it in.
+    pub const use_default_adapter = false;
+
     pub fn init(cwd: []const u8, io: std.Io) BashTool {
         return .{
             .cwd = cwd,

@@ -1650,29 +1650,57 @@ fn getAppContext(tool_context: ?*anyopaque) !*AppContext {
     return @ptrCast(@alignCast(tool_context orelse return error.InvalidToolContext));
 }
 
-const BUILTIN_TOOL_EXECUTORS = [_]agent.types.ExecuteToolFn{
-    runReadTool,
-    runBashTool,
-    runWriteTool,
-    runEditTool,
-    runGrepTool,
-    runFindTool,
-    runLsTool,
+/// Derived built-in tool executor table.
+///
+/// Each entry in `tools.ALL` either uses the default adapter (parse args via
+/// reflection, call `T.init(cwd, io).execute(allocator, args)`, surface
+/// `result.content`) or opts out by declaring
+/// `pub const use_default_adapter = false;` on the tool type. Opt-out tools
+/// keep their hand-written wrapper below and must be wired into
+/// `customExecutorFor` so the executor table stays in lockstep with
+/// `tools.ALL`.
+const BUILTIN_TOOL_EXECUTORS = blk: {
+    var arr: [tools.ALL.len]agent.types.ExecuteToolFn = undefined;
+    var seen_names: [tools.ALL.len][]const u8 = undefined;
+    for (tools.ALL, 0..) |T, i| {
+        for (seen_names[0..i]) |existing| {
+            if (std.mem.eql(u8, existing, T.name)) {
+                @compileError("duplicate built-in tool name in tools.ALL: " ++ T.name);
+            }
+        }
+        seen_names[i] = T.name;
+        arr[i] = if (@hasDecl(T, "use_default_adapter") and !T.use_default_adapter)
+            customExecutorFor(T)
+        else
+            defaultToolAdapter(T);
+    }
+    break :blk arr;
 };
 
-fn runReadTool(
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    params: std.json.Value,
-    tool_context: ?*anyopaque,
-    _: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
-) !agent.AgentToolResult {
-    const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.parseArgsFromJson(tools.ReadArgs, allocator, params);
-    const result = try tools.ReadTool.init(runtime.cwd, runtime.io).execute(allocator, args);
-    return .{ .content = result.content };
+fn customExecutorFor(comptime T: type) agent.types.ExecuteToolFn {
+    if (T == tools.BashTool) return runBashTool;
+    if (T == tools.EditTool) return runEditTool;
+    @compileError("Tool " ++ T.name ++ " opts out of the default adapter but no custom executor is wired in customExecutorFor.");
+}
+
+fn defaultToolAdapter(comptime T: type) agent.types.ExecuteToolFn {
+    const ArgsT = @typeInfo(@TypeOf(T.execute)).@"fn".params[2].type.?;
+    return struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            params: std.json.Value,
+            tool_context: ?*anyopaque,
+            _: ?*const std.atomic.Value(bool),
+            _: ?*anyopaque,
+            _: ?agent.types.AgentToolUpdateCallback,
+        ) !agent.AgentToolResult {
+            const runtime = (try getAppContext(tool_context)).tool_runtime;
+            const args = try tools.parseArgsFromJson(ArgsT, allocator, params);
+            const result = try T.init(runtime.cwd, runtime.io).execute(allocator, args);
+            return .{ .content = result.content };
+        }
+    }.run;
 }
 
 fn runBashTool(
@@ -1731,21 +1759,6 @@ fn forwardBashToolUpdate(
     try callback(forward_context.downstream_context, partial);
 }
 
-fn runWriteTool(
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    params: std.json.Value,
-    tool_context: ?*anyopaque,
-    _: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
-) !agent.AgentToolResult {
-    const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.parseArgsFromJson(tools.WriteArgs, allocator, params);
-    const result = try tools.WriteTool.init(runtime.cwd, runtime.io).execute(allocator, args);
-    return .{ .content = result.content };
-}
-
 fn runEditTool(
     allocator: std.mem.Allocator,
     _: []const u8,
@@ -1760,51 +1773,6 @@ fn runEditTool(
     defer parsed_args_storage.deinit(allocator);
     const edit_args = parsed_args_storage.toArgs();
     const result = try tools.EditTool.init(runtime.cwd, runtime.io).execute(allocator, edit_args);
-    return .{ .content = result.content };
-}
-
-fn runGrepTool(
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    params: std.json.Value,
-    tool_context: ?*anyopaque,
-    _: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
-) !agent.AgentToolResult {
-    const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.parseArgsFromJson(tools.GrepArgs, allocator, params);
-    const result = try tools.GrepTool.init(runtime.cwd, runtime.io).execute(allocator, args);
-    return .{ .content = result.content };
-}
-
-fn runFindTool(
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    params: std.json.Value,
-    tool_context: ?*anyopaque,
-    _: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
-) !agent.AgentToolResult {
-    const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.parseArgsFromJson(tools.FindArgs, allocator, params);
-    const result = try tools.FindTool.init(runtime.cwd, runtime.io).execute(allocator, args);
-    return .{ .content = result.content };
-}
-
-fn runLsTool(
-    allocator: std.mem.Allocator,
-    _: []const u8,
-    params: std.json.Value,
-    tool_context: ?*anyopaque,
-    _: ?*const std.atomic.Value(bool),
-    _: ?*anyopaque,
-    _: ?agent.types.AgentToolUpdateCallback,
-) !agent.AgentToolResult {
-    const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.parseArgsFromJson(tools.LsArgs, allocator, params);
-    const result = try tools.LsTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
 }
 
