@@ -471,6 +471,144 @@ fn loadSettingsFile(
     return parseSettingsContent(allocator, path, content.?, errors, source);
 }
 
+/// Kinds covering every simple settings field that the table-driven parser
+/// and merger need to know about. Irregular fields (`compaction`, `retry`,
+/// `packages`, `extensionPolicies`) are handled out-of-band.
+const SettingFieldKind = enum {
+    string_alloc,
+    bool_field,
+    positive_usize,
+    non_negative_usize,
+    thinking_level,
+    transport,
+    queue_mode,
+    double_escape_action,
+    tree_filter_mode,
+    string_list,
+};
+
+const SettingFieldSpec = struct {
+    json_key: []const u8,
+    field: []const u8,
+    kind: SettingFieldKind,
+};
+
+const SettingGroupSpec = struct {
+    json_key: []const u8,
+    fields: []const SettingFieldSpec,
+};
+
+const TOP_LEVEL_SETTINGS: []const SettingFieldSpec = &.{
+    .{ .json_key = "defaultProvider", .field = "default_provider", .kind = .string_alloc },
+    .{ .json_key = "defaultModel", .field = "default_model", .kind = .string_alloc },
+    .{ .json_key = "enabledModels", .field = "enabled_models", .kind = .string_list },
+    .{ .json_key = "defaultThinkingLevel", .field = "default_thinking_level", .kind = .thinking_level },
+    .{ .json_key = "transport", .field = "transport", .kind = .transport },
+    .{ .json_key = "steeringMode", .field = "steering_mode", .kind = .queue_mode },
+    .{ .json_key = "followUpMode", .field = "follow_up_mode", .kind = .queue_mode },
+    .{ .json_key = "theme", .field = "theme", .kind = .string_alloc },
+    .{ .json_key = "sessionDir", .field = "session_dir", .kind = .string_alloc },
+    .{ .json_key = "hideThinkingBlock", .field = "hide_thinking_block", .kind = .bool_field },
+    .{ .json_key = "quietStartup", .field = "quiet_startup", .kind = .bool_field },
+    .{ .json_key = "collapseChangelog", .field = "collapse_changelog", .kind = .bool_field },
+    .{ .json_key = "enableInstallTelemetry", .field = "enable_install_telemetry", .kind = .bool_field },
+    .{ .json_key = "enableSkillCommands", .field = "enable_skill_commands", .kind = .bool_field },
+    .{ .json_key = "showHardwareCursor", .field = "show_hardware_cursor", .kind = .bool_field },
+    .{ .json_key = "editorPaddingX", .field = "editor_padding_x", .kind = .non_negative_usize },
+    .{ .json_key = "autocompleteMaxVisible", .field = "autocomplete_max_visible", .kind = .positive_usize },
+    .{ .json_key = "doubleEscapeAction", .field = "double_escape_action", .kind = .double_escape_action },
+    .{ .json_key = "treeFilterMode", .field = "tree_filter_mode", .kind = .tree_filter_mode },
+    .{ .json_key = "extensions", .field = "extensions", .kind = .string_list },
+    .{ .json_key = "skills", .field = "skills", .kind = .string_list },
+    .{ .json_key = "prompts", .field = "prompts", .kind = .string_list },
+    .{ .json_key = "themes", .field = "themes", .kind = .string_list },
+};
+
+const TERMINAL_FIELDS: []const SettingFieldSpec = &.{
+    .{ .json_key = "showImages", .field = "terminal_show_images", .kind = .bool_field },
+    .{ .json_key = "imageWidthCells", .field = "terminal_image_width_cells", .kind = .positive_usize },
+    .{ .json_key = "clearOnShrink", .field = "terminal_clear_on_shrink", .kind = .bool_field },
+    .{ .json_key = "showTerminalProgress", .field = "terminal_show_progress", .kind = .bool_field },
+};
+
+const IMAGES_FIELDS: []const SettingFieldSpec = &.{
+    .{ .json_key = "autoResize", .field = "image_auto_resize", .kind = .bool_field },
+    .{ .json_key = "blockImages", .field = "image_block_images", .kind = .bool_field },
+};
+
+const WARNINGS_FIELDS: []const SettingFieldSpec = &.{
+    .{ .json_key = "anthropicExtraUsage", .field = "warning_anthropic_extra_usage", .kind = .bool_field },
+};
+
+const BRANCH_SUMMARY_FIELDS: []const SettingFieldSpec = &.{
+    .{ .json_key = "skipPrompt", .field = "branch_summary_skip_prompt", .kind = .bool_field },
+};
+
+const NESTED_SETTINGS: []const SettingGroupSpec = &.{
+    .{ .json_key = "terminal", .fields = TERMINAL_FIELDS },
+    .{ .json_key = "images", .fields = IMAGES_FIELDS },
+    .{ .json_key = "warnings", .fields = WARNINGS_FIELDS },
+    .{ .json_key = "branchSummary", .fields = BRANCH_SUMMARY_FIELDS },
+};
+
+comptime {
+    for (TOP_LEVEL_SETTINGS) |spec| {
+        if (!@hasField(Settings, spec.field)) @compileError("invalid Settings field name: " ++ spec.field);
+    }
+    for (NESTED_SETTINGS) |group| {
+        for (group.fields) |spec| {
+            if (!@hasField(Settings, spec.field)) @compileError("invalid Settings field name: " ++ spec.field);
+        }
+    }
+}
+
+/// Apply a single spec to `settings` from a JSON value that is already
+/// known to exist (caller has already done `object.get(key)`).
+/// Wrong-typed values are silently ignored to preserve the prior chain's
+/// behavior — for example a string under `hideThinkingBlock` leaves the
+/// field at its default rather than emitting a diagnostic.
+fn applySettingFromJson(
+    comptime spec: SettingFieldSpec,
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    settings: *Settings,
+) !void {
+    switch (spec.kind) {
+        .string_alloc => {
+            if (value == .string) {
+                @field(settings, spec.field) = try allocator.dupe(u8, value.string);
+            }
+        },
+        .bool_field => {
+            if (value == .bool) @field(settings, spec.field) = value.bool;
+        },
+        .positive_usize => {
+            @field(settings, spec.field) = parsePositiveUsize(value);
+        },
+        .non_negative_usize => {
+            @field(settings, spec.field) = parseNonNegativeUsize(value);
+        },
+        .thinking_level => {
+            if (value == .string) @field(settings, spec.field) = parseThinkingLevel(value.string);
+        },
+        .transport => {
+            if (value == .string) @field(settings, spec.field) = parseTransport(value.string);
+        },
+        .queue_mode => {
+            if (value == .string) @field(settings, spec.field) = parseQueueModeSetting(value.string);
+        },
+        .double_escape_action => {
+            if (value == .string) @field(settings, spec.field) = parseDoubleEscapeAction(value.string);
+        },
+        .tree_filter_mode => {
+            if (value == .string) @field(settings, spec.field) = parseTreeFilterMode(value.string);
+        },
+        .string_list => {
+            @field(settings, spec.field) = try parseStringList(allocator, value);
+        },
+    }
+}
+
 fn parseSettingsContent(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -489,101 +627,24 @@ fn parseSettingsContent(
         return result;
     }
 
-    if (parsed.value.object.get("defaultProvider")) |value| {
-        if (value == .string) result.default_provider = try allocator.dupe(u8, value.string);
+    inline for (TOP_LEVEL_SETTINGS) |spec| {
+        if (parsed.value.object.get(spec.json_key)) |value| {
+            try applySettingFromJson(spec, allocator, value, &result);
+        }
     }
-    if (parsed.value.object.get("defaultModel")) |value| {
-        if (value == .string) result.default_model = try allocator.dupe(u8, value.string);
-    }
-    result.enabled_models = try parseStringList(allocator, parsed.value.object.get("enabledModels"));
-    if (parsed.value.object.get("defaultThinkingLevel")) |value| {
-        if (value == .string) result.default_thinking_level = parseThinkingLevel(value.string);
-    }
-    if (parsed.value.object.get("transport")) |value| {
-        if (value == .string) result.transport = parseTransport(value.string);
-    }
-    if (parsed.value.object.get("steeringMode")) |value| {
-        if (value == .string) result.steering_mode = parseQueueModeSetting(value.string);
-    }
-    if (parsed.value.object.get("followUpMode")) |value| {
-        if (value == .string) result.follow_up_mode = parseQueueModeSetting(value.string);
-    }
-    if (parsed.value.object.get("theme")) |value| {
-        if (value == .string) result.theme = try allocator.dupe(u8, value.string);
-    }
-    if (parsed.value.object.get("sessionDir")) |value| {
-        if (value == .string) result.session_dir = try allocator.dupe(u8, value.string);
-    }
-    if (parsed.value.object.get("hideThinkingBlock")) |value| {
-        if (value == .bool) result.hide_thinking_block = value.bool;
-    }
-    if (parsed.value.object.get("quietStartup")) |value| {
-        if (value == .bool) result.quiet_startup = value.bool;
-    }
-    if (parsed.value.object.get("collapseChangelog")) |value| {
-        if (value == .bool) result.collapse_changelog = value.bool;
-    }
-    if (parsed.value.object.get("enableInstallTelemetry")) |value| {
-        if (value == .bool) result.enable_install_telemetry = value.bool;
-    }
-    if (parsed.value.object.get("enableSkillCommands")) |value| {
-        if (value == .bool) result.enable_skill_commands = value.bool;
-    }
-    if (parsed.value.object.get("showHardwareCursor")) |value| {
-        if (value == .bool) result.show_hardware_cursor = value.bool;
-    }
-    if (parsed.value.object.get("terminal")) |terminal_value| {
-        if (terminal_value == .object) {
-            if (terminal_value.object.get("showImages")) |inner| {
-                if (inner == .bool) result.terminal_show_images = inner.bool;
-            }
-            if (terminal_value.object.get("imageWidthCells")) |inner| {
-                result.terminal_image_width_cells = parsePositiveUsize(inner);
-            }
-            if (terminal_value.object.get("clearOnShrink")) |inner| {
-                if (inner == .bool) result.terminal_clear_on_shrink = inner.bool;
-            }
-            if (terminal_value.object.get("showTerminalProgress")) |inner| {
-                if (inner == .bool) result.terminal_show_progress = inner.bool;
+
+    inline for (NESTED_SETTINGS) |group| {
+        if (parsed.value.object.get(group.json_key)) |group_value| {
+            if (group_value == .object) {
+                inline for (group.fields) |spec| {
+                    if (group_value.object.get(spec.json_key)) |value| {
+                        try applySettingFromJson(spec, allocator, value, &result);
+                    }
+                }
             }
         }
     }
-    if (parsed.value.object.get("editorPaddingX")) |value| {
-        result.editor_padding_x = parseNonNegativeUsize(value);
-    }
-    if (parsed.value.object.get("autocompleteMaxVisible")) |value| {
-        result.autocomplete_max_visible = parsePositiveUsize(value);
-    }
-    if (parsed.value.object.get("images")) |images_value| {
-        if (images_value == .object) {
-            if (images_value.object.get("autoResize")) |inner| {
-                if (inner == .bool) result.image_auto_resize = inner.bool;
-            }
-            if (images_value.object.get("blockImages")) |inner| {
-                if (inner == .bool) result.image_block_images = inner.bool;
-            }
-        }
-    }
-    if (parsed.value.object.get("doubleEscapeAction")) |value| {
-        if (value == .string) result.double_escape_action = parseDoubleEscapeAction(value.string);
-    }
-    if (parsed.value.object.get("treeFilterMode")) |value| {
-        if (value == .string) result.tree_filter_mode = parseTreeFilterMode(value.string);
-    }
-    if (parsed.value.object.get("warnings")) |warnings_value| {
-        if (warnings_value == .object) {
-            if (warnings_value.object.get("anthropicExtraUsage")) |inner| {
-                if (inner == .bool) result.warning_anthropic_extra_usage = inner.bool;
-            }
-        }
-    }
-    if (parsed.value.object.get("branchSummary")) |value| {
-        if (value == .object) {
-            if (value.object.get("skipPrompt")) |inner| {
-                if (inner == .bool) result.branch_summary_skip_prompt = inner.bool;
-            }
-        }
-    }
+
     if (parsed.value.object.get("compaction")) |value| {
         result.compaction = parseCompactionSettings(value);
     }
@@ -591,10 +652,6 @@ fn parseSettingsContent(
         result.retry = parseRetrySettings(value);
     }
     result.packages = try parsePackageSources(allocator, parsed.value.object.get("packages"));
-    result.extensions = try parseStringList(allocator, parsed.value.object.get("extensions"));
-    result.skills = try parseStringList(allocator, parsed.value.object.get("skills"));
-    result.prompts = try parseStringList(allocator, parsed.value.object.get("prompts"));
-    result.themes = try parseStringList(allocator, parsed.value.object.get("themes"));
     result.extension_policies = try parseExtensionPolicyMap(
         allocator,
         parsed.value.object.get("extensionPolicies"),
@@ -605,75 +662,53 @@ fn parseSettingsContent(
     return result;
 }
 
+/// Merge a single spec from `overrides` into `merged`. The semantics mirror
+/// the prior per-field chain: optional scalars copy when set, strings are
+/// duplicated, and string lists are wholly replaced when present on the
+/// override (including empty-list overrides).
+fn mergeSettingFromOverride(
+    comptime spec: SettingFieldSpec,
+    allocator: std.mem.Allocator,
+    overrides: Settings,
+    merged: *Settings,
+) !void {
+    switch (spec.kind) {
+        .string_alloc => {
+            if (@field(overrides, spec.field)) |value| {
+                if (@field(merged, spec.field)) |existing| allocator.free(existing);
+                @field(merged, spec.field) = try allocator.dupe(u8, value);
+            }
+        },
+        .string_list => {
+            if (@field(overrides, spec.field) != null) {
+                freeStringList(allocator, @field(merged, spec.field));
+                @field(merged, spec.field) = try cloneStringList(allocator, @field(overrides, spec.field));
+            }
+        },
+        else => {
+            if (@field(overrides, spec.field)) |value| @field(merged, spec.field) = value;
+        },
+    }
+}
+
 fn mergeSettings(allocator: std.mem.Allocator, base: Settings, overrides: Settings) !Settings {
     var merged = try base.clone(allocator);
     errdefer merged.deinit(allocator);
 
-    if (overrides.default_provider) |value| {
-        if (merged.default_provider) |existing| allocator.free(existing);
-        merged.default_provider = try allocator.dupe(u8, value);
+    inline for (TOP_LEVEL_SETTINGS) |spec| {
+        try mergeSettingFromOverride(spec, allocator, overrides, &merged);
     }
-    if (overrides.default_model) |value| {
-        if (merged.default_model) |existing| allocator.free(existing);
-        merged.default_model = try allocator.dupe(u8, value);
+    inline for (NESTED_SETTINGS) |group| {
+        inline for (group.fields) |spec| {
+            try mergeSettingFromOverride(spec, allocator, overrides, &merged);
+        }
     }
-    if (overrides.enabled_models != null) {
-        freeStringList(allocator, merged.enabled_models);
-        merged.enabled_models = try cloneStringList(allocator, overrides.enabled_models);
-    }
-    if (overrides.default_thinking_level) |value| {
-        merged.default_thinking_level = value;
-    }
-    if (overrides.transport) |value| merged.transport = value;
-    if (overrides.steering_mode) |value| merged.steering_mode = value;
-    if (overrides.follow_up_mode) |value| merged.follow_up_mode = value;
-    if (overrides.theme) |value| {
-        if (merged.theme) |existing| allocator.free(existing);
-        merged.theme = try allocator.dupe(u8, value);
-    }
-    if (overrides.session_dir) |value| {
-        if (merged.session_dir) |existing| allocator.free(existing);
-        merged.session_dir = try allocator.dupe(u8, value);
-    }
-    if (overrides.hide_thinking_block) |value| merged.hide_thinking_block = value;
-    if (overrides.quiet_startup) |value| merged.quiet_startup = value;
-    if (overrides.collapse_changelog) |value| merged.collapse_changelog = value;
-    if (overrides.enable_install_telemetry) |value| merged.enable_install_telemetry = value;
-    if (overrides.enable_skill_commands) |value| merged.enable_skill_commands = value;
-    if (overrides.show_hardware_cursor) |value| merged.show_hardware_cursor = value;
-    if (overrides.terminal_show_images) |value| merged.terminal_show_images = value;
-    if (overrides.terminal_image_width_cells) |value| merged.terminal_image_width_cells = value;
-    if (overrides.terminal_clear_on_shrink) |value| merged.terminal_clear_on_shrink = value;
-    if (overrides.terminal_show_progress) |value| merged.terminal_show_progress = value;
-    if (overrides.editor_padding_x) |value| merged.editor_padding_x = value;
-    if (overrides.autocomplete_max_visible) |value| merged.autocomplete_max_visible = value;
-    if (overrides.image_auto_resize) |value| merged.image_auto_resize = value;
-    if (overrides.image_block_images) |value| merged.image_block_images = value;
-    if (overrides.double_escape_action) |value| merged.double_escape_action = value;
-    if (overrides.tree_filter_mode) |value| merged.tree_filter_mode = value;
-    if (overrides.warning_anthropic_extra_usage) |value| merged.warning_anthropic_extra_usage = value;
-    if (overrides.branch_summary_skip_prompt) |value| merged.branch_summary_skip_prompt = value;
+
     merged.compaction = mergeCompaction(base.compaction, overrides.compaction);
     merged.retry = mergeRetry(base.retry, overrides.retry);
     if (overrides.packages != null) {
         freePackageSources(allocator, merged.packages);
         merged.packages = try clonePackageSources(allocator, overrides.packages);
-    }
-    if (overrides.extensions != null) {
-        freeStringList(allocator, merged.extensions);
-        merged.extensions = try cloneStringList(allocator, overrides.extensions);
-    }
-    if (overrides.skills != null) {
-        freeStringList(allocator, merged.skills);
-        merged.skills = try cloneStringList(allocator, overrides.skills);
-    }
-    if (overrides.prompts != null) {
-        freeStringList(allocator, merged.prompts);
-        merged.prompts = try cloneStringList(allocator, overrides.prompts);
-    }
-    if (overrides.themes != null) {
-        freeStringList(allocator, merged.themes);
-        merged.themes = try cloneStringList(allocator, overrides.themes);
     }
     if (overrides.extension_policies != null) {
         const replacement = try mergeExtensionPolicyMaps(allocator, merged.extension_policies, overrides.extension_policies);
