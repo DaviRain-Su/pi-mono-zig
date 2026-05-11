@@ -1575,13 +1575,7 @@ pub fn normalizeSemanticHeaders(
     return semantic;
 }
 
-fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    const output = try allocator.alloc(u8, input.len);
-    for (input, 0..) |byte, index| {
-        output[index] = std.ascii.toLower(byte);
-    }
-    return output;
-}
+const asciiLowerAlloc = @import("../shared/string_utils.zig").asciiLowerAlloc;
 
 fn parseTextSignature(allocator: std.mem.Allocator, signature: ?[]const u8, message_index: usize) !ParsedTextSignature {
     const value = signature orelse return .{ .id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index}), .phase = null };
@@ -1922,12 +1916,7 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
+const freeToolCallOwned = types.freeToolCall;
 
 fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !types.ToolCall {
     const id = try allocator.dupe(u8, tool_call.id);
@@ -1945,33 +1934,7 @@ fn cloneToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) !
     };
 }
 
-fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
-    for (message.content) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
-        }
-    }
-    allocator.free(message.content);
-    if (message.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
-        allocator.free(tool_calls);
-    }
-    if (message.response_id) |response_id| allocator.free(response_id);
-    if (message.error_message) |error_message| allocator.free(error_message);
-}
+const freeAssistantMessageOwned = types.freeAssistantMessage;
 
 fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
     if (event.delta) |delta| allocator.free(delta);

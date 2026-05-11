@@ -357,12 +357,12 @@ fn jsonObjectMayShareStorage(a: std.json.ObjectMap, b: std.json.ObjectMap) bool 
     return false;
 }
 
-fn freeContentBlocks(allocator: std.mem.Allocator, blocks: []const ContentBlock) void {
+pub fn freeContentBlocks(allocator: std.mem.Allocator, blocks: []const ContentBlock) void {
     for (blocks) |block| freeContentBlock(allocator, block);
     allocator.free(blocks);
 }
 
-fn freeContentBlock(allocator: std.mem.Allocator, block: ContentBlock) void {
+pub fn freeContentBlock(allocator: std.mem.Allocator, block: ContentBlock) void {
     switch (block) {
         .text => |text| {
             allocator.free(text.text);
@@ -381,12 +381,12 @@ fn freeContentBlock(allocator: std.mem.Allocator, block: ContentBlock) void {
     }
 }
 
-fn freeToolCalls(allocator: std.mem.Allocator, tool_calls: []const ToolCall) void {
+pub fn freeToolCalls(allocator: std.mem.Allocator, tool_calls: []const ToolCall) void {
     for (tool_calls) |tool_call| freeToolCall(allocator, tool_call);
     allocator.free(tool_calls);
 }
 
-fn freeToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) void {
+pub fn freeToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);
     if (tool_call.thought_signature) |signature| allocator.free(signature);

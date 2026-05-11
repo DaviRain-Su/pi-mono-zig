@@ -373,13 +373,7 @@ fn normalizeSemanticHeaders(
     return semantic;
 }
 
-fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    const output = try allocator.alloc(u8, input.len);
-    for (input, 0..) |byte, index| {
-        output[index] = std.ascii.toLower(byte);
-    }
-    return output;
-}
+const asciiLowerAlloc = @import("../shared/string_utils.zig").asciiLowerAlloc;
 
 fn trimRightScalar(value: []const u8, scalar: u8) []const u8 {
     var end = value.len;

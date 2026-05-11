@@ -37,6 +37,22 @@ pub fn writeRedactedDiagnosticString(writer: *std.Io.Writer, value: []const u8) 
     }
 }
 
+/// Allocates a lowercased copy of `input`.
+pub fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const output = try allocator.alloc(u8, input.len);
+    for (input, 0..) |byte, index| {
+        output[index] = std.ascii.toLower(byte);
+    }
+    return output;
+}
+
+test "asciiLowerAlloc produces lowercase copy" {
+    const allocator = std.testing.allocator;
+    const result = try asciiLowerAlloc(allocator, "Hello WORLD 123");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("hello world 123", result);
+}
+
 test "containsIgnoreCase matches substrings case-insensitively" {
     try std.testing.expect(containsIgnoreCase("Hello World", "hello"));
     try std.testing.expect(containsIgnoreCase("Hello World", "WORLD"));

@@ -3001,13 +3001,7 @@ fn deinitOwnedHeaders(allocator: std.mem.Allocator, headers: *std.StringHashMap(
     headers.deinit();
 }
 
-fn asciiLowerAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    const output = try allocator.alloc(u8, input.len);
-    for (input, 0..) |byte, index| {
-        output[index] = std.ascii.toLower(byte);
-    }
-    return output;
-}
+const asciiLowerAlloc = @import("../shared/string_utils.zig").asciiLowerAlloc;
 
 /// Normalize response header names to TypeScript-compatible lowercase keys
 /// before invoking `on_response` callbacks. Mirrors the OpenAI Chat path so
@@ -3210,43 +3204,11 @@ fn drainStreamAndFreeDoneMessage(
 ) !void {
     while (stream.next()) |event| {
         defer event.deinitTransient(allocator);
-        if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+        if (event.message) |message| types.freeAssistantMessage(allocator, message);
     }
 }
 
-fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
 
-fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
-    for (message.content) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
-        }
-    }
-    if (message.content.len > 0) allocator.free(message.content);
-    if (message.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
-        allocator.free(tool_calls);
-    }
-    if (message.response_id) |response_id| allocator.free(response_id);
-}
 
 fn deinitJsonArrayItems(allocator: std.mem.Allocator, array: *std.json.Array) void {
     anthropic_json.deinitJsonArrayItems(allocator, array);

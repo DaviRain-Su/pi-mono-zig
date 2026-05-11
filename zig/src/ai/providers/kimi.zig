@@ -909,37 +909,8 @@ fn freeEvent(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) v
     if (event.error_message) |error_message| allocator.free(error_message);
 }
 
-fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
-
-fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
-    for (message.content) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .image => {},
-            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
-        }
-    }
-    allocator.free(message.content);
-    if (message.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
-        allocator.free(tool_calls);
-    }
-    if (message.response_id) |response_id| allocator.free(response_id);
-    if (message.error_message) |error_message| allocator.free(error_message);
-}
+const freeToolCallOwned = types.freeToolCall;
+const freeAssistantMessageOwned = types.freeAssistantMessage;
 
 test "buildRequestPayload uses kimi-specific fields" {
     const allocator = std.testing.allocator;
