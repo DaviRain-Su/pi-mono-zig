@@ -741,8 +741,8 @@ fn normalizeCapabilities(
         break :blk (try common.cloneJsonValue(allocator, value)).object;
     } else try std.json.ObjectMap.init(allocator, &.{}, &.{});
     errdefer common.deinitJsonValue(allocator, .{ .object = object });
-    if (object.get("exports") == null) try common.putValue(allocator, &object, "exports", try emptyArrayValue(allocator));
-    if (object.get("imports") == null) try common.putValue(allocator, &object, "imports", try emptyArrayValue(allocator));
+    try ensureArrayDefault(allocator, &object, "exports");
+    try ensureArrayDefault(allocator, &object, "imports");
     return .{ .valid = .{ .object = object } };
 }
 
@@ -869,8 +869,8 @@ fn normalizeWorkflows(
         if (workflow.get("inputSchema") == null) try common.putValue(allocator, &workflow, "inputSchema", try emptyObjectValue(allocator));
         if (workflow.get("outputSchema") == null) try common.putValue(allocator, &workflow, "outputSchema", try emptyObjectValue(allocator));
         if (workflow.get("executionMode") == null) try common.putString(allocator, &workflow, "executionMode", "agent");
-        if (workflow.get("permissions") == null) try common.putValue(allocator, &workflow, "permissions", try emptyArrayValue(allocator));
-        if (workflow.get("dependencies") == null) try common.putValue(allocator, &workflow, "dependencies", try emptyArrayValue(allocator));
+        try ensureArrayDefault(allocator, &workflow, "permissions");
+        try ensureArrayDefault(allocator, &workflow, "dependencies");
         if (workflow.get("timeoutMs") == null) try common.putInt(allocator, &workflow, "timeoutMs", 30000);
         if (workflow.get("cancellation") == null) try common.putValue(allocator, &workflow, "cancellation", try workflowCancellationDefault(allocator));
         if (workflow.get("replay") == null) try common.putValue(allocator, &workflow, "replay", try workflowReplayDefault(allocator));
@@ -1060,7 +1060,7 @@ fn normalizeDeclarationDefaults(
             const id = entry.get("id").?.string;
             if (entry.get("name") == null) try common.putString(allocator, &entry, "name", id);
             if (entry.get("displayName") == null) try common.putString(allocator, &entry, "displayName", id);
-            if (entry.get("models") == null) try common.putValue(allocator, &entry, "models", try emptyArrayValue(allocator));
+            try ensureArrayDefault(allocator, &entry, "models");
             if (entry.get("credentialRequired") == null) try common.putBool(allocator, &entry, "credentialRequired", false);
         },
     }
@@ -1107,6 +1107,29 @@ fn arraySection(
 
 fn emptyArrayValue(allocator: std.mem.Allocator) !std.json.Value {
     return .{ .array = std.json.Array.init(allocator) };
+}
+
+/// Adds `field -> []` to `object` when the key is currently absent. Used to
+/// canonicalize manifest objects so consumers can treat missing arrays and
+/// empty arrays identically. `object` accepts either `*ObjectMap` or
+/// `**ObjectMap` to match the calling-convention used by call sites that
+/// already hold a pointer.
+fn ensureArrayDefault(
+    allocator: std.mem.Allocator,
+    object: anytype,
+    field: []const u8,
+) !void {
+    const map_ptr = mapPtrFromAny(object);
+    if (map_ptr.get(field) != null) return;
+    try common.putValue(allocator, map_ptr, field, try emptyArrayValue(allocator));
+}
+
+inline fn mapPtrFromAny(object: anytype) *std.json.ObjectMap {
+    const T = @TypeOf(object);
+    const info = @typeInfo(T).pointer;
+    if (info.child == std.json.ObjectMap) return object;
+    // Otherwise it's already a `*ObjectMap` pointed-to via another pointer.
+    return object.*;
 }
 
 fn emptyObjectValue(allocator: std.mem.Allocator) !std.json.Value {

@@ -172,13 +172,13 @@ pub fn extensionForKind(kind: ArtifactKind) []const u8 {
 }
 
 pub fn getFileType(filename: []const u8) ArtifactKind {
-    const extension = extensionLower(filename);
-    if (std.mem.eql(u8, extension, "html")) return .html;
-    if (std.mem.eql(u8, extension, "svg")) return .svg;
-    if (std.mem.eql(u8, extension, "md") or std.mem.eql(u8, extension, "markdown")) return .markdown;
-    if (std.mem.eql(u8, extension, "pdf")) return .pdf;
-    if (std.mem.eql(u8, extension, "xlsx") or std.mem.eql(u8, extension, "xls")) return .excel;
-    if (std.mem.eql(u8, extension, "docx")) return .docx;
+    const extension = rawExtension(filename);
+    if (extensionEquals(extension, "html")) return .html;
+    if (extensionEquals(extension, "svg")) return .svg;
+    if (extensionEquals(extension, "md") or extensionEquals(extension, "markdown")) return .markdown;
+    if (extensionEquals(extension, "pdf")) return .pdf;
+    if (extensionEquals(extension, "xlsx") or extensionEquals(extension, "xls")) return .excel;
+    if (extensionEquals(extension, "docx")) return .docx;
     if (isImageExtension(extension)) return .image;
     if (isTextExtension(extension)) return .text;
     return .generic;
@@ -203,30 +203,42 @@ fn replaceRange(allocator: std.mem.Allocator, source: []const u8, start: usize, 
     return out.toOwnedSlice();
 }
 
-fn extensionLower(filename: []const u8) []const u8 {
+fn rawExtension(filename: []const u8) []const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, filename, '.') orelse return "";
-    return asciiLowerStatic(filename[dot + 1 ..]);
+    return filename[dot + 1 ..];
 }
 
-fn asciiLowerStatic(value: []const u8) []const u8 {
-    // All extensions checked by this module are ASCII and usually already lowercase.
-    // This covers common uppercase extensions without allocating.
-    var buffer: [32]u8 = undefined;
-    if (value.len > buffer.len) return value;
-    for (value, 0..) |byte, index| buffer[index] = std.ascii.toLower(byte);
-    return buffer[0..value.len];
+/// Case-insensitive ASCII compare against a lowercase literal. The
+/// previous implementation lowercased into a stack buffer and returned
+/// the slice, which was use-after-return UB; comparing in place avoids
+/// any allocation while still accepting mixed-case extensions like
+/// `JPG` or `MARKDOWN`.
+fn extensionEquals(extension: []const u8, comptime lowercase_literal: []const u8) bool {
+    if (extension.len != lowercase_literal.len) return false;
+    for (extension, lowercase_literal) |byte, expected| {
+        if (std.ascii.toLower(byte) != expected) return false;
+    }
+    return true;
 }
 
 fn isImageExtension(extension: []const u8) bool {
     const values = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico" };
-    for (values) |value| if (std.mem.eql(u8, extension, value)) return true;
+    for (values) |value| if (extensionEqualsRuntime(extension, value)) return true;
     return false;
 }
 
 fn isTextExtension(extension: []const u8) bool {
     const values = [_][]const u8{ "txt", "json", "xml", "yaml", "yml", "csv", "js", "ts", "jsx", "tsx", "py", "java", "c", "cpp", "h", "css", "scss", "sass", "less", "sh" };
-    for (values) |value| if (std.mem.eql(u8, extension, value)) return true;
+    for (values) |value| if (extensionEqualsRuntime(extension, value)) return true;
     return false;
+}
+
+fn extensionEqualsRuntime(extension: []const u8, lowercase_literal: []const u8) bool {
+    if (extension.len != lowercase_literal.len) return false;
+    for (extension, lowercase_literal) |byte, expected| {
+        if (std.ascii.toLower(byte) != expected) return false;
+    }
+    return true;
 }
 
 test "artifact kinds map to file extensions" {

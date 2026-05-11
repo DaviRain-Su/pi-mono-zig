@@ -1266,229 +1266,253 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
 
         switch (event.event_type) {
-            .agent_start => {
-                self.markTerminalProgressLocked(true);
-                try self.replaceLabelLocked(&self.status, "thinking");
-                try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
-            },
-            .agent_end => {
-                self.markTerminalProgressLocked(false);
-                self.clearActiveOperationLocked();
-                if (std.mem.eql(u8, self.status, "streaming") or
-                    std.mem.eql(u8, self.status, "thinking") or
-                    std.mem.eql(u8, self.status, "working") or
-                    std.mem.startsWith(u8, self.status, "working: "))
-                {
-                    try self.replaceLabelLocked(&self.status, "idle");
-                }
-            },
-            .message_start => {
-                if (event.message) |message| switch (message) {
-                    .user => |user_message| {
-                        self.removeQueuedMessageLocked(userMessageText(user_message));
-                        const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
-                        defer self.allocator.free(rendered);
-                        try self.appendItemLocked(.user, rendered);
-                        if (std.mem.eql(u8, self.status, "thinking")) {
-                            try self.ensureAssistantThinkingItemLocked();
-                        }
-                    },
-                    .assistant => |assistant_message| {
-                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
-                        try self.replaceLabelLocked(&self.status, "thinking");
-                    },
-                    else => {},
-                };
-            },
-            .message_update => {
-                var handled_thinking_event = false;
-                var handled_toolcall_event = false;
-                if (event.assistant_message_event) |assistant_event| {
-                    switch (assistant_event.event_type) {
-                        .thinking_start => {
-                            handled_thinking_event = true;
-                            try self.replaceLabelLocked(&self.status, "thinking");
-                            try self.ensureThinkingItemLocked();
-                        },
-                        .thinking_delta => {
-                            handled_thinking_event = true;
-                            try self.replaceLabelLocked(&self.status, "thinking");
-                            try self.appendThinkingDeltaLocked(assistant_event.delta orelse assistant_event.content orelse "");
-                        },
-                        .thinking_end => {
-                            handled_thinking_event = true;
-                            try self.replaceLabelLocked(&self.status, "thinking");
-                            self.freezeStreamingThinkingItemLocked();
-                            self.last_streaming_thinking_index = null;
-                        },
-                        .text_start, .text_delta, .text_end => try self.replaceLabelLocked(&self.status, "streaming"),
-                        .toolcall_start => {
-                            handled_toolcall_event = true;
-                            try self.replaceLabelLocked(&self.status, "streaming");
-                            _ = try self.ensureStreamingToolCallItemLocked(
-                                assistant_event.content_index,
-                                assistant_event.tool_call,
-                            );
-                        },
-                        .toolcall_delta => {
-                            handled_toolcall_event = true;
-                            try self.replaceLabelLocked(&self.status, "streaming");
-                            try self.appendStreamingToolCallDeltaLocked(
-                                assistant_event.content_index,
-                                assistant_event.tool_call,
-                                assistant_event.delta orelse "",
-                            );
-                        },
-                        .toolcall_end => {
-                            handled_toolcall_event = true;
-                            try self.replaceLabelLocked(&self.status, "streaming");
-                            try self.finishStreamingToolCallLocked(
-                                assistant_event.content_index,
-                                assistant_event.tool_call,
-                            );
-                        },
-                        else => {},
-                    }
-                }
-                if (handled_thinking_event) return;
-                if (handled_toolcall_event) return;
-                if (event.message) |message| switch (message) {
-                    .assistant => |assistant_message| {
-                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
-                        const rendered = try formatAssistantMessage(self.allocator, assistant_message);
-                        defer self.allocator.free(rendered);
-                        if (rendered.len == 0) {
-                            if (self.last_streaming_assistant_index) |_| return;
-                            try self.ensureAssistantThinkingItemLocked();
-                            return;
-                        }
-                        if (event.assistant_message_event == null) {
-                            try self.replaceLabelLocked(&self.status, "streaming");
-                        }
-                        const target_index = self.last_streaming_assistant_index orelse blk: {
-                            try self.appendItemLocked(.assistant, rendered);
-                            self.last_streaming_assistant_index = self.items.items.len - 1;
-                            break :blk self.last_streaming_assistant_index.?;
-                        };
-                        try self.replaceItemTextLocked(target_index, rendered);
-                    },
-                    else => {},
-                };
-            },
-            .message_end => {
-                if (event.message) |message| switch (message) {
-                    .user => {},
-                    .assistant => |assistant_message| {
-                        self.addUsageLocked(assistant_message.usage);
-                        self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
-                        const rendered = try formatAssistantMessage(self.allocator, assistant_message);
-                        defer self.allocator.free(rendered);
-                        if (self.last_streaming_assistant_index) |index| {
-                            if (rendered.len == 0) {
-                                self.removeItemLocked(index);
-                            } else {
-                                try self.replaceItemTextLocked(index, rendered);
-                            }
-                        } else if (rendered.len > 0) {
-                            try self.appendItemLocked(.assistant, rendered);
-                        }
-                        self.last_streaming_assistant_index = null;
-                        self.freezeStreamingThinkingItemLocked();
-                        self.last_streaming_thinking_index = null;
+            .agent_start => try self.handleAgentStartLocked(),
+            .agent_end => try self.handleAgentEndLocked(),
+            .message_start => try self.handleMessageStartLocked(event),
+            .message_update => try self.handleMessageUpdateLocked(event),
+            .message_end => try self.handleMessageEndLocked(event),
+            .tool_execution_start => try self.handleToolExecutionStartLocked(event),
+            .tool_execution_update => try self.handleToolExecutionUpdateLocked(event),
+            .tool_execution_end => try self.handleToolExecutionEndLocked(event),
+            else => {},
+        }
+    }
 
-                        switch (assistant_message.stop_reason) {
-                            .stop, .length, .tool_use => {},
-                            .aborted => try self.replaceLabelLocked(&self.status, "interrupted"),
-                            .error_reason => try self.replaceLabelLocked(
-                                &self.status,
-                                assistant_message.error_message orelse "error",
-                            ),
-                        }
-                    },
-                    .tool_result => {},
-                };
-            },
-            .tool_execution_start => {
-                const tool_name = event.tool_name orelse "tool";
-                if (event.tool_call_id) |tool_call_id| {
-                    if (self.streamingToolCallItemIndexByIdLocked(tool_call_id) != null) {
-                        const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
-                        defer self.allocator.free(status_text);
-                        try self.replaceLabelLocked(&self.status, status_text);
-                        try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
-                        return;
-                    }
-                }
-                const args_value = event.args orelse .null;
-                const rendered = try formatToolCall(self.allocator, tool_name, args_value);
+    fn handleAgentStartLocked(self: *AppState) !void {
+        self.markTerminalProgressLocked(true);
+        try self.replaceLabelLocked(&self.status, "thinking");
+        try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
+    }
+
+    fn handleAgentEndLocked(self: *AppState) !void {
+        self.markTerminalProgressLocked(false);
+        self.clearActiveOperationLocked();
+        if (std.mem.eql(u8, self.status, "streaming") or
+            std.mem.eql(u8, self.status, "thinking") or
+            std.mem.eql(u8, self.status, "working") or
+            std.mem.startsWith(u8, self.status, "working: "))
+        {
+            try self.replaceLabelLocked(&self.status, "idle");
+        }
+    }
+
+    fn handleMessageStartLocked(self: *AppState, event: agent.AgentEvent) !void {
+        if (event.message) |message| switch (message) {
+            .user => |user_message| {
+                self.removeQueuedMessageLocked(userMessageText(user_message));
+                const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
                 defer self.allocator.free(rendered);
-                try self.appendItemLocked(.tool_call, rendered);
-                const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
-                defer self.allocator.free(status_text);
-                try self.replaceLabelLocked(&self.status, status_text);
-                try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
-            },
-            .tool_execution_update => {
-                const tool_name = event.tool_name orelse "tool";
-                const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
-                defer self.allocator.free(status_text);
-                if (event.tool_call_id) |tool_call_id| {
-                    if (event.partial_result) |partial_result| {
-                        if (self.activeToolUpdateIndexLocked(tool_call_id)) |index| {
-                            try self.replaceToolResultItemLocked(
-                                index,
-                                tool_name,
-                                partial_result.content,
-                                false,
-                                partial_result.details,
-                            );
-                        } else {
-                            try self.appendToolResultItemLocked(
-                                tool_name,
-                                partial_result.content,
-                                false,
-                                partial_result.details,
-                            );
-                            try self.setActiveToolUpdateLocked(tool_call_id, self.items.items.len - 1);
-                        }
-                    }
+                try self.appendItemLocked(.user, rendered);
+                if (std.mem.eql(u8, self.status, "thinking")) {
+                    try self.ensureAssistantThinkingItemLocked();
                 }
+            },
+            .assistant => |assistant_message| {
+                self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
+                try self.replaceLabelLocked(&self.status, "thinking");
+            },
+            else => {},
+        };
+    }
+
+    /// Returns true if the assistant_message_event sub-dispatch fully handled
+    /// the message_update event and the caller should return early.
+    fn handleAssistantMessageEventLocked(
+        self: *AppState,
+        assistant_event: ai.AssistantMessageEvent,
+    ) !bool {
+        switch (assistant_event.event_type) {
+            .thinking_start => {
+                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.ensureThinkingItemLocked();
+                return true;
+            },
+            .thinking_delta => {
+                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.appendThinkingDeltaLocked(assistant_event.delta orelse assistant_event.content orelse "");
+                return true;
+            },
+            .thinking_end => {
+                try self.replaceLabelLocked(&self.status, "thinking");
+                self.freezeStreamingThinkingItemLocked();
+                self.last_streaming_thinking_index = null;
+                return true;
+            },
+            .text_start, .text_delta, .text_end => {
+                try self.replaceLabelLocked(&self.status, "streaming");
+                return false;
+            },
+            .toolcall_start => {
+                try self.replaceLabelLocked(&self.status, "streaming");
+                _ = try self.ensureStreamingToolCallItemLocked(
+                    assistant_event.content_index,
+                    assistant_event.tool_call,
+                );
+                return true;
+            },
+            .toolcall_delta => {
+                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.appendStreamingToolCallDeltaLocked(
+                    assistant_event.content_index,
+                    assistant_event.tool_call,
+                    assistant_event.delta orelse "",
+                );
+                return true;
+            },
+            .toolcall_end => {
+                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.finishStreamingToolCallLocked(
+                    assistant_event.content_index,
+                    assistant_event.tool_call,
+                );
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    fn handleMessageUpdateLocked(self: *AppState, event: agent.AgentEvent) !void {
+        if (event.assistant_message_event) |assistant_event| {
+            if (try self.handleAssistantMessageEventLocked(assistant_event)) return;
+        }
+        if (event.message) |message| switch (message) {
+            .assistant => |assistant_message| {
+                self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
+                const rendered = try formatAssistantMessage(self.allocator, assistant_message);
+                defer self.allocator.free(rendered);
+                if (rendered.len == 0) {
+                    if (self.last_streaming_assistant_index) |_| return;
+                    try self.ensureAssistantThinkingItemLocked();
+                    return;
+                }
+                if (event.assistant_message_event == null) {
+                    try self.replaceLabelLocked(&self.status, "streaming");
+                }
+                const target_index = self.last_streaming_assistant_index orelse blk: {
+                    try self.appendItemLocked(.assistant, rendered);
+                    self.last_streaming_assistant_index = self.items.items.len - 1;
+                    break :blk self.last_streaming_assistant_index.?;
+                };
+                try self.replaceItemTextLocked(target_index, rendered);
+            },
+            else => {},
+        };
+    }
+
+    fn handleMessageEndLocked(self: *AppState, event: agent.AgentEvent) !void {
+        if (event.message) |message| switch (message) {
+            .user => {},
+            .assistant => |assistant_message| {
+                self.addUsageLocked(assistant_message.usage);
+                self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
+                const rendered = try formatAssistantMessage(self.allocator, assistant_message);
+                defer self.allocator.free(rendered);
+                if (self.last_streaming_assistant_index) |index| {
+                    if (rendered.len == 0) {
+                        self.removeItemLocked(index);
+                    } else {
+                        try self.replaceItemTextLocked(index, rendered);
+                    }
+                } else if (rendered.len > 0) {
+                    try self.appendItemLocked(.assistant, rendered);
+                }
+                self.last_streaming_assistant_index = null;
+                self.freezeStreamingThinkingItemLocked();
+                self.last_streaming_thinking_index = null;
+
+                switch (assistant_message.stop_reason) {
+                    .stop, .length, .tool_use => {},
+                    .aborted => try self.replaceLabelLocked(&self.status, "interrupted"),
+                    .error_reason => try self.replaceLabelLocked(
+                        &self.status,
+                        assistant_message.error_message orelse "error",
+                    ),
+                }
+            },
+            .tool_result => {},
+        };
+    }
+
+    fn handleToolExecutionStartLocked(self: *AppState, event: agent.AgentEvent) !void {
+        const tool_name = event.tool_name orelse "tool";
+        if (event.tool_call_id) |tool_call_id| {
+            if (self.streamingToolCallItemIndexByIdLocked(tool_call_id) != null) {
+                const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
+                defer self.allocator.free(status_text);
                 try self.replaceLabelLocked(&self.status, status_text);
                 try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
-            },
-            .tool_execution_end => {
-                const tool_name = event.tool_name orelse "tool";
-                const result = event.result orelse return;
-                if (event.tool_call_id) |tool_call_id| {
-                    if (self.takeActiveToolUpdateIndexLocked(tool_call_id)) |index| {
-                        try self.replaceToolResultItemLocked(
-                            index,
-                            tool_name,
-                            result.content,
-                            event.is_error orelse false,
-                            result.details,
-                        );
-                    } else {
-                        try self.appendToolResultItemLocked(
-                            tool_name,
-                            result.content,
-                            event.is_error orelse false,
-                            result.details,
-                        );
-                    }
+                return;
+            }
+        }
+        const args_value = event.args orelse .null;
+        const rendered = try formatToolCall(self.allocator, tool_name, args_value);
+        defer self.allocator.free(rendered);
+        try self.appendItemLocked(.tool_call, rendered);
+        const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
+        defer self.allocator.free(status_text);
+        try self.replaceLabelLocked(&self.status, status_text);
+        try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
+    }
+
+    fn handleToolExecutionUpdateLocked(self: *AppState, event: agent.AgentEvent) !void {
+        const tool_name = event.tool_name orelse "tool";
+        const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
+        defer self.allocator.free(status_text);
+        if (event.tool_call_id) |tool_call_id| {
+            if (event.partial_result) |partial_result| {
+                if (self.activeToolUpdateIndexLocked(tool_call_id)) |index| {
+                    try self.replaceToolResultItemLocked(
+                        index,
+                        tool_name,
+                        partial_result.content,
+                        false,
+                        partial_result.details,
+                    );
                 } else {
                     try self.appendToolResultItemLocked(
                         tool_name,
-                        result.content,
-                        event.is_error orelse false,
-                        result.details,
+                        partial_result.content,
+                        false,
+                        partial_result.details,
                     );
+                    try self.setActiveToolUpdateLocked(tool_call_id, self.items.items.len - 1);
                 }
-                try self.replaceLabelLocked(&self.status, "thinking");
-                try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
-            },
-            else => {},
+            }
         }
+        try self.replaceLabelLocked(&self.status, status_text);
+        try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
+    }
+
+    fn handleToolExecutionEndLocked(self: *AppState, event: agent.AgentEvent) !void {
+        const tool_name = event.tool_name orelse "tool";
+        const result = event.result orelse return;
+        if (event.tool_call_id) |tool_call_id| {
+            if (self.takeActiveToolUpdateIndexLocked(tool_call_id)) |index| {
+                try self.replaceToolResultItemLocked(
+                    index,
+                    tool_name,
+                    result.content,
+                    event.is_error orelse false,
+                    result.details,
+                );
+            } else {
+                try self.appendToolResultItemLocked(
+                    tool_name,
+                    result.content,
+                    event.is_error orelse false,
+                    result.details,
+                );
+            }
+        } else {
+            try self.appendToolResultItemLocked(
+                tool_name,
+                result.content,
+                event.is_error orelse false,
+                result.details,
+            );
+        }
+        try self.replaceLabelLocked(&self.status, "thinking");
+        try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
     }
 
     fn appendThinkingBlocksLocked(self: *AppState, blocks: []const ai.ContentBlock) !void {
