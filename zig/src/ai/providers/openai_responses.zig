@@ -13,6 +13,7 @@ const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const responses_api = @import("../shared/responses_api.zig");
+const shared_url = @import("../shared/url.zig");
 const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
 const copilot_headers = @import("github_copilot_headers.zig");
@@ -1362,8 +1363,8 @@ const ParsedTextSignature = struct {
 };
 
 pub fn buildRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
-    const trimmed = trimRightScalar(std.mem.trim(u8, base_url, " \t\r\n"), '/');
-    return try std.fmt.allocPrint(allocator, "{s}/responses", .{trimmed});
+    const whitespace_trimmed = std.mem.trim(u8, base_url, " \t\r\n");
+    return shared_url.buildUrl("/responses", allocator, whitespace_trimmed);
 }
 
 pub const RequestSnapshotTransportMode = enum {

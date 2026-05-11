@@ -6,6 +6,7 @@ const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const resolve_api_key = @import("../shared/resolve_api_key.zig");
+const shared_url = @import("../shared/url.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 const chat_payload = @import("openai_chat_payload.zig");
@@ -325,8 +326,7 @@ fn buildOpenAIChatRequestTarget(allocator: std.mem.Allocator, base_url: []const 
 }
 
 fn buildOpenAIChatRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
-    const normalized_base_url = trimRightScalar(base_url, '/');
-    return try std.fmt.allocPrint(allocator, "{s}/chat/completions", .{normalized_base_url});
+    return shared_url.buildUrl("/chat/completions", allocator, base_url);
 }
 
 fn buildRequestPathFromUrl(allocator: std.mem.Allocator, request_url: []const u8) ![]const u8 {

@@ -4,6 +4,7 @@ const http_client = @import("../../http_client.zig");
 const env_api_keys = @import("../../env_api_keys.zig");
 const provider_json = @import("../../shared/provider_json.zig");
 const provider_stream = @import("../../shared/provider_stream.zig");
+const shared_url = @import("../../shared/url.zig");
 const chat_payload = @import("../openai_chat_payload.zig");
 
 const request_path = "/chat/completions";
@@ -131,10 +132,7 @@ fn isAbortRequested(options: ?types.ImagesOptions) bool {
 }
 
 fn buildRequestUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    var end = base_url.len;
-    while (end > 0 and base_url[end - 1] == '/') : (end -= 1) {}
-    const trimmed = base_url[0..end];
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, request_path });
+    return shared_url.buildUrl(request_path, allocator, base_url);
 }
 
 fn buildRequestHeaders(

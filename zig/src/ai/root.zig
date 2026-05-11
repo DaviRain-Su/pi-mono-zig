@@ -40,6 +40,7 @@ pub const shared = struct {
     pub const string_utils = @import("shared/string_utils.zig");
     pub const sanitize_unicode = @import("shared/sanitize_unicode.zig");
     pub const transform_messages = @import("shared/transform_messages.zig");
+    pub const url = @import("shared/url.zig");
 };
 
 // Backwards-compatible top-level aliases for existing call sites under ai.*.
@@ -179,6 +180,7 @@ test {
     _ = @import("shared/string_utils.zig");
     _ = @import("shared/sanitize_unicode.zig");
     _ = @import("shared/transform_messages.zig");
+    _ = @import("shared/url.zig");
     _ = @import("utils/diagnostics.zig");
     _ = @import("utils/event_stream.zig");
     _ = @import("utils/hash.zig");

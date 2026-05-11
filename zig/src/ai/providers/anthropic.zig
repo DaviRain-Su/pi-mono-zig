@@ -11,6 +11,7 @@ const provider_json = @import("../shared/provider_json.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
+const shared_url = @import("../shared/url.zig");
 const cloudflare = @import("cloudflare.zig");
 const github_copilot_headers = @import("github_copilot_headers.zig");
 const anthropic_json = @import("anthropic_json.zig");
@@ -169,11 +170,7 @@ pub const AnthropicProvider = struct {
 };
 
 fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
-    const trimmed = std.mem.trimEnd(u8, base_url, "/");
-    if (std.mem.endsWith(u8, trimmed, "/v1")) {
-        return std.fmt.allocPrint(allocator, "{s}/messages", .{trimmed});
-    }
-    return std.fmt.allocPrint(allocator, "{s}/v1/messages", .{trimmed});
+    return shared_url.buildUrlV1Normalized("/messages", allocator, base_url);
 }
 
 test "buildMessagesUrl appends SDK-compatible Anthropic path" {
