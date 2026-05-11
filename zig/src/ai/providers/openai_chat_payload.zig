@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 const provider_json = @import("../shared/provider_json.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
+const sanitize_unicode = @import("../shared/sanitize_unicode.zig");
 
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     provider_json.freeValue(allocator, value);
@@ -28,47 +29,11 @@ fn isFalseyJsonValue(value: std.json.Value) bool {
     };
 }
 
-pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    // In-place filtering: scan for unpaired surrogates and remove them
-    // High surrogates: 0xD800-0xDBFF
-    // Low surrogates: 0xDC00-0xDFFF
-    // This is a simplified version that works on UTF-8 encoded text.
-    // Surrogates in UTF-8 appear as 3-byte sequences: ED A0 80-ED AF BF (high) or ED B0 80-ED BF BF (low)
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < text.len) {
-        // Check for 3-byte UTF-8 surrogate sequence
-        if (i + 2 < text.len and text[i] == 0xED) {
-            const is_high = text[i + 1] >= 0xA0 and text[i + 1] <= 0xAF;
-            const is_low = text[i + 1] >= 0xB0 and text[i + 1] <= 0xBF;
-
-            if (is_high) {
-                // Check if followed by low surrogate
-                if (i + 5 < text.len and text[i + 3] == 0xED and text[i + 4] >= 0xB0 and text[i + 4] <= 0xBF) {
-                    // Valid pair, keep both
-                    try result.appendSlice(allocator, text[i .. i + 6]);
-                    i += 6;
-                    continue;
-                }
-                // Unpaired high surrogate, skip
-                i += 3;
-                continue;
-            } else if (is_low) {
-                // Unpaired low surrogate (not preceded by high), skip
-                // Note: if we got here, the preceding bytes were not a valid high surrogate
-                i += 3;
-                continue;
-            }
-        }
-
-        // Regular byte, keep it
-        try result.append(allocator, text[i]);
-        i += 1;
-    }
-
-    return try result.toOwnedSlice(allocator);
+/// Removes unpaired Unicode surrogate characters from text.
+/// Valid paired surrogates (proper emoji) are preserved.
+/// Delegates to the canonical shared implementation.
+pub fn sanitizeSurrogates(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return sanitize_unicode.sanitizeSurrogates(allocator, text);
 }
 
 pub fn processCacheRetentionEnv() ?[]const u8 {
