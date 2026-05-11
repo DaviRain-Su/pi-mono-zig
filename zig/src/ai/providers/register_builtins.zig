@@ -540,10 +540,17 @@ fn testModelFromSpec(spec: TestModelSpec) types.Model {
     };
 }
 
-fn testModelForApi(api: []const u8) types.Model {
-    for (TEST_MODEL_SPECS) |spec| {
-        if (std.mem.eql(u8, api, spec.api)) return testModelFromSpec(spec);
+const TEST_MODEL_SPECS_MAP = blk: {
+    @setEvalBranchQuota(10_000);
+    var kvs: [TEST_MODEL_SPECS.len]struct { []const u8, TestModelSpec } = undefined;
+    for (TEST_MODEL_SPECS, 0..) |spec, index| {
+        kvs[index] = .{ spec.api, spec };
     }
+    break :blk std.StaticStringMap(TestModelSpec).initComptime(kvs);
+};
+
+fn testModelForApi(api: []const u8) types.Model {
+    if (TEST_MODEL_SPECS_MAP.get(api)) |spec| return testModelFromSpec(spec);
 
     return .{
         .id = "gpt-4.1-mini",
