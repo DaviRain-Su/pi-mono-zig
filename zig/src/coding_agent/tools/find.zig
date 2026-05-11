@@ -17,6 +17,12 @@ pub const FindArgs = struct {
     pub const json_int_constraints = .{
         .limit = .positive,
     };
+
+    pub const json_field_docs = .{
+        .pattern = "Glob pattern such as '*.ts' or 'src/**/*.zig'",
+        .path = "Directory to search (defaults to cwd)",
+        .limit = "Maximum number of files to return",
+    };
 };
 
 pub const FindDetails = struct {
@@ -58,24 +64,7 @@ pub const FindTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "pattern",
-                .type_name = "string",
-                .description = "Glob pattern such as '*.ts' or 'src/**/*.zig'",
-                .required = true,
-            },
-            .{
-                .name = "path",
-                .type_name = "string",
-                .description = "Directory to search (defaults to cwd)",
-            },
-            .{
-                .name = "limit",
-                .type_name = "integer",
-                .description = "Maximum number of files to return",
-            },
-        });
+        return common.schemaFromArgs(FindArgs, allocator);
     }
 
     pub fn execute(

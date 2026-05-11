@@ -111,6 +111,119 @@ pub fn objectSchema(allocator: std.mem.Allocator, comptime fields: []const Schem
     return .{ .object = root };
 }
 
+/// Reflection-driven JSON Schema builder for tool argument structs.
+///
+/// Derives an `object`-typed schema from `T`'s fields:
+///   * Field NAME comes from `T.json_schema_names.<field>` if declared, else the Zig field name.
+///   * Field TYPE comes from `@typeInfo(field.type)` — `[]const u8` → "string", any int → "integer",
+///     `bool` → "boolean"; optional fields unwrap to their child type and become non-required.
+///   * Field DESCRIPTION must be supplied via `pub const json_field_docs = .{ .field = "..." };`.
+///     A missing entry is a compile error. There is no fallback — descriptions are part of the
+///     on-wire contract and must be authored explicitly.
+///   * Required-ness: a field is required iff it has no default value AND is not optional.
+///
+/// Optional decl `pub const json_extra_schema_fields = .{ .alias = .{ .name = "...", .type_name = "...", .description = "..." } }`
+/// lets a tool advertise additional schema entries that do not correspond to a struct field
+/// (e.g., an alternate spelling accepted via `json_aliases`).
+pub fn schemaFromArgs(comptime T: type, allocator: std.mem.Allocator) !std.json.Value {
+    comptime validateSchemaArgs(T);
+
+    var properties = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    errdefer {
+        const value = std.json.Value{ .object = properties };
+        deinitJsonValue(allocator, value);
+    }
+
+    var required = std.json.Array.init(allocator);
+    errdefer required.deinit();
+
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields) |field| {
+        const schema_name = comptime schemaFieldName(T, field.name);
+        const type_name = comptime schemaTypeName(field.type);
+        const description: []const u8 = @field(T.json_field_docs, field.name);
+        const is_required = comptime schemaFieldRequired(field);
+
+        try putValue(
+            allocator,
+            &properties,
+            schema_name,
+            try schemaProperty(allocator, type_name, description),
+        );
+        if (is_required) {
+            try required.append(.{ .string = try allocator.dupe(u8, schema_name) });
+        }
+    }
+
+    if (comptime @hasDecl(T, "json_extra_schema_fields")) {
+        const extras = T.json_extra_schema_fields;
+        inline for (@typeInfo(@TypeOf(extras)).@"struct".fields) |extra_field| {
+            const entry = @field(extras, extra_field.name);
+            const entry_name: []const u8 = entry.name;
+            const entry_type: []const u8 = entry.type_name;
+            const entry_desc: []const u8 = entry.description;
+            try putValue(
+                allocator,
+                &properties,
+                entry_name,
+                try schemaProperty(allocator, entry_type, entry_desc),
+            );
+            if (comptime @hasField(@TypeOf(entry), "required") and entry.required) {
+                try required.append(.{ .string = try allocator.dupe(u8, entry_name) });
+            }
+        }
+    }
+
+    var root = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try putString(allocator, &root, "type", "object");
+    try putValue(allocator, &root, "properties", .{ .object = properties });
+    if (required.items.len > 0) {
+        try putValue(allocator, &root, "required", .{ .array = required });
+    } else {
+        required.deinit();
+    }
+    return .{ .object = root };
+}
+
+fn schemaFieldName(comptime T: type, comptime name: [:0]const u8) []const u8 {
+    if (@hasDecl(T, "json_schema_names") and @hasField(@TypeOf(T.json_schema_names), name)) {
+        return @field(T.json_schema_names, name);
+    }
+    return name;
+}
+
+fn schemaTypeName(comptime FieldT: type) []const u8 {
+    return switch (@typeInfo(FieldT)) {
+        .optional => |opt| schemaTypeName(opt.child),
+        .pointer => |ptr| blk: {
+            if (ptr.size == .slice and ptr.child == u8) break :blk "string";
+            @compileError("schemaFromArgs: unsupported pointer field type " ++ @typeName(FieldT));
+        },
+        .bool => "boolean",
+        .int => "integer",
+        else => @compileError("schemaFromArgs: unsupported field type " ++ @typeName(FieldT)),
+    };
+}
+
+fn schemaFieldRequired(comptime field: std.builtin.Type.StructField) bool {
+    if (@typeInfo(field.type) == .optional) return false;
+    if (field.defaultValue() != null) return false;
+    return true;
+}
+
+fn validateSchemaArgs(comptime T: type) void {
+    if (!@hasDecl(T, "json_field_docs")) {
+        @compileError("schemaFromArgs: type " ++ @typeName(T) ++ " must declare `pub const json_field_docs`");
+    }
+    const docs_type = @TypeOf(T.json_field_docs);
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields) |field| {
+        if (!@hasField(docs_type, field.name)) {
+            @compileError("schemaFromArgs: " ++ @typeName(T) ++ " is missing `json_field_docs." ++ field.name ++ "`");
+        }
+    }
+}
+
 pub fn schemaArrayProperty(
     allocator: std.mem.Allocator,
     description_text: []const u8,
@@ -200,4 +313,75 @@ test "makeTextContent allocates owned text block" {
     defer deinitContentBlocks(allocator, blocks);
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("hello", blocks[0].text.text);
+}
+
+test "schemaFromArgs reflects field names, types, and required-ness" {
+    const Args = struct {
+        path: []const u8,
+        offset: ?usize = null,
+        flag: bool = false,
+
+        pub const json_field_docs = .{
+            .path = "The path",
+            .offset = "Optional offset",
+            .flag = "A flag",
+        };
+    };
+
+    const value = try schemaFromArgs(Args, std.testing.allocator);
+    defer deinitJsonValue(std.testing.allocator, value);
+
+    try std.testing.expectEqualStrings("object", value.object.get("type").?.string);
+    const properties = value.object.get("properties").?.object;
+
+    try std.testing.expectEqualStrings("string", properties.get("path").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("The path", properties.get("path").?.object.get("description").?.string);
+
+    try std.testing.expectEqualStrings("integer", properties.get("offset").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("boolean", properties.get("flag").?.object.get("type").?.string);
+
+    const required = value.object.get("required").?.array;
+    try std.testing.expectEqual(@as(usize, 1), required.items.len);
+    try std.testing.expectEqualStrings("path", required.items[0].string);
+}
+
+test "schemaFromArgs honors json_schema_names override" {
+    const Args = struct {
+        ignore_case: bool = false,
+
+        pub const json_schema_names = .{ .ignore_case = "ignoreCase" };
+        pub const json_field_docs = .{ .ignore_case = "Case-insensitive" };
+    };
+
+    const value = try schemaFromArgs(Args, std.testing.allocator);
+    defer deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try std.testing.expect(properties.get("ignoreCase") != null);
+    try std.testing.expect(properties.get("ignore_case") == null);
+    try std.testing.expect(value.object.get("required") == null);
+}
+
+test "schemaFromArgs adds json_extra_schema_fields entries" {
+    const Args = struct {
+        command: []const u8,
+
+        pub const json_field_docs = .{ .command = "Cmd" };
+
+        pub const json_extra_schema_fields = .{
+            .alias_a = .{
+                .name = "alias_a",
+                .type_name = "integer",
+                .description = "Alias A",
+            },
+        };
+    };
+
+    const value = try schemaFromArgs(Args, std.testing.allocator);
+    defer deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try std.testing.expect(properties.get("command") != null);
+    try std.testing.expectEqualStrings("integer", properties.get("alias_a").?.object.get("type").?.string);
+    try std.testing.expectEqualStrings("Alias A", properties.get("alias_a").?.object.get("description").?.string);
 }

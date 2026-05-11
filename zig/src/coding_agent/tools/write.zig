@@ -10,6 +10,11 @@ const jsonObject = common.jsonObject;
 pub const WriteArgs = struct {
     path: []const u8,
     content: []const u8,
+
+    pub const json_field_docs = .{
+        .path = "Path to the file to write (absolute or relative to cwd)",
+        .content = "Content to write to the file",
+    };
 };
 
 pub const WriteExecutionResult = struct {
@@ -39,20 +44,7 @@ pub const WriteTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "path",
-                .type_name = "string",
-                .description = "Path to the file to write (absolute or relative to cwd)",
-                .required = true,
-            },
-            .{
-                .name = "content",
-                .type_name = "string",
-                .description = "Content to write to the file",
-                .required = true,
-            },
-        });
+        return common.schemaFromArgs(WriteArgs, allocator);
     }
 
     pub fn execute(

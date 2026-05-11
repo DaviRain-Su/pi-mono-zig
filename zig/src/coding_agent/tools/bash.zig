@@ -23,6 +23,19 @@ pub const BashArgs = struct {
     pub const json_int_constraints = .{
         .timeout_seconds = .positive,
     };
+
+    pub const json_field_docs = .{
+        .command = "Shell command to execute",
+        .timeout_seconds = "Timeout in seconds before the process group is terminated. Accepts either timeout_seconds or timeout.",
+    };
+
+    pub const json_extra_schema_fields = .{
+        .timeout = .{
+            .name = "timeout",
+            .type_name = "integer",
+            .description = "Alias for timeout_seconds. Timeout in seconds before the process group is terminated.",
+        },
+    };
 };
 
 fn normalizeBackslashes(allocator: std.mem.Allocator, command: []const u8) ![]const u8 {
@@ -134,24 +147,7 @@ pub const BashTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "command",
-                .type_name = "string",
-                .description = "Shell command to execute",
-                .required = true,
-            },
-            .{
-                .name = "timeout_seconds",
-                .type_name = "integer",
-                .description = "Timeout in seconds before the process group is terminated. Accepts either timeout_seconds or timeout.",
-            },
-            .{
-                .name = "timeout",
-                .type_name = "integer",
-                .description = "Alias for timeout_seconds. Timeout in seconds before the process group is terminated.",
-            },
-        });
+        return common.schemaFromArgs(BashArgs, allocator);
     }
 
     pub fn execute(

@@ -16,6 +16,12 @@ pub const ReadArgs = struct {
         .offset = .positive,
         .limit = .positive,
     };
+
+    pub const json_field_docs = .{
+        .path = "Path to the file to read (absolute or relative to cwd)",
+        .offset = "1-indexed line number to start reading from",
+        .limit = "Maximum number of lines to read",
+    };
 };
 
 pub const ReadDetails = struct {
@@ -57,24 +63,7 @@ pub const ReadTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "path",
-                .type_name = "string",
-                .description = "Path to the file to read (absolute or relative to cwd)",
-                .required = true,
-            },
-            .{
-                .name = "offset",
-                .type_name = "integer",
-                .description = "1-indexed line number to start reading from",
-            },
-            .{
-                .name = "limit",
-                .type_name = "integer",
-                .description = "Maximum number of lines to read",
-            },
-        });
+        return common.schemaFromArgs(ReadArgs, allocator);
     }
 
     pub fn execute(

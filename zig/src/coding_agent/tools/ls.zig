@@ -16,6 +16,11 @@ pub const LsArgs = struct {
     pub const json_int_constraints = .{
         .limit = .positive,
     };
+
+    pub const json_field_docs = .{
+        .path = "Directory to list (defaults to cwd)",
+        .limit = "Maximum number of directory entries to return",
+    };
 };
 
 pub const LsDetails = struct {
@@ -57,18 +62,7 @@ pub const LsTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "path",
-                .type_name = "string",
-                .description = "Directory to list (defaults to cwd)",
-            },
-            .{
-                .name = "limit",
-                .type_name = "integer",
-                .description = "Maximum number of directory entries to return",
-            },
-        });
+        return common.schemaFromArgs(LsArgs, allocator);
     }
 
     pub fn execute(

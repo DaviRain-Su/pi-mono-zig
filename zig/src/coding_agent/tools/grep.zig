@@ -26,6 +26,20 @@ pub const GrepArgs = struct {
     pub const json_int_constraints = .{
         .limit = .positive,
     };
+
+    pub const json_schema_names = .{
+        .ignore_case = "ignoreCase",
+    };
+
+    pub const json_field_docs = .{
+        .pattern = "Search pattern (regex or literal string)",
+        .path = "File or directory to search (defaults to cwd)",
+        .glob = "Optional glob filter such as '*.ts' or 'src/**/*.zig'",
+        .ignore_case = "Case-insensitive search",
+        .literal = "Treat pattern as a literal string instead of a regex",
+        .context = "Number of context lines to include before and after each match",
+        .limit = "Maximum number of matches to return",
+    };
 };
 
 pub const GrepDetails = struct {
@@ -67,44 +81,7 @@ pub const GrepTool = struct {
     }
 
     pub fn schema(allocator: std.mem.Allocator) !std.json.Value {
-        return common.objectSchema(allocator, &.{
-            .{
-                .name = "pattern",
-                .type_name = "string",
-                .description = "Search pattern (regex or literal string)",
-                .required = true,
-            },
-            .{
-                .name = "path",
-                .type_name = "string",
-                .description = "File or directory to search (defaults to cwd)",
-            },
-            .{
-                .name = "glob",
-                .type_name = "string",
-                .description = "Optional glob filter such as '*.ts' or 'src/**/*.zig'",
-            },
-            .{
-                .name = "ignoreCase",
-                .type_name = "boolean",
-                .description = "Case-insensitive search",
-            },
-            .{
-                .name = "literal",
-                .type_name = "boolean",
-                .description = "Treat pattern as a literal string instead of a regex",
-            },
-            .{
-                .name = "context",
-                .type_name = "integer",
-                .description = "Number of context lines to include before and after each match",
-            },
-            .{
-                .name = "limit",
-                .type_name = "integer",
-                .description = "Maximum number of matches to return",
-            },
-        });
+        return common.schemaFromArgs(GrepArgs, allocator);
     }
 
     pub fn execute(

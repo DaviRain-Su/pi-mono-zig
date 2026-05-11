@@ -108,3 +108,112 @@ test {
     _ = @import("find.zig");
     _ = @import("ls.zig");
 }
+
+fn expectSchemaProperty(
+    properties: std.json.ObjectMap,
+    name: []const u8,
+    expected_type: []const u8,
+) !void {
+    const entry = properties.get(name) orelse {
+        std.debug.print("missing schema property: {s}\n", .{name});
+        return error.MissingProperty;
+    };
+    try std.testing.expectEqualStrings(expected_type, entry.object.get("type").?.string);
+    const description = entry.object.get("description").?.string;
+    try std.testing.expect(description.len > 0);
+}
+
+fn expectRequired(value: std.json.Value, names: []const []const u8) !void {
+    if (names.len == 0) {
+        try std.testing.expect(value.object.get("required") == null);
+        return;
+    }
+    const required = value.object.get("required").?.array;
+    try std.testing.expectEqual(names.len, required.items.len);
+    for (names, 0..) |expected, idx| {
+        try std.testing.expectEqualStrings(expected, required.items[idx].string);
+    }
+}
+
+test "read schema describes path, offset, limit" {
+    const value = try read.ReadTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    try std.testing.expectEqualStrings("object", value.object.get("type").?.string);
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "offset", "integer");
+    try expectSchemaProperty(properties, "limit", "integer");
+    try expectRequired(value, &.{"path"});
+}
+
+test "write schema describes path and content" {
+    const value = try write.WriteTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "content", "string");
+    try expectRequired(value, &.{ "path", "content" });
+}
+
+test "grep schema exposes ignoreCase (not ignore_case) and required pattern" {
+    const value = try grep.GrepTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "pattern", "string");
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "glob", "string");
+    try expectSchemaProperty(properties, "ignoreCase", "boolean");
+    try std.testing.expect(properties.get("ignore_case") == null);
+    try expectSchemaProperty(properties, "literal", "boolean");
+    try expectSchemaProperty(properties, "context", "integer");
+    try expectSchemaProperty(properties, "limit", "integer");
+    try expectRequired(value, &.{"pattern"});
+}
+
+test "find schema describes pattern, path, limit" {
+    const value = try find.FindTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "pattern", "string");
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "limit", "integer");
+    try expectRequired(value, &.{"pattern"});
+}
+
+test "ls schema describes optional path and limit with no required entries" {
+    const value = try ls.LsTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "limit", "integer");
+    try expectRequired(value, &.{});
+}
+
+test "bash schema advertises command, timeout_seconds, and timeout alias" {
+    const value = try bash.BashTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "command", "string");
+    try expectSchemaProperty(properties, "timeout_seconds", "integer");
+    try expectSchemaProperty(properties, "timeout", "integer");
+    try expectRequired(value, &.{"command"});
+}
+
+test "edit schema describes path, edits array, and legacy oldText/newText" {
+    const value = try edit.EditTool.schema(std.testing.allocator);
+    defer common.deinitJsonValue(std.testing.allocator, value);
+
+    const properties = value.object.get("properties").?.object;
+    try expectSchemaProperty(properties, "path", "string");
+    try expectSchemaProperty(properties, "oldText", "string");
+    try expectSchemaProperty(properties, "newText", "string");
+    const edits_entry = properties.get("edits").?.object;
+    try std.testing.expectEqualStrings("array", edits_entry.get("type").?.string);
+    try expectRequired(value, &.{"path"});
+}
