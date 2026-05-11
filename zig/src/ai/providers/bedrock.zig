@@ -2855,28 +2855,16 @@ fn putIntegerField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, ke
 
 fn eventTypeName(event_type: types.EventType) []const u8 {
     return switch (event_type) {
-        .start => "start",
-        .text_start => "text_start",
-        .text_delta => "text_delta",
-        .text_end => "text_end",
-        .thinking_start => "thinking_start",
-        .thinking_delta => "thinking_delta",
-        .thinking_end => "thinking_end",
-        .toolcall_start => "toolcall_start",
-        .toolcall_delta => "toolcall_delta",
-        .toolcall_end => "toolcall_end",
-        .done => "done",
         .error_event => "error",
+        inline else => |_, tag| @tagName(tag),
     };
 }
 
 fn stopReasonName(stop_reason: types.StopReason) []const u8 {
     return switch (stop_reason) {
-        .stop => "stop",
-        .length => "length",
         .tool_use => "toolUse",
         .error_reason => "error",
-        .aborted => "aborted",
+        inline else => |_, tag| @tagName(tag),
     };
 }
 
