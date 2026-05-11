@@ -254,6 +254,88 @@ pub fn getApiKeyProviderDisplayName(provider_id: []const u8) []const u8 {
     return provider_id;
 }
 
+/// Per-provider auth specials lifted out of scattered `std.mem.eql` chains.
+/// Each row encodes every aspect that the auth helpers consult on a per-provider
+/// basis. Aspects with no row default to `null`/`false` and the call sites pick a
+/// shared default.
+const AuthProviderInfo = struct {
+    id: []const u8,
+    /// Built-in public OAuth client id; when set, no on-disk client config is required.
+    default_public_client_id: ?[]const u8 = null,
+    /// Alternate root-object key in `oauth-clients.json` (e.g. "google" for
+    /// `google-gemini-cli`, "github" for `github-copilot`).
+    oauth_config_alias_key: ?[]const u8 = null,
+    /// JSON snippet shown when client config is missing.
+    oauth_config_snippet: ?[]const u8 = null,
+    /// When true, the OAuth state parameter is a random hex value instead of
+    /// being derived from the PKCE verifier.
+    uses_hex_oauth_state: bool = false,
+    /// When true, the authorize URL `scope` parameter is built dynamically from
+    /// `GOOGLE_SCOPES` instead of using the descriptor's static `scope` field.
+    uses_dynamic_google_scopes: bool = false,
+    /// When true, stored OAuth credentials must include a `project_id` and the
+    /// resolved API key is a JSON blob carrying `token` + `projectId`.
+    requires_project_id: bool = false,
+};
+
+const ANTHROPIC_OAUTH_SNIPPET =
+    \\{
+    \\  "anthropic": {
+    \\    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+    \\  }
+    \\}
+;
+
+const GOOGLE_OAUTH_SNIPPET =
+    \\{
+    \\  "google-gemini-cli": {
+    \\    "client_id": "YOUR_GOOGLE_CLIENT_ID",
+    \\    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
+    \\  }
+    \\}
+;
+
+const GITHUB_COPILOT_OAUTH_SNIPPET =
+    \\{
+    \\  "github-copilot": {
+    \\    "client_id": "YOUR_GITHUB_CLIENT_ID"
+    \\  }
+    \\}
+;
+
+const AUTH_PROVIDERS = [_]AuthProviderInfo{
+    .{
+        .id = "anthropic",
+        .default_public_client_id = DEFAULT_ANTHROPIC_CLIENT_ID,
+        .oauth_config_snippet = ANTHROPIC_OAUTH_SNIPPET,
+    },
+    .{
+        .id = "github-copilot",
+        .default_public_client_id = DEFAULT_GITHUB_COPILOT_CLIENT_ID,
+        .oauth_config_alias_key = "github",
+        .oauth_config_snippet = GITHUB_COPILOT_OAUTH_SNIPPET,
+    },
+    .{
+        .id = "openai-codex",
+        .default_public_client_id = DEFAULT_OPENAI_CODEX_CLIENT_ID,
+        .uses_hex_oauth_state = true,
+    },
+    .{
+        .id = "google-gemini-cli",
+        .oauth_config_alias_key = "google",
+        .oauth_config_snippet = GOOGLE_OAUTH_SNIPPET,
+        .uses_dynamic_google_scopes = true,
+        .requires_project_id = true,
+    },
+};
+
+fn authInfoFor(id: []const u8) ?*const AuthProviderInfo {
+    for (&AUTH_PROVIDERS) |*info| {
+        if (std.mem.eql(u8, info.id, id)) return info;
+    }
+    return null;
+}
+
 pub fn isApiKeyLoginProvider(
     provider_id: []const u8,
     oauth_provider_ids: []const []const u8,
@@ -371,7 +453,8 @@ fn startBrowserLoginForDescriptor(
     const verifier = try generatePkceVerifier(allocator, io);
     errdefer allocator.free(verifier);
 
-    const state = if (std.mem.eql(u8, desc.id, "openai-codex"))
+    const auth_info = authInfoFor(desc.id);
+    const state = if (auth_info != null and auth_info.?.uses_hex_oauth_state)
         try generateOpenAICodexState(allocator, io)
     else
         try allocator.dupe(u8, verifier);
@@ -389,7 +472,7 @@ fn startBrowserLoginForDescriptor(
     const encoded_redirect_uri = try formEncode(allocator, desc.redirect_uri);
     defer allocator.free(encoded_redirect_uri);
 
-    const scope_text = if (std.mem.eql(u8, desc.id, "google-gemini-cli"))
+    const scope_text = if (auth_info != null and auth_info.?.uses_dynamic_google_scopes)
         try std.mem.join(allocator, " ", &GOOGLE_SCOPES)
     else
         try allocator.dupe(u8, desc.scope);
@@ -618,7 +701,8 @@ pub fn buildApiKeyFromStoredEntry(
         }
         if (std.mem.eql(u8, value, "oauth")) {
             const access = getObjectString(object, "access") orelse getObjectString(object, "access_token") orelse return null;
-            if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+            const info = authInfoFor(provider_id);
+            if (info != null and info.?.requires_project_id) {
                 const project_id = getObjectString(object, "projectId") orelse getObjectString(object, "project_id") orelse return null;
                 return try buildGoogleStoredApiKey(allocator, access, project_id);
             }
@@ -1174,10 +1258,8 @@ fn resolveOAuthClientId(
 }
 
 fn defaultPublicOAuthClientId(provider_id: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, provider_id, "anthropic")) return DEFAULT_ANTHROPIC_CLIENT_ID;
-    if (std.mem.eql(u8, provider_id, "github-copilot")) return DEFAULT_GITHUB_COPILOT_CLIENT_ID;
-    if (std.mem.eql(u8, provider_id, "openai-codex")) return DEFAULT_OPENAI_CODEX_CLIENT_ID;
-    return null;
+    const info = authInfoFor(provider_id) orelse return null;
+    return info.default_public_client_id;
 }
 
 fn isValidAnthropicClientId(value: []const u8) bool {
@@ -1232,14 +1314,11 @@ fn findOAuthProviderObject(root: std.json.ObjectMap, provider_id: []const u8) ?s
         if (value == .object) return value.object;
     }
 
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
-        if (root.get("google")) |value| {
-            if (value == .object) return value.object;
-        }
-    }
-    if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        if (root.get("github")) |value| {
-            if (value == .object) return value.object;
+    if (authInfoFor(provider_id)) |info| {
+        if (info.oauth_config_alias_key) |alias| {
+            if (root.get(alias)) |value| {
+                if (value == .object) return value.object;
+            }
         }
     }
 
@@ -1247,32 +1326,10 @@ fn findOAuthProviderObject(root: std.json.ObjectMap, provider_id: []const u8) ?s
 }
 
 fn oauthConfigSnippet(provider_id: []const u8) []const u8 {
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
-        return
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "YOUR_GOOGLE_CLIENT_ID",
-        \\    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
-        \\  }
-        \\}
-        ;
+    if (authInfoFor(provider_id)) |info| {
+        if (info.oauth_config_snippet) |snippet| return snippet;
     }
-    if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        return
-        \\{
-        \\  "github-copilot": {
-        \\    "client_id": "YOUR_GITHUB_CLIENT_ID"
-        \\  }
-        \\}
-        ;
-    }
-    return
-    \\{
-    \\  "anthropic": {
-    \\    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    \\  }
-    \\}
-    ;
+    return ANTHROPIC_OAUTH_SNIPPET;
 }
 
 fn exchangeAnthropicAuthorizationCode(
@@ -1792,7 +1849,8 @@ fn parseStoredOAuthCredential(
     const access = getObjectStringAny(object, &[_][]const u8{ "access", "access_token" }) orelse return null;
     const refresh = getObjectStringAny(object, &[_][]const u8{ "refresh", "refresh_token" }) orelse "";
     const expires = getObjectInt(object, "expires") orelse 0;
-    const project_id = if (std.mem.eql(u8, provider_id, "google-gemini-cli"))
+    const info = authInfoFor(provider_id);
+    const project_id = if (info != null and info.?.requires_project_id)
         getObjectStringAny(object, &[_][]const u8{ "projectId", "project_id" }) orelse return null
     else
         null;
@@ -1810,7 +1868,8 @@ fn buildApiKeyFromOAuthCredential(
     provider_id: []const u8,
     credential: *const OAuthCredential,
 ) ![]u8 {
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
+    const info = authInfoFor(provider_id);
+    if (info != null and info.?.requires_project_id) {
         const project_id = credential.project_id orelse return error.MissingProjectId;
         return try buildGoogleStoredApiKey(allocator, credential.access, project_id);
     }
