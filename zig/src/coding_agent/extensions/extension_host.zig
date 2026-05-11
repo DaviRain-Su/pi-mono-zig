@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const enforcement = @import("enforcement.zig");
 const extension_registry = @import("extension_registry.zig");
 const extension_protocol = @import("extension_protocol.zig");
+const policy_resource_helpers = @import("policy_resource_helpers.zig");
 const common = @import("../tools/common.zig");
 
 pub const HOST_MARKER_ENV = "PI_M6_EXTENSION_HOST_MARKER";
@@ -63,6 +64,7 @@ pub const HostProcess = struct {
     term: ?std.process.Child.Term = null,
     diagnostic_source: []u8,
     approved_capabilities: []enforcement.Grant,
+    resource_limits: enforcement.ResourceLimits,
     policy_lookup_key: ?[]u8,
     stderr_diagnostics_recorded: usize = 0,
     stderr_diagnostics_truncated: bool = false,
@@ -92,6 +94,8 @@ pub const HostProcess = struct {
         errdefer allocator.free(diagnostic_source);
         const approved_capabilities = try allocator.dupe(enforcement.Grant, options.approved_capabilities);
         errdefer allocator.free(approved_capabilities);
+        var resource_limits = try policy_resource_helpers.cloneEnforcementResourceLimits(allocator, options.resource_limits);
+        errdefer policy_resource_helpers.deinitEnforcementResourceLimits(allocator, &resource_limits);
         const policy_lookup_key = if (options.policy_lookup_key) |policy_key| try allocator.dupe(u8, policy_key) else null;
         errdefer if (policy_lookup_key) |policy_key| allocator.free(policy_key);
 
@@ -106,7 +110,7 @@ pub const HostProcess = struct {
                 allocator,
                 .{
                     .approved_grants = approved_capabilities,
-                    .resource_limits = options.resource_limits,
+                    .resource_limits = resource_limits,
                 },
                 .{
                     .runtime_kind = "process_jsonl",
@@ -118,6 +122,7 @@ pub const HostProcess = struct {
             .shutdown_timeout_ms = options.shutdown_timeout_ms,
             .diagnostic_source = diagnostic_source,
             .approved_capabilities = approved_capabilities,
+            .resource_limits = resource_limits,
             .policy_lookup_key = policy_lookup_key,
         };
 
@@ -134,6 +139,7 @@ pub const HostProcess = struct {
         self.state.deinit();
         self.allocator.free(self.diagnostic_source);
         self.allocator.free(self.approved_capabilities);
+        policy_resource_helpers.deinitEnforcementResourceLimits(self.allocator, &self.resource_limits);
         if (self.policy_lookup_key) |policy_key| self.allocator.free(policy_key);
         self.allocator.destroy(self);
     }
@@ -187,7 +193,7 @@ pub const HostProcess = struct {
             self.stderr_file = null;
         }
         self.mutex.lockUncancelable(self.io);
-        self.state.clearPendingRequests();
+        self.state.closePendingRequests();
         self.state.registry.deinit();
         self.state.registry = extension_registry.Registry.init(self.allocator);
         self.mutex.unlock(self.io);
@@ -328,6 +334,7 @@ pub const HostProcess = struct {
         {
             self.mutex.lockUncancelable(self.io);
             errdefer self.mutex.unlock(self.io);
+            try self.enforceToolExecutionLocked(tool_name, tool_call_id);
             const file = self.stdin_file orelse {
                 try self.state.addDiagnostic(.host_exit, .@"error", "extension host stdin was closed before tool execution");
                 return error.ExtensionHostClosed;
@@ -380,6 +387,70 @@ pub const HostProcess = struct {
         }
         self.shutdown() catch {};
         return error.ToolExecutionTimedOut;
+    }
+
+    fn enforceToolExecutionLocked(self: *HostProcess, tool_name: []const u8, tool_call_id: []const u8) !void {
+        const decision = enforcement.decide(
+            self.state.registry_principal,
+            self.state.registry_policy,
+            .tool_use,
+            .{ .id = tool_name },
+            .call,
+            "process_jsonl/tool_execute",
+            .{ .turns = 1, .replay_key = tool_call_id },
+            &self.state.registry_accounting,
+        );
+        switch (decision) {
+            .allow => return,
+            .deny => |denial| {
+                try self.addToolDenialDiagnosticLocked(denial);
+                return error.ExtensionPermissionDenied;
+            },
+        }
+    }
+
+    fn addToolDenialDiagnosticLocked(self: *HostProcess, denial: enforcement.DenyDecision) !void {
+        var envelope: std.Io.Writer.Allocating = .init(self.allocator);
+        defer envelope.deinit();
+        try envelope.writer.writeAll("{\"schemaVersion\":\"diagnostic-envelope.v0\",\"severity\":\"error\",\"runtimeKind\":\"process_jsonl\",\"category\":");
+        try std.json.Stringify.value(denial.category, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"capability\":");
+        try std.json.Stringify.value(denial.capability.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"branch\":");
+        try std.json.Stringify.value(denial.branch.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"phase\":");
+        try std.json.Stringify.value(denial.phase.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"mode\":");
+        try std.json.Stringify.value(denial.mode, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"principal\":{\"runtimeKind\":");
+        try std.json.Stringify.value(denial.principal.runtime_kind, .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"extensionId\":");
+        try std.json.Stringify.value(denial.principal.extension_id, .{}, &envelope.writer);
+        if (denial.principal.policy_lookup_key) |policy_lookup_key| {
+            try envelope.writer.writeAll(",\"policyLookupKey\":");
+            try std.json.Stringify.value(policy_lookup_key, .{}, &envelope.writer);
+        }
+        try envelope.writer.writeAll("},\"operation\":");
+        try std.json.Stringify.value(denial.operation.jsonName(), .{}, &envelope.writer);
+        try envelope.writer.writeAll(",\"target\":{\"id\":");
+        if (enforcement.diagnosticTargetId(denial.operation, denial.target)) |target_id| {
+            try std.json.Stringify.value(target_id, .{}, &envelope.writer);
+        } else {
+            try envelope.writer.writeAll("null");
+        }
+        try envelope.writer.writeAll("},\"reason\":");
+        try std.json.Stringify.value(denial.reason, .{}, &envelope.writer);
+        if (denial.limit_name) |limit_name| {
+            try envelope.writer.writeAll(",\"limit\":{\"name\":");
+            try std.json.Stringify.value(limit_name, .{}, &envelope.writer);
+            if (denial.limit_value) |limit_value| {
+                try envelope.writer.writeAll(",\"configuredValue\":");
+                try envelope.writer.print("{}", .{limit_value});
+            }
+            try envelope.writer.writeAll("}");
+        }
+        try envelope.writer.writeAll(",\"recoveryHint\":\"Grant the required extension capability, narrow the call target, or disable the extension tool.\",\"message\":\"process_jsonl tool execution denied by enforcement substrate\"}");
+        try self.state.addDiagnostic(.host_error, .@"error", envelope.written());
     }
 
     pub fn invokeExtensionEvent(
@@ -920,6 +991,85 @@ test "process_jsonl host executes correlated tool calls and consumes repeated id
     try std.testing.expect(std.mem.indexOf(u8, capture, "\"input\":{\"value\":\"alpha\"}") != null);
 }
 
+test "process_jsonl tool execution permission broker enforces resource limits and tool scopes before host side effects" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pi-process-tool-permission-capture.jsonl",
+    });
+    defer allocator.free(capture_path);
+
+    const source_scopes = try allocator.alloc([]const u8, 1);
+    defer allocator.free(source_scopes);
+    source_scopes[0] = "allowed.tool";
+    const source_scopes_ptr = source_scopes.ptr;
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; printf '{{\"type\":\"ready\"}}\\n'; while IFS= read -r line; do " ++
+            "printf '%s\\n' \"$line\" >> {s}; " ++
+            "case \"$line\" in " ++
+            "*'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; " ++
+            "*'\"tool_call\"'*) printf '{{\"type\":\"tool_result\",\"toolCallId\":\"repeat\",\"content\":[{{\"type\":\"text\",\"text\":\"allowed\"}}]}}\\n';; " ++
+            "esac; done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-tool-permission" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/permission-extension.js",
+        .initialize = .{
+            .marker = "pi-process-tool-permission",
+            .cwd = "/tmp",
+            .fixture = "permission-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+        .approved_capabilities = &.{.tool_use},
+        .resource_limits = .{ .turns = 1, .tool_scopes = source_scopes },
+        .policy_lookup_key = "process-jsonl:permission-fixture",
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    host.mutex.lockUncancelable(std.testing.io);
+    {
+        defer host.mutex.unlock(std.testing.io);
+        try std.testing.expect(host.state.registry_policy.resource_limits.tool_scopes.ptr != source_scopes_ptr);
+        try std.testing.expectEqualStrings("allowed.tool", host.state.registry_policy.resource_limits.tool_scopes[0]);
+    }
+
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"value\":\"alpha\"}", .{});
+    defer args.deinit();
+
+    var first = try host.executeTool(allocator, "allowed.tool", "repeat", args.value, 500);
+    defer first.deinit(allocator);
+    try std.testing.expect(!first.is_error);
+    try std.testing.expectEqualStrings("allowed", first.content[0].text.text);
+
+    var replay = try host.executeTool(allocator, "allowed.tool", "repeat", args.value, 500);
+    defer replay.deinit(allocator);
+    try std.testing.expect(!replay.is_error);
+    try std.testing.expectEqual(@as(usize, 1), host.state.registry_accounting.replay_keys_recorded);
+
+    try std.testing.expectError(error.ExtensionPermissionDenied, host.executeTool(allocator, "secret.denied.tool", "denied-call", args.value, 500));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "\"category\":\"resource_limit_exceeded\""));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "\"limit\":{\"name\":\"toolScopes\""));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "\"policyLookupKey\":\"process-jsonl:permission-fixture\""));
+    try std.testing.expect(hostDiagnosticContains(host, .host_error, "\"target\":{\"id\":\"[redacted]\""));
+
+    try host.shutdown();
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"toolName\":\"allowed.tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "secret.denied.tool") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture, "\"type\":\"shutdown\"") != null);
+}
+
 test "process_jsonl host keeps stderr and malformed stdout diagnostic-only while preserving tool result" {
     const allocator = std.testing.allocator;
     const script =
@@ -1353,6 +1503,69 @@ test "M6 host lifecycle cleans up after shutdown write failure" {
     try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
 }
 
+test "process_jsonl host shutdown and deinit close pending work once" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const capture_path = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "pi-process-shutdown-once-capture.jsonl",
+    });
+    defer allocator.free(capture_path);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "IFS= read -r init; " ++
+            "printf '{{\"type\":\"ready\"}}\\n'; " ++
+            "printf '{{\"type\":\"extension_ui_request\",\"id\":\"pending-ui\",\"method\":\"input\",\"responseRequired\":true}}\\n'; " ++
+            "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {s}; case \"$line\" in *'\"shutdown\"'*) printf '{{\"type\":\"shutdown_complete\"}}\\n'; exit 0;; esac; done",
+        .{capture_path},
+    );
+    defer allocator.free(script);
+    const argv = [_][]const u8{ "/bin/sh", "-c", script, "pi-process-shutdown-once" };
+    var host = try HostProcess.start(allocator, std.testing.io, .{
+        .argv = &argv,
+        .extension_path = "fixture/shutdown-once.js",
+        .initialize = .{
+            .marker = "pi-process-shutdown-once",
+            .cwd = "/tmp",
+            .fixture = "shutdown-once-fixture",
+        },
+        .shutdown_timeout_ms = 500,
+    });
+    defer host.deinit();
+
+    try host.waitForReady(500);
+    var elapsed: u64 = 0;
+    while (host.pendingCount() == 0 and elapsed <= 500) : (elapsed += 10) {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.pendingCount());
+    host.mutex.lockUncancelable(std.testing.io);
+    {
+        defer host.mutex.unlock(std.testing.io);
+        try host.state.addPendingExtensionEventRequest("pending-extension-event");
+        try std.testing.expectEqual(@as(usize, 1), host.state.pending_extension_event_ids.count());
+    }
+
+    try host.shutdown();
+    try host.shutdown();
+    try std.testing.expect(host.hasShutdownComplete());
+    try std.testing.expectEqual(@as(usize, 0), host.pendingCount());
+    host.mutex.lockUncancelable(std.testing.io);
+    {
+        defer host.mutex.unlock(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 0), host.state.pending_extension_event_ids.count());
+        try std.testing.expect(host.state.pending_requests_closed);
+    }
+
+    const capture = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, capture_path, allocator, .unlimited);
+    defer allocator.free(capture);
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences(capture, "\"type\":\"shutdown\""));
+}
+
 test "M11 host process drains live register_* frames into observable runtime registry" {
     const allocator = std.testing.allocator;
     const script =
@@ -1704,6 +1917,16 @@ fn hostDiagnosticContains(host: *HostProcess, category: DiagnosticCategory, need
         if (diagnostic.category == category and std.mem.indexOf(u8, diagnostic.message, needle) != null) return true;
     }
     return false;
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOf(u8, haystack[index..], needle)) |relative| {
+        count += 1;
+        index += relative + needle.len;
+    }
+    return count;
 }
 
 fn feedExtensionHostFuzzChunks(

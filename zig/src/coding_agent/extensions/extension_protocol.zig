@@ -734,6 +734,10 @@ fn registryFrameOperation(type_name: []const u8) ?enforcement.Operation {
         std.mem.eql(u8, type_name, "register_flag") or
         std.mem.eql(u8, type_name, "register_capability") or
         std.mem.eql(u8, type_name, "unregister_capability") or
+        std.mem.eql(u8, type_name, "register_workflow") or
+        std.mem.eql(u8, type_name, "unregister_workflow") or
+        std.mem.eql(u8, type_name, "register_hook") or
+        std.mem.eql(u8, type_name, "unregister_hook") or
         std.mem.eql(u8, type_name, "clear_extension_registrations") or
         std.mem.eql(u8, type_name, "register_message_renderer") or
         std.mem.eql(u8, type_name, "unregister_message_renderer"))
@@ -1397,6 +1401,50 @@ test "process_jsonl registry frames default-deny before mutation" {
         try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"principal\":{\"runtimeKind\":\"process_jsonl\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"mode\":\"process_jsonl/registry_frame\"") != null);
     }
+}
+
+test "process_jsonl permission broker default-denies every mutating registry frame class" {
+    const allocator = std.testing.allocator;
+    var parser = JsonlFrameParser{};
+    defer parser.deinit(allocator);
+    var state = ProtocolState.init(allocator);
+    defer state.deinit();
+
+    const frames =
+        "{\"type\":\"ready\"}\n" ++
+        "{\"type\":\"register_tool\",\"name\":\"denied-tool\",\"label\":\"Denied\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_command\",\"name\":\"denied-command\",\"description\":\"Denied\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_capability\",\"id\":\"denied-capability\",\"kind\":\"workflow\",\"title\":\"Denied\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_hook\",\"event\":\"message_end\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"set_widget\",\"key\":\"denied-widget\",\"lines\":[\"Denied\"],\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_provider\",\"name\":\"denied-provider\",\"displayName\":\"Denied\",\"models\":[{\"id\":\"denied-model\"}],\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"resources_discover\",\"skillPaths\":[\"fixture/skills\"],\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_message_renderer\",\"customType\":\"secret-renderer-token\",\"extensionPath\":\"fixture/denied.ts\"}\n" ++
+        "{\"type\":\"register_workflow\",\"id\":\"denied-workflow\",\"description\":\"Denied\",\"toolName\":\"workflow.denied\",\"extensionPath\":\"fixture/denied.ts\"}\n";
+    try parser.feed(allocator, frames, &state);
+
+    try std.testing.expect(state.ready_seen);
+    try std.testing.expectEqual(@as(usize, 0), state.registry_frames_applied);
+    const counts = extension_registry.registrySurfaceCounts(&state.registry);
+    try std.testing.expectEqual(@as(usize, 0), counts.tools);
+    try std.testing.expectEqual(@as(usize, 0), counts.commands);
+    try std.testing.expectEqual(@as(usize, 0), counts.capabilities);
+    try std.testing.expectEqual(@as(usize, 0), counts.providers);
+    try std.testing.expectEqual(@as(usize, 0), counts.resource_discoveries);
+    try std.testing.expectEqual(@as(usize, 0), counts.widgets);
+    try std.testing.expectEqual(@as(usize, 0), counts.message_renderers);
+    try std.testing.expect(!state.registry.hasHook("message_end"));
+    try std.testing.expect(state.registry.workflowForToolName("workflow.denied") == null);
+    try std.testing.expectEqual(@as(usize, 9), state.diagnosticCategoryCount(.host_error));
+    for (state.diagnostics.items) |diagnostic| {
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"schemaVersion\":\"diagnostic-envelope.v0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"category\":\"denied_capability\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"operation\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"target\":{\"id\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "\"recoveryHint\":\"Grant the required extension capability or disable the registry frame.\"") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[7].message, "secret-renderer-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.diagnostics.items[7].message, "[REDACTED]") != null);
 }
 
 test "process_jsonl registry frames mutate only with matching grants" {
