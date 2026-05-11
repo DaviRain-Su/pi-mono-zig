@@ -1197,7 +1197,79 @@ test "ISS-401 pre-start abort takes precedence over provider lookup and setup fa
     );
 }
 
-test "built-in representative provider families convert setup failures into terminal streams" {
+test "ISS-505 successful provider stream exposes one done terminal and null afterwards" {
+    api_registry.clear();
+    defer api_registry.clear();
+    resetRecordingState();
+    recording_state.response_text = "iss-505 complete";
+
+    try api_registry.register(.{
+        .api = "recording:test:iss-505-success",
+        .stream = recordingStream,
+        .stream_simple = recordingStreamSimple,
+    });
+
+    const model = streamContractTestModel("recording:test:iss-505-success", "recording", "recording-model");
+    var stream_instance = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+    defer stream_instance.deinit();
+
+    const terminal = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings("recording:test:iss-505-success", terminal.message.?.api);
+    try std.testing.expectEqualStrings("recording", terminal.message.?.provider);
+    try std.testing.expectEqualStrings("recording-model", terminal.message.?.model);
+    try std.testing.expectEqual(types.StopReason.stop, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("iss-505 complete", terminal.message.?.content[0].text.text);
+    try std.testing.expect(stream_instance.next() == null);
+
+    const result = stream_instance.result().?;
+    try std.testing.expectEqualStrings(terminal.message.?.api, result.api);
+    try std.testing.expectEqualStrings(terminal.message.?.provider, result.provider);
+    try std.testing.expectEqualStrings(terminal.message.?.model, result.model);
+    try std.testing.expectEqual(terminal.message.?.stop_reason, result.stop_reason);
+    try std.testing.expectEqualStrings(terminal.message.?.content[0].text.text, result.content[0].text.text);
+}
+
+test "ISS-505 provider setup failure exposes one terminal error output and null afterwards" {
+    api_registry.clear();
+    defer api_registry.clear();
+    failing_stream_calls = 0;
+
+    try api_registry.register(.{
+        .api = "recording:test:iss-505-error",
+        .stream = failingContractStream,
+        .stream_simple = failingContractStream,
+    });
+
+    const model = streamContractTestModel("recording:test:iss-505-error", "recording", "recording-model");
+    var stream_instance = try stream(
+        std.testing.allocator,
+        std.Io.failing,
+        model,
+        .{ .messages = &[_]types.Message{} },
+        null,
+    );
+    defer stream_instance.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), failing_stream_calls);
+    try expectSingleTerminalError(
+        &stream_instance,
+        "recording:test:iss-505-error",
+        "recording",
+        "recording-model",
+        .error_reason,
+        "CallbackFailed",
+    );
+}
+
+test "ISS-505 built-in representative provider families convert setup failures into terminal streams without network" {
     api_registry.resetForTesting();
     defer api_registry.clear();
 
@@ -1207,9 +1279,15 @@ test "built-in representative provider families convert setup failures into term
     }{
         .{ .api = "openai-completions", .provider = "openai" },
         .{ .api = "openai-responses", .provider = "openai" },
+        .{ .api = "azure-openai-responses", .provider = "azure-openai-responses" },
+        .{ .api = "openai-codex-responses", .provider = "openai-codex" },
         .{ .api = "anthropic-messages", .provider = "anthropic" },
+        .{ .api = "kimi-completions", .provider = "kimi" },
+        .{ .api = "mistral-conversations", .provider = "mistral" },
         .{ .api = "google-generative-ai", .provider = "google" },
+        .{ .api = "google-gemini-cli", .provider = "google-gemini-cli" },
         .{ .api = "google-vertex", .provider = "google-vertex" },
+        .{ .api = "bedrock-converse-stream", .provider = "amazon-bedrock" },
     };
 
     for (cases) |case| {

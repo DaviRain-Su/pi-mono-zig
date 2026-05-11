@@ -37,41 +37,8 @@ const tool_call_ownership_matrix = [_]ToolCallOwnershipCase{
     .{ .label = "Faux", .api = "faux", .provider = "faux", .model = "faux-contract-model", .contract = .normalized_inline, .built_in = false },
 };
 
-fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
-    allocator.free(tool_call.id);
-    allocator.free(tool_call.name);
-    if (tool_call.thought_signature) |signature| allocator.free(signature);
-    provider_json.freeValue(allocator, tool_call.arguments);
-}
-
-fn freeAssistantMessageOwned(allocator: std.mem.Allocator, message: types.AssistantMessage) void {
-    for (message.content) |block| {
-        switch (block) {
-            .text => |text| {
-                allocator.free(text.text);
-                if (text.text_signature) |signature| allocator.free(signature);
-            },
-            .thinking => |thinking| {
-                allocator.free(thinking.thinking);
-                if (thinking.thinking_signature) |signature| allocator.free(signature);
-                if (thinking.signature) |signature| allocator.free(signature);
-            },
-            .image => |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            },
-            .tool_call => |tool_call| freeToolCallOwned(allocator, tool_call),
-        }
-    }
-    allocator.free(message.content);
-
-    if (message.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| freeToolCallOwned(allocator, tool_call);
-        allocator.free(tool_calls);
-    }
-    if (message.response_id) |response_id| allocator.free(response_id);
-    if (message.error_message) |error_message| allocator.free(error_message);
-}
+const freeToolCallOwned = types.freeToolCall;
+const freeAssistantMessageOwned = types.freeAssistantMessage;
 
 fn freeEventOwned(allocator: std.mem.Allocator, event: types.AssistantMessageEvent) void {
     event.deinitTransient(allocator);
@@ -313,6 +280,40 @@ fn expectToolCallOwnershipCase(allocator: std.mem.Allocator, case: ToolCallOwner
     try std.testing.expect(saw_done);
 }
 
+fn readFixtureJson(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(std.json.Value) {
+    const bytes = try std.Io.Dir.readFileAlloc(
+        .cwd(),
+        std.testing.io,
+        path,
+        allocator,
+        .limited(1_000_000),
+    );
+    defer allocator.free(bytes);
+    return try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+}
+
+fn objectFieldString(value: std.json.Value, field: []const u8) ![]const u8 {
+    if (value != .object) return error.InvalidFixtureField;
+    const field_value = value.object.get(field) orelse return error.MissingFixtureField;
+    if (field_value != .string) return error.InvalidFixtureField;
+    return field_value.string;
+}
+
+fn expectFieldContains(value: std.json.Value, field: []const u8, needle: []const u8) !void {
+    const haystack = try objectFieldString(value, field);
+    try std.testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
+}
+
+fn expectScenarioPresent(manifest: std.json.Value, scenario_id: []const u8) !void {
+    if (manifest != .object) return error.InvalidFixtureField;
+    const scenario_ids = manifest.object.get("scenarioIds") orelse return error.MissingFixtureField;
+    if (scenario_ids != .array) return error.InvalidFixtureField;
+    for (scenario_ids.array.items) |value| {
+        if (value == .string and std.mem.eql(u8, value.string, scenario_id)) return;
+    }
+    return error.MissingScenarioFixture;
+}
+
 test "ISS-200 provider stream matrix covers every built-in API for tool-call ownership" {
     try expectMatrixCoversBuiltIns();
 }
@@ -395,6 +396,95 @@ test "ISS-200 preserves openai_chat_sse dual-allocation exception in matrix" {
             } else {
                 freeEventOwned(std.testing.allocator, event);
             }
+        }
+    }
+}
+
+test "ISS-100 OpenAI Chat dual-allocation exception stays isolated to chat-compatible streams" {
+    try configureProviderMatrix();
+    defer api_registry.resetForTesting();
+
+    var legacy_count: usize = 0;
+    for (tool_call_ownership_matrix) |case| {
+        var stream_instance = try stream_ops.stream(
+            std.testing.allocator,
+            std.Io.failing,
+            contractModel(case),
+            .{ .messages = &[_]types.Message{} },
+            null,
+        );
+        defer stream_instance.deinit();
+
+        while (stream_instance.next()) |event| {
+            if (event.event_type == .done) {
+                defer freeAssistantMessageOwned(std.testing.allocator, event.message.?);
+                try expectToolCallMessage(case, event.message.?);
+                switch (case.contract) {
+                    .legacy_dual_allocated => {
+                        legacy_count += 1;
+                        try std.testing.expectEqualStrings("openai-completions", case.api);
+                        try std.testing.expect(event.message.?.tool_calls != null);
+                        try std.testing.expect(event.message.?.tool_calls.?[0].id.ptr != event.message.?.content[0].tool_call.id.ptr);
+                        try std.testing.expect(event.message.?.tool_calls.?[0].name.ptr != event.message.?.content[0].tool_call.name.ptr);
+                    },
+                    .normalized_inline => try std.testing.expect(event.message.?.tool_calls == null),
+                }
+            } else {
+                freeEventOwned(std.testing.allocator, event);
+            }
+        }
+        try std.testing.expect(stream_instance.next() == null);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), legacy_count);
+}
+
+test "ISS-100 OpenAI Chat parity manifest remains local mocked fetch with chat-specific stream fixtures" {
+    const allocator = std.testing.allocator;
+    const manifest = try readFixtureJson(allocator, "test/golden/openai-chat/manifest.json");
+    defer manifest.deinit();
+
+    try std.testing.expectEqualStrings(
+        "zig/test/generate-openai-chat-fixtures.ts",
+        try objectFieldString(manifest.value, "generatedBy"),
+    );
+    try expectFieldContains(manifest.value, "captureBoundary", "OpenAI Chat request");
+    try expectFieldContains(manifest.value, "network", "local mocked global fetch only");
+    try expectFieldContains(manifest.value, "network", "unhandled requests throw");
+    try expectScenarioPresent(manifest.value, "signature-stream-multi-tool");
+    try expectScenarioPresent(manifest.value, "signature-cross-model-stripped");
+}
+
+test "VAL-PROVIDER-010 provider parity manifests declare local no-network fixture boundaries" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        path: []const u8,
+        generated_by: []const u8,
+        network_needles: []const []const u8,
+    }{
+        .{
+            .path = "test/golden/openai-chat/manifest.json",
+            .generated_by = "zig/test/generate-openai-chat-fixtures.ts",
+            .network_needles = &[_][]const u8{ "local mocked global fetch only", "unhandled requests throw" },
+        },
+        .{
+            .path = "test/golden/openai-responses/manifest.json",
+            .generated_by = "zig/test/generate-openai-responses-fixtures.ts",
+            .network_needles = &[_][]const u8{ "local mocked global fetch only", "unhandled requests throw" },
+        },
+        .{
+            .path = "test/golden/bedrock/manifest.json",
+            .generated_by = "zig/test/generate-bedrock-fixtures.ts",
+            .network_needles = &[_][]const u8{ "local BedrockRuntimeClient.send mock only", "no AWS metadata", "credential store", "remote Bedrock access" },
+        },
+    };
+
+    for (cases) |case| {
+        const manifest = try readFixtureJson(allocator, case.path);
+        defer manifest.deinit();
+        try std.testing.expectEqualStrings(case.generated_by, try objectFieldString(manifest.value, "generatedBy"));
+        for (case.network_needles) |needle| {
+            try expectFieldContains(manifest.value, "network", needle);
         }
     }
 }
