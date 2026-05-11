@@ -78,13 +78,52 @@ pub fn isValidThinkingLevel(level: []const u8) bool {
 }
 
 pub fn parseThinkingLevel(level: []const u8) ?ThinkingLevel {
-    if (std.mem.eql(u8, level, "off")) return .off;
-    if (std.mem.eql(u8, level, "minimal")) return .minimal;
-    if (std.mem.eql(u8, level, "low")) return .low;
-    if (std.mem.eql(u8, level, "medium")) return .medium;
-    if (std.mem.eql(u8, level, "high")) return .high;
-    if (std.mem.eql(u8, level, "xhigh")) return .xhigh;
-    return null;
+    return std.meta.stringToEnum(ThinkingLevel, level);
+}
+
+const FlagKind = enum {
+    bool_flag,
+    optional_string,
+};
+
+const FlagSpec = struct {
+    long: []const u8,
+    short: ?[]const u8 = null,
+    field: []const u8,
+    kind: FlagKind,
+};
+
+const FLAG_SPECS = [_]FlagSpec{
+    .{ .long = "--help", .short = "-h", .field = "help", .kind = .bool_flag },
+    .{ .long = "--version", .short = "-v", .field = "version", .kind = .bool_flag },
+    .{ .long = "--continue", .short = "-c", .field = "continue_session", .kind = .bool_flag },
+    .{ .long = "--resume", .short = "-r", .field = "resume_session", .kind = .bool_flag },
+    .{ .long = "--no-session", .field = "no_session", .kind = .bool_flag },
+    .{ .long = "--no-tools", .short = "-nt", .field = "no_tools", .kind = .bool_flag },
+    .{ .long = "--no-builtin-tools", .short = "-nbt", .field = "no_builtin_tools", .kind = .bool_flag },
+    .{ .long = "--no-extensions", .short = "-ne", .field = "no_extensions", .kind = .bool_flag },
+    .{ .long = "--no-skills", .short = "-ns", .field = "no_skills", .kind = .bool_flag },
+    .{ .long = "--no-prompt-templates", .short = "-np", .field = "no_prompt_templates", .kind = .bool_flag },
+    .{ .long = "--no-themes", .field = "no_themes", .kind = .bool_flag },
+    .{ .long = "--no-context-files", .short = "-nc", .field = "no_context_files", .kind = .bool_flag },
+    .{ .long = "--verbose", .field = "verbose", .kind = .bool_flag },
+    .{ .long = "--offline", .field = "offline", .kind = .bool_flag },
+    .{ .long = "--provider", .field = "provider", .kind = .optional_string },
+    .{ .long = "--model", .field = "model", .kind = .optional_string },
+    .{ .long = "--api-key", .field = "api_key", .kind = .optional_string },
+    .{ .long = "--system-prompt", .field = "system_prompt", .kind = .optional_string },
+    .{ .long = "--session", .field = "session", .kind = .optional_string },
+    .{ .long = "--fork", .field = "fork", .kind = .optional_string },
+    .{ .long = "--session-dir", .field = "session_dir", .kind = .optional_string },
+    .{ .long = "--export", .field = "export_path", .kind = .optional_string },
+};
+
+comptime {
+    for (FLAG_SPECS) |spec| {
+        if (!@hasField(Args, spec.field)) {
+            @compileError("FlagSpec references unknown Args field: " ++ spec.field);
+        }
+    }
 }
 
 pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
@@ -107,37 +146,13 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
     var index: usize = 0;
     while (index < argv.len) : (index += 1) {
         const arg = argv[index];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            result.help = true;
-        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            result.version = true;
-        } else if (std.mem.eql(u8, arg, "--mode")) {
+
+        // Custom-handler flags: bespoke semantics that don't fit a "set this field" pattern.
+        if (std.mem.eql(u8, arg, "--mode")) {
             if (takeNext(argv, &index)) |value| result.mode = parseMode(value);
-        } else if (std.mem.eql(u8, arg, "--continue") or std.mem.eql(u8, arg, "-c")) {
-            result.continue_session = true;
-        } else if (std.mem.eql(u8, arg, "--resume") or std.mem.eql(u8, arg, "-r")) {
-            result.resume_session = true;
-        } else if (std.mem.eql(u8, arg, "--provider")) {
-            if (takeNext(argv, &index)) |value| result.provider = value;
-        } else if (std.mem.eql(u8, arg, "--model")) {
-            if (takeNext(argv, &index)) |value| result.model = value;
-        } else if (std.mem.eql(u8, arg, "--api-key")) {
-            if (takeNext(argv, &index)) |value| result.api_key = value;
-        } else if (std.mem.eql(u8, arg, "--system-prompt")) {
-            if (takeNext(argv, &index)) |value| result.system_prompt = value;
-        } else if (std.mem.eql(u8, arg, "--no-session")) {
-            result.no_session = true;
-        } else if (std.mem.eql(u8, arg, "--session")) {
-            if (takeNext(argv, &index)) |value| result.session = value;
-        } else if (std.mem.eql(u8, arg, "--fork")) {
-            if (takeNext(argv, &index)) |value| result.fork = value;
-        } else if (std.mem.eql(u8, arg, "--session-dir")) {
-            if (takeNext(argv, &index)) |value| result.session_dir = value;
-        } else if (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt")) {
-            result.no_tools = true;
-        } else if (std.mem.eql(u8, arg, "--no-builtin-tools") or std.mem.eql(u8, arg, "-nbt")) {
-            result.no_builtin_tools = true;
-        } else if (std.mem.eql(u8, arg, "--thinking")) {
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--thinking")) {
             if (takeNext(argv, &index)) |value| {
                 if (parseThinkingLevel(value)) |level| {
                     result.thinking = level;
@@ -145,7 +160,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
                     try diagnostics.append(allocator, .{ .kind = "warning", .message = "Invalid thinking level" });
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--print") or std.mem.eql(u8, arg, "-p")) {
             result.print = true;
             if (peek(argv, index + 1)) |next| {
                 if (!std.mem.startsWith(u8, next, "@") and (!std.mem.startsWith(u8, next, "-") or std.mem.startsWith(u8, next, "---"))) {
@@ -153,19 +170,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
                     index += 1;
                 }
             }
-        } else if (std.mem.eql(u8, arg, "--export")) {
-            if (takeNext(argv, &index)) |value| result.export_path = value;
-        } else if (std.mem.eql(u8, arg, "--no-extensions") or std.mem.eql(u8, arg, "-ne")) {
-            result.no_extensions = true;
-        } else if (std.mem.eql(u8, arg, "--no-skills") or std.mem.eql(u8, arg, "-ns")) {
-            result.no_skills = true;
-        } else if (std.mem.eql(u8, arg, "--no-prompt-templates") or std.mem.eql(u8, arg, "-np")) {
-            result.no_prompt_templates = true;
-        } else if (std.mem.eql(u8, arg, "--no-themes")) {
-            result.no_themes = true;
-        } else if (std.mem.eql(u8, arg, "--no-context-files") or std.mem.eql(u8, arg, "-nc")) {
-            result.no_context_files = true;
-        } else if (std.mem.eql(u8, arg, "--list-models")) {
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--list-models")) {
             if (peek(argv, index + 1)) |next| {
                 if (!std.mem.startsWith(u8, next, "-") and !std.mem.startsWith(u8, next, "@")) {
                     result.list_models = next;
@@ -176,11 +183,30 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
             } else {
                 result.list_models_all = true;
             }
-        } else if (std.mem.eql(u8, arg, "--verbose")) {
-            result.verbose = true;
-        } else if (std.mem.eql(u8, arg, "--offline")) {
-            result.offline = true;
-        } else if (std.mem.startsWith(u8, arg, "@")) {
+            continue;
+        }
+
+        // Table-driven flag dispatch: first matching spec wins.
+        var matched = false;
+        inline for (FLAG_SPECS) |spec| {
+            if (!matched) {
+                const hit = std.mem.eql(u8, arg, spec.long) or
+                    (spec.short != null and std.mem.eql(u8, arg, spec.short.?));
+                if (hit) {
+                    switch (spec.kind) {
+                        .bool_flag => @field(result, spec.field) = true,
+                        .optional_string => if (takeNext(argv, &index)) |value| {
+                            @field(result, spec.field) = value;
+                        },
+                    }
+                    matched = true;
+                }
+            }
+        }
+        if (matched) continue;
+
+        // Remaining positional/unknown handling.
+        if (std.mem.startsWith(u8, arg, "@")) {
             try file_args.append(allocator, arg[1..]);
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try appendUnknownFlag(allocator, &unknown_flags, argv, &index);
@@ -198,10 +224,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !Args {
 }
 
 fn parseMode(value: []const u8) ?Mode {
-    if (std.mem.eql(u8, value, "text")) return .text;
-    if (std.mem.eql(u8, value, "json")) return .json;
-    if (std.mem.eql(u8, value, "rpc")) return .rpc;
-    return null;
+    return std.meta.stringToEnum(Mode, value);
 }
 
 fn takeNext(argv: []const []const u8, index: *usize) ?[]const u8 {
@@ -240,4 +263,71 @@ test "parseArgs separates messages files and extension flags" {
     try std.testing.expectEqualStrings("prompt.md", parsed.file_args[0]);
     try std.testing.expectEqualStrings("plan", parsed.unknown_flags[0].name);
     try std.testing.expectEqualStrings("hello", parsed.messages[0]);
+}
+
+test "parseArgs --print captures prompt and treats yaml frontmatter as message" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "--print", "---\ntitle: hi\n---\nbody" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.print);
+    try std.testing.expectEqual(@as(usize, 1), parsed.messages.len);
+    try std.testing.expectEqualStrings("---\ntitle: hi\n---\nbody", parsed.messages[0]);
+}
+
+test "parseArgs --print without prompt leaves messages empty" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "--print", "--verbose" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.print);
+    try std.testing.expect(parsed.verbose);
+    try std.testing.expectEqual(@as(usize, 0), parsed.messages.len);
+}
+
+test "parseArgs --list-models without arg sets list_models_all" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{"--list-models"};
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.list_models_all);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.list_models);
+}
+
+test "parseArgs --list-models with provider captures provider value" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "--list-models", "anthropic" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(!parsed.list_models_all);
+    try std.testing.expectEqualStrings("anthropic", parsed.list_models.?);
+}
+
+test "parseArgs --thinking with invalid level emits warning diagnostic" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "--thinking", "turbo" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(?ThinkingLevel, null), parsed.thinking);
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostics.len);
+    try std.testing.expectEqualStrings("warning", parsed.diagnostics[0].kind);
+}
+
+test "parseArgs --mode parses valid mode" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "--mode", "rpc" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(?Mode, .rpc), parsed.mode);
+}
+
+test "parseArgs short bool flags toggle target field" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{ "-c", "-nt", "-nbt", "-ne" };
+    var parsed = try parseArgs(allocator, &argv);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.continue_session);
+    try std.testing.expect(parsed.no_tools);
+    try std.testing.expect(parsed.no_builtin_tools);
+    try std.testing.expect(parsed.no_extensions);
 }
