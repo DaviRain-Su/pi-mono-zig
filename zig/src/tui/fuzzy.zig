@@ -5,19 +5,174 @@ pub const FuzzyMatch = struct {
     score: f64,
 };
 
-pub fn fuzzyMatch(query: []const u8, text: []const u8) FuzzyMatch {
-    const primary = matchQuery(query, text);
-    if (primary.matches) return primary;
+/// Generic fuzzy matcher parameterised by a `Cfg` namespace.
+///
+/// Required `Cfg` declarations:
+///   - `Score: type`                    Numeric type used for scores (e.g. `f64`, `i32`).
+///   - `boundary_bonus: Score`          Subtracted from score on word-boundary match.
+///   - `consecutive_penalty_unit: Score`Subtracted per `consecutive_matches` step.
+///   - `gap_weight: Score`              Added per byte of gap between matches.
+///   - `position_weight: Score`         Multiplied with byte index and added per match.
+///   - `exact_match_bonus: Score`       Subtracted on exact case-insensitive equality (0 = disabled).
+///   - `swap_bonus: Score`              Added when a swapped alphanumeric retry succeeds.
+///   - `trim_query: bool`               If true, trim whitespace from the query before matching.
+///   - `boundary_includes_newline: bool`If true, '\n' and '\r' also count as word boundaries.
+pub fn FuzzyMatcher(comptime Cfg: type) type {
+    return struct {
+        pub const Score = Cfg.Score;
+        pub const Match = struct {
+            matches: bool,
+            score: Score,
+        };
 
-    var swapped_buffer: [256]u8 = undefined;
-    const swapped = swappedAlphaNumeric(query, swapped_buffer[0..]) orelse return primary;
-    const swapped_match = matchQuery(swapped, text);
-    if (!swapped_match.matches) return primary;
+        /// Match `query` against `text`. Honours `Cfg.trim_query`.
+        pub fn match(query: []const u8, text: []const u8) Match {
+            const effective = if (comptime Cfg.trim_query)
+                std.mem.trim(u8, query, " \t\r\n")
+            else
+                query;
+            return matchNormalized(effective, text);
+        }
 
-    return .{
-        .matches = true,
-        .score = swapped_match.score + 5.0,
+        /// Match with an automatic retry on a swapped alphanumeric query.
+        pub fn matchWithSwap(query: []const u8, text: []const u8) Match {
+            if (query.len == 0) return .{ .matches = true, .score = 0 };
+
+            const primary = match(query, text);
+            if (primary.matches) return primary;
+
+            var swapped_buffer: [256]u8 = undefined;
+            const swapped = buildSwappedQuery(query, swapped_buffer[0..]) orelse return primary;
+            const swapped_match = match(swapped, text);
+            if (!swapped_match.matches) return primary;
+
+            return .{
+                .matches = true,
+                .score = swapped_match.score + Cfg.swap_bonus,
+            };
+        }
+
+        /// Core scoring routine. `query` is assumed already normalized.
+        pub fn matchNormalized(query: []const u8, text: []const u8) Match {
+            if (query.len == 0) return .{ .matches = true, .score = 0 };
+            if (query.len > text.len) return .{ .matches = false, .score = 0 };
+
+            var query_index: usize = 0;
+            var score: Score = 0;
+            var last_match_index: ?usize = null;
+            var consecutive_matches: usize = 0;
+
+            for (text, 0..) |byte, index| {
+                if (query_index >= query.len) break;
+                if (std.ascii.toLower(byte) != std.ascii.toLower(query[query_index])) continue;
+
+                const is_word_boundary = index == 0 or isWordBoundary(text[index - 1]);
+                if (last_match_index) |last| {
+                    if (last + 1 == index) {
+                        consecutive_matches += 1;
+                        score -= fromInt(consecutive_matches) * Cfg.consecutive_penalty_unit;
+                    } else {
+                        consecutive_matches = 0;
+                        score += fromInt(index - last - 1) * Cfg.gap_weight;
+                    }
+                } else {
+                    consecutive_matches = 0;
+                }
+
+                if (is_word_boundary) score -= Cfg.boundary_bonus;
+                score += fromInt(index) * Cfg.position_weight;
+
+                last_match_index = index;
+                query_index += 1;
+            }
+
+            if (query_index < query.len) return .{ .matches = false, .score = 0 };
+
+            if (comptime Cfg.exact_match_bonus != 0) {
+                if (std.ascii.eqlIgnoreCase(query, text)) score -= Cfg.exact_match_bonus;
+            }
+
+            return .{ .matches = true, .score = score };
+        }
+
+        /// Build a swapped alphanumeric variant of `query`: either `alpha+digit`
+        /// becomes `digit+alpha` or vice versa. Returns `null` if `query` is not
+        /// a contiguous alpha-then-digit (or digit-then-alpha) sequence.
+        pub fn buildSwappedQuery(query: []const u8, buffer: []u8) ?[]const u8 {
+            if (query.len == 0 or query.len > buffer.len) return null;
+
+            // Try alpha-prefix + digit-suffix.
+            var split_index: usize = 0;
+            while (split_index < query.len and std.ascii.isAlphabetic(query[split_index])) : (split_index += 1) {}
+            if (split_index > 0 and split_index < query.len) {
+                var digit_index = split_index;
+                while (digit_index < query.len and std.ascii.isDigit(query[digit_index])) : (digit_index += 1) {}
+                if (digit_index == query.len) {
+                    @memcpy(buffer[0 .. query.len - split_index], query[split_index..]);
+                    @memcpy(buffer[query.len - split_index .. query.len], query[0..split_index]);
+                    return buffer[0..query.len];
+                }
+            }
+
+            // Try digit-prefix + alpha-suffix.
+            split_index = 0;
+            while (split_index < query.len and std.ascii.isDigit(query[split_index])) : (split_index += 1) {}
+            if (split_index > 0 and split_index < query.len) {
+                var alpha_index = split_index;
+                while (alpha_index < query.len and std.ascii.isAlphabetic(query[alpha_index])) : (alpha_index += 1) {}
+                if (alpha_index == query.len) {
+                    @memcpy(buffer[0 .. query.len - split_index], query[split_index..]);
+                    @memcpy(buffer[query.len - split_index .. query.len], query[0..split_index]);
+                    return buffer[0..query.len];
+                }
+            }
+
+            return null;
+        }
+
+        fn isWordBoundary(byte: u8) bool {
+            if (comptime Cfg.boundary_includes_newline) {
+                return switch (byte) {
+                    ' ', '\t', '\n', '\r', '-', '_', '.', '/', ':' => true,
+                    else => false,
+                };
+            }
+            return switch (byte) {
+                ' ', '\t', '-', '_', '.', '/', ':' => true,
+                else => false,
+            };
+        }
+
+        fn fromInt(x: usize) Score {
+            return switch (@typeInfo(Score)) {
+                .float => @as(Score, @floatFromInt(x)),
+                .int => @as(Score, @intCast(x)),
+                else => @compileError("FuzzyMatcher: Cfg.Score must be an int or float type"),
+            };
+        }
     };
+}
+
+/// Cfg used by the string-oriented helpers in this file. Mirrors the prior
+/// `matchQuery` behaviour exactly: f64 scores, trims whitespace, treats '\n'/'\r'
+/// as boundaries, rewards exact case-insensitive equality.
+const StringFuzzyCfg = struct {
+    pub const Score = f64;
+    pub const boundary_bonus: Score = 10;
+    pub const consecutive_penalty_unit: Score = 5;
+    pub const gap_weight: Score = 2;
+    pub const position_weight: Score = 0.1;
+    pub const exact_match_bonus: Score = 100;
+    pub const swap_bonus: Score = 5;
+    pub const trim_query: bool = true;
+    pub const boundary_includes_newline: bool = true;
+};
+
+const StringMatcher = FuzzyMatcher(StringFuzzyCfg);
+
+pub fn fuzzyMatch(query: []const u8, text: []const u8) FuzzyMatch {
+    const result = StringMatcher.matchWithSwap(query, text);
+    return .{ .matches = result.matches, .score = result.score };
 }
 
 pub fn fuzzyFilterStringItemsAlloc(
@@ -69,96 +224,6 @@ pub fn fuzzyFilterStringItemsAlloc(
     const out = try allocator.alloc([]const u8, ranked.items.len);
     for (ranked.items, 0..) |entry, index| out[index] = entry.item;
     return out;
-}
-
-fn matchQuery(query: []const u8, text: []const u8) FuzzyMatch {
-    const normalized_query = std.mem.trim(u8, query, " \t\r\n");
-    if (normalized_query.len == 0) return .{ .matches = true, .score = 0 };
-    if (normalized_query.len > text.len) return .{ .matches = false, .score = 0 };
-
-    var query_index: usize = 0;
-    var score: f64 = 0;
-    var last_match_index: ?usize = null;
-    var consecutive_matches: usize = 0;
-
-    for (text, 0..) |byte, index| {
-        if (query_index >= normalized_query.len) break;
-        if (asciiLower(byte) != asciiLower(normalized_query[query_index])) continue;
-
-        const is_word_boundary = index == 0 or isWordBoundary(text[index - 1]);
-        if (last_match_index) |last| {
-            if (last + 1 == index) {
-                consecutive_matches += 1;
-                score -= @as(f64, @floatFromInt(consecutive_matches * 5));
-            } else {
-                consecutive_matches = 0;
-                score += @as(f64, @floatFromInt((index - last - 1) * 2));
-            }
-        } else {
-            consecutive_matches = 0;
-        }
-
-        if (is_word_boundary) score -= 10;
-        score += @as(f64, @floatFromInt(index)) * 0.1;
-
-        last_match_index = index;
-        query_index += 1;
-    }
-
-    if (query_index < normalized_query.len) return .{ .matches = false, .score = 0 };
-    if (asciiEql(normalized_query, text)) score -= 100;
-
-    return .{ .matches = true, .score = score };
-}
-
-fn swappedAlphaNumeric(query: []const u8, buffer: []u8) ?[]const u8 {
-    if (query.len == 0 or query.len > buffer.len) return null;
-
-    var split: ?usize = null;
-    const first_is_alpha = std.ascii.isAlphabetic(query[0]);
-    const first_is_digit = std.ascii.isDigit(query[0]);
-    if (!first_is_alpha and !first_is_digit) return null;
-
-    for (query, 0..) |byte, index| {
-        if (first_is_alpha) {
-            if (std.ascii.isAlphabetic(byte)) continue;
-            if (std.ascii.isDigit(byte)) {
-                split = index;
-                break;
-            }
-            return null;
-        }
-        if (std.ascii.isDigit(byte)) continue;
-        if (std.ascii.isAlphabetic(byte)) {
-            split = index;
-            break;
-        }
-        return null;
-    }
-
-    const boundary = split orelse return null;
-    if (boundary == 0 or boundary == query.len) return null;
-    for (query[boundary..]) |byte| {
-        if (first_is_alpha and !std.ascii.isDigit(byte)) return null;
-        if (first_is_digit and !std.ascii.isAlphabetic(byte)) return null;
-    }
-
-    @memcpy(buffer[0 .. query.len - boundary], query[boundary..]);
-    @memcpy(buffer[query.len - boundary .. query.len], query[0..boundary]);
-    return buffer[0..query.len];
-}
-
-fn asciiLower(byte: u8) u8 {
-    return std.ascii.toLower(byte);
-}
-
-fn asciiEql(left: []const u8, right: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(left, right);
-}
-
-fn isWordBoundary(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or
-        byte == '-' or byte == '_' or byte == '.' or byte == '/' or byte == ':';
 }
 
 test "fuzzyMatch rewards exact and boundary matches" {

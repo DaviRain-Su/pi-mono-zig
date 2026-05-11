@@ -1,5 +1,6 @@
 const std = @import("std");
 const select_list = @import("vaxis-widgets").components.select_list;
+const fuzzy = @import("../fuzzy.zig");
 
 pub const Item = select_list.SelectItem;
 
@@ -14,22 +15,26 @@ const RankedItem = struct {
     original_index: usize,
 };
 
+/// Cfg used by the Item-oriented autocomplete helpers. Matches the previous
+/// `fuzzyMatchNormalized` behaviour exactly: i32 scores, no query trim, no
+/// newline boundaries, no exact-match bonus.
+const AutocompleteFuzzyCfg = struct {
+    pub const Score = i32;
+    pub const boundary_bonus: Score = 100;
+    pub const consecutive_penalty_unit: Score = 50;
+    pub const gap_weight: Score = 20;
+    pub const position_weight: Score = 1;
+    pub const exact_match_bonus: Score = 0;
+    pub const swap_bonus: Score = 50;
+    pub const trim_query: bool = false;
+    pub const boundary_includes_newline: bool = false;
+};
+
+const Matcher = fuzzy.FuzzyMatcher(AutocompleteFuzzyCfg);
+
 pub fn fuzzyMatch(query: []const u8, text: []const u8) Match {
-    if (query.len == 0) return .{ .matches = true, .score = 0 };
-
-    const primary = fuzzyMatchNormalized(query, text);
-    if (primary.matches) return primary;
-
-    var swapped_buffer: [256]u8 = undefined;
-    const swapped = buildSwappedQuery(query, swapped_buffer[0..]) orelse return primary;
-
-    const swapped_match = fuzzyMatchNormalized(swapped, text);
-    if (!swapped_match.matches) return primary;
-
-    return .{
-        .matches = true,
-        .score = swapped_match.score + 50,
-    };
+    const result = Matcher.matchWithSwap(query, text);
+    return .{ .matches = result.matches, .score = result.score };
 }
 
 pub fn fuzzyFilterAlloc(
@@ -76,89 +81,9 @@ pub fn fuzzyFilterAlloc(
     return filtered;
 }
 
-fn fuzzyMatchNormalized(query: []const u8, text: []const u8) Match {
-    if (query.len == 0) return .{ .matches = true, .score = 0 };
-    if (query.len > text.len) return .{ .matches = false, .score = 0 };
-
-    var query_index: usize = 0;
-    var score: i32 = 0;
-    var last_match_index: ?usize = null;
-    var consecutive_matches: usize = 0;
-
-    for (text, 0..) |byte, index| {
-        if (query_index >= query.len) break;
-        if (asciiLower(byte) != asciiLower(query[query_index])) continue;
-
-        const is_word_boundary = index == 0 or isWordBoundary(text[index - 1]);
-        if (last_match_index) |last| {
-            if (last + 1 == index) {
-                consecutive_matches += 1;
-                score -= @as(i32, @intCast(consecutive_matches * 50));
-            } else {
-                consecutive_matches = 0;
-                score += @as(i32, @intCast((index - last - 1) * 20));
-            }
-        } else {
-            consecutive_matches = 0;
-        }
-
-        if (is_word_boundary) score -= 100;
-        score += @as(i32, @intCast(index));
-        last_match_index = index;
-        query_index += 1;
-    }
-
-    if (query_index < query.len) {
-        return .{ .matches = false, .score = 0 };
-    }
-
-    return .{ .matches = true, .score = score };
-}
-
-fn buildSwappedQuery(query: []const u8, buffer: []u8) ?[]const u8 {
-    if (query.len == 0 or query.len > buffer.len) return null;
-
-    var split_index: usize = 0;
-    while (split_index < query.len and std.ascii.isAlphabetic(query[split_index])) : (split_index += 1) {}
-    if (split_index > 0 and split_index < query.len) {
-        var digit_index = split_index;
-        while (digit_index < query.len and std.ascii.isDigit(query[digit_index])) : (digit_index += 1) {}
-        if (digit_index == query.len) {
-            @memcpy(buffer[0 .. query.len - split_index], query[split_index..]);
-            @memcpy(buffer[query.len - split_index .. query.len], query[0..split_index]);
-            return buffer[0..query.len];
-        }
-    }
-
-    split_index = 0;
-    while (split_index < query.len and std.ascii.isDigit(query[split_index])) : (split_index += 1) {}
-    if (split_index > 0 and split_index < query.len) {
-        var alpha_index = split_index;
-        while (alpha_index < query.len and std.ascii.isAlphabetic(query[alpha_index])) : (alpha_index += 1) {}
-        if (alpha_index == query.len) {
-            @memcpy(buffer[0 .. query.len - split_index], query[split_index..]);
-            @memcpy(buffer[query.len - split_index .. query.len], query[0..split_index]);
-            return buffer[0..query.len];
-        }
-    }
-
-    return null;
-}
-
 fn lessThanRankedItem(_: void, lhs: RankedItem, rhs: RankedItem) bool {
     if (lhs.score != rhs.score) return lhs.score < rhs.score;
     return lhs.original_index < rhs.original_index;
-}
-
-fn asciiLower(byte: u8) u8 {
-    return std.ascii.toLower(byte);
-}
-
-fn isWordBoundary(byte: u8) bool {
-    return switch (byte) {
-        ' ', '\t', '-', '_', '.', '/', ':' => true,
-        else => false,
-    };
 }
 
 test "fuzzy match rewards boundaries and consecutive matches" {
