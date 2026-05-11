@@ -1,10 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const truncate = @import("truncate.zig");
 
-const parseRequiredString = common.parseRequiredString;
-const parseOptionalString = common.parseOptionalString;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -16,6 +15,14 @@ else
 pub const BashArgs = struct {
     command: []const u8,
     timeout_seconds: ?u64 = null,
+
+    pub const json_aliases = .{
+        .timeout_seconds = .{ "timeout_seconds", "timeout" },
+    };
+
+    pub const json_int_constraints = .{
+        .timeout_seconds = .positive,
+    };
 };
 
 fn normalizeBackslashes(allocator: std.mem.Allocator, command: []const u8) ![]const u8 {
@@ -386,15 +393,7 @@ pub const BashTool = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !BashArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    const command = try parseRequiredString(args.object, "command");
-    const timeout_seconds = try getOptionalPositiveIntEither(args.object, "timeout_seconds", "timeout");
-
-    return .{
-        .command = command,
-        .timeout_seconds = timeout_seconds,
-    };
+    return args_parser.parseArgsFromJson(BashArgs, std.heap.page_allocator, args);
 }
 
 const OutputReaderState = struct {
@@ -617,17 +616,6 @@ fn captureOutputInSecureTempFile(
     temp_file.file.?.close(io);
     temp_file.file = null;
     return temp_file.releasePath();
-}
-
-fn getOptionalPositiveInt(object: std.json.ObjectMap, key: []const u8) !?u64 {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer <= 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
-}
-
-fn getOptionalPositiveIntEither(object: std.json.ObjectMap, first: []const u8, second: []const u8) !?u64 {
-    return (try getOptionalPositiveInt(object, first)) orelse try getOptionalPositiveInt(object, second);
 }
 
 fn processExists(allocator: std.mem.Allocator, pid: std.posix.pid_t) !bool {

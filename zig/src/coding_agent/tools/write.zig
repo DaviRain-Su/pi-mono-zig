@@ -1,10 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const mutation_queue = @import("file_mutation_queue.zig");
 
-const parseRequiredString = common.parseRequiredString;
-const parseOptionalString = common.parseOptionalString;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -85,12 +84,7 @@ pub const WriteTool = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !WriteArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    return .{
-        .path = try parseRequiredString(args.object, "path"),
-        .content = try parseRequiredString(args.object, "content"),
-    };
+    return args_parser.parseArgsFromJson(WriteArgs, std.heap.page_allocator, args);
 }
 
 

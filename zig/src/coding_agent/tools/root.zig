@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub const common = @import("common.zig");
+pub const args_parser = @import("args_parser.zig");
+pub const parseArgsFromJson = args_parser.parseArgsFromJson;
 pub const file_mutation_queue = @import("file_mutation_queue.zig");
 pub const edit_diff = @import("edit_diff.zig");
 pub const output_accumulator = @import("output_accumulator.zig");
@@ -90,6 +92,7 @@ pub fn forEach(comptime ctx: anytype, comptime callback: fn (comptime ctx: @Type
 
 test {
     _ = @import("common.zig");
+    _ = @import("args_parser.zig");
     _ = @import("file_mutation_queue.zig");
     _ = @import("edit_diff.zig");
     _ = @import("output_accumulator.zig");

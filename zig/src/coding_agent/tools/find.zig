@@ -1,10 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const truncate = @import("truncate.zig");
 
-const parseOptionalString = common.parseOptionalString;
-const getOptionalPositiveInt = common.getOptionalPositiveInt;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -14,6 +13,10 @@ pub const FindArgs = struct {
     pattern: []const u8,
     path: ?[]const u8 = null,
     limit: ?usize = null,
+
+    pub const json_int_constraints = .{
+        .limit = .positive,
+    };
 };
 
 pub const FindDetails = struct {
@@ -235,17 +238,7 @@ pub const FindTool = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !FindArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    const pattern = (try parseOptionalString(args.object, "pattern")) orelse return error.InvalidToolArguments;
-    const path = try parseOptionalString(args.object, "path");
-    const limit = try getOptionalPositiveInt(args.object, "limit");
-
-    return .{
-        .pattern = pattern,
-        .path = path,
-        .limit = limit,
-    };
+    return args_parser.parseArgsFromJson(FindArgs, std.heap.page_allocator, args);
 }
 
 fn buildNotice(

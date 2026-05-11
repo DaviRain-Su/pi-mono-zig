@@ -1670,11 +1670,7 @@ fn runReadTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = tools.ReadArgs{
-        .path = try getRequiredString(params, "path"),
-        .offset = getOptionalUsize(params, "offset"),
-        .limit = getOptionalUsize(params, "limit"),
-    };
+    const args = try tools.parseArgsFromJson(tools.ReadArgs, allocator, params);
     const result = try tools.ReadTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
 }
@@ -1689,7 +1685,7 @@ fn runBashTool(
     on_update: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = try tools.bash.parseArguments(params);
+    const args = try tools.parseArgsFromJson(tools.BashArgs, allocator, params);
     var update_forward = BashToolUpdateForwardContext{
         .allocator = allocator,
         .downstream_context = on_update_context,
@@ -1745,10 +1741,7 @@ fn runWriteTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = tools.WriteArgs{
-        .path = try getRequiredString(params, "path"),
-        .content = try getRequiredString(params, "content"),
-    };
+    const args = try tools.parseArgsFromJson(tools.WriteArgs, allocator, params);
     const result = try tools.WriteTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
 }
@@ -1780,15 +1773,7 @@ fn runGrepTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = tools.GrepArgs{
-        .pattern = try getRequiredString(params, "pattern"),
-        .path = getOptionalString(params, "path"),
-        .glob = getOptionalStringEither(params, "glob", "glob_pattern"),
-        .ignore_case = getOptionalBoolEither(params, "ignoreCase", "ignore_case") orelse false,
-        .literal = getOptionalBool(params, "literal") orelse false,
-        .context = getOptionalUsize(params, "context") orelse 0,
-        .limit = getOptionalUsize(params, "limit"),
-    };
+    const args = try tools.parseArgsFromJson(tools.GrepArgs, allocator, params);
     const result = try tools.GrepTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
 }
@@ -1803,11 +1788,7 @@ fn runFindTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = tools.FindArgs{
-        .pattern = try getRequiredString(params, "pattern"),
-        .path = getOptionalString(params, "path"),
-        .limit = getOptionalUsize(params, "limit"),
-    };
+    const args = try tools.parseArgsFromJson(tools.FindArgs, allocator, params);
     const result = try tools.FindTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
 }
@@ -1822,64 +1803,9 @@ fn runLsTool(
     _: ?agent.types.AgentToolUpdateCallback,
 ) !agent.AgentToolResult {
     const runtime = (try getAppContext(tool_context)).tool_runtime;
-    const args = tools.LsArgs{
-        .path = getOptionalString(params, "path"),
-        .limit = getOptionalUsize(params, "limit"),
-    };
+    const args = try tools.parseArgsFromJson(tools.LsArgs, allocator, params);
     const result = try tools.LsTool.init(runtime.cwd, runtime.io).execute(allocator, args);
     return .{ .content = result.content };
-}
-
-fn getRequiredString(value: std.json.Value, key: []const u8) ![]const u8 {
-    return getStringObjectValue(value, key) orelse error.InvalidToolArguments;
-}
-
-fn getOptionalString(value: std.json.Value, key: []const u8) ?[]const u8 {
-    return getStringObjectValue(value, key);
-}
-
-fn getOptionalStringEither(value: std.json.Value, first: []const u8, second: []const u8) ?[]const u8 {
-    return getStringObjectValue(value, first) orelse getStringObjectValue(value, second);
-}
-
-fn getOptionalBool(value: std.json.Value, key: []const u8) ?bool {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return null,
-    };
-    const raw = object.get(key) orelse return null;
-    return switch (raw) {
-        .bool => |bool_value| bool_value,
-        else => null,
-    };
-}
-
-fn getOptionalBoolEither(value: std.json.Value, first: []const u8, second: []const u8) ?bool {
-    return getOptionalBool(value, first) orelse getOptionalBool(value, second);
-}
-
-fn getOptionalUsize(value: std.json.Value, key: []const u8) ?usize {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return null,
-    };
-    const raw = object.get(key) orelse return null;
-    return switch (raw) {
-        .integer => |integer| std.math.cast(usize, integer) orelse null,
-        else => null,
-    };
-}
-
-fn getStringObjectValue(value: std.json.Value, key: []const u8) ?[]const u8 {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return null,
-    };
-    const raw = object.get(key) orelse return null;
-    return switch (raw) {
-        .string => |string| string,
-        else => null,
-    };
 }
 
 test "buildAgentTools threads app context into execute callbacks" {

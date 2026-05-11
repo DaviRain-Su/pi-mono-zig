@@ -1,11 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const truncate = @import("truncate.zig");
 
-const parseRequiredString = common.parseRequiredString;
-const parseOptionalString = common.parseOptionalString;
-const getOptionalPositiveInt = common.getOptionalPositiveInt;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -19,6 +17,15 @@ pub const GrepArgs = struct {
     literal: bool = false,
     context: usize = 0,
     limit: ?usize = null,
+
+    pub const json_aliases = .{
+        .glob = .{ "glob", "glob_pattern" },
+        .ignore_case = .{ "ignoreCase", "ignore_case" },
+    };
+
+    pub const json_int_constraints = .{
+        .limit = .positive,
+    };
 };
 
 pub const GrepDetails = struct {
@@ -303,25 +310,7 @@ const Match = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !GrepArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    const pattern = try parseRequiredString(args.object, "pattern");
-    const path = try parseOptionalString(args.object, "path");
-    const glob = try parseOptionalString(args.object, "glob");
-    const ignore_case = try parseOptionalBool(args.object, "ignoreCase");
-    const literal = try parseOptionalBool(args.object, "literal");
-    const context = try getOptionalNonNegativeInt(args.object, "context");
-    const limit = try getOptionalPositiveInt(args.object, "limit");
-
-    return .{
-        .pattern = pattern,
-        .path = path,
-        .glob = glob,
-        .ignore_case = ignore_case orelse false,
-        .literal = literal orelse false,
-        .context = context orelse 0,
-        .limit = limit,
-    };
+    return args_parser.parseArgsFromJson(GrepArgs, std.heap.page_allocator, args);
 }
 
 fn appendContextBlock(
@@ -423,19 +412,6 @@ fn exitCodeFromTerm(term: std.process.Child.Term) u8 {
         .exited => |code| code,
         else => 1,
     };
-}
-
-fn parseOptionalBool(object: std.json.ObjectMap, key: []const u8) !?bool {
-    const value = object.get(key) orelse return null;
-    if (value != .bool) return error.InvalidToolArguments;
-    return value.bool;
-}
-
-fn getOptionalNonNegativeInt(object: std.json.ObjectMap, key: []const u8) !?usize {
-    const value = object.get(key) orelse return null;
-    if (value != .integer) return error.InvalidToolArguments;
-    if (value.integer < 0) return error.InvalidToolArguments;
-    return @intCast(value.integer);
 }
 
 fn getStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {

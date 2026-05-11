@@ -1,11 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const truncate = @import("truncate.zig");
 
-const parseRequiredString = common.parseRequiredString;
-const parseOptionalString = common.parseOptionalString;
-const getOptionalPositiveInt = common.getOptionalPositiveInt;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -13,6 +11,11 @@ pub const ReadArgs = struct {
     path: []const u8,
     offset: ?usize = null,
     limit: ?usize = null,
+
+    pub const json_int_constraints = .{
+        .offset = .positive,
+        .limit = .positive,
+    };
 };
 
 pub const ReadDetails = struct {
@@ -104,17 +107,7 @@ pub const ReadTool = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !ReadArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    const path = try parseRequiredString(args.object, "path");
-    const offset = try getOptionalPositiveInt(args.object, "offset");
-    const limit = try getOptionalPositiveInt(args.object, "limit");
-
-    return .{
-        .path = path,
-        .offset = offset,
-        .limit = limit,
-    };
+    return args_parser.parseArgsFromJson(ReadArgs, std.heap.page_allocator, args);
 }
 
 fn buildImageResult(

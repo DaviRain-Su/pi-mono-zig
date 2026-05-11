@@ -1,10 +1,9 @@
 const std = @import("std");
 const ai = @import("ai");
 const common = @import("common.zig");
+const args_parser = @import("args_parser.zig");
 const truncate = @import("truncate.zig");
 
-const parseOptionalString = common.parseOptionalString;
-const getOptionalPositiveInt = common.getOptionalPositiveInt;
 const makeAbsoluteTestPath = common.makeAbsoluteTestPath;
 const jsonObject = common.jsonObject;
 
@@ -13,6 +12,10 @@ const DEFAULT_LIMIT: usize = 500;
 pub const LsArgs = struct {
     path: ?[]const u8 = null,
     limit: ?usize = null,
+
+    pub const json_int_constraints = .{
+        .limit = .positive,
+    };
 };
 
 pub const LsDetails = struct {
@@ -213,15 +216,7 @@ const ListedEntry = struct {
 };
 
 pub fn parseArguments(args: std.json.Value) !LsArgs {
-    if (args != .object) return error.InvalidToolArguments;
-
-    const path = try parseOptionalString(args.object, "path");
-    const limit = try getOptionalPositiveInt(args.object, "limit");
-
-    return .{
-        .path = path,
-        .limit = limit,
-    };
+    return args_parser.parseArgsFromJson(LsArgs, std.heap.page_allocator, args);
 }
 
 fn buildNotice(
