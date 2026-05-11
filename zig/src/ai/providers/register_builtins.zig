@@ -49,6 +49,20 @@ const BuiltInProviderError = error{
     TestOnlyProviderOverrideUnavailable,
 };
 
+const BuiltInApi = enum {
+    @"anthropic-messages",
+    @"openai-completions",
+    @"kimi-completions",
+    @"mistral-conversations",
+    @"openai-responses",
+    @"azure-openai-responses",
+    @"openai-codex-responses",
+    @"google-generative-ai",
+    @"google-gemini-cli",
+    @"google-vertex",
+    @"bedrock-converse-stream",
+};
+
 const PROVIDER_METADATA = [_]ProviderMetadata{
     .{
         .api = "anthropic-messages",
@@ -129,6 +143,18 @@ const PROVIDER_METADATA = [_]ProviderMetadata{
     },
 };
 
+comptime {
+    const enum_fields = @typeInfo(BuiltInApi).@"enum".fields;
+    if (enum_fields.len != PROVIDER_METADATA.len) {
+        @compileError("BuiltInApi enum length must match PROVIDER_METADATA length");
+    }
+    for (enum_fields, 0..) |field, index| {
+        if (!std.mem.eql(u8, field.name, PROVIDER_METADATA[index].api)) {
+            @compileError("BuiltInApi tag order must match PROVIDER_METADATA order");
+        }
+    }
+}
+
 const test_overrides_len = if (builtin.is_test) PROVIDER_METADATA.len else 0;
 var test_overrides = [_]?ProviderFns{null} ** test_overrides_len;
 
@@ -181,10 +207,8 @@ fn buildBuiltInProviders() [PROVIDER_METADATA.len]BuiltInProvider {
 }
 
 fn providerIndexForApi(api: types.Api) ?usize {
-    for (PROVIDER_METADATA, 0..) |metadata, index| {
-        if (std.mem.eql(u8, api, metadata.api)) return index;
-    }
-    return null;
+    const tag = std.meta.stringToEnum(BuiltInApi, api) orelse return null;
+    return @intFromEnum(tag);
 }
 
 fn streamWrapper(comptime index: usize, comptime mode: DispatchMode) StreamFunction {
