@@ -35,17 +35,7 @@ pub const SelectorOverlay = union(enum) {
 
     pub fn deinit(self: *SelectorOverlay, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .info => |*overlay| overlay.deinit(allocator),
-            .settings => |*overlay| overlay.deinit(allocator),
-            .settings_editor => |*overlay| overlay.deinit(allocator),
-            .session => |*overlay| overlay.deinit(allocator),
-            .model => |*overlay| overlay.deinit(allocator),
-            .scoped_models => |*overlay| overlay.deinit(allocator),
-            .theme => |*overlay| overlay.deinit(allocator),
-            .tree => |*overlay| overlay.deinit(allocator),
-            .fork => |*overlay| overlay.deinit(allocator),
-            .auth => |*overlay| overlay.deinit(allocator),
-            .extension_dialog => |*overlay| overlay.deinit(allocator),
+            inline else => |*overlay| overlay.deinit(allocator),
         }
         self.* = undefined;
     }
