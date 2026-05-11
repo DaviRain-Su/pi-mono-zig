@@ -133,137 +133,51 @@ pub const ThemeColors = struct {
     markdown_list_bullet: ?[]u8 = null,
     tool_output: ?[]u8 = null,
 
+    comptime {
+        const color_fields = @typeInfo(ThemeColor).@"enum".fields;
+        const colors_fields = @typeInfo(ThemeColors).@"struct".fields;
+        if (colors_fields.len != color_fields.len) {
+            @compileError("ThemeColors must have one field per ThemeColor tag");
+        }
+        for (color_fields, colors_fields) |ef, sf| {
+            if (!std.mem.eql(u8, ef.name, sf.name)) {
+                @compileError("ThemeColors field `" ++ sf.name ++ "` must match ThemeColor tag `" ++ ef.name ++ "`");
+            }
+        }
+    }
+
     fn clone(self: ThemeColors, allocator: std.mem.Allocator) !ThemeColors {
-        return .{
-            .primary = if (self.primary) |value| try allocator.dupe(u8, value) else null,
-            .secondary = if (self.secondary) |value| try allocator.dupe(u8, value) else null,
-            .success = if (self.success) |value| try allocator.dupe(u8, value) else null,
-            .warning = if (self.warning) |value| try allocator.dupe(u8, value) else null,
-            .@"error" = if (self.@"error") |value| try allocator.dupe(u8, value) else null,
-            .background = if (self.background) |value| try allocator.dupe(u8, value) else null,
-            .foreground = if (self.foreground) |value| try allocator.dupe(u8, value) else null,
-            .border = if (self.border) |value| try allocator.dupe(u8, value) else null,
-            .muted = if (self.muted) |value| try allocator.dupe(u8, value) else null,
-            .dim = if (self.dim) |value| try allocator.dupe(u8, value) else null,
-            .thinking_text = if (self.thinking_text) |value| try allocator.dupe(u8, value) else null,
-            .selected_bg = if (self.selected_bg) |value| try allocator.dupe(u8, value) else null,
-            .user_message_bg = if (self.user_message_bg) |value| try allocator.dupe(u8, value) else null,
-            .custom_message_bg = if (self.custom_message_bg) |value| try allocator.dupe(u8, value) else null,
-            .tool_pending_bg = if (self.tool_pending_bg) |value| try allocator.dupe(u8, value) else null,
-            .tool_success_bg = if (self.tool_success_bg) |value| try allocator.dupe(u8, value) else null,
-            .tool_error_bg = if (self.tool_error_bg) |value| try allocator.dupe(u8, value) else null,
-            .border_accent = if (self.border_accent) |value| try allocator.dupe(u8, value) else null,
-            .border_muted = if (self.border_muted) |value| try allocator.dupe(u8, value) else null,
-            .markdown_heading = if (self.markdown_heading) |value| try allocator.dupe(u8, value) else null,
-            .markdown_link = if (self.markdown_link) |value| try allocator.dupe(u8, value) else null,
-            .markdown_code = if (self.markdown_code) |value| try allocator.dupe(u8, value) else null,
-            .markdown_code_border = if (self.markdown_code_border) |value| try allocator.dupe(u8, value) else null,
-            .markdown_quote = if (self.markdown_quote) |value| try allocator.dupe(u8, value) else null,
-            .markdown_quote_border = if (self.markdown_quote_border) |value| try allocator.dupe(u8, value) else null,
-            .markdown_rule = if (self.markdown_rule) |value| try allocator.dupe(u8, value) else null,
-            .markdown_list_bullet = if (self.markdown_list_bullet) |value| try allocator.dupe(u8, value) else null,
-            .tool_output = if (self.tool_output) |value| try allocator.dupe(u8, value) else null,
-        };
+        var result: ThemeColors = .{};
+        errdefer result.deinit(allocator);
+        inline for (@typeInfo(ThemeColors).@"struct".fields) |f| {
+            if (@field(self, f.name)) |value| {
+                @field(result, f.name) = try allocator.dupe(u8, value);
+            }
+        }
+        return result;
     }
 
     fn deinit(self: *ThemeColors, allocator: std.mem.Allocator) void {
-        if (self.primary) |value| allocator.free(value);
-        if (self.secondary) |value| allocator.free(value);
-        if (self.success) |value| allocator.free(value);
-        if (self.warning) |value| allocator.free(value);
-        if (self.@"error") |value| allocator.free(value);
-        if (self.background) |value| allocator.free(value);
-        if (self.foreground) |value| allocator.free(value);
-        if (self.border) |value| allocator.free(value);
-        if (self.muted) |value| allocator.free(value);
-        if (self.dim) |value| allocator.free(value);
-        if (self.thinking_text) |value| allocator.free(value);
-        if (self.selected_bg) |value| allocator.free(value);
-        if (self.user_message_bg) |value| allocator.free(value);
-        if (self.custom_message_bg) |value| allocator.free(value);
-        if (self.tool_pending_bg) |value| allocator.free(value);
-        if (self.tool_success_bg) |value| allocator.free(value);
-        if (self.tool_error_bg) |value| allocator.free(value);
-        if (self.border_accent) |value| allocator.free(value);
-        if (self.border_muted) |value| allocator.free(value);
-        if (self.markdown_heading) |value| allocator.free(value);
-        if (self.markdown_link) |value| allocator.free(value);
-        if (self.markdown_code) |value| allocator.free(value);
-        if (self.markdown_code_border) |value| allocator.free(value);
-        if (self.markdown_quote) |value| allocator.free(value);
-        if (self.markdown_quote_border) |value| allocator.free(value);
-        if (self.markdown_rule) |value| allocator.free(value);
-        if (self.markdown_list_bullet) |value| allocator.free(value);
-        if (self.tool_output) |value| allocator.free(value);
+        inline for (@typeInfo(ThemeColors).@"struct".fields) |f| {
+            if (@field(self, f.name)) |value| allocator.free(value);
+        }
         self.* = .{};
     }
 
     fn get(self: ThemeColors, color: ThemeColor) ?[]const u8 {
-        return switch (color) {
-            .primary => self.primary,
-            .secondary => self.secondary,
-            .success => self.success,
-            .warning => self.warning,
-            .@"error" => self.@"error",
-            .background => self.background,
-            .foreground => self.foreground,
-            .border => self.border,
-            .muted => self.muted,
-            .dim => self.dim,
-            .thinking_text => self.thinking_text,
-            .selected_bg => self.selected_bg,
-            .user_message_bg => self.user_message_bg,
-            .custom_message_bg => self.custom_message_bg,
-            .tool_pending_bg => self.tool_pending_bg,
-            .tool_success_bg => self.tool_success_bg,
-            .tool_error_bg => self.tool_error_bg,
-            .border_accent => self.border_accent,
-            .border_muted => self.border_muted,
-            .markdown_heading => self.markdown_heading,
-            .markdown_link => self.markdown_link,
-            .markdown_code => self.markdown_code,
-            .markdown_code_border => self.markdown_code_border,
-            .markdown_quote => self.markdown_quote,
-            .markdown_quote_border => self.markdown_quote_border,
-            .markdown_rule => self.markdown_rule,
-            .markdown_list_bullet => self.markdown_list_bullet,
-            .tool_output => self.tool_output,
-        };
+        switch (color) {
+            inline else => |tag| return @field(self, @tagName(tag)),
+        }
     }
 
     fn replace(self: *ThemeColors, allocator: std.mem.Allocator, color: ThemeColor, value: []const u8) !void {
-        const target = switch (color) {
-            .primary => &self.primary,
-            .secondary => &self.secondary,
-            .success => &self.success,
-            .warning => &self.warning,
-            .@"error" => &self.@"error",
-            .background => &self.background,
-            .foreground => &self.foreground,
-            .border => &self.border,
-            .muted => &self.muted,
-            .dim => &self.dim,
-            .thinking_text => &self.thinking_text,
-            .selected_bg => &self.selected_bg,
-            .user_message_bg => &self.user_message_bg,
-            .custom_message_bg => &self.custom_message_bg,
-            .tool_pending_bg => &self.tool_pending_bg,
-            .tool_success_bg => &self.tool_success_bg,
-            .tool_error_bg => &self.tool_error_bg,
-            .border_accent => &self.border_accent,
-            .border_muted => &self.border_muted,
-            .markdown_heading => &self.markdown_heading,
-            .markdown_link => &self.markdown_link,
-            .markdown_code => &self.markdown_code,
-            .markdown_code_border => &self.markdown_code_border,
-            .markdown_quote => &self.markdown_quote,
-            .markdown_quote_border => &self.markdown_quote_border,
-            .markdown_rule => &self.markdown_rule,
-            .markdown_list_bullet => &self.markdown_list_bullet,
-            .tool_output => &self.tool_output,
-        };
-        if (target.*) |existing| allocator.free(existing);
-        target.* = try allocator.dupe(u8, value);
+        switch (color) {
+            inline else => |tag| {
+                const target = &@field(self, @tagName(tag));
+                if (target.*) |existing| allocator.free(existing);
+                target.* = try allocator.dupe(u8, value);
+            },
+        }
     }
 };
 
@@ -476,40 +390,28 @@ pub const PaletteTemplate = struct {
     tool_output: ?[]const u8 = null,
 };
 
+comptime {
+    for (@typeInfo(PaletteTemplate).@"struct".fields) |f| {
+        if (!@hasField(ThemeColor, f.name)) {
+            @compileError("PaletteTemplate field `" ++ f.name ++ "` has no matching ThemeColor tag");
+        }
+    }
+}
+
 fn initNamed(allocator: std.mem.Allocator, name: []const u8, palette: PaletteTemplate) !Theme {
     var theme = Theme{
         .name = try allocator.dupe(u8, name),
     };
     errdefer theme.deinit(allocator);
 
-    try theme.setColor(allocator, .primary, palette.primary);
-    try theme.setColor(allocator, .secondary, palette.secondary);
-    try theme.setColor(allocator, .success, palette.success);
-    try theme.setColor(allocator, .warning, palette.warning);
-    try theme.setColor(allocator, .@"error", palette.@"error");
-    try theme.setColor(allocator, .background, palette.background);
-    try theme.setColor(allocator, .foreground, palette.foreground);
-    try theme.setColor(allocator, .border, palette.border);
-    try theme.setColor(allocator, .muted, palette.muted);
-    if (palette.dim) |value| try theme.setColor(allocator, .dim, value);
-    if (palette.thinking_text) |value| try theme.setColor(allocator, .thinking_text, value);
-    if (palette.selected_bg) |value| try theme.setColor(allocator, .selected_bg, value);
-    if (palette.user_message_bg) |value| try theme.setColor(allocator, .user_message_bg, value);
-    if (palette.custom_message_bg) |value| try theme.setColor(allocator, .custom_message_bg, value);
-    if (palette.tool_pending_bg) |value| try theme.setColor(allocator, .tool_pending_bg, value);
-    if (palette.tool_success_bg) |value| try theme.setColor(allocator, .tool_success_bg, value);
-    if (palette.tool_error_bg) |value| try theme.setColor(allocator, .tool_error_bg, value);
-    if (palette.border_accent) |value| try theme.setColor(allocator, .border_accent, value);
-    if (palette.border_muted) |value| try theme.setColor(allocator, .border_muted, value);
-    if (palette.markdown_heading) |value| try theme.setColor(allocator, .markdown_heading, value);
-    if (palette.markdown_link) |value| try theme.setColor(allocator, .markdown_link, value);
-    if (palette.markdown_code) |value| try theme.setColor(allocator, .markdown_code, value);
-    if (palette.markdown_code_border) |value| try theme.setColor(allocator, .markdown_code_border, value);
-    if (palette.markdown_quote) |value| try theme.setColor(allocator, .markdown_quote, value);
-    if (palette.markdown_quote_border) |value| try theme.setColor(allocator, .markdown_quote_border, value);
-    if (palette.markdown_rule) |value| try theme.setColor(allocator, .markdown_rule, value);
-    if (palette.markdown_list_bullet) |value| try theme.setColor(allocator, .markdown_list_bullet, value);
-    if (palette.tool_output) |value| try theme.setColor(allocator, .tool_output, value);
+    inline for (@typeInfo(PaletteTemplate).@"struct".fields) |f| {
+        const tag = @field(ThemeColor, f.name);
+        const value = @field(palette, f.name);
+        switch (@typeInfo(f.type)) {
+            .optional => if (value) |v| try theme.setColor(allocator, tag, v),
+            else => try theme.setColor(allocator, tag, value),
+        }
+    }
     try theme.applyDerivedStyles(allocator);
     return theme;
 }
