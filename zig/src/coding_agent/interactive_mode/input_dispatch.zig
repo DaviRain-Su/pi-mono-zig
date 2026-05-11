@@ -2085,33 +2085,32 @@ pub fn handleAppAction(
         .clipboard_pasteImage => {},
         .chat_scrollToBottom => app_state.chatScrollToBottom(),
         // Overlay-scoped actions are resolved and executed only by their overlay
-        // dispatchers. Listing each action here makes new Action variants require
-        // deliberate main-editor dispatch coverage at compile time.
-        .session_toggleNamedFilter,
-        .tree_foldOrUp,
-        .tree_unfoldOrDown,
-        .tree_editLabel,
-        .tree_toggleLabelTimestamp,
-        .session_togglePath,
-        .session_toggleSort,
-        .session_rename,
-        .session_delete,
-        .session_deleteNoninvasive,
-        .models_save,
-        .models_enableAll,
-        .models_clearAll,
-        .models_toggleProvider,
-        .models_reorderUp,
-        .models_reorderDown,
-        .tree_filter_default,
-        .tree_filter_noTools,
-        .tree_filter_userOnly,
-        .tree_filter_labeledOnly,
-        .tree_filter_all,
-        .tree_filter_cycleForward,
-        .tree_filter_cycleBackward,
-        => {},
+        // dispatchers. Any Action variant whose tag name starts with one of the
+        // overlay prefixes (`tree_`, `session_`, `models_`) and is not explicitly
+        // dispatched above is a no-op here. The comptime guard ensures new Action
+        // variants without a known overlay prefix surface as a compile error
+        // rather than silently falling through.
+        inline else => |tag| {
+            if (comptime !isOverlayScopedActionTag(tag)) {
+                @compileError("Unhandled Action variant in handleAppAction: " ++ @tagName(tag));
+            }
+        },
     }
+}
+
+/// Returns true when the Action tag name starts with one of the overlay
+/// prefixes whose actions are dispatched exclusively by overlay handlers
+/// (`tree_*`, `session_*`, `models_*`).
+///
+/// `session_*` variants that ARE dispatched by the main editor (e.g.,
+/// `session_new`, `session_tree`, `session_fork`, `session_resume`) are
+/// matched by explicit cases earlier in the `handleAppAction` switch and
+/// never reach the `inline else` branch that calls this predicate.
+fn isOverlayScopedActionTag(comptime tag: keybindings_mod.Action) bool {
+    const name = @tagName(tag);
+    return std.mem.startsWith(u8, name, "tree_") or
+        std.mem.startsWith(u8, name, "session_") or
+        std.mem.startsWith(u8, name, "models_");
 }
 
 test "protocol events update kitty state through app context" {
