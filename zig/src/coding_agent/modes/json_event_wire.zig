@@ -899,7 +899,7 @@ fn agentEventTypeToString(event_type: agent.AgentEventType) []const u8 {
 fn assistantEventTypeToString(event_type: ai.EventType) []const u8 {
     return switch (event_type) {
         .error_event => "error",
-        else => @tagName(event_type),
+        inline else => |tag| @tagName(tag),
     };
 }
 
