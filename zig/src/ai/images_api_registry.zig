@@ -15,58 +15,74 @@ pub const ImagesApiProvider = struct {
     generate_images: ImagesFunction,
 };
 
-var registry: std.StringHashMap(ImagesApiProvider) = undefined;
+const STATIC_BUILTINS = blk: {
+    const providers = image_builtins.builtInProviders();
+    var entries: [providers.len]struct { []const u8, ImagesApiProvider } = undefined;
+    for (providers, 0..) |provider, index| {
+        entries[index] = .{ provider.api, provider };
+    }
+    break :blk std.StaticStringMap(ImagesApiProvider).initComptime(entries);
+};
+
+var overrides: std.StringHashMap(ImagesApiProvider) = undefined;
 var initialized = false;
 
 pub fn init() void {
     if (initialized) return;
-    registry = std.StringHashMap(ImagesApiProvider).init(std.heap.page_allocator);
-    registerBuiltIns();
+    overrides = std.StringHashMap(ImagesApiProvider).init(std.heap.page_allocator);
     initialized = true;
 }
 
 pub fn register(provider: ImagesApiProvider) !void {
     init();
-    try registry.put(provider.api, provider);
+    try overrides.put(provider.api, provider);
 }
 
 pub fn get(api: types.ImagesApi) ?ImagesApiProvider {
-    init();
-    return registry.get(api);
+    if (initialized) {
+        if (overrides.get(api)) |provider| return provider;
+    }
+    return STATIC_BUILTINS.get(api);
 }
 
 pub fn getApiCount() usize {
-    init();
-    return registry.count();
+    const static_count: usize = STATIC_BUILTINS.kvs.len;
+    return static_count + if (initialized) overrides.count() else 0;
+}
+
+pub fn unregister(api: types.ImagesApi) void {
+    if (!initialized) return;
+    _ = overrides.remove(api);
 }
 
 pub fn clear() void {
-    init();
-    registry.clearAndFree();
+    if (!initialized) return;
+    overrides.clearAndFree();
 }
 
 pub fn resetForTesting() void {
-    if (initialized) registry.clearAndFree();
-    initialized = false;
+    if (initialized) overrides.clearAndFree();
 }
 
 pub fn resetToBuiltIns() void {
-    init();
-    registry.clearAndFree();
-    registerBuiltIns();
+    clear();
 }
 
-fn registerBuiltIns() void {
-    for (image_builtins.builtInProviders()) |provider| {
-        registry.put(provider.api, provider) catch @panic("failed to register built-in images provider");
-    }
-}
-
-test "built-in images providers are registered on first init" {
+test "built-in images providers are accessible via static map" {
     resetForTesting();
     defer clear();
 
-    try std.testing.expectEqual(image_builtins.expectedBuiltInApiCount(), getApiCount());
+    try std.testing.expectEqual(image_builtins.expectedBuiltInApiCount(), STATIC_BUILTINS.kvs.len);
+    for (image_builtins.expectedBuiltInApis()) |api| {
+        try std.testing.expect(get(api) != null);
+    }
+}
+
+test "built-in images providers survive clear" {
+    resetForTesting();
+    defer clear();
+
+    clear();
     for (image_builtins.expectedBuiltInApis()) |api| {
         try std.testing.expect(get(api) != null);
     }

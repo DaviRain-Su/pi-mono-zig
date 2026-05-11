@@ -17,66 +17,72 @@ pub const ApiProvider = struct {
     stream_simple: StreamFunction,
 };
 
-var registry: std.StringHashMap(ApiProvider) = undefined;
+const STATIC_BUILTINS = blk: {
+    const providers = register_builtins.builtInProviders();
+    var entries: [providers.len]struct { []const u8, ApiProvider } = undefined;
+    for (providers, 0..) |provider, index| {
+        entries[index] = .{
+            provider.api,
+            .{
+                .api = provider.api,
+                .stream = provider.stream,
+                .stream_simple = provider.stream_simple,
+            },
+        };
+    }
+    break :blk std.StaticStringMap(ApiProvider).initComptime(entries);
+};
+
+var overrides: std.StringHashMap(ApiProvider) = undefined;
 var initialized = false;
 
 pub fn init() void {
     if (initialized) return;
-    registry = std.StringHashMap(ApiProvider).init(std.heap.page_allocator);
-    registerBuiltIns();
+    overrides = std.StringHashMap(ApiProvider).init(std.heap.page_allocator);
     initialized = true;
 }
 
 pub fn register(provider: ApiProvider) !void {
     init();
-    try registry.put(provider.api, provider);
+    try overrides.put(provider.api, provider);
 }
 
 pub fn get(api: types.Api) ?ApiProvider {
-    init();
-    return registry.get(api);
+    if (initialized) {
+        if (overrides.get(api)) |provider| return provider;
+    }
+    return STATIC_BUILTINS.get(api);
 }
 
 pub fn getApiCount() usize {
-    init();
-    return registry.count();
+    const static_count: usize = STATIC_BUILTINS.kvs.len;
+    return static_count + if (initialized) overrides.count() else 0;
 }
 
 pub fn unregister(api: types.Api) void {
-    init();
-    _ = registry.remove(api);
+    if (!initialized) return;
+    _ = overrides.remove(api);
 }
 
 pub fn clear() void {
-    init();
-    registry.clearAndFree();
+    if (!initialized) return;
+    overrides.clearAndFree();
 }
 
 pub fn resetForTesting() void {
     if (initialized) {
-        registry.clearAndFree();
+        overrides.clearAndFree();
     }
     register_builtins.clearProviderOverrides();
-    initialized = false;
 }
 
 pub fn resetToBuiltIns() void {
-    init();
-    registry.clearAndFree();
-    registerBuiltIns();
-}
-
-fn registerBuiltIns() void {
-    for (register_builtins.builtInProviders()) |provider| {
-        registry.put(provider.api, .{
-            .api = provider.api,
-            .stream = provider.stream,
-            .stream_simple = provider.stream_simple,
-        }) catch @panic("failed to register built-in AI provider");
-    }
+    clear();
 }
 
 test "registry basic operations" {
+    init();
+    defer clear();
     clear();
 
     const dummy_stream: StreamFunction = struct {
@@ -96,53 +102,135 @@ test "registry basic operations" {
     }.f;
 
     try register(.{
-        .api = "openai-completions",
+        .api = "custom:test:registry-ops",
         .stream = dummy_stream,
         .stream_simple = dummy_stream,
     });
 
-    try std.testing.expectEqual(@as(usize, 1), getApiCount());
+    try std.testing.expectEqual(STATIC_BUILTINS.kvs.len + 1, getApiCount());
 
-    const provider = get("openai-completions");
+    const provider = get("custom:test:registry-ops");
     try std.testing.expect(provider != null);
-    try std.testing.expectEqualStrings("openai-completions", provider.?.api);
+    try std.testing.expectEqualStrings("custom:test:registry-ops", provider.?.api);
 
     const not_found = get("nonexistent");
     try std.testing.expect(not_found == null);
 
-    unregister("openai-completions");
-    try std.testing.expect(get("openai-completions") == null);
+    unregister("custom:test:registry-ops");
+    try std.testing.expect(get("custom:test:registry-ops") == null);
 }
 
-test "built-in providers are registered on first init" {
+test "built-in providers are accessible via static map" {
     resetForTesting();
     defer clear();
 
-    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), getApiCount());
-
+    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), STATIC_BUILTINS.kvs.len);
     for (register_builtins.expectedBuiltInApis()) |api| {
         try std.testing.expect(get(api) != null);
     }
 }
 
-test "clear removes built-in providers" {
-    resetForTesting();
-    clear();
-
-    try std.testing.expectEqual(@as(usize, 0), getApiCount());
-    try std.testing.expect(get("openai-completions") == null);
-    try std.testing.expect(get("anthropic-messages") == null);
-}
-
-test "resetToBuiltIns restores built-in providers after clear" {
+test "clear preserves built-in providers and removes overrides" {
     resetForTesting();
     defer clear();
 
+    const dummy_stream: StreamFunction = struct {
+        fn f(_: std.mem.Allocator, io: std.Io, model: types.Model, _: types.Context, _: ?types.StreamOptions) anyerror!event_stream.AssistantMessageEventStream {
+            var stream = event_stream.createAssistantMessageEventStream(std.heap.page_allocator, io);
+            stream.end(.{
+                .content = &[_]types.ContentBlock{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = types.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 0,
+            });
+            return stream;
+        }
+    }.f;
+
+    try register(.{
+        .api = "custom:test:clear",
+        .stream = dummy_stream,
+        .stream_simple = dummy_stream,
+    });
+
     clear();
-    try std.testing.expectEqual(@as(usize, 0), getApiCount());
+
+    try std.testing.expect(get("custom:test:clear") == null);
+    try std.testing.expect(get("openai-completions") != null);
+    try std.testing.expect(get("anthropic-messages") != null);
+}
+
+test "resetToBuiltIns clears overrides without rebuilding built-ins" {
+    resetForTesting();
+    defer clear();
+
+    const dummy_stream: StreamFunction = struct {
+        fn f(_: std.mem.Allocator, io: std.Io, model: types.Model, _: types.Context, _: ?types.StreamOptions) anyerror!event_stream.AssistantMessageEventStream {
+            var stream = event_stream.createAssistantMessageEventStream(std.heap.page_allocator, io);
+            stream.end(.{
+                .content = &[_]types.ContentBlock{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = types.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 0,
+            });
+            return stream;
+        }
+    }.f;
+
+    try register(.{
+        .api = "custom:test:reset",
+        .stream = dummy_stream,
+        .stream_simple = dummy_stream,
+    });
 
     resetToBuiltIns();
-    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), getApiCount());
+
+    try std.testing.expect(get("custom:test:reset") == null);
+    try std.testing.expectEqual(register_builtins.expectedBuiltInApiCount(), STATIC_BUILTINS.kvs.len);
     try std.testing.expect(get("openai-completions") != null);
     try std.testing.expect(get("bedrock-converse-stream") != null);
+}
+
+test "register overrides built-in provider and unregister restores it" {
+    resetForTesting();
+    defer clear();
+
+    const baseline = get("openai-completions") orelse return error.MissingBuiltIn;
+
+    const overriding_stream: StreamFunction = struct {
+        fn f(_: std.mem.Allocator, io: std.Io, model: types.Model, _: types.Context, _: ?types.StreamOptions) anyerror!event_stream.AssistantMessageEventStream {
+            var stream = event_stream.createAssistantMessageEventStream(std.heap.page_allocator, io);
+            stream.end(.{
+                .content = &[_]types.ContentBlock{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = types.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 0,
+            });
+            return stream;
+        }
+    }.f;
+
+    try register(.{
+        .api = "openai-completions",
+        .stream = overriding_stream,
+        .stream_simple = overriding_stream,
+    });
+
+    const overridden = get("openai-completions").?;
+    try std.testing.expect(overridden.stream == overriding_stream);
+    try std.testing.expect(overridden.stream != baseline.stream);
+
+    unregister("openai-completions");
+
+    const restored = get("openai-completions").?;
+    try std.testing.expect(restored.stream == baseline.stream);
 }
