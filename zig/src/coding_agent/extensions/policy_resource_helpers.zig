@@ -127,7 +127,4 @@ fn cloneConstStringList(
     return cloned;
 }
 
-fn freeConstStringList(allocator: std.mem.Allocator, values: []const []const u8) void {
-    for (values) |value| allocator.free(value);
-    allocator.free(values);
-}
+const freeConstStringList = @import("../slice_utils.zig").freeStringSlice;

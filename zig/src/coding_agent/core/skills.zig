@@ -222,10 +222,7 @@ fn escapeXml(writer: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
-pub fn freeStringList(allocator: std.mem.Allocator, values: []const []u8) void {
-    for (values) |value| allocator.free(value);
-    allocator.free(values);
-}
+pub const freeStringList = @import("../slice_utils.zig").freeStringSlice;
 
 pub fn deinitDiagnostics(allocator: std.mem.Allocator, diagnostics: []ResourceDiagnostic) void {
     for (diagnostics) |diagnostic| allocator.free(diagnostic.message);

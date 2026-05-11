@@ -18,11 +18,8 @@ pub fn freeOwnedSelectItems(allocator: std.mem.Allocator, items: []tui.SelectIte
     allocator.free(items);
 }
 
-/// Frees an owned slice of allocated strings.
-pub fn freeOwnedStrings(allocator: std.mem.Allocator, strings: [][]u8) void {
-    for (strings) |string| allocator.free(string);
-    allocator.free(strings);
-}
+/// Frees an owned slice of allocated strings (alias for slice_utils.freeStringSlice).
+pub const freeOwnedStrings = @import("../slice_utils.zig").freeStringSlice;
 
 /// Allocates a 2-column [label, description] table from select items.
 /// Cell text borrows directly from items; do not free items before the table.

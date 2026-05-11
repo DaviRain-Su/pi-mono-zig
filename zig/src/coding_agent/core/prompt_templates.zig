@@ -39,10 +39,7 @@ pub fn parseCommandArgs(allocator: std.mem.Allocator, args_string: []const u8) !
     return args.toOwnedSlice(allocator);
 }
 
-pub fn freeCommandArgs(allocator: std.mem.Allocator, args: [][]u8) void {
-    for (args) |arg| allocator.free(arg);
-    allocator.free(args);
-}
+pub const freeCommandArgs = @import("../slice_utils.zig").freeStringSlice;
 
 pub fn substituteArgs(allocator: std.mem.Allocator, content: []const u8, args: []const []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);

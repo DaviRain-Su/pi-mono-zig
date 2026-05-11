@@ -3513,11 +3513,7 @@ fn cloneStringListConst(allocator: std.mem.Allocator, source: ?[][]u8) !?[]const
 
 const freeOwnedStringList = @import("../slice_utils.zig").freeStringSlice;
 
-fn freeConstStringList(allocator: std.mem.Allocator, items: ?[]const []const u8) void {
-    const list = items orelse return;
-    for (list) |item| allocator.free(@constCast(item));
-    allocator.free(list);
-}
+const freeConstStringList = @import("../slice_utils.zig").freeOptionalStringSlice;
 
 fn isTrustedFileUrl(url: []const u8, asset_root: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "file://")) return false;
