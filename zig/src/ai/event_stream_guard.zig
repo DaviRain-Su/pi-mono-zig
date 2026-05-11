@@ -30,6 +30,30 @@ const BlockEntry = struct {
     state: BlockState,
 };
 
+const BlockEventPhase = enum {
+    start,
+    delta,
+    end,
+};
+
+const BlockEventMapping = struct {
+    event_type: types.EventType,
+    kind: BlockKind,
+    phase: BlockEventPhase,
+};
+
+const BLOCK_EVENT_MAPPINGS = .{
+    BlockEventMapping{ .event_type = .text_start, .kind = .text, .phase = .start },
+    BlockEventMapping{ .event_type = .thinking_start, .kind = .thinking, .phase = .start },
+    BlockEventMapping{ .event_type = .toolcall_start, .kind = .tool_call, .phase = .start },
+    BlockEventMapping{ .event_type = .text_delta, .kind = .text, .phase = .delta },
+    BlockEventMapping{ .event_type = .thinking_delta, .kind = .thinking, .phase = .delta },
+    BlockEventMapping{ .event_type = .toolcall_delta, .kind = .tool_call, .phase = .delta },
+    BlockEventMapping{ .event_type = .text_end, .kind = .text, .phase = .end },
+    BlockEventMapping{ .event_type = .thinking_end, .kind = .thinking, .phase = .end },
+    BlockEventMapping{ .event_type = .toolcall_end, .kind = .tool_call, .phase = .end },
+};
+
 /// Debug/test guard for ISS-504 / INV-3 assistant event streams.
 ///
 /// The guard is intentionally standalone so tests and debug-only wrappers can
@@ -56,15 +80,6 @@ pub const EventOrderingGuard = struct {
 
         switch (event.event_type) {
             .start => {},
-            .text_start => try self.validateStart(event.content_index, .text),
-            .thinking_start => try self.validateStart(event.content_index, .thinking),
-            .toolcall_start => try self.validateStart(event.content_index, .tool_call),
-            .text_delta => try self.validateDelta(event.content_index, .text),
-            .thinking_delta => try self.validateDelta(event.content_index, .thinking),
-            .toolcall_delta => try self.validateDelta(event.content_index, .tool_call),
-            .text_end => try self.validateEnd(event.content_index, .text),
-            .thinking_end => try self.validateEnd(event.content_index, .thinking),
-            .toolcall_end => try self.validateEnd(event.content_index, .tool_call),
             .done => try self.validateSuccessTerminal(),
             // INV-5: error_event terminates without requiring providers to
             // first close every open block. Stream-level provider errors
@@ -72,6 +87,19 @@ pub const EventOrderingGuard = struct {
             // can fire mid-block; downstream accumulators reset state on
             // error rather than relying on synthetic `_end` events.
             .error_event => self.terminal_seen = true,
+            else => try self.dispatchBlockEvent(event),
+        }
+    }
+
+    fn dispatchBlockEvent(self: *EventOrderingGuard, event: types.AssistantMessageEvent) EventOrderingError!void {
+        inline for (BLOCK_EVENT_MAPPINGS) |mapping| {
+            if (event.event_type == mapping.event_type) {
+                switch (mapping.phase) {
+                    .start => return try self.validateStart(event.content_index, mapping.kind),
+                    .delta => return try self.validateDelta(event.content_index, mapping.kind),
+                    .end => return try self.validateEnd(event.content_index, mapping.kind),
+                }
+            }
         }
     }
 

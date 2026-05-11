@@ -3,12 +3,17 @@ const std = @import("std");
 pub const types = @import("types.zig");
 pub const api_registry = @import("api_registry.zig");
 pub const model_registry = @import("model_registry.zig");
+pub const models = @import("models.zig");
+pub const image_model_registry = @import("image_model_registry.zig");
+pub const image_models = @import("image_models.zig");
 pub const model_discovery = @import("model_discovery.zig");
+pub const session_resources = @import("session_resources.zig");
 pub const json_parse = @import("json_parse.zig");
 pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
 pub const event_stream_guard = @import("event_stream_guard.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
+pub const images_api_registry = @import("images_api_registry.zig");
 
 pub const oauth = struct {
     pub const pkce = @import("oauth/pkce.zig");
@@ -19,6 +24,11 @@ pub const shared = struct {
     pub const abort_signal = @import("shared/abort_signal.zig");
     pub const finalize = @import("shared/finalize.zig");
     pub const overflow = @import("shared/overflow.zig");
+    pub const diagnostics = @import("shared/diagnostics.zig");
+    pub const hash = @import("shared/hash.zig");
+    pub const headers = @import("shared/headers.zig");
+    pub const typebox_helpers = @import("shared/typebox_helpers.zig");
+    pub const validation = @import("shared/validation.zig");
     pub const provider_error = @import("shared/provider_error.zig");
     pub const provider_json = @import("shared/provider_json.zig");
     pub const provider_stream = @import("shared/provider_stream.zig");
@@ -28,6 +38,7 @@ pub const shared = struct {
     pub const sse_loop = @import("shared/sse_loop.zig");
     pub const stop_reason = @import("shared/stop_reason.zig");
     pub const string_utils = @import("shared/string_utils.zig");
+    pub const sanitize_unicode = @import("shared/sanitize_unicode.zig");
     pub const transform_messages = @import("shared/transform_messages.zig");
 };
 
@@ -44,6 +55,7 @@ pub const providers = struct {
     pub const openai_codex_responses = @import("providers/openai_codex_responses.zig");
     pub const anthropic = @import("providers/anthropic.zig");
     pub const google = @import("providers/google.zig");
+    pub const google_shared = @import("providers/google_shared.zig");
     pub const google_gemini_cli = @import("providers/google_gemini_cli.zig");
     pub const google_vertex = @import("providers/google_vertex.zig");
     pub const mistral = @import("providers/mistral.zig");
@@ -53,11 +65,17 @@ pub const providers = struct {
     pub const faux = @import("providers/faux.zig");
     pub const cloudflare = @import("providers/cloudflare.zig");
     pub const github_copilot_headers = @import("providers/github_copilot_headers.zig");
+
+    pub const images = struct {
+        pub const register_builtins = @import("providers/images/register_builtins.zig");
+        pub const openrouter = @import("providers/images/openrouter.zig");
+    };
 };
 
 // Internal alias so the public `stream` / `complete` re-exports below do not
 // collide with a public module name.
 const stream_ops = @import("stream.zig");
+const images_ops = @import("images.zig");
 
 // Re-export commonly used types
 pub const Model = types.Model;
@@ -70,11 +88,18 @@ pub const ThinkingLevelMapEntry = types.ThinkingLevelMapEntry;
 pub const Message = types.Message;
 pub const Context = types.Context;
 pub const StreamOptions = types.StreamOptions;
+pub const ImagesOptions = types.ImagesOptions;
+pub const ImagesContext = types.ImagesContext;
+pub const ImagesModel = types.ImagesModel;
+pub const AssistantImages = types.AssistantImages;
+pub const ImagesStopReason = types.ImagesStopReason;
 pub const AssistantMessage = types.AssistantMessage;
 pub const AssistantMessageEvent = types.AssistantMessageEvent;
 pub const EventType = types.EventType;
 pub const StopReason = types.StopReason;
 pub const Usage = types.Usage;
+pub const DiagnosticErrorInfo = types.DiagnosticErrorInfo;
+pub const AssistantMessageDiagnostic = types.AssistantMessageDiagnostic;
 pub const Tool = types.Tool;
 pub const ToolCall = types.ToolCall;
 pub const ContentBlock = types.ContentBlock;
@@ -90,6 +115,7 @@ pub const stream = stream_ops.stream;
 pub const complete = stream_ops.complete;
 pub const streamSimple = stream_ops.streamSimple;
 pub const completeSimple = stream_ops.completeSimple;
+pub const generateImages = images_ops.generateImages;
 pub const getEnvApiKey = env_api_keys.getEnvApiKey;
 
 test {
@@ -111,17 +137,38 @@ test {
     _ = @import("providers/register_builtins.zig");
     _ = @import("providers/cloudflare.zig");
     _ = @import("providers/github_copilot_headers.zig");
+    _ = @import("bedrock_provider.zig");
     _ = @import("model_registry.zig");
+    _ = @import("models.zig");
+    _ = @import("models.generated.zig");
+    _ = @import("image_model_registry.zig");
+    _ = @import("image_models.zig");
+    _ = @import("image_models.generated.zig");
     _ = @import("model_discovery.zig");
+    _ = @import("session_resources.zig");
     _ = @import("json_parse.zig");
     _ = @import("stream.zig");
     _ = @import("event_stream_guard.zig");
     _ = @import("env_api_keys.zig");
+    _ = @import("images_api_registry.zig");
+    _ = @import("images.zig");
     _ = @import("oauth/types.zig");
     _ = @import("oauth/pkce.zig");
+    _ = @import("oauth.zig");
+    _ = @import("providers/amazon_bedrock.zig");
+    _ = @import("providers/google_shared.zig");
+    _ = @import("providers/openai_completions.zig");
+    _ = @import("providers/openai_responses_shared.zig");
+    _ = @import("providers/simple_options.zig");
+    _ = @import("providers/transform_messages.zig");
     _ = @import("shared/abort_signal.zig");
     _ = @import("shared/finalize.zig");
     _ = @import("shared/overflow.zig");
+    _ = @import("shared/diagnostics.zig");
+    _ = @import("shared/hash.zig");
+    _ = @import("shared/headers.zig");
+    _ = @import("shared/typebox_helpers.zig");
+    _ = @import("shared/validation.zig");
     _ = @import("shared/provider_error.zig");
     _ = @import("shared/provider_json.zig");
     _ = @import("shared/provider_stream.zig");
@@ -130,6 +177,28 @@ test {
     _ = @import("shared/sse_loop.zig");
     _ = @import("shared/stop_reason.zig");
     _ = @import("shared/string_utils.zig");
+    _ = @import("shared/sanitize_unicode.zig");
     _ = @import("shared/transform_messages.zig");
+    _ = @import("utils/diagnostics.zig");
+    _ = @import("utils/event_stream.zig");
+    _ = @import("utils/hash.zig");
+    _ = @import("utils/headers.zig");
+    _ = @import("utils/json_parse.zig");
+    _ = @import("utils/json_parse_wasm.zig");
+    _ = @import("utils/json_parse_wasm_node.zig");
+    _ = @import("utils/oauth/common.zig");
+    _ = @import("utils/oauth/anthropic.zig");
+    _ = @import("utils/oauth/github_copilot.zig");
+    _ = @import("utils/oauth/index.zig");
+    _ = @import("utils/oauth/oauth_page.zig");
+    _ = @import("utils/oauth/openai_codex.zig");
+    _ = @import("utils/oauth/pkce.zig");
+    _ = @import("utils/oauth/types.zig");
+    _ = @import("utils/overflow.zig");
+    _ = @import("utils/sanitize_unicode.zig");
+    _ = @import("utils/typebox_helpers.zig");
+    _ = @import("utils/validation.zig");
     _ = @import("providers/faux.zig");
+    _ = @import("providers/images/register_builtins.zig");
+    _ = @import("providers/images/openrouter.zig");
 }

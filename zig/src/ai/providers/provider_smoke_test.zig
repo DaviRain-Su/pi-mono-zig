@@ -466,24 +466,10 @@ test "provider smoke Cloudflare Gateway Anthropic capture routing auth metadata"
     try std.testing.expect(std.mem.indexOf(u8, lower_request, "\r\nauthorization:") == null);
 }
 
-fn expectOpenAICompatSetupFailure(expectation: CaptureExpectation) !void {
+fn expectProviderSetupFailure(comptime Provider: type, expectation: CaptureExpectation) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var stream = try openai.OpenAIProvider.stream(
-        allocator,
-        io,
-        smokeModel(expectation, "http://127.0.0.1:1"),
-        smokeContext(),
-        .{ .api_key = "provider-smoke-key" },
-    );
-    defer stream.deinit();
-    try expectOnlyTerminalErrorMetadata(&stream, expectation.api, expectation.provider, expectation.model_id);
-}
-
-fn expectAnthropicSetupFailure(expectation: CaptureExpectation) !void {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var stream = try anthropic.AnthropicProvider.stream(
+    var stream = try Provider.stream(
         allocator,
         io,
         smokeModel(expectation, "http://127.0.0.1:1"),
@@ -502,7 +488,7 @@ test "provider smoke Moonshot Kimi Code and Cloudflare setup failures are termin
         .{ .provider = "cloudflare-workers-ai", .api = "openai-completions", .model_id = "@cf/moonshotai/kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
         .{ .provider = "cloudflare-ai-gateway", .api = "openai-completions", .model_id = "workers-ai/@cf/moonshotai/kimi-k2.6", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
     };
-    for (openai_cases) |case| try expectOpenAICompatSetupFailure(case);
+    for (openai_cases) |case| try expectProviderSetupFailure(openai.OpenAIProvider, case);
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -545,7 +531,7 @@ test "provider smoke Xiaomi setup failures are terminal error events" {
         .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
         .{ .provider = "xiaomi-token-plan-sgp", .api = "anthropic-messages", .model_id = "mimo-v2.5-pro", .base_path = "", .expected_request_line = "", .expected_auth_header = "" },
     };
-    for (cases) |case| try expectAnthropicSetupFailure(case);
+    for (cases) |case| try expectProviderSetupFailure(anthropic.AnthropicProvider, case);
 }
 
 test "provider smoke Cloudflare Responses placeholder failure is terminal error event" {

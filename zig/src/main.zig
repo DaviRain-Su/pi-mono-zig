@@ -3,12 +3,17 @@ const ai = @import("ai");
 const agent = @import("agent");
 const cli = @import("cli/args.zig");
 const bootstrap = @import("cli/bootstrap.zig");
+const cli_config_selector = @import("cli/config_selector.zig");
 const package_command_dispatch = @import("cli/package_command_dispatch.zig");
 const cli_preflight = @import("cli/preflight.zig");
 const extension_cli = @import("cli/extension_cli.zig");
+const file_processor = @import("cli/file_processor.zig");
+const initial_message = @import("cli/initial_message.zig");
 const input_prep = @import("cli/input_prep.zig");
+const list_models = @import("cli/list_models.zig");
 const runtime_prep = @import("cli/runtime_prep.zig");
 const run_mode_dispatch = @import("cli/run_mode_dispatch.zig");
+const session_picker = @import("cli/session_picker.zig");
 const output = @import("cli/output.zig");
 const coding_agent = @import("coding_agent/root.zig");
 const config_mod = @import("coding_agent/config/config.zig");
@@ -30,6 +35,14 @@ const effectiveToolSelection = bootstrap.effectiveToolSelection;
 const offlineModeEnabled = bootstrap.offlineModeEnabled;
 const prepareCliRuntime = runtime_prep.prepareCliRuntime;
 const startupNetworkOperationsEnabled = bootstrap.startupNetworkOperationsEnabled;
+
+test {
+    _ = cli_config_selector;
+    _ = file_processor;
+    _ = initial_message;
+    _ = list_models;
+    _ = session_picker;
+}
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
@@ -1087,7 +1100,6 @@ fn expectInstallLockSettingsMetadataMatchesLoadedRegistry(
             }
         }
         try std.testing.expect(found);
-
     }
 }
 
@@ -2680,7 +2692,6 @@ test "runCli extension boolean/string flags accepts registered local Bun fixture
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("ext-flags ok\n", stdout_capture.writer.buffered());
     try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "extension is unapproved; no matching extensionPolicies entry") != null);
-
 }
 
 test "runCli M11 extension registry dump emits live registry snapshot for explicit --extension" {

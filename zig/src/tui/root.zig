@@ -6,7 +6,7 @@ pub const vaxis = @import("vaxis");
 const vw = @import("vaxis-widgets");
 pub const ansi = vw.ansi;
 pub const draw = vw.draw;
-pub const keys = vw.keys;
+pub const keys = @import("keys.zig");
 pub const layout = vw.layout;
 pub const constraints = vw.constraints;
 pub const test_helpers = vw.test_helpers;
@@ -21,17 +21,20 @@ pub const visual_parity = @import("visual_parity.zig");
 
 // Components: generic ones from vaxis-widgets, pi-specific ones local
 pub const components = struct {
+    pub const index = @import("components/index.zig");
     pub const autocomplete = @import("components/autocomplete.zig");
-    pub const text = vw.components.text;
-    pub const box = vw.components.box;
-    pub const editor = vw.components.editor;
+    pub const text = @import("components/text.zig").module;
+    pub const box = @import("components/box.zig").module;
+    pub const editor = @import("components/editor.zig").module;
     pub const flex = vw.components.flex;
-    pub const image = vw.components.image;
-    pub const loader = vw.components.loader;
-    pub const markdown = vw.components.markdown;
-    pub const select_list = vw.components.select_list;
-    pub const spacer = vw.components.spacer;
-    pub const truncated_text = vw.components.truncated_text;
+    pub const image = @import("components/image.zig").module;
+    pub const loader = @import("components/loader.zig").module;
+    pub const markdown = @import("components/markdown.zig").module;
+    pub const select_list = @import("components/select_list.zig").module;
+    pub const spacer = @import("components/spacer.zig").module;
+    pub const truncated_text = @import("components/truncated_text.zig").module;
+    pub const cancellable_loader = @import("components/cancellable_loader.zig").module;
+    pub const settings_list = @import("components/settings_list.zig").module;
     pub const viewport = vw.components.viewport;
     pub const table = vw.components.table;
     pub const tabs = vw.components.tabs;
@@ -56,6 +59,16 @@ pub const components = struct {
     pub const menu = vw.components.menu;
     pub const toast = vw.components.toast;
 };
+
+pub const autocomplete = @import("autocomplete.zig");
+pub const editor_component = @import("editor_component.zig");
+pub const fuzzy = @import("fuzzy.zig");
+pub const keybindings = @import("keybindings.zig");
+pub const kill_ring = @import("kill_ring.zig");
+pub const stdin_buffer = @import("stdin_buffer.zig");
+pub const terminal_image = @import("terminal_image.zig");
+pub const undo_stack = @import("undo_stack.zig");
+pub const utils = @import("utils.zig");
 
 // Top-level re-exports (backward compatible)
 pub const DrawComponent = draw.Component;
@@ -87,6 +100,16 @@ pub const OverlayMargin = tui.OverlayMargin;
 pub const OverlayAnimation = tui.OverlayAnimation;
 pub const OverlayAnimationKind = tui.OverlayAnimationKind;
 pub const OverlayOptions = tui.OverlayOptions;
+pub const EditorComponent = editor_component.EditorComponent;
+pub const FuzzyMatch = fuzzy.FuzzyMatch;
+pub const fuzzyMatch = fuzzy.fuzzyMatch;
+pub const fuzzyFilterStringItemsAlloc = fuzzy.fuzzyFilterStringItemsAlloc;
+pub const KeybindingsManager = keybindings.KeybindingsManager;
+pub const KillRing = kill_ring.KillRing;
+pub const StdinBuffer = stdin_buffer.StdinBuffer;
+pub const TerminalCapabilities = terminal_image.TerminalCapabilities;
+pub const TerminalImageDimensions = terminal_image.ImageDimensions;
+pub const ImageProtocol = terminal_image.ImageProtocol;
 
 // Widget re-exports
 pub const Text = vw.Text;
@@ -211,6 +234,16 @@ test {
     _ = @import("theme.zig");
     _ = @import("tui.zig");
     _ = @import("visual_parity.zig");
+    _ = @import("autocomplete.zig");
+    _ = @import("editor_component.zig");
+    _ = @import("fuzzy.zig");
+    _ = @import("keys.zig");
+    _ = @import("keybindings.zig");
+    _ = @import("kill_ring.zig");
+    _ = @import("stdin_buffer.zig");
+    _ = @import("terminal_image.zig");
+    _ = @import("undo_stack.zig");
+    _ = @import("utils.zig");
     _ = @import("components/autocomplete.zig");
 }
 

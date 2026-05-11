@@ -96,9 +96,16 @@ pub fn build(b: *std.Build) void {
     tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     tui_mod.addImport("vaxis-widgets", vaxis_widgets_mod);
 
+    const web_ui_mod = b.createModule(.{
+        .root_source_file = b.path("src/web_ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
     mod.addImport("tui", tui_mod);
+    mod.addImport("web_ui", web_ui_mod);
     mod.addImport("zwasm", zwasm_dep.module("zwasm"));
 
     // Main executable
@@ -212,6 +219,15 @@ pub fn build(b: *std.Build) void {
     const agent_test_step = b.step("test-agent", "Run agent unit tests only");
     agent_test_step.dependOn(external_tool_check_step);
     agent_test_step.dependOn(&run_agent_tests.step);
+
+    const web_ui_tests = b.addTest(.{
+        .root_module = web_ui_mod,
+    });
+    const run_web_ui_tests = b.addRunArtifact(web_ui_tests);
+    test_step.dependOn(&run_web_ui_tests.step);
+
+    const web_ui_test_step = b.step("test-web-ui", "Run web-ui parity facade tests only");
+    web_ui_test_step.dependOn(&run_web_ui_tests.step);
 
     const coding_agent_mod = b.createModule(.{
         .root_source_file = b.path("src/coding_agent/root.zig"),

@@ -216,6 +216,7 @@ pub const AssistantMessage = struct {
     /// (e.g. OpenRouter `auto` -> `anthropic/...`). Equivalent to
     /// TypeScript `AssistantMessage.responseModel`.
     response_model: ?[]const u8 = null,
+    diagnostics: ?[]const AssistantMessageDiagnostic = null,
     usage: Usage,
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,
@@ -272,7 +273,39 @@ pub fn freeAssistantMessage(allocator: std.mem.Allocator, message: AssistantMess
     if (message.tool_calls) |tool_calls| freeToolCalls(allocator, tool_calls);
     if (message.response_id) |response_id| allocator.free(response_id);
     if (message.response_model) |response_model| allocator.free(response_model);
+    if (message.diagnostics) |diagnostics| freeAssistantMessageDiagnostics(allocator, diagnostics);
     if (message.error_message) |error_message| allocator.free(error_message);
+}
+
+pub const DiagnosticErrorInfo = struct {
+    name: ?[]const u8 = null,
+    message: []const u8,
+    stack: ?[]const u8 = null,
+    code: ?std.json.Value = null,
+};
+
+pub const AssistantMessageDiagnostic = struct {
+    type: []const u8,
+    timestamp: i64,
+    error_info: ?DiagnosticErrorInfo = null,
+    details: ?std.json.Value = null,
+};
+
+pub fn freeAssistantMessageDiagnostics(
+    allocator: std.mem.Allocator,
+    diagnostics: []const AssistantMessageDiagnostic,
+) void {
+    for (diagnostics) |diagnostic| {
+        allocator.free(diagnostic.type);
+        if (diagnostic.error_info) |info| {
+            if (info.name) |name| allocator.free(name);
+            allocator.free(info.message);
+            if (info.stack) |stack| allocator.free(stack);
+            if (info.code) |code| provider_json.freeValue(allocator, code);
+        }
+        if (diagnostic.details) |details| provider_json.freeValue(allocator, details);
+    }
+    allocator.free(diagnostics);
 }
 
 fn assertNoInvalidDualOwnedToolCalls(message: AssistantMessage) void {

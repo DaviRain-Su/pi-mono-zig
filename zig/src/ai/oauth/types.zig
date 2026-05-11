@@ -5,10 +5,14 @@ pub const OAuthCredentials = struct {
     refresh: []const u8,
     access: []const u8,
     expires: i64,
-    
+    account_id: ?[]const u8 = null,
+    enterprise_url: ?[]const u8 = null,
+
     pub fn deinit(self: *const OAuthCredentials, allocator: std.mem.Allocator) void {
         allocator.free(self.refresh);
         allocator.free(self.access);
+        if (self.account_id) |account_id| allocator.free(account_id);
+        if (self.enterprise_url) |enterprise_url| allocator.free(enterprise_url);
     }
 };
 
@@ -26,7 +30,7 @@ pub const OAuthPrompt = struct {
 pub const OAuthAuthInfo = struct {
     url: []const u8,
     instructions: ?[]const u8 = null,
-    
+
     pub fn deinit(self: *const OAuthAuthInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.url);
         if (self.instructions) |instr| allocator.free(instr);
@@ -45,22 +49,22 @@ pub const OAuthLoginCallbacks = struct {
 pub const OAuthProviderInterface = struct {
     id: OAuthProviderId,
     name: []const u8,
-    
+
     /// Run the login flow, return credentials to persist
     login: *const fn (
         allocator: std.mem.Allocator,
         callbacks: OAuthLoginCallbacks,
     ) anyerror!OAuthCredentials,
-    
+
     /// Whether login uses a local callback server and supports manual code input
     uses_callback_server: bool = false,
-    
+
     /// Refresh expired credentials, return updated credentials to persist
     refreshToken: *const fn (
         allocator: std.mem.Allocator,
         credentials: OAuthCredentials,
     ) anyerror!OAuthCredentials,
-    
+
     /// Convert credentials to API key string for the provider
     getApiKey: *const fn (credentials: OAuthCredentials) []const u8,
 };
