@@ -7,43 +7,53 @@ const json_format = @import("../shared/json_format.zig");
 /// below; new code should prefer `json_format.writeJsonString` directly.
 pub const writeJsonString = json_format.writeJsonString;
 
-pub const command_types = [_][]const u8{
-    "prompt",
-    "steer",
-    "follow_up",
-    "abort",
-    "new_session",
-    "get_state",
-    "set_model",
-    "cycle_model",
-    "get_available_models",
-    "set_thinking_level",
-    "cycle_thinking_level",
-    "set_steering_mode",
-    "set_follow_up_mode",
-    "compact",
-    "set_auto_compaction",
-    "set_auto_retry",
-    "abort_retry",
-    "bash",
-    "abort_bash",
-    "get_session_stats",
-    "export_html",
-    "switch_session",
-    "fork",
-    "clone",
-    "get_fork_messages",
-    "get_last_assistant_text",
-    "set_session_name",
-    "get_messages",
-    "get_commands",
+/// Wire-protocol command set shared with the TypeScript ts-rpc runtime. Each
+/// enum tag's `@tagName` is the byte-exact on-wire `type` string. The field
+/// order here is the canonical iteration order surfaced via `command_types`.
+///
+/// `navigate_to` is intentionally absent — it is a Zig-only escape hatch that
+/// bypasses the `isKnownCommandType` gate in `ts_rpc_mode.handleCommand`.
+pub const TsRpcCommand = enum {
+    prompt,
+    steer,
+    follow_up,
+    abort,
+    new_session,
+    get_state,
+    set_model,
+    cycle_model,
+    get_available_models,
+    set_thinking_level,
+    cycle_thinking_level,
+    set_steering_mode,
+    set_follow_up_mode,
+    compact,
+    set_auto_compaction,
+    set_auto_retry,
+    abort_retry,
+    bash,
+    abort_bash,
+    get_session_stats,
+    export_html,
+    switch_session,
+    fork,
+    clone,
+    get_fork_messages,
+    get_last_assistant_text,
+    set_session_name,
+    get_messages,
+    get_commands,
+};
+
+pub const command_types: [@typeInfo(TsRpcCommand).@"enum".fields.len][]const u8 = blk: {
+    const fields = @typeInfo(TsRpcCommand).@"enum".fields;
+    var names: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |field, index| names[index] = field.name;
+    break :blk names;
 };
 
 pub fn isKnownCommandType(command_type: []const u8) bool {
-    for (command_types) |known| {
-        if (std.mem.eql(u8, known, command_type)) return true;
-    }
-    return false;
+    return std.meta.stringToEnum(TsRpcCommand, command_type) != null;
 }
 
 pub fn stripTrailingCarriageReturn(line: []const u8) []const u8 {

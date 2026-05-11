@@ -57,6 +57,7 @@ const EXTENSION_COMMAND_ACK_TIMEOUT_MS = 1000;
 
 pub const command_types = ts_rpc_wire.command_types;
 pub const isKnownCommandType = ts_rpc_wire.isKnownCommandType;
+const TsRpcCommand = ts_rpc_wire.TsRpcCommand;
 const stripTrailingCarriageReturn = ts_rpc_wire.stripTrailingCarriageReturn;
 const writeJsonString = ts_rpc_wire.writeJsonString;
 
@@ -842,468 +843,9 @@ const TsRpcServer = struct {
             return;
         };
 
-        if (std.mem.eql(u8, command, "prompt")) {
-            const message = requiredString(object, "message") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            var images_owned = true;
-            defer if (images_owned) ts_rpc_state_json.deinitImages(self.allocator, images);
-            const streaming_behavior = parsePromptStreamingBehavior(object) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-
-            if (try self.tryDispatchExtensionPromptCommand(id, command, message)) {
-                return;
-            }
-
-            // Emit input extension event before agent processes the message
-            if (self.extension_host) |host| self.emitExtensionInputEvent(host, message, "rpc");
-
-            if (session.isStreaming() or self.hasInFlightPrompt()) {
-                const behavior = streaming_behavior orelse {
-                    try self.writeErrorResponse(
-                        id,
-                        command,
-                        "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-                    );
-                    return;
-                };
-                switch (behavior) {
-                    .steer => session.steer(message, images) catch |err| {
-                        try self.writeCommandError(id, command, err);
-                        return;
-                    },
-                    .follow_up => session.followUp(message, images) catch |err| {
-                        try self.writeCommandError(id, command, err);
-                        return;
-                    },
-                }
-                try self.writeQueueUpdate();
-                try self.enqueueDeferredSuccess(id, command, .queued_prompt);
-                return;
-            }
-
-            const message_copy = self.allocator.dupe(u8, message) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            var message_owned = true;
-            defer if (message_owned) self.allocator.free(message_copy);
-
-            const task = PromptTask.create(self.allocator, self.io, self, session, id, message_copy, images) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            images_owned = false;
-            message_owned = false;
-            self.prompt_tasks.append(self.allocator, task) catch |err| {
-                task.joinAndDestroy();
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            task.spawn() catch |err| {
-                _ = self.prompt_tasks.pop();
-                task.joinAndDestroy();
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            task.waitForResponse();
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "steer")) {
-            const message = requiredString(object, "message") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer ts_rpc_state_json.deinitImages(self.allocator, images);
-            session.steer(message, images) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeQueueUpdate();
-            if (session.isStreaming() or self.hasInFlightPrompt()) {
-                try self.enqueueDeferredSuccess(id, command, .queue_control);
-            } else {
-                try self.writeSuccessResponseNoData(id, command);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "follow_up")) {
-            const message = requiredString(object, "message") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer ts_rpc_state_json.deinitImages(self.allocator, images);
-            session.followUp(message, images) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeQueueUpdate();
-            if (session.isStreaming() or self.hasInFlightPrompt()) {
-                try self.enqueueDeferredSuccess(id, command, .queue_control);
-            } else {
-                try self.writeSuccessResponseNoData(id, command);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "abort")) {
-            const defer_response = session.isStreaming() or self.hasInFlightPrompt();
-            if (defer_response) {
-                try self.enqueueDeferredSuccess(id, command, .abort);
-            } else {
-                self.abortActivePromptWork();
-                try self.writeSuccessResponseNoData(id, command);
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "new_session")) {
-            const parent_session = optionalString(object, "parentSession") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (self.extension_host) |ext_host| {
-                // For new sessions, targetSessionFile is undefined (the new session file
-                // doesn't exist yet). parentSession is the old session being shut down,
-                // not the target for the switch event.
-                self.emitSessionBeforeSwitchEvent(ext_host, "new", null);
-            }
-            var host = TsRpcSessionHost.init(self);
-            const result = host.newSession(parent_session) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            _ = result;
-            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_state")) {
-            const data = try ts_rpc_state_json.buildStateJson(self.allocator, session);
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_model")) {
-            const provider = requiredString(object, "provider") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const model_id = requiredString(object, "modelId") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const model = ai.model_registry.getDefault().find(provider, model_id) orelse {
-                const message = try std.fmt.allocPrint(self.allocator, "Model not found: {s}/{s}", .{ provider, model_id });
-                defer self.allocator.free(message);
-                try self.writeErrorResponse(id, command, message);
-                return;
-            };
-            const prev_model = session.agent.getModel();
-            const changed = !modelsEqual(prev_model, model);
-            session.setModel(model) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (changed) {
-                if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, session.agent.getModel(), prev_model, "set");
-            }
-            const data = try ts_rpc_state_json.buildModelJson(self.allocator, model);
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "cycle_model")) {
-            try self.writeSuccessResponseRawData(id, command, "null");
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_available_models")) {
-            const data = try ts_rpc_state_json.buildAvailableModelsJson(self.allocator);
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_thinking_level")) {
-            const level = ts_rpc_state_json.parseThinkingLevel(object, "level") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const prev_level = session.agent.getThinkingLevel();
-            const effective_level = clampAgentThinkingLevel(session.agent.getModel(), level);
-            session.setThinkingLevelWithSource(effective_level, "set") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (effective_level != prev_level) {
-                if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, effective_level, prev_level, "set");
-            }
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "cycle_thinking_level")) {
-            const model = session.agent.getModel();
-            if (!model.reasoning) {
-                try self.writeSuccessResponseRawData(id, command, "null");
-                return;
-            }
-            const prev_level = session.agent.getThinkingLevel();
-            const next_level = ts_rpc_state_json.nextSupportedThinkingLevel(model, prev_level);
-            session.setThinkingLevelWithSource(next_level, "cycle") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (next_level != prev_level) {
-                if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level, "cycle");
-            }
-            const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{ts_rpc_state_json.thinkingLevelName(next_level)});
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_steering_mode")) {
-            session.agent.steering_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_follow_up_mode")) {
-            session.agent.follow_up_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "compact")) {
-            const custom_instructions = optionalString(object, "customInstructions") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (self.extension_host) |ext_host| self.emitSessionBeforeCompactEvent(ext_host, custom_instructions);
-            try self.writeCompactionStartEvent("manual");
-            const result = session.compact(custom_instructions) catch |err| {
-                try self.writeCompactionEndEvent("manual", null, true, false);
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const data = try ts_rpc_state_json.buildCompactionResultJson(self.allocator, result);
-            defer self.allocator.free(data);
-            try self.writeCompactionEndEvent("manual", data, false, false);
-            if (self.extension_host) |ext_host| self.emitSessionCompactEvent(ext_host);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_auto_compaction")) {
-            session.compaction_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_auto_retry")) {
-            session.retry_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "abort_retry")) {
-            session.abortRetry();
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "bash")) {
-            const bash_command = requiredString(object, "command") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            self.bash_manager.start(self.bashCompletionCallbacks(), session.cwd, id, bash_command) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "abort_bash")) {
-            self.output_mutex.lockUncancelable(self.io);
-            defer self.output_mutex.unlock(self.io);
-            self.abortActiveBashTask();
-            try self.writeSuccessResponseNoDataLocked(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_session_stats")) {
-            const data = try ts_rpc_state_json.buildSessionStatsJson(self.allocator, session);
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "export_html")) {
-            const output_path = optionalString(object, "outputPath") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const path = session_advanced.exportToHtml(self.allocator, self.io, session, output_path) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer self.allocator.free(path);
-            var out: std.Io.Writer.Allocating = .init(self.allocator);
-            defer out.deinit();
-            try out.writer.writeAll("{\"path\":");
-            try writeJsonString(self.allocator, &out.writer, path);
-            try out.writer.writeAll("}");
-            try self.writeSuccessResponseRawData(id, command, out.written());
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "switch_session")) {
-            const session_path = requiredString(object, "sessionPath") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (self.extension_host) |ext_host| {
-                self.emitSessionBeforeSwitchEvent(ext_host, "resume", session_path);
-            }
-            var host = TsRpcSessionHost.init(self);
-            var result = host.switchSession(session_path) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer result.deinit(self.allocator);
-            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "fork")) {
-            const entry_id = requiredString(object, "entryId") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            if (self.extension_host) |ext_host| {
-                self.emitSessionBeforeForkEvent(ext_host, entry_id, "before");
-            }
-            var host = TsRpcSessionHost.init(self);
-            var result = host.fork(entry_id, .before) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer result.deinit(self.allocator);
-            var out: std.Io.Writer.Allocating = .init(self.allocator);
-            defer out.deinit();
-            try out.writer.writeAll("{\"text\":");
-            try writeJsonString(self.allocator, &out.writer, result.selected_text orelse "");
-            try out.writer.writeAll(",\"cancelled\":false}");
-            try self.writeSuccessResponseRawData(id, command, out.written());
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "clone")) {
-            if (self.extension_host) |ext_host| {
-                if (session.session_manager.getLeafId()) |leaf_id| {
-                    self.emitSessionBeforeForkEvent(ext_host, leaf_id, "at");
-                }
-            }
-            var host = TsRpcSessionHost.init(self);
-            var result = host.clone() catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            defer result.deinit(self.allocator);
-            try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_fork_messages")) {
-            const data = try ts_rpc_state_json.buildForkMessagesJson(self.allocator, session);
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_last_assistant_text")) {
-            const text = try lastAssistantTextAlloc(self.allocator, session);
-            defer if (text) |value| self.allocator.free(value);
-            var out: std.Io.Writer.Allocating = .init(self.allocator);
-            defer out.deinit();
-            try out.writer.writeAll("{\"text\":");
-            if (text) |value| {
-                try writeJsonString(self.allocator, &out.writer, value);
-            } else {
-                try out.writer.writeAll("null");
-            }
-            try out.writer.writeAll("}");
-            try self.writeSuccessResponseRawData(id, command, out.written());
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "set_session_name")) {
-            const raw_name = requiredString(object, "name") catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            const name = std.mem.trim(u8, raw_name, &std.ascii.whitespace);
-            if (name.len == 0) {
-                try self.writeErrorResponse(id, command, "Session name cannot be empty");
-                return;
-            }
-            _ = session.session_manager.appendSessionInfo(name) catch |err| {
-                try self.writeCommandError(id, command, err);
-                return;
-            };
-            try self.writeSessionInfoChangedEvent(name);
-            try self.writeSuccessResponseNoData(id, command);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_messages")) {
-            const data = try ts_rpc_state_json.buildMessagesJson(self.allocator, session.agent.getMessages());
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
-        if (std.mem.eql(u8, command, "get_commands")) {
-            const data = try self.buildCommandsJson();
-            defer self.allocator.free(data);
-            try self.writeSuccessResponseRawData(id, command, data);
-            return;
-        }
-
+        // navigate_to is a Zig-only extension command not in the TypeScript
+        // protocol. It is gated separately above isKnownCommandType, so it
+        // never appears in the TsRpcCommand enum; handle it before the switch.
         if (std.mem.eql(u8, command, "navigate_to")) {
             const entry_id = requiredString(object, "entryId") catch |err| {
                 try self.writeCommandError(id, command, err);
@@ -1323,7 +865,445 @@ const TsRpcServer = struct {
             return;
         }
 
-        try self.writeNotImplemented(id, command);
+        const tag = std.meta.stringToEnum(TsRpcCommand, command) orelse {
+            try self.writeNotImplemented(id, command);
+            return;
+        };
+
+        switch (tag) {
+            .prompt => {
+                const message = requiredString(object, "message") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                var images_owned = true;
+                defer if (images_owned) ts_rpc_state_json.deinitImages(self.allocator, images);
+                const streaming_behavior = parsePromptStreamingBehavior(object) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+
+                if (try self.tryDispatchExtensionPromptCommand(id, command, message)) {
+                    return;
+                }
+
+                // Emit input extension event before agent processes the message
+                if (self.extension_host) |host| self.emitExtensionInputEvent(host, message, "rpc");
+
+                if (session.isStreaming() or self.hasInFlightPrompt()) {
+                    const behavior = streaming_behavior orelse {
+                        try self.writeErrorResponse(
+                            id,
+                            command,
+                            "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+                        );
+                        return;
+                    };
+                    switch (behavior) {
+                        .steer => session.steer(message, images) catch |err| {
+                            try self.writeCommandError(id, command, err);
+                            return;
+                        },
+                        .follow_up => session.followUp(message, images) catch |err| {
+                            try self.writeCommandError(id, command, err);
+                            return;
+                        },
+                    }
+                    try self.writeQueueUpdate();
+                    try self.enqueueDeferredSuccess(id, command, .queued_prompt);
+                    return;
+                }
+
+                const message_copy = self.allocator.dupe(u8, message) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                var message_owned = true;
+                defer if (message_owned) self.allocator.free(message_copy);
+
+                const task = PromptTask.create(self.allocator, self.io, self, session, id, message_copy, images) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                images_owned = false;
+                message_owned = false;
+                self.prompt_tasks.append(self.allocator, task) catch |err| {
+                    task.joinAndDestroy();
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                task.spawn() catch |err| {
+                    _ = self.prompt_tasks.pop();
+                    task.joinAndDestroy();
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                task.waitForResponse();
+            },
+
+            .steer => {
+                const message = requiredString(object, "message") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer ts_rpc_state_json.deinitImages(self.allocator, images);
+                session.steer(message, images) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeQueueUpdate();
+                if (session.isStreaming() or self.hasInFlightPrompt()) {
+                    try self.enqueueDeferredSuccess(id, command, .queue_control);
+                } else {
+                    try self.writeSuccessResponseNoData(id, command);
+                }
+            },
+
+            .follow_up => {
+                const message = requiredString(object, "message") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const images = ts_rpc_state_json.parseImages(self.allocator, object) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer ts_rpc_state_json.deinitImages(self.allocator, images);
+                session.followUp(message, images) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeQueueUpdate();
+                if (session.isStreaming() or self.hasInFlightPrompt()) {
+                    try self.enqueueDeferredSuccess(id, command, .queue_control);
+                } else {
+                    try self.writeSuccessResponseNoData(id, command);
+                }
+            },
+
+            .abort => {
+                const defer_response = session.isStreaming() or self.hasInFlightPrompt();
+                if (defer_response) {
+                    try self.enqueueDeferredSuccess(id, command, .abort);
+                } else {
+                    self.abortActivePromptWork();
+                    try self.writeSuccessResponseNoData(id, command);
+                }
+            },
+
+            .new_session => {
+                const parent_session = optionalString(object, "parentSession") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (self.extension_host) |ext_host| {
+                    // For new sessions, targetSessionFile is undefined (the new session file
+                    // doesn't exist yet). parentSession is the old session being shut down,
+                    // not the target for the switch event.
+                    self.emitSessionBeforeSwitchEvent(ext_host, "new", null);
+                }
+                var host = TsRpcSessionHost.init(self);
+                const result = host.newSession(parent_session) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                _ = result;
+                try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
+            },
+
+            .get_state => {
+                const data = try ts_rpc_state_json.buildStateJson(self.allocator, session);
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .set_model => {
+                const provider = requiredString(object, "provider") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const model_id = requiredString(object, "modelId") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const model = ai.model_registry.getDefault().find(provider, model_id) orelse {
+                    const message = try std.fmt.allocPrint(self.allocator, "Model not found: {s}/{s}", .{ provider, model_id });
+                    defer self.allocator.free(message);
+                    try self.writeErrorResponse(id, command, message);
+                    return;
+                };
+                const prev_model = session.agent.getModel();
+                const changed = !modelsEqual(prev_model, model);
+                session.setModel(model) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (changed) {
+                    if (self.extension_host) |host| self.emitExtensionModelSelectEvent(host, session.agent.getModel(), prev_model, "set");
+                }
+                const data = try ts_rpc_state_json.buildModelJson(self.allocator, model);
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .cycle_model => {
+                try self.writeSuccessResponseRawData(id, command, "null");
+            },
+
+            .get_available_models => {
+                const data = try ts_rpc_state_json.buildAvailableModelsJson(self.allocator);
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .set_thinking_level => {
+                const level = ts_rpc_state_json.parseThinkingLevel(object, "level") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const prev_level = session.agent.getThinkingLevel();
+                const effective_level = clampAgentThinkingLevel(session.agent.getModel(), level);
+                session.setThinkingLevelWithSource(effective_level, "set") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (effective_level != prev_level) {
+                    if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, effective_level, prev_level, "set");
+                }
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .cycle_thinking_level => {
+                const model = session.agent.getModel();
+                if (!model.reasoning) {
+                    try self.writeSuccessResponseRawData(id, command, "null");
+                    return;
+                }
+                const prev_level = session.agent.getThinkingLevel();
+                const next_level = ts_rpc_state_json.nextSupportedThinkingLevel(model, prev_level);
+                session.setThinkingLevelWithSource(next_level, "cycle") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (next_level != prev_level) {
+                    if (self.extension_host) |host| self.emitExtensionThinkingLevelSelectEvent(host, next_level, prev_level, "cycle");
+                }
+                const data = try std.fmt.allocPrint(self.allocator, "{{\"level\":\"{s}\"}}", .{ts_rpc_state_json.thinkingLevelName(next_level)});
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .set_steering_mode => {
+                session.agent.steering_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .set_follow_up_mode => {
+                session.agent.follow_up_queue.mode = ts_rpc_state_json.parseQueueMode(object, "mode") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .compact => {
+                const custom_instructions = optionalString(object, "customInstructions") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (self.extension_host) |ext_host| self.emitSessionBeforeCompactEvent(ext_host, custom_instructions);
+                try self.writeCompactionStartEvent("manual");
+                const result = session.compact(custom_instructions) catch |err| {
+                    try self.writeCompactionEndEvent("manual", null, true, false);
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const data = try ts_rpc_state_json.buildCompactionResultJson(self.allocator, result);
+                defer self.allocator.free(data);
+                try self.writeCompactionEndEvent("manual", data, false, false);
+                if (self.extension_host) |ext_host| self.emitSessionCompactEvent(ext_host);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .set_auto_compaction => {
+                session.compaction_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .set_auto_retry => {
+                session.retry_settings.enabled = parseRequiredBool(object, "enabled") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .abort_retry => {
+                session.abortRetry();
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .bash => {
+                const bash_command = requiredString(object, "command") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                self.bash_manager.start(self.bashCompletionCallbacks(), session.cwd, id, bash_command) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+            },
+
+            .abort_bash => {
+                self.output_mutex.lockUncancelable(self.io);
+                defer self.output_mutex.unlock(self.io);
+                self.abortActiveBashTask();
+                try self.writeSuccessResponseNoDataLocked(id, command);
+            },
+
+            .get_session_stats => {
+                const data = try ts_rpc_state_json.buildSessionStatsJson(self.allocator, session);
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .export_html => {
+                const output_path = optionalString(object, "outputPath") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const path = session_advanced.exportToHtml(self.allocator, self.io, session, output_path) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer self.allocator.free(path);
+                var out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer out.deinit();
+                try out.writer.writeAll("{\"path\":");
+                try writeJsonString(self.allocator, &out.writer, path);
+                try out.writer.writeAll("}");
+                try self.writeSuccessResponseRawData(id, command, out.written());
+            },
+
+            .switch_session => {
+                const session_path = requiredString(object, "sessionPath") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (self.extension_host) |ext_host| {
+                    self.emitSessionBeforeSwitchEvent(ext_host, "resume", session_path);
+                }
+                var host = TsRpcSessionHost.init(self);
+                var result = host.switchSession(session_path) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer result.deinit(self.allocator);
+                try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
+            },
+
+            .fork => {
+                const entry_id = requiredString(object, "entryId") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                if (self.extension_host) |ext_host| {
+                    self.emitSessionBeforeForkEvent(ext_host, entry_id, "before");
+                }
+                var host = TsRpcSessionHost.init(self);
+                var result = host.fork(entry_id, .before) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer result.deinit(self.allocator);
+                var out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer out.deinit();
+                try out.writer.writeAll("{\"text\":");
+                try writeJsonString(self.allocator, &out.writer, result.selected_text orelse "");
+                try out.writer.writeAll(",\"cancelled\":false}");
+                try self.writeSuccessResponseRawData(id, command, out.written());
+            },
+
+            .clone => {
+                if (self.extension_host) |ext_host| {
+                    if (session.session_manager.getLeafId()) |leaf_id| {
+                        self.emitSessionBeforeForkEvent(ext_host, leaf_id, "at");
+                    }
+                }
+                var host = TsRpcSessionHost.init(self);
+                var result = host.clone() catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                defer result.deinit(self.allocator);
+                try self.writeSuccessResponseRawData(id, command, "{\"cancelled\":false}");
+            },
+
+            .get_fork_messages => {
+                const data = try ts_rpc_state_json.buildForkMessagesJson(self.allocator, session);
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .get_last_assistant_text => {
+                const text = try lastAssistantTextAlloc(self.allocator, session);
+                defer if (text) |value| self.allocator.free(value);
+                var out: std.Io.Writer.Allocating = .init(self.allocator);
+                defer out.deinit();
+                try out.writer.writeAll("{\"text\":");
+                if (text) |value| {
+                    try writeJsonString(self.allocator, &out.writer, value);
+                } else {
+                    try out.writer.writeAll("null");
+                }
+                try out.writer.writeAll("}");
+                try self.writeSuccessResponseRawData(id, command, out.written());
+            },
+
+            .set_session_name => {
+                const raw_name = requiredString(object, "name") catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                const name = std.mem.trim(u8, raw_name, &std.ascii.whitespace);
+                if (name.len == 0) {
+                    try self.writeErrorResponse(id, command, "Session name cannot be empty");
+                    return;
+                }
+                _ = session.session_manager.appendSessionInfo(name) catch |err| {
+                    try self.writeCommandError(id, command, err);
+                    return;
+                };
+                try self.writeSessionInfoChangedEvent(name);
+                try self.writeSuccessResponseNoData(id, command);
+            },
+
+            .get_messages => {
+                const data = try ts_rpc_state_json.buildMessagesJson(self.allocator, session.agent.getMessages());
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+
+            .get_commands => {
+                const data = try self.buildCommandsJson();
+                defer self.allocator.free(data);
+                try self.writeSuccessResponseRawData(id, command, data);
+            },
+        }
     }
 
     fn writeCommandError(self: *TsRpcServer, id: ?[]const u8, command: []const u8, err: anyerror) !void {
