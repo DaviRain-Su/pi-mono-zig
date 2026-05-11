@@ -39,11 +39,17 @@ pub const BUILT_IN_PROVIDER_DISPLAY_NAMES: []const ProviderDisplayName = &.{
     .{ .provider = "xiaomi-token-plan-sgp", .display_name = "Xiaomi MiMo Token Plan (Singapore)" },
 };
 
-pub fn builtInProviderDisplayName(provider: []const u8) ?[]const u8 {
-    for (BUILT_IN_PROVIDER_DISPLAY_NAMES) |entry| {
-        if (std.mem.eql(u8, entry.provider, provider)) return entry.display_name;
+const BUILT_IN_PROVIDER_DISPLAY_NAME_MAP = std.StaticStringMap([]const u8).initComptime(blk: {
+    const entries = BUILT_IN_PROVIDER_DISPLAY_NAMES;
+    var kv: [entries.len]struct { []const u8, []const u8 } = undefined;
+    for (entries, 0..) |entry, i| {
+        kv[i] = .{ entry.provider, entry.display_name };
     }
-    return null;
+    break :blk kv;
+});
+
+pub fn builtInProviderDisplayName(provider: []const u8) ?[]const u8 {
+    return BUILT_IN_PROVIDER_DISPLAY_NAME_MAP.get(provider);
 }
 
 test "builtInProviderDisplayName returns known provider names" {
