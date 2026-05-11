@@ -912,37 +912,47 @@ fn parseUsage(value: std.json.Value) types.Usage {
 }
 
 fn extractFailureMessage(allocator: std.mem.Allocator, response_value: ?std.json.Value) ![]const u8 {
-    const response = response_value orelse return try allocator.dupe(u8, "Unknown error (no error details in response)");
-    if (response != .object) return try allocator.dupe(u8, "Unknown error (no error details in response)");
+    const response = response_value orelse return try sanitizeProviderTerminalError(allocator, "Unknown error (no error details in response)");
+    if (response != .object) return try sanitizeProviderTerminalError(allocator, "Unknown error (no error details in response)");
 
     if (response.object.get("error")) |error_value| {
         if (error_value == .object) {
             const code = extractStringField(error_value, "code") orelse "unknown";
             const message = extractStringField(error_value, "message") orelse "no message";
-            return try std.fmt.allocPrint(allocator, "{s}: {s}", .{ code, message });
+            const raw = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ code, message });
+            defer allocator.free(raw);
+            return try sanitizeProviderTerminalError(allocator, raw);
         }
     }
 
     if (response.object.get("incomplete_details")) |details_value| {
         if (details_value == .object) {
             if (extractStringField(details_value, "reason")) |reason| {
-                return try std.fmt.allocPrint(allocator, "incomplete: {s}", .{reason});
+                const raw = try std.fmt.allocPrint(allocator, "incomplete: {s}", .{reason});
+                defer allocator.free(raw);
+                return try sanitizeProviderTerminalError(allocator, raw);
             }
         }
     }
 
-    return try allocator.dupe(u8, "Unknown error (no error details in response)");
+    return try sanitizeProviderTerminalError(allocator, "Unknown error (no error details in response)");
 }
 
 fn extractTopLevelErrorMessage(allocator: std.mem.Allocator, value: std.json.Value) ![]const u8 {
     if (extractStringField(value, "code")) |code| {
         const message = extractStringField(value, "message") orelse "Unknown error";
-        return try std.fmt.allocPrint(allocator, "Error Code {s}: {s}", .{ code, message });
+        const raw = try std.fmt.allocPrint(allocator, "Error Code {s}: {s}", .{ code, message });
+        defer allocator.free(raw);
+        return try sanitizeProviderTerminalError(allocator, raw);
     }
     if (extractStringField(value, "message")) |message| {
-        return try allocator.dupe(u8, message);
+        return try sanitizeProviderTerminalError(allocator, message);
     }
-    return try allocator.dupe(u8, "Unknown error");
+    return try sanitizeProviderTerminalError(allocator, "Unknown error");
+}
+
+fn sanitizeProviderTerminalError(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
+    return provider_error.sanitizeProviderErrorDetail(allocator, message);
 }
 
 fn mapStopReason(status: []const u8) types.StopReason {
@@ -1900,6 +1910,61 @@ test "parseSseStreamLines finalizes Azure Responses tool call on EOF mid-block" 
     try std.testing.expectEqual(@as(usize, 1), done.message.?.content.len);
     try std.testing.expectEqualStrings("lookup", done.message.?.content[0].tool_call.name);
     try std.testing.expectEqualStrings("local", done.message.?.content[0].tool_call.arguments.object.get("query").?.string);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "ISS-310 parseSseStreamLines finalizes Azure partial text before sanitized response.failed terminal error" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_azure_failed\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_failed\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial azure\"}\n" ++
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_azure_failed\",\"error\":{\"code\":\"server_error\",\"message\":\"failed with sk-azure-secret from /Users/alice/pi/azure_openai_responses.zig and request_id req_azure_random_123456\"}}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"must_not_emit\",\"status\":\"completed\"}}\n",
+    );
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = "gpt-4.1",
+        .name = "Azure GPT-4.1",
+        .api = "azure-openai-responses",
+        .provider = "azure-openai-responses",
+        .base_url = "https://example.openai.azure.com",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+    const delta = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("partial azure", delta.delta.?);
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("partial azure", text_end.content.?);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqualStrings(terminal.error_message.?, terminal.message.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("resp_azure_failed", terminal.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 1), terminal.message.?.content.len);
+    try std.testing.expectEqualStrings("partial azure", terminal.message.?.content[0].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "sk-azure-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "/Users/alice") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "req_azure_random") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal.error_message.?, "[REDACTED]") != null);
+    try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
     try std.testing.expect(stream.next() == null);
 }
 
