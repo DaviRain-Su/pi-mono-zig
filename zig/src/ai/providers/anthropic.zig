@@ -258,7 +258,7 @@ pub fn buildRequestPayload(
     }
 
     if (options) |stream_options| {
-        const anthropic_opts = stream_options.anthropicOptions();
+        const anthropic_opts = stream_options.providerOptions("anthropic");
         if (stream_options.temperature) |temperature| {
             if (anthropic_opts.thinking_enabled != true) {
                 try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
@@ -2909,7 +2909,7 @@ fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Cont
 fn shouldUseInterleavedThinkingBeta(model: types.Model, options: ?types.StreamOptions) bool {
     if (supportsAdaptiveThinking(model)) return false;
     if (options) |stream_options| {
-        const anthropic_opts = stream_options.anthropicOptions();
+        const anthropic_opts = stream_options.providerOptions("anthropic");
         return anthropic_opts.interleaved_thinking orelse true;
     }
     return true;

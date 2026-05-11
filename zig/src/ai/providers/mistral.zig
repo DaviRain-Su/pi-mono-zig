@@ -216,7 +216,7 @@ pub fn buildRequestPayload(
         if (stream_options.metadata) |metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "metadata"), try provider_json.cloneValue(allocator, metadata));
         }
-        const mistral_opts = stream_options.mistralOptions();
+        const mistral_opts = stream_options.providerOptions("mistral");
         if (mistral_opts.reasoning_effort) |effort| {
             try payload.put(allocator, try allocator.dupe(u8, "reasoning_effort"), .{ .string = try allocator.dupe(u8, effort) });
         }

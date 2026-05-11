@@ -257,10 +257,10 @@ fn recordingStream(
         recording_state.saw_max_tokens = stream_options.max_tokens;
         recording_state.saw_temperature = stream_options.temperature;
         recording_state.saw_api_key = stream_options.api_key;
-        recording_state.saw_responses_options = stream_options.responsesOptions();
-        recording_state.saw_mistral_options = stream_options.mistralOptions();
-        recording_state.saw_anthropic_options = stream_options.anthropicOptions();
-        recording_state.saw_bedrock_options = stream_options.bedrockOptions();
+        recording_state.saw_responses_options = stream_options.providerOptions("responses");
+        recording_state.saw_mistral_options = stream_options.providerOptions("mistral");
+        recording_state.saw_anthropic_options = stream_options.providerOptions("anthropic");
+        recording_state.saw_bedrock_options = stream_options.providerOptions("bedrock");
     }
 
     const result_allocator = std.heap.page_allocator;
@@ -611,7 +611,7 @@ test "streamSimple routes Bedrock fixed reasoning through provider adjustment" {
             ) !event_stream.AssistantMessageEventStream {
                 recording_state.stream_simple_calls += 1;
                 const base = options orelse types.StreamOptions{};
-                const bedrock_opts = base.bedrockOptions();
+                const bedrock_opts = base.providerOptions("bedrock");
                 const adjusted = simple_options_mod.adjustMaxTokensForThinking(
                     base.max_tokens orelse 0,
                     model.max_tokens,

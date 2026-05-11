@@ -224,7 +224,7 @@ pub fn buildRequestPayload(
                 try payload.put(allocator, try allocator.dupe(u8, "prompt_cache_retention"), .{ .string = try allocator.dupe(u8, "24h") });
             }
         }
-        const responses_opts = stream_options.responsesOptions();
+        const responses_opts = stream_options.providerOptions("responses");
         if (responses_opts.service_tier) |service_tier| {
             try payload.put(allocator, try allocator.dupe(u8, "service_tier"), .{ .string = try allocator.dupe(u8, service_tier) });
         }

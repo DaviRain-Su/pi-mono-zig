@@ -266,7 +266,7 @@ fn appendOptionPayloadFields(
             const field = if (std.mem.eql(u8, compat.max_tokens_field, "max_tokens")) "max_tokens" else "max_completion_tokens";
             try payload.put(allocator, try allocator.dupe(u8, field), std.json.Value{ .integer = @intCast(max) });
         }
-        const openai_opts = opts.openaiOptions();
+        const openai_opts = opts.providerOptions("openai");
         if (openai_opts.tool_choice) |tool_choice| {
             try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try provider_json.cloneValue(allocator, tool_choice));
         }
@@ -311,7 +311,7 @@ fn appendReasoningPayloadFields(
     options: ?types.StreamOptions,
 ) !void {
     if (model.reasoning) {
-        const openai_opts = if (options) |opts| opts.openaiOptions() else types.OpenAIChatStreamOptions{};
+        const openai_opts = if (options) |opts| opts.providerOptions("openai") else types.OpenAIChatStreamOptions{};
         const effort = openai_opts.reasoning_effort;
         if (std.mem.eql(u8, compat.thinking_format, "zai") or std.mem.eql(u8, compat.thinking_format, "qwen")) {
             try payload.put(allocator, try allocator.dupe(u8, "enable_thinking"), .{ .bool = effort != null });

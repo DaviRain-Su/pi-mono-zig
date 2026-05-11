@@ -226,7 +226,7 @@ fn resolveDeploymentNameWithEnv(
     env_deployment_map: ?[]const u8,
 ) ![]const u8 {
     if (options) |stream_options| {
-        const azure_opts = stream_options.azureOptions();
+        const azure_opts = stream_options.providerOptions("azure");
         if (azure_opts.deployment_name) |deployment_name| {
             if (deployment_name.len > 0) return try allocator.dupe(u8, deployment_name);
         }
@@ -266,7 +266,7 @@ fn resolveAzureBaseUrlWithEnv(
     env_resource_name: ?[]const u8,
 ) ![]const u8 {
     if (options) |stream_options| {
-        const azure_opts = stream_options.azureOptions();
+        const azure_opts = stream_options.providerOptions("azure");
         if (azure_opts.base_url) |value| {
             if (std.mem.trim(u8, value, " \t\r\n").len > 0) {
                 return try normalizeAzureBaseUrl(allocator, value);
@@ -320,7 +320,7 @@ fn resolveAzureApiVersionWithEnv(
     env_api_version: ?[]const u8,
 ) !ResolvedApiVersion {
     if (options) |stream_options| {
-        const azure_opts = stream_options.azureOptions();
+        const azure_opts = stream_options.providerOptions("azure");
         if (azure_opts.api_version) |value| {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) return .{ .value = trimmed, .owned = false };

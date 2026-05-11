@@ -157,7 +157,7 @@ pub fn buildRequestPayload(
 
     var text_config = try initObject(allocator);
     errdefer text_config.deinit(allocator);
-    var responses_opts = if (options) |stream_options| stream_options.responsesOptions() else types.ResponsesStreamOptions{};
+    var responses_opts = if (options) |stream_options| stream_options.providerOptions("responses") else types.ResponsesStreamOptions{};
     const text_verbosity = responses_opts.text_verbosity orelse "low";
     try text_config.put(allocator, try allocator.dupe(u8, "verbosity"), .{ .string = try allocator.dupe(u8, text_verbosity) });
     try payload.put(allocator, try allocator.dupe(u8, "text"), .{ .object = text_config });
@@ -176,7 +176,7 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "instructions"), .{ .string = try allocator.dupe(u8, instructions) });
 
     if (options) |stream_options| {
-        responses_opts = stream_options.responsesOptions();
+        responses_opts = stream_options.providerOptions("responses");
         if (stream_options.temperature) |temperature| {
             try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
         }

@@ -203,7 +203,7 @@ fn buildInnerRequestValue(
         if (tools.len > 0) {
             try request.put(allocator, try allocator.dupe(u8, "tools"), try buildToolsValue(allocator, tools));
             if (options) |stream_options| {
-                const google_opts = stream_options.googleOptions();
+                const google_opts = stream_options.providerOptions("google");
                 if (google_opts.tool_choice) |tool_choice| {
                     try request.put(allocator, try allocator.dupe(u8, "toolConfig"), try buildToolConfigValue(allocator, tool_choice));
                 }
@@ -681,7 +681,7 @@ fn buildGenerationConfigValue(
         if (stream_options.max_tokens) |max_tokens| {
             try generation_config.put(allocator, try allocator.dupe(u8, "maxOutputTokens"), .{ .integer = @intCast(max_tokens) });
         }
-        const google_opts = stream_options.googleOptions();
+        const google_opts = stream_options.providerOptions("google");
         if (google_opts.thinking) |thinking| {
             if (model.reasoning) {
                 var thinking_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});

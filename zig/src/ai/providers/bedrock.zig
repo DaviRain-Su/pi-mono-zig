@@ -275,7 +275,7 @@ fn buildStreamSimpleBedrockOptions(model: types.Model, options: ?types.StreamOpt
     var base = stream_options;
     if (base.max_tokens == null) base.max_tokens = defaultSimpleMaxTokens(model);
 
-    var bedrock_opts = stream_options.bedrockOptions();
+    var bedrock_opts = stream_options.providerOptions("bedrock");
     const reasoning = bedrock_opts.reasoning orelse return base;
     if (isAnthropicClaudeModel(model) and !supportsAdaptiveThinking(model.id, model.name)) {
         const adjusted = simple_options.adjustMaxTokensForThinking(
@@ -341,7 +341,7 @@ fn buildRequestPayloadWithFixtureEnv(
     }
 
     if (options) |stream_options| {
-        const bedrock_opts = stream_options.bedrockOptions();
+        const bedrock_opts = stream_options.providerOptions("bedrock");
         if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |request_metadata| {
             try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
         }
@@ -457,7 +457,7 @@ pub fn buildRequestSurfaceSnapshotValue(
 
     var client_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     if (options) |stream_options| {
-        const bedrock_opts = stream_options.bedrockOptions();
+        const bedrock_opts = stream_options.providerOptions("bedrock");
         if (bedrock_opts.profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
     }
     if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
@@ -754,7 +754,7 @@ fn isGovCloudBedrockTarget(model: types.Model, options: types.StreamOptions, fix
 }
 
 fn configuredBedrockRegion(options: types.StreamOptions, fixture_env: ?FixtureEnv) ?[]const u8 {
-    const bedrock_opts = options.bedrockOptions();
+    const bedrock_opts = options.providerOptions("bedrock");
     if (bedrock_opts.region) |region| return region;
     if (fixture_env) |env| {
         if (nonEmpty(env.aws_region)) |region| return region;
@@ -792,7 +792,7 @@ fn buildAdditionalModelRequestFieldsValue(
     options: types.StreamOptions,
     fixture_env: ?FixtureEnv,
 ) !?std.json.Value {
-    const bedrock_opts = options.bedrockOptions();
+    const bedrock_opts = options.providerOptions("bedrock");
     const reasoning = bedrock_opts.reasoning orelse return null;
     if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
 
@@ -1040,7 +1040,7 @@ fn buildToolConfigValue(
     options: ?types.StreamOptions,
 ) !?std.json.Value {
     if (options) |stream_options| {
-        const bedrock_opts = stream_options.bedrockOptions();
+        const bedrock_opts = stream_options.providerOptions("bedrock");
         if (bedrock_opts.tool_choice) |tool_choice| {
             if (tool_choice == .none) return null;
         }
@@ -1066,7 +1066,7 @@ fn buildToolConfigValue(
     try config.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tool_entries });
 
     if (options) |stream_options| {
-        const bedrock_opts = stream_options.bedrockOptions();
+        const bedrock_opts = stream_options.providerOptions("bedrock");
         if (bedrock_opts.tool_choice) |tool_choice| {
             if (try buildToolChoiceValue(allocator, tool_choice)) |choice_value| {
                 try config.put(allocator, try allocator.dupe(u8, "toolChoice"), choice_value);
@@ -1135,7 +1135,7 @@ fn resolveBedrockAuth(allocator: std.mem.Allocator, options: ?types.StreamOption
     }
 
     if (options) |stream_options| {
-        const bedrock_opts = stream_options.bedrockOptions();
+        const bedrock_opts = stream_options.providerOptions("bedrock");
         if (bedrock_opts.bearer_token) |token| {
             if (std.mem.trim(u8, token, " \t\r\n").len > 0) {
                 return .{ .bearer = try allocator.dupe(u8, token) };
@@ -1219,7 +1219,7 @@ fn percentEncodePathSegment(allocator: std.mem.Allocator, value: []const u8) ![]
 
 fn resolveBedrockRegion(allocator: std.mem.Allocator, base_url: []const u8, options: ?types.StreamOptions) ![]u8 {
     if (options) |stream_options| {
-        if (stream_options.bedrockOptions().region) |region| return try allocator.dupe(u8, region);
+        if (stream_options.providerOptions("bedrock").region) |region| return try allocator.dupe(u8, region);
     }
     if (try loadEnvOptional(allocator, "AWS_REGION")) |region| return region;
     if (try loadEnvOptional(allocator, "AWS_DEFAULT_REGION")) |region| return region;
@@ -1251,7 +1251,7 @@ fn resolveBedrockRegion(allocator: std.mem.Allocator, base_url: []const u8, opti
 
 fn hasConfiguredBedrockRegion(allocator: std.mem.Allocator, options: ?types.StreamOptions) !bool {
     if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrockOptions().region) != null) return true;
+        if (nonEmpty(stream_options.providerOptions("bedrock").region) != null) return true;
     }
     if (try loadEnvOptional(allocator, "AWS_REGION")) |region| {
         allocator.free(region);
@@ -2624,7 +2624,7 @@ fn setProcessEnvOptional(allocator: std.mem.Allocator, name: []const u8, value: 
 
 fn requestSurfaceRegionSnapshot(base_url: []const u8, options: ?types.StreamOptions, env: FixtureEnv, endpoint: ResolvedBedrockEndpoint) FixtureRegion {
     if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrockOptions().region) != null) return .{ .source = "options.region", .value = endpoint.region };
+        if (nonEmpty(stream_options.providerOptions("bedrock").region) != null) return .{ .source = "options.region", .value = endpoint.region };
     }
     if (nonEmpty(env.aws_region) != null) return .{ .source = "AWS_REGION", .value = endpoint.region };
     if (nonEmpty(env.aws_default_region) != null) return .{ .source = "AWS_DEFAULT_REGION", .value = endpoint.region };
@@ -2651,7 +2651,7 @@ fn requestSurfaceEndpointSnapshot(
 
 fn hasRequestSurfaceConfiguredRegion(options: ?types.StreamOptions, env: FixtureEnv) bool {
     if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrockOptions().region) != null) return true;
+        if (nonEmpty(stream_options.providerOptions("bedrock").region) != null) return true;
     }
     return nonEmpty(env.aws_region) != null or nonEmpty(env.aws_default_region) != null;
 }
@@ -2659,7 +2659,7 @@ fn hasRequestSurfaceConfiguredRegion(options: ?types.StreamOptions, env: Fixture
 fn useProductionHttpRequestBoundary(options: ?types.StreamOptions, env: FixtureEnv) bool {
     if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) return false;
     if (options) |stream_options| {
-        if (nonEmpty(stream_options.bedrockOptions().bearer_token) != null) return true;
+        if (nonEmpty(stream_options.providerOptions("bedrock").bearer_token) != null) return true;
     }
     if (nonEmpty(env.aws_bearer_token_bedrock) != null) return true;
     return nonEmpty(env.aws_access_key_id) != null and nonEmpty(env.aws_secret_access_key) != null;
@@ -2676,7 +2676,7 @@ fn buildProductionAuthSnapshot(
     var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
     errdefer object.deinit(allocator);
 
-    const option_bearer = if (options) |stream_options| nonEmpty(stream_options.bedrockOptions().bearer_token) else null;
+    const option_bearer = if (options) |stream_options| nonEmpty(stream_options.providerOptions("bedrock").bearer_token) else null;
     const env_bearer = nonEmpty(env.aws_bearer_token_bedrock);
 
     if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) {
@@ -2707,11 +2707,11 @@ fn buildProductionAuthSnapshot(
             var profile_boundary = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
             errdefer profile_boundary.deinit(allocator);
             try profile_boundary.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, "aws-sdk-shared-ini-profile-resolution") });
-            const configured_profile = if (options) |stream_options| nonEmpty(stream_options.bedrockOptions().profile) else null;
+            const configured_profile = if (options) |stream_options| nonEmpty(stream_options.providerOptions("bedrock").profile) else null;
             const env_profile = nonEmpty(env.aws_profile);
             try profile_boundary.put(allocator, try allocator.dupe(u8, "selectedProfile"), .{ .string = try allocator.dupe(u8, configured_profile orelse env_profile orelse "default") });
             if (options) |stream_options| {
-                if (nonEmpty(stream_options.bedrockOptions().profile)) |profile| {
+                if (nonEmpty(stream_options.providerOptions("bedrock").profile)) |profile| {
                     try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
                     try profile_boundary.put(allocator, try allocator.dupe(u8, "configuredProfile"), .{ .string = try allocator.dupe(u8, profile) });
                 }

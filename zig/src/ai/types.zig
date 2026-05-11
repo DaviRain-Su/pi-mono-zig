@@ -607,32 +607,15 @@ pub const StreamOptions = struct {
     /// `ProviderStreamOptions`).
     provider: ProviderStreamOptions = .{},
 
-    pub fn anthropicOptions(self: StreamOptions) AnthropicStreamOptions {
-        return self.provider.anthropic orelse .{};
-    }
-
-    pub fn azureOptions(self: StreamOptions) AzureStreamOptions {
-        return self.provider.azure orelse .{};
-    }
-
-    pub fn bedrockOptions(self: StreamOptions) BedrockStreamOptions {
-        return self.provider.bedrock orelse .{};
-    }
-
-    pub fn googleOptions(self: StreamOptions) GoogleStreamOptions {
-        return self.provider.google orelse .{};
-    }
-
-    pub fn mistralOptions(self: StreamOptions) MistralStreamOptions {
-        return self.provider.mistral orelse .{};
-    }
-
-    pub fn openaiOptions(self: StreamOptions) OpenAIChatStreamOptions {
-        return self.provider.openai orelse .{};
-    }
-
-    pub fn responsesOptions(self: StreamOptions) ResponsesStreamOptions {
-        return self.provider.responses orelse .{};
+    /// Returns the provider-specific options for `field_name` (a field name on
+    /// `ProviderStreamOptions`), falling back to the variant's default if the
+    /// caller did not set them. The seven per-provider accessors collapse into
+    /// this single reflection-based helper.
+    pub fn providerOptions(
+        self: StreamOptions,
+        comptime field_name: []const u8,
+    ) @typeInfo(@FieldType(ProviderStreamOptions, field_name)).optional.child {
+        return @field(self.provider, field_name) orelse .{};
     }
 };
 
