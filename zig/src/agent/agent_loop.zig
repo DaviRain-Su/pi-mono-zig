@@ -1057,6 +1057,11 @@ const CountedToolFixture = struct {
     execute_count: usize = 0,
 };
 
+const HookLifecycleFixture = struct {
+    execute_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    after_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
 fn echoToolExecute(
     allocator: std.mem.Allocator,
     _: []const u8,
@@ -1084,6 +1089,20 @@ fn countedEchoToolExecute(
 ) !types.AgentToolResult {
     const fixture: *CountedToolFixture = @ptrCast(@alignCast(tool_context orelse return error.MissingCountedToolFixture));
     fixture.execute_count += 1;
+    return try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
+}
+
+fn lifecycleEchoToolExecute(
+    allocator: std.mem.Allocator,
+    tool_call_id: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    on_update_context: ?*anyopaque,
+    on_update: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const fixture: *HookLifecycleFixture = @ptrCast(@alignCast(tool_context orelse return error.MissingHookLifecycleFixture));
+    _ = fixture.execute_count.fetchAdd(1, .seq_cst);
     return try echoToolExecute(allocator, tool_call_id, params, tool_context, signal, on_update_context, on_update);
 }
 
@@ -1228,6 +1247,24 @@ fn errorBeforeToolCall(
     return error.BeforeToolCallFailed;
 }
 
+fn mixedBeforeToolCall(
+    _: std.mem.Allocator,
+    context: types.BeforeToolCallContext,
+    _: ?*const std.atomic.Value(bool),
+) !?types.BeforeToolCallResult {
+    const value = try getStringArg(context.args.*, "value");
+    if (std.mem.eql(u8, value, "block")) {
+        return .{
+            .block = true,
+            .reason = "blocked by mixed hook",
+        };
+    }
+    if (std.mem.eql(u8, value, "error")) {
+        return error.BeforeToolCallFailed;
+    }
+    return null;
+}
+
 fn recordAfterToolCallOrder(
     _: std.mem.Allocator,
     context: types.AfterToolCallContext,
@@ -1236,6 +1273,17 @@ fn recordAfterToolCallOrder(
     const tool = tool_execution.findTool(context.context.tools, context.tool_call.name) orelse return error.MissingParallelHookOrderingTool;
     const capture: *ParallelHookOrderingCapture = @ptrCast(@alignCast(tool.execute_context orelse return error.MissingParallelHookOrderingCapture));
     try capture.after_hook_order.append(capture.allocator, context.tool_call.id);
+    return null;
+}
+
+fn recordHookLifecycleAfterToolCall(
+    _: std.mem.Allocator,
+    context: types.AfterToolCallContext,
+    _: ?*const std.atomic.Value(bool),
+) !?types.AfterToolCallResult {
+    const tool = tool_execution.findTool(context.context.tools, context.tool_call.name) orelse return error.MissingHookLifecycleTool;
+    const fixture: *HookLifecycleFixture = @ptrCast(@alignCast(tool.execute_context orelse return error.MissingHookLifecycleFixture));
+    _ = fixture.after_count.fetchAdd(1, .seq_cst);
     return null;
 }
 
@@ -1537,6 +1585,32 @@ fn buildToolCallAssistantMessage(
     return ai.providers.faux.fauxAssistantMessage(blocks, .{
         .stop_reason = .tool_use,
     });
+}
+
+fn iss409MixedContinuationFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 2), call_count.*);
+    try std.testing.expectEqual(@as(usize, 6), context.messages.len);
+    try expectUserText(context.messages[0], "hello");
+    try std.testing.expectEqual(ai.StopReason.tool_use, context.messages[1].assistant.stop_reason);
+    try std.testing.expectEqualStrings("tool-1", context.messages[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-blocked", context.messages[3].tool_result.tool_call_id);
+    try std.testing.expect(context.messages[3].tool_result.is_error);
+    try std.testing.expectEqualStrings("blocked by mixed hook", context.messages[3].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("tool-error", context.messages[4].tool_result.tool_call_id);
+    try std.testing.expect(context.messages[4].tool_result.is_error);
+    try std.testing.expectEqualStrings("BeforeToolCallFailed", context.messages[4].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("tool-2", context.messages[5].tool_result.tool_call_id);
+
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("continued after mixed hooks");
+    return faux.fauxAssistantMessage(blocks, .{});
 }
 
 test "runAgentLoop executes a single tool call and appends the tool result to the transcript" {
@@ -3933,6 +4007,128 @@ test "ISS-409 before_tool_call error skips execution and emits cleanup result" {
     try std.testing.expectEqual(@as(usize, 1), tool_start_count);
     try std.testing.expectEqual(@as(usize, 1), tool_end_count);
     try std.testing.expectEqual(@as(usize, 1), tool_result_message_count);
+}
+
+test "ISS-409 parallel mixed before_tool_call outcomes preserve lifecycle and transcript order" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{});
+    defer registration.unregister();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const first_args = try jsonStringObject(arena.allocator(), "value", "first");
+    const blocked_args = try jsonStringObject(arena.allocator(), "value", "block");
+    const error_args = try jsonStringObject(arena.allocator(), "value", "error");
+    const second_args = try jsonStringObject(arena.allocator(), "value", "second");
+    const blocks = try arena.allocator().alloc(faux.FauxContentBlock, 4);
+    blocks[0] = try faux.fauxToolCall(arena.allocator(), "echo", first_args, .{ .id = "tool-1" });
+    blocks[1] = try faux.fauxToolCall(arena.allocator(), "echo", blocked_args, .{ .id = "tool-blocked" });
+    blocks[2] = try faux.fauxToolCall(arena.allocator(), "echo", error_args, .{ .id = "tool-error" });
+    blocks[3] = try faux.fauxToolCall(arena.allocator(), "echo", second_args, .{ .id = "tool-2" });
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .message = faux.fauxAssistantMessage(blocks, .{ .stop_reason = .tool_use }) },
+        .{ .factory = iss409MixedContinuationFactory },
+    });
+
+    const fixture = try std.testing.allocator.create(HookLifecycleFixture);
+    defer std.testing.allocator.destroy(fixture);
+    fixture.* = .{};
+
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute_context = fixture,
+        .execute = lifecycleEchoToolExecute,
+    };
+
+    var capture = ToolExecutionCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.testing.io,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .tool_execution = .parallel,
+            .before_tool_call = mixedBeforeToolCall,
+            .after_tool_call = recordHookLifecycleAfterToolCall,
+            .convert_to_llm = defaultConvertToLlmForTest,
+        },
+        &capture,
+        captureToolEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 7), result.len);
+    try std.testing.expectEqual(@as(usize, 2), fixture.execute_count.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.after_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("tool-1", result[2].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-blocked", result[3].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-error", result[4].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("tool-2", result[5].tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("continued after mixed hooks", result[6].assistant.content[0].text.text);
+    try std.testing.expect(!result[2].tool_result.is_error);
+    try std.testing.expect(result[3].tool_result.is_error);
+    try std.testing.expect(result[4].tool_result.is_error);
+    try std.testing.expect(!result[5].tool_result.is_error);
+
+    var tool_start_count: usize = 0;
+    var tool_end_count: usize = 0;
+    var last_start_index: ?usize = null;
+    var first_end_index: ?usize = null;
+    var tool_result_message_ids = std.ArrayList([]const u8).empty;
+    defer tool_result_message_ids.deinit(std.testing.allocator);
+
+    for (capture.events.items, 0..) |event, index| {
+        switch (event.event_type) {
+            .tool_execution_start => {
+                tool_start_count += 1;
+                last_start_index = index;
+            },
+            .tool_execution_end => {
+                tool_end_count += 1;
+                if (first_end_index == null) first_end_index = index;
+                if (std.mem.eql(u8, event.tool_call_id.?, "tool-blocked") or
+                    std.mem.eql(u8, event.tool_call_id.?, "tool-error"))
+                {
+                    try std.testing.expectEqual(true, event.is_error.?);
+                }
+            },
+            .message_end => if (event.message) |message| switch (message) {
+                .tool_result => |tool_result| try tool_result_message_ids.append(std.testing.allocator, tool_result.tool_call_id),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), tool_start_count);
+    try std.testing.expectEqual(@as(usize, 4), tool_end_count);
+    try std.testing.expect(last_start_index != null);
+    try std.testing.expect(first_end_index != null);
+    try std.testing.expect(last_start_index.? < first_end_index.?);
+    try std.testing.expectEqual(@as(usize, 4), tool_result_message_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", tool_result_message_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-blocked", tool_result_message_ids.items[1]);
+    try std.testing.expectEqualStrings("tool-error", tool_result_message_ids.items[2]);
+    try std.testing.expectEqualStrings("tool-2", tool_result_message_ids.items[3]);
+    try std.testing.expectEqual(@as(usize, 4), capture.turn_tool_result_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", capture.turn_tool_result_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-blocked", capture.turn_tool_result_ids.items[1]);
+    try std.testing.expectEqualStrings("tool-error", capture.turn_tool_result_ids.items[2]);
+    try std.testing.expectEqualStrings("tool-2", capture.turn_tool_result_ids.items[3]);
 }
 
 test "runAgentLoop lets afterToolCall override the tool result before it enters the transcript" {

@@ -97,6 +97,12 @@ const PreparedToolCallEntry = struct {
     source_index: usize,
 };
 
+const ImmediateToolCallEntry = struct {
+    tool_call: ai.ToolCall,
+    outcome: ImmediateToolCallOutcome,
+    source_index: usize,
+};
+
 pub const PreparedToolCallOrImmediate = union(enum) {
     prepared: PreparedToolCall,
     immediate: ImmediateToolCallOutcome,
@@ -250,6 +256,8 @@ pub fn executeToolCallsParallel(
         }
         prepared_calls.deinit(allocator);
     }
+    var immediate_calls = std.ArrayList(ImmediateToolCallEntry).empty;
+    defer immediate_calls.deinit(allocator);
 
     for (tool_calls, 0..) |tool_call, source_index| {
         try emit(emit_context, .{
@@ -273,18 +281,20 @@ pub fn executeToolCallsParallel(
                 .prepared = prepared_tool,
                 .source_index = source_index,
             }),
-            .immediate => |immediate| {
-                const tool_result = try finalizeImmediateToolCall(
-                    tool_call,
-                    immediate.result,
-                    immediate.is_error,
-                    emit_context,
-                    emit,
-                );
-                result_slots[source_index] = tool_result;
-            },
+            .immediate => |immediate| try immediate_calls.append(allocator, .{
+                .tool_call = tool_call,
+                .outcome = immediate,
+                .source_index = source_index,
+            }),
         }
     }
+
+    try finalizeImmediateToolCallsInSourceOrder(
+        immediate_calls.items,
+        result_slots,
+        emit_context,
+        emit,
+    );
 
     if (prepared_calls.items.len == 0) {
         try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
@@ -670,6 +680,23 @@ fn finalizeImmediateToolCall(
 ) !types.ToolResultMessage {
     try emitToolExecutionEnd(tool_call, result, is_error, emit_context, emit);
     return createToolResultMessage(tool_call, result, is_error);
+}
+
+fn finalizeImmediateToolCallsInSourceOrder(
+    immediate_calls: []const ImmediateToolCallEntry,
+    result_slots: []?types.ToolResultMessage,
+    emit_context: ?*anyopaque,
+    emit: types.AgentEventCallback,
+) !void {
+    for (immediate_calls) |entry| {
+        result_slots[entry.source_index] = try finalizeImmediateToolCall(
+            entry.tool_call,
+            entry.outcome.result,
+            entry.outcome.is_error,
+            emit_context,
+            emit,
+        );
+    }
 }
 
 fn emitToolExecutionEnd(
