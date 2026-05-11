@@ -153,6 +153,14 @@ pub const SessionEntry = union(enum) {
     }
 };
 
+/// Auto-generated tag enum for `SessionEntry`. The enum tag names are the
+/// canonical on-wire `type` strings shared with the TS implementation
+/// (e.g. `"message"`, `"thinking_level_change"`). Both the parser and the
+/// writer derive their string identifiers from `@tagName`, so adding a new
+/// `SessionEntry` variant produces a compile-time error in `parseEntryLine`'s
+/// exhaustive switch and the on-wire string stays in sync automatically.
+pub const SessionEntryTag = std.meta.Tag(SessionEntry);
+
 pub fn deinitHeader(allocator: std.mem.Allocator, header: *SessionHeader) void {
     allocator.free(header.id);
     allocator.free(header.timestamp);
@@ -502,23 +510,23 @@ pub fn headerToJsonValue(allocator: std.mem.Allocator, header: SessionHeader) !s
 pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.json.Value {
     return switch (entry) {
         .message => |message_entry| blk: {
-            var object = try baseEntryObject(allocator, "message", message_entry.id, message_entry.parent_id, message_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.message), message_entry.id, message_entry.parent_id, message_entry.timestamp);
             try common.putValue(allocator, &object, "message", try messageToJsonValue(allocator, message_entry.message));
             break :blk .{ .object = object };
         },
         .thinking_level_change => |thinking_entry| blk: {
-            var object = try baseEntryObject(allocator, "thinking_level_change", thinking_entry.id, thinking_entry.parent_id, thinking_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.thinking_level_change), thinking_entry.id, thinking_entry.parent_id, thinking_entry.timestamp);
             try common.putString(allocator, &object, "thinkingLevel", thinkingLevelToString(thinking_entry.thinking_level));
             break :blk .{ .object = object };
         },
         .model_change => |model_entry| blk: {
-            var object = try baseEntryObject(allocator, "model_change", model_entry.id, model_entry.parent_id, model_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.model_change), model_entry.id, model_entry.parent_id, model_entry.timestamp);
             try common.putString(allocator, &object, "provider", model_entry.provider);
             try common.putString(allocator, &object, "modelId", model_entry.model_id);
             break :blk .{ .object = object };
         },
         .compaction => |compaction_entry| blk: {
-            var object = try baseEntryObject(allocator, "compaction", compaction_entry.id, compaction_entry.parent_id, compaction_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.compaction), compaction_entry.id, compaction_entry.parent_id, compaction_entry.timestamp);
             try object.put(
                 allocator,
                 try allocator.dupe(u8, "firstKeptEntryId"),
@@ -533,7 +541,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
         .branch_summary => |branch_summary_entry| blk: {
-            var object = try baseEntryObject(allocator, "branch_summary", branch_summary_entry.id, branch_summary_entry.parent_id, branch_summary_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.branch_summary), branch_summary_entry.id, branch_summary_entry.parent_id, branch_summary_entry.timestamp);
             try common.putString(allocator, &object, "fromId", branch_summary_entry.from_id);
             try common.putString(allocator, &object, "summary", branch_summary_entry.summary);
             if (branch_summary_entry.details) |details| {
@@ -545,7 +553,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
         .custom => |custom_entry| blk: {
-            var object = try baseEntryObject(allocator, "custom", custom_entry.id, custom_entry.parent_id, custom_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.custom), custom_entry.id, custom_entry.parent_id, custom_entry.timestamp);
             try common.putString(allocator, &object, "customType", custom_entry.custom_type);
             if (custom_entry.data) |data| {
                 try common.putValue(allocator, &object, "data", try common.cloneJsonValue(allocator, data));
@@ -553,7 +561,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
         .custom_message => |custom_message_entry| blk: {
-            var object = try baseEntryObject(allocator, "custom_message", custom_message_entry.id, custom_message_entry.parent_id, custom_message_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.custom_message), custom_message_entry.id, custom_message_entry.parent_id, custom_message_entry.timestamp);
             try common.putString(allocator, &object, "customType", custom_message_entry.custom_type);
             try common.putValue(allocator, &object, "content", try customMessageContentToJsonValue(allocator, custom_message_entry.content));
             try common.putBool(allocator, &object, "display", custom_message_entry.display);
@@ -563,7 +571,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
         .label => |label_entry| blk: {
-            var object = try baseEntryObject(allocator, "label", label_entry.id, label_entry.parent_id, label_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.label), label_entry.id, label_entry.parent_id, label_entry.timestamp);
             try common.putString(allocator, &object, "targetId", label_entry.target_id);
             try object.put(
                 allocator,
@@ -573,7 +581,7 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
         .session_info => |session_info_entry| blk: {
-            var object = try baseEntryObject(allocator, "session_info", session_info_entry.id, session_info_entry.parent_id, session_info_entry.timestamp);
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.session_info), session_info_entry.id, session_info_entry.parent_id, session_info_entry.timestamp);
             if (session_info_entry.name) |name| {
                 try common.putString(allocator, &object, "name", name);
             } else {
@@ -582,6 +590,27 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             break :blk .{ .object = object };
         },
     };
+}
+
+comptime {
+    // Lock the on-wire JSONL `type` strings to enum tag names so byte-parity
+    // with the TS implementation cannot drift unnoticed if a tag is renamed.
+    const expected = .{
+        .{ SessionEntryTag.message, "message" },
+        .{ SessionEntryTag.thinking_level_change, "thinking_level_change" },
+        .{ SessionEntryTag.model_change, "model_change" },
+        .{ SessionEntryTag.compaction, "compaction" },
+        .{ SessionEntryTag.branch_summary, "branch_summary" },
+        .{ SessionEntryTag.custom, "custom" },
+        .{ SessionEntryTag.custom_message, "custom_message" },
+        .{ SessionEntryTag.label, "label" },
+        .{ SessionEntryTag.session_info, "session_info" },
+    };
+    for (expected) |pair| {
+        if (!std.mem.eql(u8, @tagName(pair[0]), pair[1])) {
+            @compileError("SessionEntryTag name drift: on-wire string parity broken for " ++ pair[1]);
+        }
+    }
 }
 
 pub fn stringifyHeaderLine(allocator: std.mem.Allocator, header: SessionHeader) ![]u8 {
@@ -788,17 +817,20 @@ pub fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEn
     const object = try requireObject(parsed.value);
     const entry_type = try getRequiredString(object, "type");
 
-    if (std.mem.eql(u8, entry_type, "message")) return parseMessageEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "thinking_level_change")) return parseThinkingLevelChangeEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "model_change")) return parseModelChangeEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "compaction")) return parseCompactionEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "branch_summary")) return parseBranchSummaryEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "custom")) return parseCustomEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "custom_message")) return parseCustomMessageEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "label")) return parseLabelEntry(allocator, object);
-    if (std.mem.eql(u8, entry_type, "session_info")) return parseSessionInfoEntry(allocator, object);
+    const tag = std.meta.stringToEnum(SessionEntryTag, entry_type) orelse
+        return error.UnsupportedSessionEntryType;
 
-    return error.UnsupportedSessionEntryType;
+    return switch (tag) {
+        .message => parseMessageEntry(allocator, object),
+        .thinking_level_change => parseThinkingLevelChangeEntry(allocator, object),
+        .model_change => parseModelChangeEntry(allocator, object),
+        .compaction => parseCompactionEntry(allocator, object),
+        .branch_summary => parseBranchSummaryEntry(allocator, object),
+        .custom => parseCustomEntry(allocator, object),
+        .custom_message => parseCustomMessageEntry(allocator, object),
+        .label => parseLabelEntry(allocator, object),
+        .session_info => parseSessionInfoEntry(allocator, object),
+    };
 }
 
 const ParsedEntryBase = struct {
