@@ -19,6 +19,27 @@ const ErrorCode = struct {
     const not_initialized: i64 = -32001;
 };
 
+/// JSON-RPC method set understood by `RpcServer.handleLine`. Each tag's
+/// `@tagName` is the byte-exact on-wire method string. Adding a new method
+/// requires extending both this enum and the exhaustive switch below — a
+/// compile error guarantees the dispatcher stays in sync with the wire
+/// protocol.
+pub const RpcMethod = enum {
+    @"$/cancelRequest",
+    initialize,
+    chat,
+    complete,
+    stream,
+};
+
+comptime {
+    std.debug.assert(std.mem.eql(u8, @tagName(RpcMethod.@"$/cancelRequest"), "$/cancelRequest"));
+    std.debug.assert(std.mem.eql(u8, @tagName(RpcMethod.initialize), "initialize"));
+    std.debug.assert(std.mem.eql(u8, @tagName(RpcMethod.chat), "chat"));
+    std.debug.assert(std.mem.eql(u8, @tagName(RpcMethod.complete), "complete"));
+    std.debug.assert(std.mem.eql(u8, @tagName(RpcMethod.stream), "stream"));
+}
+
 const RequestId = union(enum) {
     none,
     null_id,
@@ -286,10 +307,13 @@ const RpcServer = struct {
         };
 
         const params = root_object.get("params");
+        const maybe_method = std.meta.stringToEnum(RpcMethod, method);
 
-        if (std.mem.eql(u8, method, "$/cancelRequest")) {
-            try self.handleCancel(request_id, params);
-            return;
+        if (maybe_method) |parsed_method| {
+            if (parsed_method == .@"$/cancelRequest") {
+                try self.handleCancel(request_id, params);
+                return;
+            }
         }
 
         if (self.active_request != null) {
@@ -299,51 +323,55 @@ const RpcServer = struct {
             return;
         }
 
-        if (std.mem.eql(u8, method, "initialize")) {
-            self.initialized = true;
+        const rpc_method = maybe_method orelse {
+            if (!self.initialized) {
+                if (request_id.hasResponse()) {
+                    try self.writeErrorResponse(request_id, ErrorCode.not_initialized, "Server not initialized");
+                }
+                return;
+            }
             if (request_id.hasResponse()) {
-                const result_value = try buildInitializeResultValue(std.heap.page_allocator, self.session);
-                try self.writeSuccessResponse(request_id, result_value);
+                try self.writeErrorResponse(request_id, ErrorCode.method_not_found, "Method not found");
             }
             return;
-        }
+        };
 
-        if (!self.initialized) {
-            if (request_id.hasResponse()) {
-                try self.writeErrorResponse(request_id, ErrorCode.not_initialized, "Server not initialized");
-            }
-            return;
-        }
-
-        if (std.mem.eql(u8, method, "chat")) {
-            const message = extractMessageParam(params) catch {
-                try self.writeErrorResponse(request_id, ErrorCode.invalid_params, "chat requires params.message");
+        switch (rpc_method) {
+            .@"$/cancelRequest" => unreachable, // handled above before active-request gate
+            .initialize => {
+                self.initialized = true;
+                if (request_id.hasResponse()) {
+                    const result_value = try buildInitializeResultValue(std.heap.page_allocator, self.session);
+                    try self.writeSuccessResponse(request_id, result_value);
+                }
                 return;
-            };
-            self.active_request = try ActiveRequest.create(self.allocator, self, request_id, .chat, message);
-            return;
-        }
-
-        if (std.mem.eql(u8, method, "complete")) {
-            const message = extractMessageParam(params) catch {
-                try self.writeErrorResponse(request_id, ErrorCode.invalid_params, "complete requires params.message");
+            },
+            .chat, .complete, .stream => |m| {
+                if (!self.initialized) {
+                    if (request_id.hasResponse()) {
+                        try self.writeErrorResponse(request_id, ErrorCode.not_initialized, "Server not initialized");
+                    }
+                    return;
+                }
+                const error_message = switch (m) {
+                    .chat => "chat requires params.message",
+                    .complete => "complete requires params.message",
+                    .stream => "stream requires params.message",
+                    .initialize, .@"$/cancelRequest" => unreachable,
+                };
+                const active_method: ActiveMethod = switch (m) {
+                    .chat => .chat,
+                    .complete => .complete,
+                    .stream => .stream,
+                    .initialize, .@"$/cancelRequest" => unreachable,
+                };
+                const message = extractMessageParam(params) catch {
+                    try self.writeErrorResponse(request_id, ErrorCode.invalid_params, error_message);
+                    return;
+                };
+                self.active_request = try ActiveRequest.create(self.allocator, self, request_id, active_method, message);
                 return;
-            };
-            self.active_request = try ActiveRequest.create(self.allocator, self, request_id, .complete, message);
-            return;
-        }
-
-        if (std.mem.eql(u8, method, "stream")) {
-            const message = extractMessageParam(params) catch {
-                try self.writeErrorResponse(request_id, ErrorCode.invalid_params, "stream requires params.message");
-                return;
-            };
-            self.active_request = try ActiveRequest.create(self.allocator, self, request_id, .stream, message);
-            return;
-        }
-
-        if (request_id.hasResponse()) {
-            try self.writeErrorResponse(request_id, ErrorCode.method_not_found, "Method not found");
+            },
         }
     }
 
