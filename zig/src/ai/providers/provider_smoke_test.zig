@@ -303,7 +303,7 @@ test "provider smoke Xiaomi standalone captures Anthropic routing auth and metad
     }
 }
 
-test "provider smoke Cloudflare Workers AI and Gateway compat capture routing auth metadata" {
+test "ISS-090 provider smoke Cloudflare Workers AI and Gateway compat capture routing auth metadata" {
     const cases = [_]CaptureExpectation{
         .{
             .provider = "cloudflare-workers-ai",
@@ -335,7 +335,7 @@ test "provider smoke Cloudflare Workers AI and Gateway compat capture routing au
     }
 }
 
-test "provider smoke Cloudflare placeholders substitute and fail explicitly" {
+test "ISS-090 provider smoke Cloudflare placeholders substitute and fail explicitly" {
     const allocator = std.testing.allocator;
 
     var env_map = std.process.Environ.Map.init(allocator);
@@ -373,7 +373,7 @@ test "provider smoke Cloudflare placeholders substitute and fail explicitly" {
     try std.testing.expectError(error.MissingCloudflareGatewayId, cloudflare.resolveCloudflareBaseUrlFromMap(allocator, compat_model, &missing_gateway_map));
 }
 
-test "provider smoke Cloudflare Gateway OpenAI Responses capture routing auth metadata" {
+test "ISS-090 provider smoke Cloudflare Gateway OpenAI Responses capture routing auth metadata" {
     const allocator = std.heap.page_allocator;
     const io = std.testing.io;
     var server = try provider_error.TestCaptureServer.init(
@@ -418,7 +418,7 @@ test "provider smoke Cloudflare Gateway OpenAI Responses capture routing auth me
     );
 }
 
-test "provider smoke Cloudflare Gateway Anthropic capture routing auth metadata" {
+test "ISS-090 provider smoke Cloudflare Gateway Anthropic capture routing auth metadata" {
     const allocator = std.heap.page_allocator;
     const io = std.testing.io;
     var server = try provider_error.TestCaptureServer.init(

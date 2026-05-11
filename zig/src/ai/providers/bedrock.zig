@@ -1928,7 +1928,13 @@ fn handleEventValue(
     if (value.object.get("messageStop")) |stop_value| {
         if (stop_value == .object) {
             if (stop_value.object.get("stopReason")) |reason_value| {
-                if (reason_value == .string) output.stop_reason = mapStopReason(reason_value.string);
+                if (reason_value == .string) {
+                    const mapped = try mapStopReasonWithMessage(allocator, reason_value.string);
+                    output.stop_reason = mapped.stop_reason;
+                    if (mapped.error_message) |message| {
+                        replaceOutputErrorMessageOwned(allocator, output, message);
+                    }
+                }
             }
         }
         return;
@@ -2345,7 +2351,7 @@ fn emitStreamFailureMessage(
 ) !void {
     try collectOutputFromPartials(allocator, output, content_blocks, tool_calls, active_blocks);
     output.stop_reason = stop_reason;
-    output.error_message = try allocator.dupe(u8, message_text);
+    try setOutputErrorMessageCopy(allocator, output, message_text);
     stream_ptr.push(.{ .event_type = .error_event, .error_message = output.error_message, .message = output.* });
     stream_ptr.end(output.*);
 }
@@ -2406,7 +2412,16 @@ fn finalizeOutput(
     }
     if (active_blocks.items.len != 0) return BedrockError.InvalidBedrockChunk;
     if (output.stop_reason == .error_reason or output.stop_reason == .aborted) {
-        try emitStreamFailureMessage(allocator, stream_ptr, output, content_blocks, tool_calls, active_blocks, output.stop_reason, "An unknown error occurred");
+        try emitStreamFailureMessage(
+            allocator,
+            stream_ptr,
+            output,
+            content_blocks,
+            tool_calls,
+            active_blocks,
+            output.stop_reason,
+            output.error_message orelse "An unknown error occurred",
+        );
         return;
     }
     try finalize.finalizeOutput(allocator, output, .{
@@ -2426,6 +2441,38 @@ pub fn mapStopReason(reason: []const u8) types.StopReason {
     return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.bedrock_mappings, reason, .error_reason);
 }
 
+fn mapStopReasonWithMessage(allocator: std.mem.Allocator, reason: []const u8) !stop_reason_mod.StopReasonResult {
+    inline for (stop_reason_mod.bedrock_mappings) |mapping| {
+        if (std.mem.eql(u8, reason, mapping.literal)) {
+            return .{
+                .stop_reason = mapping.reason,
+                .error_message = if (mapping.reason == .error_reason)
+                    try std.fmt.allocPrint(allocator, "Bedrock stop reason: {s}", .{reason})
+                else
+                    null,
+            };
+        }
+    }
+    return .{
+        .stop_reason = .error_reason,
+        .error_message = try std.fmt.allocPrint(allocator, "UnknownStopReason: {s}", .{reason}),
+    };
+}
+
+fn setOutputErrorMessageCopy(allocator: std.mem.Allocator, output: *types.AssistantMessage, message_text: []const u8) !void {
+    if (output.error_message) |existing| {
+        if (existing.ptr == message_text.ptr and existing.len == message_text.len) return;
+        allocator.free(existing);
+        output.error_message = null;
+    }
+    output.error_message = try allocator.dupe(u8, message_text);
+}
+
+fn replaceOutputErrorMessageOwned(allocator: std.mem.Allocator, output: *types.AssistantMessage, message: []const u8) void {
+    if (output.error_message) |existing| allocator.free(existing);
+    output.error_message = message;
+}
+
 test "ISS-041 mapStopReason aligns Bedrock safety stops with terminal errors" {
     try std.testing.expectEqual(types.StopReason.stop, mapStopReason("end_turn"));
     try std.testing.expectEqual(types.StopReason.stop, mapStopReason("stop_sequence"));
@@ -2435,6 +2482,50 @@ test "ISS-041 mapStopReason aligns Bedrock safety stops with terminal errors" {
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("guardrail_intervened"));
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("content_filtered"));
     try std.testing.expectEqual(types.StopReason.error_reason, mapStopReason("future_stop_reason"));
+}
+
+test "ISS-041 Bedrock safety and unknown stop reasons emit terminal errors with reason metadata" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+    const model = runtimePreservationTestModel("bedrock-converse-stream", "amazon-bedrock");
+
+    const cases = [_]struct {
+        reason: []const u8,
+        expected_error: []const u8,
+    }{
+        .{ .reason = "guardrail_intervened", .expected_error = "Bedrock stop reason: guardrail_intervened" },
+        .{ .reason = "content_filtered", .expected_error = "Bedrock stop reason: content_filtered" },
+        .{ .reason = "future_stop_reason", .expected_error = "UnknownStopReason: future_stop_reason" },
+    };
+
+    for (cases) |case| {
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(allocator);
+        try appendEventStreamFrame(allocator, &body, "messageStart", "{\"role\":\"assistant\"}");
+        try appendEventStreamFrame(allocator, &body, "contentBlockDelta", "{\"contentBlockIndex\":0,\"delta\":{\"text\":\"partial before safety stop\"}}");
+        try appendEventStreamFrame(allocator, &body, "contentBlockStop", "{\"contentBlockIndex\":0}");
+        const message_stop = try std.fmt.allocPrint(allocator, "{{\"stopReason\":\"{s}\"}}", .{case.reason});
+        defer allocator.free(message_stop);
+        try appendEventStreamFrame(allocator, &body, "messageStop", message_stop);
+
+        var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+        defer stream.deinit();
+
+        try parseEventStreamFrames(allocator, &stream, body.items, model, null);
+
+        try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+        try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+        try std.testing.expectEqual(types.EventType.text_delta, stream.next().?.event_type);
+        try std.testing.expectEqual(types.EventType.text_end, stream.next().?.event_type);
+        const terminal = stream.next().?;
+        try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+        try std.testing.expect(terminal.message != null);
+        try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+        try std.testing.expectEqualStrings("partial before safety stop", terminal.message.?.content[0].text.text);
+        try std.testing.expectEqualStrings(case.expected_error, terminal.error_message.?);
+        try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+        try std.testing.expect(stream.next() == null);
+    }
 }
 
 fn authErrorMessage(err: anyerror) []const u8 {
