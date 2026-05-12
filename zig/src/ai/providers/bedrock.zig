@@ -2459,7 +2459,7 @@ fn mapStopReasonWithMessage(allocator: std.mem.Allocator, reason: []const u8) !s
     }
     return .{
         .stop_reason = .error_reason,
-        .error_message = try std.fmt.allocPrint(allocator, "UnknownStopReason: {s}", .{reason}),
+        .error_message = try allocator.dupe(u8, "An unknown error occurred"),
     };
 }
 
@@ -2499,7 +2499,7 @@ test "ISS-041 Bedrock safety and unknown stop reasons emit terminal errors with 
     }{
         .{ .reason = "guardrail_intervened", .expected_error = "Bedrock stop reason: guardrail_intervened" },
         .{ .reason = "content_filtered", .expected_error = "Bedrock stop reason: content_filtered" },
-        .{ .reason = "future_stop_reason", .expected_error = "UnknownStopReason: future_stop_reason" },
+        .{ .reason = "future_stop_reason", .expected_error = "An unknown error occurred" },
     };
 
     for (cases) |case| {
@@ -2852,7 +2852,7 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
 fn eventTypeName(event_type: types.EventType) []const u8 {
     return switch (event_type) {
         .error_event => "error",
-        inline else => |_, tag| @tagName(tag),
+        inline else => |tag| @tagName(tag),
     };
 }
 
@@ -2860,7 +2860,7 @@ fn stopReasonName(stop_reason: types.StopReason) []const u8 {
     return switch (stop_reason) {
         .tool_use => "toolUse",
         .error_reason => "error",
-        inline else => |_, tag| @tagName(tag),
+        inline else => |tag| @tagName(tag),
     };
 }
 
