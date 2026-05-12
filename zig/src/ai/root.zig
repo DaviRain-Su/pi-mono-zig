@@ -13,6 +13,7 @@ pub const http_client = @import("http_client.zig");
 pub const event_stream = @import("event_stream.zig");
 pub const event_stream_guard = @import("event_stream_guard.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
+pub const provider_info = @import("provider_info.zig");
 pub const images_api_registry = @import("images_api_registry.zig");
 
 pub const oauth = struct {
@@ -151,6 +152,7 @@ test {
     _ = @import("stream.zig");
     _ = @import("event_stream_guard.zig");
     _ = @import("env_api_keys.zig");
+    _ = @import("provider_info.zig");
     _ = @import("images_api_registry.zig");
     _ = @import("images.zig");
     _ = @import("oauth/types.zig");
