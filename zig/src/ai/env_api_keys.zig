@@ -31,6 +31,7 @@ pub fn getEnvApiKeyFromMap(
         return try firstEnvValue(allocator, env_map, env_vars);
     }
 
+    // Bespoke auth resolution: this provider's env-var semantics don't reduce to a flat ordered list (see ProviderInfo.env_vars doc). Reason: ADC file probe + project/location AND-conjunction + sentinel return.
     if (std.mem.eql(u8, provider, "google-vertex")) {
         if (env_map.get("GOOGLE_CLOUD_API_KEY")) |api_key| {
             if (isNonEmptyCredentialValue(api_key)) return try allocator.dupe(u8, api_key);
@@ -44,6 +45,7 @@ pub fn getEnvApiKeyFromMap(
         }
     }
 
+    // Bespoke auth resolution: this provider's env-var semantics don't reduce to a flat ordered list (see ProviderInfo.env_vars doc). Reason: AND-conjunction across heterogeneous AWS env vars + sentinel return.
     if (std.mem.eql(u8, provider, "amazon-bedrock")) {
         const has_standard_keys = envMapHasNonEmpty(env_map, "AWS_ACCESS_KEY_ID") and envMapHasNonEmpty(env_map, "AWS_SECRET_ACCESS_KEY");
         const has_alt_auth = envMapHasNonEmpty(env_map, "AWS_PROFILE") or

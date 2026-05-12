@@ -30,12 +30,12 @@ pub const ProviderInfo = struct {
     default_model: ?[]const u8 = null,
     missing_api_key_message: ?[]const u8 = null,
     env_var: ?[]const u8 = null,
-    /// Ordered list of fallback env vars to consult, in declaration order.
-    /// The first var with a non-empty value wins. Used by providers whose
-    /// API-key resolution is a flat ordered lookup over multiple env vars
-    /// (e.g. anthropic, github-copilot). Providers with conditional logic
-    /// (ADC files, AWS profiles, etc.) leave this `null` and keep their
-    /// bespoke branch in `env_api_keys.zig`.
+    /// Set for providers whose env auth fits a flat priority-ordered list
+    /// where success returns the literal value of the first non-empty env
+    /// var (e.g. anthropic, github-copilot). Providers with sentinel-return
+    /// semantics, filesystem probes (ADC), or AND-conjunction across
+    /// heterogeneous env vars are dispatched in `env_api_keys.zig` -- see
+    /// the `google-vertex` and `amazon-bedrock` branches there.
     env_vars: ?[]const []const u8 = null,
     /// Default `Api` identifier used to talk to this provider. Mirrors the
     /// canonical `(provider, api)` pairs in `model_registry.builtInProviderConfigs()`.
