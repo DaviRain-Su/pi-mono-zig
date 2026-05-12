@@ -370,18 +370,12 @@ fn processToolCallDelta(state: *SseParseState, delta: std.json.Value) !void {
 }
 
 fn processToolCallItem(state: *SseParseState, tool_call_item: std.json.Value) !void {
-    // Chat Completions has no explicit content-block lifecycle events, but in
-    // plain text/tool/text streams a tool-call delta is the clearest available
-    // boundary between adjacent text spans. Close the current text block before
-    // opening or updating a tool so later text deltas reopen at a new stable
-    // content_index instead of being coalesced into the pre-tool text block.
-    //
-    // Keep mixed reasoning streams on the legacy accumulator path: without
-    // protocol block-end events, closing text while a reasoning accumulator is
-    // also open changes established OpenAI-compatible parity ordering.
-    if (state.thinking_block == null) {
-        try finishActiveTextBlock(state.allocator, &state.text_block, &state.block_order, state.stream_ptr);
-    }
+    // Mirrors the TS Chat Completions parser (`ensureTextBlock` / `ensureToolCallBlock`
+    // in `packages/ai/src/providers/openai-completions.ts`): the active text block is
+    // never closed by an incoming tool-call delta. A subsequent text delta resumes
+    // the SAME text block (same content_index) so that text → tool → text streams
+    // (gpt-oss, Kimi-style mixed outputs) coalesce into one text block plus one
+    // tool_call block instead of splitting around the tool.
 
     const tc_id = if (tool_call_item.object.get("id")) |id_v|
         if (id_v == .string) id_v.string else null
@@ -415,27 +409,6 @@ fn processToolCallItem(state: *SseParseState, tool_call_item: std.json.Value) !v
         .delta = delta_str,
         .owns_delta = delta_str != null,
     });
-}
-
-fn finishActiveTextBlock(
-    allocator: std.mem.Allocator,
-    text_block: *?ActiveTextBlock,
-    block_order: *std.ArrayList(StreamingBlockOrderEntry),
-    stream_ptr: *event_stream.AssistantMessageEventStream,
-) !void {
-    if (text_block.*) |*block| {
-        const content = try allocator.dupe(u8, block.text.items);
-        errdefer allocator.free(content);
-        if (block.content_index >= block_order.items.len) return error.InvalidContentIndex;
-        block_order.items[block.content_index].text_content = content;
-        stream_ptr.push(.{
-            .event_type = .text_end,
-            .content_index = @intCast(block.content_index),
-            .content = content,
-        });
-        deinitActiveTextBlock(block, allocator);
-        text_block.* = null;
-    }
 }
 
 fn extractToolCallName(tool_call_item: std.json.Value) ?[]const u8 {
@@ -1024,7 +997,10 @@ test "openai_chat_sse keeps interleaved indexed tool arguments separated" {
     try std.testing.expectEqualStrings("call_city", done.message.?.content[1].tool_call.id);
 }
 
-test "openai_chat_sse keeps text content indexes stable around tool boundaries" {
+test "openai_chat_sse coalesces text-tool-text into a single text block" {
+    // Port of TS PR #4228 (commit 6b271842): text deltas separated by tool-call
+    // deltas must reuse the same text block (same content_index) rather than
+    // splitting around the tool call.
     const allocator = std.testing.allocator;
     const io = std.Io.failing;
 
@@ -1053,9 +1029,9 @@ test "openai_chat_sse keeps text content indexes stable around tool boundaries" 
     const start = stream.next().?;
     try std.testing.expectEqual(types.EventType.start, start.event_type);
 
-    const first_text_start = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_start, first_text_start.event_type);
-    try std.testing.expectEqual(@as(u32, 0), first_text_start.content_index.?);
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
 
     const first_text_delta = stream.next().?;
     defer first_text_delta.deinitTransient(allocator);
@@ -1063,11 +1039,7 @@ test "openai_chat_sse keeps text content indexes stable around tool boundaries" 
     try std.testing.expectEqual(@as(u32, 0), first_text_delta.content_index.?);
     try std.testing.expectEqualStrings("before ", first_text_delta.delta.?);
 
-    const first_text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, first_text_end.event_type);
-    try std.testing.expectEqual(@as(u32, 0), first_text_end.content_index.?);
-    try std.testing.expectEqualStrings("before ", first_text_end.content.?);
-
+    // Tool-call delta must NOT close the text block.
     const tool_start = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
@@ -1077,34 +1049,35 @@ test "openai_chat_sse keeps text content indexes stable around tool boundaries" 
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
 
-    const second_text_start = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_start, second_text_start.event_type);
-    try std.testing.expectEqual(@as(u32, 2), second_text_start.content_index.?);
-
+    // Subsequent text delta resumes the SAME text block (no new text_start,
+    // same content_index 0).
     const second_text_delta = stream.next().?;
     defer second_text_delta.deinitTransient(allocator);
     try std.testing.expectEqual(types.EventType.text_delta, second_text_delta.event_type);
-    try std.testing.expectEqual(@as(u32, 2), second_text_delta.content_index.?);
+    try std.testing.expectEqual(@as(u32, 0), second_text_delta.content_index.?);
     try std.testing.expectEqualStrings("after", second_text_delta.delta.?);
+
+    // End-of-stream finalization closes the text block first (it was pushed
+    // before the tool call), then the tool call, matching TS `finishBlock`
+    // order over `blocks`.
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before after", text_end.content.?);
 
     const tool_end = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
     try std.testing.expectEqualStrings("call_weather", tool_end.tool_call.?.id);
-
-    const second_text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, second_text_end.event_type);
-    try std.testing.expectEqual(@as(u32, 2), second_text_end.content_index.?);
-    try std.testing.expectEqualStrings("after", second_text_end.content.?);
+    try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
 
     const done = stream.next().?;
     try std.testing.expectEqual(types.EventType.done, done.event_type);
     try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
-    try std.testing.expectEqual(@as(usize, 3), done.message.?.content.len);
-    try std.testing.expectEqualStrings("before ", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before after", done.message.?.content[0].text.text);
     try std.testing.expectEqualStrings("call_weather", done.message.?.content[1].tool_call.id);
     try std.testing.expectEqualStrings("Berlin", done.message.?.content[1].tool_call.arguments.object.get("city").?.string);
-    try std.testing.expectEqualStrings("after", done.message.?.content[2].text.text);
 
     const message = stream.result() orelse return error.MissingAssistantMessage;
     defer types.freeAssistantMessage(allocator, message);
@@ -1143,17 +1116,20 @@ test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
     try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
     try std.testing.expectEqualStrings("before tool", text_delta.delta.?);
-    const text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
-    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
-    try std.testing.expectEqualStrings("before tool", text_end.content.?);
 
+    // Tool-call delta no longer closes the text block; text_end is emitted at
+    // EOF via finishStreamingBlocks instead.
     const tool_start = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
     const tool_delta = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_end.content.?);
     const tool_end = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
