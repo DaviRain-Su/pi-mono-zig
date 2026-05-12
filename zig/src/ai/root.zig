@@ -10,6 +10,7 @@ pub const model_discovery = @import("model_discovery.zig");
 pub const session_resources = @import("session_resources.zig");
 pub const json_parse = @import("json_parse.zig");
 pub const http_client = @import("http_client.zig");
+pub const websocket_client = @import("websocket_client.zig");
 pub const event_stream = @import("event_stream.zig");
 pub const event_stream_guard = @import("event_stream_guard.zig");
 pub const env_api_keys = @import("env_api_keys.zig");
@@ -154,6 +155,7 @@ test {
     _ = @import("env_api_keys.zig");
     _ = @import("provider_info.zig");
     _ = @import("images_api_registry.zig");
+    _ = @import("websocket_client.zig");
     _ = @import("images.zig");
     _ = @import("oauth/types.zig");
     _ = @import("oauth/pkce.zig");
