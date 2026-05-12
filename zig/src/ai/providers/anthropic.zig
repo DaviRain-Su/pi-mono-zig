@@ -535,6 +535,9 @@ test "parse anthropic stream emits text events" {
         "\n" ++
         "event: message_delta\n" ++
         "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
         "\n";
 
     var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
@@ -2081,6 +2084,12 @@ fn parseSseStreamLines(
         }
     }
 
+    if (!shouldTolerateNoncanonicalAnthropicChunk(model) and handler.saw_message_start and !handler.saw_message_stop) {
+        const error_message = try allocator.dupe(u8, "Anthropic stream ended before message_stop");
+        try emitOwnedAnthropicStreamError(allocator, stream_ptr, &output, &content_blocks, &tool_calls, &active_blocks, model, error_message);
+        return;
+    }
+
     if (content_blocks.items.len == 0 and tool_calls.items.len == 0) {
         const error_message = try allocator.dupe(u8, "Provider returned an empty assistant response");
         output.stop_reason = .error_reason;
@@ -2117,6 +2126,8 @@ const AnthropicSseFrameHandler = struct {
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
+    saw_message_start: bool = false,
+    saw_message_stop: bool = false,
 
     pub fn handleFrame(self: *AnthropicSseFrameHandler, sse_event: []const u8, data: []const u8) !bool {
         const event_finished = try processAnthropicSseEvent(
@@ -2131,6 +2142,8 @@ const AnthropicSseFrameHandler = struct {
             self.model,
             self.context,
             self.options,
+            &self.saw_message_start,
+            &self.saw_message_stop,
         );
         return !event_finished;
     }
@@ -2234,6 +2247,8 @@ fn processAnthropicSseEvent(
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
+    saw_message_start: *bool,
+    saw_message_stop: *bool,
 ) !bool {
     if (data.len == 0) return false;
     if (std.mem.eql(u8, std.mem.trim(u8, data, " \t\r\n"), "[DONE]")) return true;
@@ -2277,6 +2292,7 @@ fn processAnthropicSseEvent(
     }
 
     if (std.mem.eql(u8, event_type.string, "message_start")) {
+        saw_message_start.* = true;
         if (value.object.get("message")) |message_value| {
             if (message_value == .object) {
                 if (message_value.object.get("id")) |id_value| {
@@ -2321,9 +2337,12 @@ fn processAnthropicSseEvent(
         return false;
     }
 
-    if (std.mem.eql(u8, event_type.string, "message_stop") or
-        std.mem.eql(u8, event_type.string, "ping"))
-    {
+    if (std.mem.eql(u8, event_type.string, "message_stop")) {
+        saw_message_stop.* = true;
+        return false;
+    }
+
+    if (std.mem.eql(u8, event_type.string, "ping")) {
         return false;
     }
 
@@ -3564,6 +3583,42 @@ test "VAL-M9-STREAM-005 stream on_response failure returns one terminal error ev
     defer stream.deinit();
 
     try expectOnlyTerminalErrorAnthropic(&stream, "FixtureAnthropicResponseFailure", .error_reason);
+}
+
+test "anthropic stream ending after message_start without message_stop yields terminal error event" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_premature\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        streamErrorContractAnthropicModel(url),
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    const start_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start_event.event_type);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expect(terminal.error_message != null);
+    try std.testing.expectEqualStrings("Anthropic stream ended before message_stop", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+
+    try std.testing.expect(stream.next() == null);
 }
 
 test "VAL-M9-STREAM-010 stream pre-aborted signal yields terminal aborted event without throwing" {
