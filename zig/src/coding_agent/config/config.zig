@@ -1202,6 +1202,112 @@ fn loadLegacySettingsApiKeys(
     }
 }
 
+/// Strip `//` line comments, `/* */` block comments, and trailing commas
+/// before `}` or `]` from a JSON document so user-supplied `models.json`
+/// files can be annotated. String literals are preserved verbatim; only
+/// comments and trailing commas outside of strings are touched.
+///
+/// Mirrors the TS `stripJsonComments` helper added in
+/// `packages/coding-agent/src/core/model-registry.ts` (commit bb25a394).
+/// Caller owns the returned slice.
+fn stripJsonComments(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    // Pass 1: copy `input` to `no_comments`, dropping `//` line and `/* */`
+    // block comments. String literals are copied through unchanged.
+    var no_comments = std.ArrayList(u8).empty;
+    errdefer no_comments.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c == '"') {
+            // Copy a string literal verbatim, respecting `\"` escapes.
+            try no_comments.append(allocator, c);
+            i += 1;
+            while (i < input.len) {
+                const sc = input[i];
+                try no_comments.append(allocator, sc);
+                i += 1;
+                if (sc == '\\') {
+                    if (i < input.len) {
+                        try no_comments.append(allocator, input[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if (sc == '"') break;
+            }
+            continue;
+        }
+        if (c == '/' and i + 1 < input.len) {
+            const next = input[i + 1];
+            if (next == '/') {
+                // Line comment: skip until newline (newline itself preserved).
+                i += 2;
+                while (i < input.len and input[i] != '\n') : (i += 1) {}
+                continue;
+            }
+            if (next == '*') {
+                // Block comment: skip until matching `*/`.
+                i += 2;
+                while (i + 1 < input.len and !(input[i] == '*' and input[i + 1] == '/')) : (i += 1) {}
+                if (i + 1 < input.len) i += 2 else i = input.len;
+                continue;
+            }
+        }
+        try no_comments.append(allocator, c);
+        i += 1;
+    }
+
+    // Pass 2: strip trailing commas before `}` or `]`. Strings are skipped.
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    const cleaned = no_comments.items;
+    var j: usize = 0;
+    while (j < cleaned.len) {
+        const c = cleaned[j];
+        if (c == '"') {
+            try out.append(allocator, c);
+            j += 1;
+            while (j < cleaned.len) {
+                const sc = cleaned[j];
+                try out.append(allocator, sc);
+                j += 1;
+                if (sc == '\\') {
+                    if (j < cleaned.len) {
+                        try out.append(allocator, cleaned[j]);
+                        j += 1;
+                    }
+                    continue;
+                }
+                if (sc == '"') break;
+            }
+            continue;
+        }
+        if (c == ',') {
+            // Look ahead past whitespace for `}` or `]`.
+            var k: usize = j + 1;
+            while (k < cleaned.len) : (k += 1) {
+                switch (cleaned[k]) {
+                    ' ', '\t', '\r', '\n' => continue,
+                    else => break,
+                }
+            }
+            if (k < cleaned.len and (cleaned[k] == '}' or cleaned[k] == ']')) {
+                // Drop the comma; keep the trailing whitespace + closer
+                // intact by simply advancing past the comma.
+                j += 1;
+                continue;
+            }
+        }
+        try out.append(allocator, c);
+        j += 1;
+    }
+
+    no_comments.deinit(allocator);
+    return out.toOwnedSlice(allocator);
+}
+
 fn loadModelsConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1215,7 +1321,13 @@ fn loadModelsConfig(
     defer if (content) |value| allocator.free(value);
     if (content == null) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content.?, .{}) catch |err| {
+    const stripped = stripJsonComments(allocator, content.?) catch |err| {
+        try config_errors.appendError(allocator, errors, .models, path, err);
+        return;
+    };
+    defer allocator.free(stripped);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, stripped, .{}) catch |err| {
         try config_errors.appendError(allocator, errors, .models, path, err);
         return;
     };
@@ -2799,4 +2911,177 @@ test "RuntimeConfig.effectiveSessionDir falls back to default when env and setti
     const expected = try std.fs.path.join(allocator, &[_][]const u8{ project_dir, ".pi", "sessions" });
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, session_dir);
+}
+
+test "stripJsonComments removes line comments outside strings" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\// header comment
+        \\{
+        \\  "id": "x" // trailing comment
+        \\}
+    ;
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    const expected =
+        \\
+        \\{
+        \\  "id": "x" 
+        \\}
+    ;
+    try std.testing.expectEqualStrings(expected, stripped);
+}
+
+test "stripJsonComments removes block comments outside strings" {
+    const allocator = std.testing.allocator;
+    const input = "{/* block */ \"a\": /* mid */ 1 /* tail */}";
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    try std.testing.expectEqualStrings("{ \"a\":  1 }", stripped);
+}
+
+test "stripJsonComments removes trailing commas before } and ]" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "a": [1, 2, 3,],
+        \\  "b": 4,
+        \\}
+    ;
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    const expected =
+        \\{
+        \\  "a": [1, 2, 3],
+        \\  "b": 4
+        \\}
+    ;
+    try std.testing.expectEqualStrings(expected, stripped);
+}
+
+test "stripJsonComments preserves // and trailing commas inside string literals" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{ "url": "https://example.com/path", "note": "ends with comma," }
+    ;
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    try std.testing.expectEqualStrings(input, stripped);
+}
+
+test "stripJsonComments handles escaped quotes inside string literals" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\{ "quote": "He said \"// not a comment\" today" }
+    ;
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    try std.testing.expectEqualStrings(input, stripped);
+}
+
+test "stripJsonComments strips trailing comma even with comment between" {
+    // Regression for the second commit in TS bb25a394: a `//` between a
+    // trailing comma and its closer must not hide the comma from the
+    // trailing-comma pass.
+    const allocator = std.testing.allocator;
+    const input =
+        \\{
+        \\  "a": 1, // trailing
+        \\}
+    ;
+    const stripped = try stripJsonComments(allocator, input);
+    defer allocator.free(stripped);
+    const expected =
+        \\{
+        \\  "a": 1 
+        \\}
+    ;
+    try std.testing.expectEqualStrings(expected, stripped);
+}
+
+test "loadModelsConfig parses JSONC with comments and trailing commas" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models.json",
+        .data =
+        \\// User-supplied models.json with JSONC niceties.
+        \\{
+        \\  /* providers map */
+        \\  "providers": {
+        \\    "local-jsonc": {
+        \\      "api": "openai-completions",
+        \\      "baseUrl": "http://localhost:1234/v1", // local server
+        \\      "apiKey": "jsonc-key",
+        \\      "models": [
+        \\        {
+        \\          "id": "jsonc-model",
+        \\          "name": "JSONC Model",
+        \\        },
+        \\      ],
+        \\    },
+        \\  },
+        \\}
+        ,
+    });
+
+    const models_path = try makeTmpPath(allocator, tmp, "models.json");
+    defer allocator.free(models_path);
+
+    ai.model_registry.clearDefault();
+    defer ai.model_registry.resetForTesting();
+
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
+    defer deinitStringMap(allocator, &provider_api_keys);
+
+    try loadModelsConfig(allocator, std.testing.io, models_path, &provider_api_keys, false, &errors);
+
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+    try std.testing.expectEqualStrings("jsonc-key", provider_api_keys.get("local-jsonc").?);
+    const model = ai.model_registry.find("local-jsonc", "jsonc-model").?;
+    try std.testing.expectEqualStrings("JSONC Model", model.name);
+}
+
+test "loadModelsConfig preserves // inside string values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models.json",
+        .data =
+        \\{
+        \\  "providers": {
+        \\    "with-url": {
+        \\      "api": "openai-completions",
+        \\      "baseUrl": "https://example.com/v1",
+        \\      "models": [
+        \\        { "id": "url-model" }
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+        ,
+    });
+
+    const models_path = try makeTmpPath(allocator, tmp, "models.json");
+    defer allocator.free(models_path);
+
+    ai.model_registry.clearDefault();
+    defer ai.model_registry.resetForTesting();
+
+    var errors = std.ArrayList(ConfigError).empty;
+    defer config_errors.deinitList(allocator, &errors);
+    var provider_api_keys = std.StringHashMap([]const u8).init(allocator);
+    defer deinitStringMap(allocator, &provider_api_keys);
+
+    try loadModelsConfig(allocator, std.testing.io, models_path, &provider_api_keys, false, &errors);
+
+    try std.testing.expectEqual(@as(usize, 0), errors.items.len);
+    const provider = ai.model_registry.getProviderConfig("with-url").?;
+    try std.testing.expectEqualStrings("https://example.com/v1", provider.base_url);
 }
