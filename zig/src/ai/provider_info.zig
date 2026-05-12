@@ -47,6 +47,14 @@ pub const ProviderInfo = struct {
     /// the boot-time default, prefer the provider named here first (if its
     /// credentials are also configured). `null` means no preference.
     prefer_initial: ?[]const u8 = null,
+    /// Built-in public OAuth client id shipped with the binary for providers
+    /// that expose a hard-coded "public" OAuth application (Anthropic Claude
+    /// Pro/Max, GitHub Copilot, OpenAI Codex). Providers whose OAuth flow
+    /// requires an end-user-supplied client id (e.g. google-gemini-cli with a
+    /// user-owned GCP project) leave this `null` and rely on the on-disk
+    /// `oauth-clients.json` config; the auth-layer cross-check test asserts
+    /// agreement between this field and the `AuthProviderInfo` table.
+    oauth_default_client_id: ?[]const u8 = null,
 };
 
 pub const PROVIDERS: []const ProviderInfo = &.{
@@ -64,6 +72,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "Anthropic credentials required.\nSet ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY, pass --api-key, or run /login anthropic.",
         .env_vars = &.{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY" },
         .default_api = "anthropic-messages",
+        .oauth_default_client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
     },
     .{
         .id = "azure-openai-responses",
@@ -120,6 +129,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "GitHub Copilot credentials required.\nRun /login github-copilot, or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.",
         .env_vars = &.{ "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN" },
         .default_api = "openai-responses",
+        .oauth_default_client_id = "Iv1.b507a08c87ecfe98",
     },
     .{
         .id = "google",
@@ -253,6 +263,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex for ChatGPT Plus/Pro subscription auth.",
         .env_var = "OPENAI_API_KEY",
         .default_api = "openai-codex-responses",
+        .oauth_default_client_id = "app_EMoamEEZ73f0CkXaXp7hrann",
     },
     .{
         .id = "openai-responses",
@@ -382,6 +393,11 @@ pub fn preferInitialFor(id: []const u8) ?[]const u8 {
     return info.prefer_initial;
 }
 
+pub fn oauthDefaultClientIdFor(id: []const u8) ?[]const u8 {
+    const info = providerInfoFor(id) orelse return null;
+    return info.oauth_default_client_id;
+}
+
 test "providerInfoFor returns canonical row for a known provider" {
     const info = providerInfoFor("openai").?;
     try std.testing.expectEqualStrings("openai", info.id);
@@ -416,6 +432,23 @@ test "every PROVIDERS row has a unique id" {
             try std.testing.expect(!std.mem.eql(u8, provider.id, other.id));
         }
     }
+}
+
+test "oauthDefaultClientIdFor returns the canonical public client ids" {
+    try std.testing.expectEqualStrings(
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        oauthDefaultClientIdFor("anthropic").?,
+    );
+    try std.testing.expectEqualStrings(
+        "Iv1.b507a08c87ecfe98",
+        oauthDefaultClientIdFor("github-copilot").?,
+    );
+    try std.testing.expectEqualStrings(
+        "app_EMoamEEZ73f0CkXaXp7hrann",
+        oauthDefaultClientIdFor("openai-codex").?,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), oauthDefaultClientIdFor("google-gemini-cli"));
+    try std.testing.expectEqual(@as(?[]const u8, null), oauthDefaultClientIdFor("openai"));
 }
 
 test "provider_info default_api matches model_registry built-ins" {

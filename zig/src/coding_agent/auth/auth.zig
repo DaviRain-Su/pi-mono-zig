@@ -8,6 +8,14 @@ pub const OAuthCallbackProviderKind = oauth_callback_listener.ProviderKind;
 pub const defaultOAuthCallbackPath = oauth_callback_listener.defaultCallbackPath;
 pub const defaultOAuthCallbackPort = oauth_callback_listener.defaultCallbackPort;
 
+// Public OAuth client ids for the providers that ship a hard-coded "public"
+// OAuth application with the binary. These are also recorded on
+// `ai.provider_info.PROVIDERS` (field `oauth_default_client_id`) so display
+// names, default models, env vars, and OAuth client ids are all consolidated
+// onto one canonical per-provider table. The runtime cross-check test
+// `auth provider client ids agree with ai.provider_info.PROVIDERS` below
+// asserts agreement between this file and provider_info; do not edit one
+// without updating the other.
 const DEFAULT_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98";
 const DEFAULT_OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -2124,6 +2132,55 @@ test "loadOAuthClientCredentials uses public built-in client ids without oauth c
     });
     defer allocator.free(copilot_body);
     try std.testing.expectEqualStrings("client_id=Iv1.b507a08c87ecfe98&scope=read%3Auser", copilot_body);
+}
+
+test "auth provider client ids agree with ai.provider_info.PROVIDERS" {
+    // Cross-check: every AUTH_PROVIDERS row that hard-codes a public OAuth
+    // client id must agree with the canonical value on
+    // ai.provider_info.PROVIDERS. Conversely, every provider_info row that
+    // carries an `oauth_default_client_id` must have a matching AUTH_PROVIDERS
+    // row (so a new provider cannot silently get a public client id on only
+    // one side of the consolidation).
+    for (&AUTH_PROVIDERS) |info| {
+        const info_id_default = ai.provider_info.oauthDefaultClientIdFor(info.id);
+        if (info.default_public_client_id) |expected| {
+            if (info_id_default == null) {
+                std.debug.print(
+                    "auth provider '{s}' has default_public_client_id but provider_info row has null oauth_default_client_id\n",
+                    .{info.id},
+                );
+                return error.TestExpectedEqual;
+            }
+            try std.testing.expectEqualStrings(expected, info_id_default.?);
+        } else {
+            if (info_id_default) |unexpected| {
+                std.debug.print(
+                    "auth provider '{s}' has no default_public_client_id but provider_info row carries one ('{s}')\n",
+                    .{ info.id, unexpected },
+                );
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+
+    for (ai.provider_info.PROVIDERS) |info| {
+        const id_default = info.oauth_default_client_id orelse continue;
+        const auth_info = authInfoFor(info.id) orelse {
+            std.debug.print(
+                "provider_info row '{s}' carries oauth_default_client_id='{s}' but has no AUTH_PROVIDERS row\n",
+                .{ info.id, id_default },
+            );
+            return error.TestExpectedEqual;
+        };
+        const auth_default = auth_info.default_public_client_id orelse {
+            std.debug.print(
+                "provider_info row '{s}' carries oauth_default_client_id='{s}' but AUTH_PROVIDERS row has null default_public_client_id\n",
+                .{ info.id, id_default },
+            );
+            return error.TestExpectedEqual;
+        };
+        try std.testing.expectEqualStrings(id_default, auth_default);
+    }
 }
 
 test "startGoogleBrowserLogin loads client config from safe non-legacy file" {
