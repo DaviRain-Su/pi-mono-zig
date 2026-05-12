@@ -1147,3 +1147,115 @@ test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
     try std.testing.expectEqualStrings("local", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
     try std.testing.expect(stream.next() == null);
 }
+
+test "openai_chat_sse accumulates mixed content reasoning and parallel tool deltas independently" {
+    // Port of TS PR #4228 (commit 6b271842) regression scenario:
+    //   packages/ai/test/openai-completions-tool-choice.test.ts —
+    //   "accumulates mixed content, reasoning, and parallel tool call deltas independently"
+    //
+    // Exercises the TS dual-map semantics (by-index + by-id) of `ensureToolCallBlock`
+    // through Zig's `ensureActiveToolCall`:
+    //   - parallel tool calls indexed by `index`
+    //   - parallel tool calls tracked by `id` only (no index)
+    //   - id changing on a subsequent delta with the same `index` (initial id wins;
+    //     later ids are recorded as observed aliases)
+    //   - tool delta with no id and no name on a subsequent chunk (matched by index)
+    //   - text and reasoning deltas resuming the same blocks across tool deltas
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body_lines =
+        \\data: {"id":"chatcmpl-mixed","choices":[{"delta":{"content":"answer 1","reasoning_content":"think 1","tool_calls":[{"index":0,"id":"tc_read_initial","function":{"name":"read","arguments":"{\"path\":\"README"}},{"index":1,"id":"tc_grep_initial","function":{"name":"grep","arguments":"{\"pattern\":\"TODO"}},{"id":"tc_list_no_index","function":{"name":"list","arguments":"{\"path\":\"packages"}},{"id":"tc_write_no_index","function":{"name":"write","arguments":"{\"path\":\"out"}}]}}]}
+        \\data: {"choices":[{"delta":{"content":" answer 2","tool_calls":[{"index":1,"id":"tc_grep_changed","function":{"arguments":"\",\"path\":\"src"}},{"id":"tc_write_no_index","function":{"arguments":".txt\",\"content\":\"ok\"}"}},{"id":"tc_list_no_index","function":{"arguments":"/ai\"}"}}]}}]}
+        \\data: {"choices":[{"finish_reason":"tool_calls","delta":{"content":"\n","reasoning_content":" think 2","tool_calls":[{"index":0,"id":"tc_read_changed","function":{"arguments":".md\"}"}},{"index":1,"function":{"arguments":"\"}"}}]}}]}
+        \\data: [DONE]
+    ;
+    const body = try std.fmt.allocPrint(allocator, "{s}\n", .{body_lines});
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
+
+    var text_start_count: usize = 0;
+    var text_delta_count: usize = 0;
+    var text_end_count: usize = 0;
+    var thinking_start_count: usize = 0;
+    var thinking_delta_count: usize = 0;
+    var thinking_end_count: usize = 0;
+    var toolcall_start_count: usize = 0;
+    var toolcall_delta_count: usize = 0;
+    var toolcall_end_count: usize = 0;
+    var done_seen = false;
+
+    while (stream.next()) |event| {
+        defer event.deinitTransient(allocator);
+        switch (event.event_type) {
+            .start => {},
+            .text_start => text_start_count += 1,
+            .text_delta => text_delta_count += 1,
+            .text_end => text_end_count += 1,
+            .thinking_start => thinking_start_count += 1,
+            .thinking_delta => thinking_delta_count += 1,
+            .thinking_end => thinking_end_count += 1,
+            .toolcall_start => toolcall_start_count += 1,
+            .toolcall_delta => toolcall_delta_count += 1,
+            .toolcall_end => toolcall_end_count += 1,
+            .done => done_seen = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), text_start_count);
+    try std.testing.expectEqual(@as(usize, 3), text_delta_count);
+    try std.testing.expectEqual(@as(usize, 1), text_end_count);
+    try std.testing.expectEqual(@as(usize, 1), thinking_start_count);
+    try std.testing.expectEqual(@as(usize, 2), thinking_delta_count);
+    try std.testing.expectEqual(@as(usize, 1), thinking_end_count);
+    try std.testing.expectEqual(@as(usize, 4), toolcall_start_count);
+    try std.testing.expectEqual(@as(usize, 9), toolcall_delta_count);
+    try std.testing.expectEqual(@as(usize, 4), toolcall_end_count);
+    try std.testing.expect(done_seen);
+
+    const message = stream.result() orelse return error.MissingAssistantMessage;
+    defer types.freeAssistantMessage(allocator, message);
+
+    try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
+    try std.testing.expectEqual(@as(usize, 6), message.content.len);
+
+    // Block-order is determined by first-appearance: text, thinking, then the
+    // four tool calls in the order they first appeared in chunk 1.
+    try std.testing.expectEqualStrings("answer 1 answer 2\n", message.content[0].text.text);
+    try std.testing.expectEqualStrings("think 1 think 2", message.content[1].thinking.thinking);
+    try std.testing.expectEqualStrings("reasoning_content", message.content[1].thinking.thinking_signature.?);
+
+    // First-seen id wins for the canonical id (mirrors TS `if (!block.id && toolCall.id) block.id = ...`).
+    const read_call = message.content[2].tool_call;
+    try std.testing.expectEqualStrings("tc_read_initial", read_call.id);
+    try std.testing.expectEqualStrings("read", read_call.name);
+    try std.testing.expectEqualStrings("README.md", read_call.arguments.object.get("path").?.string);
+
+    const grep_call = message.content[3].tool_call;
+    try std.testing.expectEqualStrings("tc_grep_initial", grep_call.id);
+    try std.testing.expectEqualStrings("grep", grep_call.name);
+    try std.testing.expectEqualStrings("TODO", grep_call.arguments.object.get("pattern").?.string);
+    try std.testing.expectEqualStrings("src", grep_call.arguments.object.get("path").?.string);
+
+    const list_call = message.content[4].tool_call;
+    try std.testing.expectEqualStrings("tc_list_no_index", list_call.id);
+    try std.testing.expectEqualStrings("list", list_call.name);
+    try std.testing.expectEqualStrings("packages/ai", list_call.arguments.object.get("path").?.string);
+
+    const write_call = message.content[5].tool_call;
+    try std.testing.expectEqualStrings("tc_write_no_index", write_call.id);
+    try std.testing.expectEqualStrings("write", write_call.name);
+    try std.testing.expectEqualStrings("out.txt", write_call.arguments.object.get("path").?.string);
+    try std.testing.expectEqualStrings("ok", write_call.arguments.object.get("content").?.string);
+}
