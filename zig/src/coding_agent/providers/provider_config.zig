@@ -3,6 +3,7 @@ const ai = @import("ai");
 const string_utils = ai.shared.string_utils;
 const auth = @import("../auth/auth.zig");
 const common = @import("../tools/common.zig");
+const provider_info = @import("../core/provider_info.zig");
 
 const faux = ai.providers.faux;
 
@@ -685,47 +686,8 @@ fn resolveAvailableProviderAuthStatus(
 const MISSING_API_KEY_FALLBACK: []const u8 =
     "Provider credentials required.\nPass --api-key, run /login <provider>, or configure the provider environment variables.";
 
-const MISSING_API_KEY_MESSAGES = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "openai", "OpenAI credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai to save a key." },
-    .{ "openai-responses", "OpenAI Responses credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-responses to save a key." },
-    .{ "openai-codex", "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex for ChatGPT Plus/Pro subscription auth." },
-    .{ "azure-openai-responses", "Azure OpenAI credentials required.\nSet AZURE_OPENAI_API_KEY, pass --api-key, or run /login azure-openai-responses to save a key." },
-    .{ "google", "Google Gemini credentials required.\nSet GEMINI_API_KEY, pass --api-key, or run /login google to save a key." },
-    .{ "google-gemini-cli", "Google Cloud Code Assist credentials required.\nRun /login google-gemini-cli. Paid tiers may also require GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID." },
-    .{ "google-vertex", "Google Vertex AI credentials required.\nSet GOOGLE_CLOUD_API_KEY, or configure GOOGLE_APPLICATION_CREDENTIALS with GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION. /login google-vertex can also store an API key." },
-    .{ "anthropic", "Anthropic credentials required.\nSet ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY, pass --api-key, or run /login anthropic." },
-    .{ "github-copilot", "GitHub Copilot credentials required.\nRun /login github-copilot, or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN." },
-    .{ "amazon-bedrock", "Amazon Bedrock credentials required.\nRun /login amazon-bedrock to store a proxy/API key, or configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, AWS_BEARER_TOKEN_BEDROCK, or another supported AWS auth source." },
-    .{ "mistral", "Mistral credentials required.\nSet MISTRAL_API_KEY, pass --api-key, or run /login mistral." },
-    .{ "groq", "Groq credentials required.\nSet GROQ_API_KEY, pass --api-key, or run /login groq." },
-    .{ "cerebras", "Cerebras credentials required.\nSet CEREBRAS_API_KEY, pass --api-key, or run /login cerebras." },
-    .{ "xai", "xAI credentials required.\nSet XAI_API_KEY, pass --api-key, or run /login xai." },
-    .{ "openrouter", "OpenRouter credentials required.\nSet OPENROUTER_API_KEY, pass --api-key, or run /login openrouter." },
-    .{ "vercel-ai-gateway", "Vercel AI Gateway credentials required.\nSet AI_GATEWAY_API_KEY, pass --api-key, or run /login vercel-ai-gateway." },
-    .{ "zai", "ZAI credentials required.\nSet ZAI_API_KEY, pass --api-key, or run /login zai." },
-    .{ "minimax", "MiniMax credentials required.\nSet MINIMAX_API_KEY, pass --api-key, or run /login minimax." },
-    .{ "minimax-cn", "MiniMax (China) credentials required.\nSet MINIMAX_CN_API_KEY, pass --api-key, or run /login minimax-cn." },
-    .{ "moonshotai", "Moonshot AI credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai." },
-    .{ "moonshotai-cn", "Moonshot AI (China) credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login moonshotai-cn." },
-    .{ "huggingface", "Hugging Face credentials required.\nSet HF_TOKEN, pass --api-key, or run /login huggingface." },
-    .{ "fireworks", "Fireworks credentials required.\nSet FIREWORKS_API_KEY, pass --api-key, or run /login fireworks." },
-    .{ "together", "Together AI credentials required.\nSet TOGETHER_API_KEY, pass --api-key, or run /login together." },
-    .{ "opencode", "OpenCode Zen credentials required.\nSet OPENCODE_API_KEY, pass --api-key, or run /login opencode." },
-    .{ "opencode-go", "OpenCode Go credentials required.\nSet OPENCODE_API_KEY, pass --api-key, or run /login opencode-go." },
-    .{ "deepseek", "DeepSeek credentials required.\nSet DEEPSEEK_API_KEY, pass --api-key, or run /login deepseek." },
-    .{ "kimi-coding", "Kimi For Coding credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-coding." },
-    .{ "kimi-code-openai", "Kimi Code (OpenAI Compatible) credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-code-openai." },
-    .{ "kimi", "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi." },
-    .{ "cloudflare-workers-ai", "Cloudflare Workers AI credentials required.\nSet CLOUDFLARE_API_KEY and CLOUDFLARE_ACCOUNT_ID, pass --api-key, or run /login cloudflare-workers-ai." },
-    .{ "cloudflare-ai-gateway", "Cloudflare AI Gateway credentials required.\nSet CLOUDFLARE_API_KEY, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_GATEWAY_ID, pass --api-key, or run /login cloudflare-ai-gateway." },
-    .{ "xiaomi", "Xiaomi MiMo credentials required.\nSet XIAOMI_API_KEY, pass --api-key, or run /login xiaomi." },
-    .{ "xiaomi-token-plan-cn", "Xiaomi MiMo Token Plan (China) credentials required.\nSet XIAOMI_TOKEN_PLAN_CN_API_KEY, pass --api-key, or run /login xiaomi-token-plan-cn." },
-    .{ "xiaomi-token-plan-ams", "Xiaomi MiMo Token Plan (Amsterdam) credentials required.\nSet XIAOMI_TOKEN_PLAN_AMS_API_KEY, pass --api-key, or run /login xiaomi-token-plan-ams." },
-    .{ "xiaomi-token-plan-sgp", "Xiaomi MiMo Token Plan (Singapore) credentials required.\nSet XIAOMI_TOKEN_PLAN_SGP_API_KEY, pass --api-key, or run /login xiaomi-token-plan-sgp." },
-});
-
 fn missingApiKeyMessage(provider: []const u8) []const u8 {
-    return MISSING_API_KEY_MESSAGES.get(provider) orelse MISSING_API_KEY_FALLBACK;
+    return provider_info.missingApiKeyMessageFor(provider) orelse MISSING_API_KEY_FALLBACK;
 }
 
 test "resolveProviderConfig uses canonical defaults from model registry" {

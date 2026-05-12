@@ -1,4 +1,5 @@
 const std = @import("std");
+const provider_info = @import("provider_info.zig");
 
 pub const ResolveCliModelResult = struct {
     provider_name: ?[]const u8 = null,
@@ -33,47 +34,30 @@ pub const DefaultModelForProvider = struct {
     model: []const u8,
 };
 
-pub const default_model_per_provider = [_]DefaultModelForProvider{
-    .{ .provider = "amazon-bedrock", .model = "us.anthropic.claude-opus-4-6-v1" },
-    .{ .provider = "anthropic", .model = "claude-opus-4-7" },
-    .{ .provider = "openai", .model = "gpt-5.4" },
-    .{ .provider = "azure-openai-responses", .model = "gpt-5.4" },
-    .{ .provider = "openai-codex", .model = "gpt-5.5" },
-    .{ .provider = "deepseek", .model = "deepseek-v4-pro" },
-    .{ .provider = "google", .model = "gemini-3.1-pro-preview" },
-    .{ .provider = "google-vertex", .model = "gemini-3.1-pro-preview" },
-    .{ .provider = "github-copilot", .model = "gpt-5.4" },
-    .{ .provider = "openrouter", .model = "moonshotai/kimi-k2.6" },
-    .{ .provider = "vercel-ai-gateway", .model = "zai/glm-5.1" },
-    .{ .provider = "xai", .model = "grok-4.20-0309-reasoning" },
-    .{ .provider = "groq", .model = "openai/gpt-oss-120b" },
-    .{ .provider = "cerebras", .model = "zai-glm-4.7" },
-    .{ .provider = "zai", .model = "glm-4.7" },
-    .{ .provider = "mistral", .model = "devstral-medium-latest" },
-    .{ .provider = "minimax", .model = "MiniMax-M2.7" },
-    .{ .provider = "minimax-cn", .model = "MiniMax-M2.7" },
-    .{ .provider = "moonshotai", .model = "kimi-k2.6" },
-    .{ .provider = "moonshotai-cn", .model = "kimi-k2.6" },
-    .{ .provider = "huggingface", .model = "moonshotai/Kimi-K2.6" },
-    .{ .provider = "fireworks", .model = "accounts/fireworks/models/kimi-k2p6" },
-    .{ .provider = "together", .model = "moonshotai/Kimi-K2.6" },
-    .{ .provider = "opencode", .model = "kimi-k2.6" },
-    .{ .provider = "opencode-go", .model = "kimi-k2.6" },
-    .{ .provider = "kimi-coding", .model = "kimi-for-coding" },
-    .{ .provider = "kimi-code-openai", .model = "kimi-for-coding" },
-    .{ .provider = "cloudflare-workers-ai", .model = "@cf/moonshotai/kimi-k2.6" },
-    .{ .provider = "cloudflare-ai-gateway", .model = "workers-ai/@cf/moonshotai/kimi-k2.6" },
-    .{ .provider = "xiaomi", .model = "mimo-v2.5-pro" },
-    .{ .provider = "xiaomi-token-plan-cn", .model = "mimo-v2.5-pro" },
-    .{ .provider = "xiaomi-token-plan-ams", .model = "mimo-v2.5-pro" },
-    .{ .provider = "xiaomi-token-plan-sgp", .model = "mimo-v2.5-pro" },
+/// Per-provider default model identifiers, derived from the canonical
+/// `provider_info.PROVIDERS` table. Providers whose `default_model` is null are
+/// omitted so this list preserves the exact set of entries the previous
+/// hand-maintained array exposed.
+pub const default_model_per_provider: []const DefaultModelForProvider = blk: {
+    const all = provider_info.PROVIDERS;
+    var count: usize = 0;
+    for (all) |entry| {
+        if (entry.default_model != null) count += 1;
+    }
+    var result: [count]DefaultModelForProvider = undefined;
+    var index: usize = 0;
+    for (all) |entry| {
+        if (entry.default_model) |default_model| {
+            result[index] = .{ .provider = entry.id, .model = default_model };
+            index += 1;
+        }
+    }
+    const final = result;
+    break :blk &final;
 };
 
 pub fn defaultModelForProvider(provider: []const u8) ?[]const u8 {
-    for (default_model_per_provider) |entry| {
-        if (std.mem.eql(u8, entry.provider, provider)) return entry.model;
-    }
-    return null;
+    return provider_info.defaultModelFor(provider);
 }
 
 test "model resolver facade exposes default provider models" {
