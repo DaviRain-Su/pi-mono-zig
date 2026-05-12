@@ -69,7 +69,8 @@ append initial prompts
 |  |  collect assistant tool_calls                              |  |
 |  |                                                             |  |
 |  |  no tool calls?                                            |  |
-|  |    turn_end -> check abort -> drain steering               |  |
+|  |    turn_end -> should_stop_after_turn -> check abort       |  |
+|  |      -> drain steering                                     |  |
 |  |                                                             |  |
 |  |  tool calls?                                               |  |
 |  |    for each tool_call: tool_execution_start                |  |
@@ -83,7 +84,8 @@ append initial prompts
 |  |    emit tool_execution_end                                 |  |
 |  |    emit tool_result message_start -> message_end           |  |
 |  |    append tool_result messages                             |  |
-|  |    turn_end -> check abort -> drain steering               |  |
+|  |    turn_end -> should_stop_after_turn -> check abort       |  |
+|  |      -> drain steering                                     |  |
 |  |                                                             |  |
 |  +-------------------------------------------------------------+  |
 |                                                                   |
@@ -108,9 +110,9 @@ Abort and error exits are terminal for the current run:
 
 TypeScript has a few loop policies that Zig does not currently expose as direct
 agent-loop controls, including `agentLoopContinue`, dynamic `getApiKey`, and
-`shouldStopAfterTurn`/tool-result `terminate`. Those are not part of this
-module's current state machine; adding them should be treated as behavior work,
-not as documentation cleanup.
+tool-result `terminate`. Those are not part of this module's current state
+machine; adding them should be treated as behavior work, not as documentation
+cleanup.
 
 ## Major transition details
 

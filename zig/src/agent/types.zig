@@ -125,6 +125,13 @@ pub const AfterToolCallContext = struct {
     context: AgentContext,
 };
 
+pub const ShouldStopAfterTurnContext = struct {
+    assistant_message: ai.AssistantMessage,
+    tool_results: []const ToolResultMessage,
+    context: AgentContext,
+    new_messages: []const AgentMessage,
+};
+
 pub const BeforeToolCallFn = *const fn (
     allocator: std.mem.Allocator,
     context: BeforeToolCallContext,
@@ -136,6 +143,13 @@ pub const AfterToolCallFn = *const fn (
     context: AfterToolCallContext,
     signal: ?*const std.atomic.Value(bool),
 ) anyerror!?AfterToolCallResult;
+
+pub const ShouldStopAfterTurnFn = *const fn (
+    allocator: std.mem.Allocator,
+    context: ShouldStopAfterTurnContext,
+    callback_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+) anyerror!bool;
 
 pub const AgentTool = struct {
     name: []const u8,
@@ -227,6 +241,8 @@ pub const AgentLoopConfig = struct {
     get_steering_messages: ?PendingMessagesFn = null,
     get_follow_up_messages_context: ?*anyopaque = null,
     get_follow_up_messages: ?PendingMessagesFn = null,
+    should_stop_after_turn_context: ?*anyopaque = null,
+    should_stop_after_turn: ?ShouldStopAfterTurnFn = null,
 };
 
 pub const AgentEventType = enum {
