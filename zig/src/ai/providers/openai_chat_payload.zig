@@ -1,8 +1,13 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_json_put = @import("../shared/provider_json_put.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
 const sanitize_unicode = @import("../shared/sanitize_unicode.zig");
+
+const putBoolValue = provider_json_put.putBoolValue;
+const putStringValue = provider_json_put.putStringValue;
+const putObjectValue = provider_json_put.putObjectValue;
 
 pub fn freeOwnedJsonValue(allocator: std.mem.Allocator, value: std.json.Value) void {
     provider_json.freeValue(allocator, value);
@@ -754,18 +759,6 @@ pub fn buildResolvedCompatSnapshotValue(allocator: std.mem.Allocator, model: typ
     }
 
     return .{ .object = object };
-}
-
-fn putBoolValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .bool = value });
-}
-
-fn putStringValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
-}
-
-fn putObjectValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), value);
 }
 
 fn emptyObjectValue(allocator: std.mem.Allocator) !std.json.Value {

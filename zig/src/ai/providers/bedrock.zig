@@ -7,7 +7,11 @@ const abort_helper = @import("../shared/abort_signal.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_json_put = @import("../shared/provider_json_put.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
+
+const putStringField = provider_json_put.putStringValue;
+const putIntegerField = provider_json_put.putIntegerValue;
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
@@ -2843,14 +2847,6 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
             tool_call.partial_json.deinit(allocator);
         },
     }
-}
-
-fn putStringField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = try allocator.dupe(u8, value) });
-}
-
-fn putIntegerField(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: anytype) !void {
-    try object.put(allocator, try allocator.dupe(u8, key), .{ .integer = @intCast(value) });
 }
 
 fn eventTypeName(event_type: types.EventType) []const u8 {
