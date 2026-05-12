@@ -127,6 +127,543 @@ fn isCodexNonTransportError(err: anyerror) bool {
     };
 }
 
+// ============================================================================
+// WebSocket Connection Cache (port of TS `websocketSessionCache`)
+// ============================================================================
+//
+// Per-process cache keyed by session_id. Each entry owns a live
+// `websocket_client.Client` plus a `continuation` snapshot describing the
+// last accepted request body and the items the server returned, so that the
+// next compatible call can rewrite its request as
+// `{ ...body, previous_response_id, input: delta }` and reuse the socket.
+//
+// Lifetime / TTL:
+//   * 5-minute idle TTL. Stale entries are dropped lazily on the next
+//     `acquire` call — there is no background thread.
+//   * `busy` flag: only one in-flight call may use the cached socket at a
+//     time. Parallel callers with cache hit + busy fall through to a fresh
+//     uncached single-shot connection.
+//
+// Continuation match contract (mirrors TS
+// `buildCachedWebSocketRequestBody`):
+//   * Non-input fields of the new request must equal the prior request's
+//     (stable JSON round-trip comparison modulo `input` and
+//     `previous_response_id`).
+//   * The new `input` array must be a prefix-extension of
+//     `prior_input ++ prior_response_items` (deep equal).
+//   * `function_call_output` items from the assistant's prior response are
+//     filtered out — the server expects the caller to re-send tool results
+//     as part of the delta `input`.
+//
+// Time source is abstracted via `time_source_ns` so tests can advance the
+// TTL clock without spinning real time.
+
+const SESSION_WEBSOCKET_CACHE_TTL_NS: i128 =
+    @as(i128, 5) * std.time.ns_per_min;
+
+/// Read the wall-clock time used for cache TTL comparisons. Tests may
+/// override this by setting `WebSocketConnectionCache.test_now_override`.
+fn currentTimeNs(io: std.Io) i128 {
+    if (WebSocketConnectionCache.test_now_override) |t| return t;
+    return std.Io.Clock.real.now(io).nanoseconds;
+}
+
+const WebSocketCacheContinuation = struct {
+    last_request_body: std.json.Value,
+    last_response_id: []u8,
+    last_response_items: std.json.Array,
+
+    fn deinit(self: *WebSocketCacheContinuation, allocator: std.mem.Allocator) void {
+        provider_json.freeValue(allocator, self.last_request_body);
+        allocator.free(self.last_response_id);
+        provider_json.freeValue(allocator, .{ .array = self.last_response_items });
+    }
+};
+
+const WebSocketCacheEntry = struct {
+    allocator: std.mem.Allocator,
+    client: *websocket_client.Client,
+    busy: bool,
+    last_used_ns: i128,
+    continuation: ?WebSocketCacheContinuation = null,
+
+    fn deinit(self: *WebSocketCacheEntry) void {
+        if (self.continuation) |*continuation| continuation.deinit(self.allocator);
+        self.client.deinit();
+        self.allocator.destroy(self.client);
+    }
+};
+
+const WebSocketConnectionCache = struct {
+    var mutex: std.Io.Mutex = .init;
+    var initialized: bool = false;
+    var entries: std.StringHashMap(*WebSocketCacheEntry) = undefined;
+    /// Test-only clock override. When non-null, replaces the wall clock
+    /// reading used for entry timestamps and expiry comparisons.
+    var test_now_override: ?i128 = null;
+
+    fn ensureInitialized() void {
+        if (!initialized) {
+            entries = std.StringHashMap(*WebSocketCacheEntry).init(std.heap.page_allocator);
+            initialized = true;
+        }
+    }
+
+    fn isExpiredAt(entry: *const WebSocketCacheEntry, now_ns: i128) bool {
+        return (now_ns - entry.last_used_ns) >= SESSION_WEBSOCKET_CACHE_TTL_NS;
+    }
+
+    fn discardEntryLocked(session_id: []const u8, entry: *WebSocketCacheEntry) void {
+        if (entries.fetchRemove(session_id)) |removed| {
+            std.heap.page_allocator.free(removed.key);
+        }
+        entry.deinit();
+        std.heap.page_allocator.destroy(entry);
+    }
+};
+
+/// Override the cache's wall clock for tests. Pass `null` to restore the
+/// real-time clock.
+pub fn setWebSocketCacheNowOverrideForTesting(now_ns: ?i128, io: std.Io) void {
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.test_now_override = now_ns;
+}
+
+/// Test-only inspector — returns true iff the cache currently holds an
+/// entry for `session_id` (regardless of busy/idle state).
+pub fn hasCachedWebSocketSessionForTesting(session_id: []const u8, io: std.Io) bool {
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+    return WebSocketConnectionCache.entries.contains(session_id);
+}
+
+/// Closes the cached WebSocket connection for `session_id` (or all of them
+/// if `null`). Mirrors TS `closeOpenAICodexWebSocketSessions`. Safe to call
+/// at session-end as a cleanup hook.
+pub fn closeOpenAICodexWebSocketSessions(session_id: ?[]const u8, io: std.Io) void {
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+
+    if (session_id) |id| {
+        if (WebSocketConnectionCache.entries.get(id)) |entry| {
+            WebSocketConnectionCache.discardEntryLocked(id, entry);
+        }
+        return;
+    }
+
+    // Close all. Collect keys first because we mutate the map during
+    // iteration via discardEntryLocked.
+    var keys = std.ArrayList([]const u8).empty;
+    defer keys.deinit(std.heap.page_allocator);
+    var iterator = WebSocketConnectionCache.entries.iterator();
+    while (iterator.next()) |entry| {
+        keys.append(std.heap.page_allocator, entry.key_ptr.*) catch return;
+    }
+    for (keys.items) |key| {
+        if (WebSocketConnectionCache.entries.get(key)) |entry| {
+            WebSocketConnectionCache.discardEntryLocked(key, entry);
+        }
+    }
+}
+
+const CacheAcquireResult = struct {
+    entry: *WebSocketCacheEntry,
+    /// True when the entry was already present and reusable. Callers should
+    /// rewrite the request body via `buildCachedWebSocketRequestBody` when
+    /// `reused` is true and the entry has a continuation.
+    reused: bool,
+};
+
+const CacheBusyState = enum { free, busy_skip, fresh };
+
+/// Inspects the cache for `session_id` without taking ownership. Returns:
+///   * `.free`     — an idle reusable entry is available; caller should
+///                   open/use it via `acquireCachedConnection`.
+///   * `.busy_skip` — an entry exists but is busy; caller must open a
+///                   fresh single-shot uncached connection (not stored).
+///   * `.fresh`    — no entry; caller should open a new cached connection.
+fn peekCacheBusyState(session_id: []const u8, io: std.Io) CacheBusyState {
+    const now = currentTimeNs(io);
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+
+    const entry = WebSocketConnectionCache.entries.get(session_id) orelse return .fresh;
+    if (WebSocketConnectionCache.isExpiredAt(entry, now)) {
+        WebSocketConnectionCache.discardEntryLocked(session_id, entry);
+        return .fresh;
+    }
+    if (entry.busy) return .busy_skip;
+    return .free;
+}
+
+/// Marks an existing idle entry as busy and returns it. Returns null if
+/// the entry has disappeared or expired between `peekCacheBusyState` and
+/// here, in which case the caller should fall through to a fresh connect.
+fn acquireExistingEntry(session_id: []const u8, io: std.Io) ?*WebSocketCacheEntry {
+    const now = currentTimeNs(io);
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+
+    const entry = WebSocketConnectionCache.entries.get(session_id) orelse return null;
+    if (WebSocketConnectionCache.isExpiredAt(entry, now)) {
+        WebSocketConnectionCache.discardEntryLocked(session_id, entry);
+        return null;
+    }
+    if (entry.busy) return null;
+    entry.busy = true;
+    return entry;
+}
+
+/// Installs a freshly-opened client as the cached entry for `session_id`,
+/// transferring ownership of the heap-allocated client. The caller must
+/// not deinit / destroy the client after this call.
+fn installCacheEntry(
+    session_id: []const u8,
+    client_ptr: *websocket_client.Client,
+    io: std.Io,
+) error{OutOfMemory}!*WebSocketCacheEntry {
+    const now = currentTimeNs(io);
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+
+    // If a stale entry exists for the same session id, evict it first.
+    if (WebSocketConnectionCache.entries.get(session_id)) |existing| {
+        WebSocketConnectionCache.discardEntryLocked(session_id, existing);
+    }
+
+    const entry = try std.heap.page_allocator.create(WebSocketCacheEntry);
+    errdefer std.heap.page_allocator.destroy(entry);
+    entry.* = .{
+        .allocator = std.heap.page_allocator,
+        .client = client_ptr,
+        .busy = true,
+        .last_used_ns = now,
+        .continuation = null,
+    };
+
+    const key_owned = try std.heap.page_allocator.dupe(u8, session_id);
+    errdefer std.heap.page_allocator.free(key_owned);
+    try WebSocketConnectionCache.entries.put(key_owned, entry);
+    return entry;
+}
+
+/// Releases a cache entry. If `keep_alive` is false the entry is closed
+/// and removed; otherwise its `busy` flag is cleared and `last_used_ns`
+/// is refreshed so the idle TTL starts over.
+fn releaseCacheEntry(session_id: []const u8, entry: *WebSocketCacheEntry, keep_alive: bool, io: std.Io) void {
+    const now = currentTimeNs(io);
+    WebSocketConnectionCache.mutex.lockUncancelable(io);
+    defer WebSocketConnectionCache.mutex.unlock(io);
+    WebSocketConnectionCache.ensureInitialized();
+
+    if (!keep_alive) {
+        // Only evict if the entry is still the one cached for this session.
+        if (WebSocketConnectionCache.entries.get(session_id)) |current| {
+            if (current == entry) {
+                WebSocketConnectionCache.discardEntryLocked(session_id, entry);
+                return;
+            }
+        }
+        // Entry was already evicted; just deinit it.
+        entry.deinit();
+        std.heap.page_allocator.destroy(entry);
+        return;
+    }
+
+    entry.busy = false;
+    entry.last_used_ns = now;
+}
+
+/// Replaces the continuation snapshot for an entry currently in our hand
+/// (i.e. busy). Frees any prior continuation.
+fn setEntryContinuation(
+    entry: *WebSocketCacheEntry,
+    request_body: std.json.Value,
+    response_id: []u8,
+    response_items: std.json.Array,
+) void {
+    if (entry.continuation) |*existing| existing.deinit(entry.allocator);
+    entry.continuation = .{
+        .last_request_body = request_body,
+        .last_response_id = response_id,
+        .last_response_items = response_items,
+    };
+}
+
+fn clearEntryContinuation(entry: *WebSocketCacheEntry) void {
+    if (entry.continuation) |*existing| existing.deinit(entry.allocator);
+    entry.continuation = null;
+}
+
+// --- Body equality / prefix-extension ---------------------------------------
+
+/// Returns a JSON value equal to `body` but with `input` and
+/// `previous_response_id` stripped. Allocated owned values out of
+/// `allocator` (release via `provider_json.freeValue`).
+fn cloneBodyWithoutInput(allocator: std.mem.Allocator, body: std.json.Value) !std.json.Value {
+    if (body != .object) return try provider_json.cloneValue(allocator, body);
+    var cloned = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = cloned });
+    var iterator = body.object.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "input") or std.mem.eql(u8, key, "previous_response_id")) continue;
+        const cloned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(cloned_key);
+        const cloned_value = try provider_json.cloneValue(allocator, entry.value_ptr.*);
+        errdefer provider_json.freeValue(allocator, cloned_value);
+        try cloned.put(allocator, cloned_key, cloned_value);
+    }
+    return .{ .object = cloned };
+}
+
+fn bodiesMatchExceptInput(
+    allocator: std.mem.Allocator,
+    a: std.json.Value,
+    b: std.json.Value,
+) !bool {
+    const a_stripped = try cloneBodyWithoutInput(allocator, a);
+    defer provider_json.freeValue(allocator, a_stripped);
+    const b_stripped = try cloneBodyWithoutInput(allocator, b);
+    defer provider_json.freeValue(allocator, b_stripped);
+
+    const a_json = try std.json.Stringify.valueAlloc(allocator, a_stripped, .{});
+    defer allocator.free(a_json);
+    const b_json = try std.json.Stringify.valueAlloc(allocator, b_stripped, .{});
+    defer allocator.free(b_json);
+    return std.mem.eql(u8, a_json, b_json);
+}
+
+fn responseInputItemsEqual(
+    allocator: std.mem.Allocator,
+    a: std.json.Value,
+    b: std.json.Value,
+) !bool {
+    const a_json = try std.json.Stringify.valueAlloc(allocator, a, .{});
+    defer allocator.free(a_json);
+    const b_json = try std.json.Stringify.valueAlloc(allocator, b, .{});
+    defer allocator.free(b_json);
+    return std.mem.eql(u8, a_json, b_json);
+}
+
+const CachedDeltaResult = union(enum) {
+    /// Body is incompatible with the prior continuation; caller must send
+    /// the full request body as-is.
+    no_match,
+    /// Body matches; caller must send a rewritten request with
+    /// `previous_response_id` set and `input` replaced by `delta_items`.
+    /// `delta_items` is owned by the caller.
+    matched: struct {
+        previous_response_id: []u8,
+        delta_items: std.json.Array,
+    },
+};
+
+/// Computes the cached-request delta against `continuation`. Returns
+/// `.matched` only when the request bodies match modulo `input` and the
+/// new `input` is a prefix-extension of `prior_input ++ prior_response_items`.
+fn computeCachedDelta(
+    allocator: std.mem.Allocator,
+    body: std.json.Value,
+    continuation: WebSocketCacheContinuation,
+) !CachedDeltaResult {
+    if (body != .object) return .no_match;
+    if (!try bodiesMatchExceptInput(allocator, body, continuation.last_request_body)) return .no_match;
+
+    const current_input_value = body.object.get("input") orelse return .no_match;
+    if (current_input_value != .array) return .no_match;
+    const current_input = current_input_value.array;
+
+    // Baseline = prior_input ++ prior_response_items
+    var baseline = std.json.Array.init(allocator);
+    defer baseline.deinit();
+    const prior_input_value = continuation.last_request_body.object.get("input");
+    if (prior_input_value) |val| {
+        if (val == .array) {
+            for (val.array.items) |item| try baseline.append(item);
+        }
+    }
+    for (continuation.last_response_items.items) |item| try baseline.append(item);
+
+    if (current_input.items.len < baseline.items.len) return .no_match;
+
+    // Prefix equality via JSON serialization on each item.
+    for (baseline.items, 0..) |baseline_item, idx| {
+        const current_item = current_input.items[idx];
+        if (!try responseInputItemsEqual(allocator, baseline_item, current_item)) return .no_match;
+    }
+
+    var delta_items = std.json.Array.init(allocator);
+    errdefer {
+        for (delta_items.items) |item| provider_json.freeValue(allocator, item);
+        delta_items.deinit();
+    }
+    for (current_input.items[baseline.items.len..]) |item| {
+        try delta_items.append(try provider_json.cloneValue(allocator, item));
+    }
+
+    const previous_response_id = try allocator.dupe(u8, continuation.last_response_id);
+    return .{ .matched = .{
+        .previous_response_id = previous_response_id,
+        .delta_items = delta_items,
+    } };
+}
+
+/// If `entry.continuation` is set and the body is a compatible prefix
+/// extension, returns a new request body where `input` is the delta and
+/// `previous_response_id` is set. Otherwise clears the continuation and
+/// returns null (caller sends `body` unmodified). Caller owns the returned
+/// value (release via `provider_json.freeValue`).
+fn buildCachedWebSocketRequestBody(
+    allocator: std.mem.Allocator,
+    entry: *WebSocketCacheEntry,
+    body: std.json.Value,
+) !?std.json.Value {
+    const continuation = entry.continuation orelse return null;
+    if (continuation.last_response_id.len == 0) {
+        clearEntryContinuation(entry);
+        return null;
+    }
+    const delta = try computeCachedDelta(allocator, body, continuation);
+    if (delta == .no_match) {
+        clearEntryContinuation(entry);
+        return null;
+    }
+
+    // `delta.matched.previous_response_id` and `delta.matched.delta_items`
+    // are owned here. We move them into `cloned` below; on any failure
+    // before the move we must free them.
+    var prev_id_owned: ?[]u8 = delta.matched.previous_response_id;
+    var delta_items_owned: ?std.json.Array = delta.matched.delta_items;
+    errdefer {
+        if (prev_id_owned) |id| allocator.free(id);
+        if (delta_items_owned) |items| {
+            for (items.items) |item| provider_json.freeValue(allocator, item);
+            var mutable = items;
+            mutable.deinit();
+        }
+    }
+
+    // Build {...body, previous_response_id, input: delta_items}.
+    var cloned = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = cloned });
+
+    var iterator = body.object.iterator();
+    while (iterator.next()) |kv| {
+        const key = kv.key_ptr.*;
+        if (std.mem.eql(u8, key, "input") or std.mem.eql(u8, key, "previous_response_id")) continue;
+        const cloned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(cloned_key);
+        const cloned_value = try provider_json.cloneValue(allocator, kv.value_ptr.*);
+        errdefer provider_json.freeValue(allocator, cloned_value);
+        try cloned.put(allocator, cloned_key, cloned_value);
+    }
+
+    const prev_key = try allocator.dupe(u8, "previous_response_id");
+    errdefer allocator.free(prev_key);
+    try cloned.put(allocator, prev_key, .{ .string = prev_id_owned.? });
+    prev_id_owned = null; // ownership moved into `cloned`
+
+    const input_key = try allocator.dupe(u8, "input");
+    errdefer allocator.free(input_key);
+    try cloned.put(allocator, input_key, .{ .array = delta_items_owned.? });
+    delta_items_owned = null; // ownership moved into `cloned`
+
+    return .{ .object = cloned };
+}
+
+// --- Response item extraction (mirrors TS convertResponsesMessages call) ----
+
+/// Refreshes the continuation snapshot on `entry` after a successful
+/// response. `original_request_body` and `output` are NOT mutated. Returns
+/// `OutOfMemory` if the snapshot cannot be allocated; on any other failure
+/// the prior continuation is cleared.
+fn updateCacheContinuation(
+    allocator: std.mem.Allocator,
+    entry: *WebSocketCacheEntry,
+    original_request_body: std.json.Value,
+    output: types.AssistantMessage,
+) !void {
+    const response_id = output.response_id orelse {
+        // No response_id — clear any prior continuation; we can't chain.
+        clearEntryContinuation(entry);
+        return;
+    };
+
+    const entry_alloc = entry.allocator;
+    const body_clone = try provider_json.cloneValue(entry_alloc, original_request_body);
+    errdefer provider_json.freeValue(entry_alloc, body_clone);
+    const id_owned = try entry_alloc.dupe(u8, response_id);
+    errdefer entry_alloc.free(id_owned);
+
+    var response_items = try buildResponseItemsForContinuation(allocator, output);
+    // Items currently live in `allocator`; transfer to entry_alloc.
+    var items_in_entry_alloc = std.json.Array.init(entry_alloc);
+    errdefer {
+        for (items_in_entry_alloc.items) |item| provider_json.freeValue(entry_alloc, item);
+        items_in_entry_alloc.deinit();
+    }
+    for (response_items.items) |item| {
+        const cloned = try provider_json.cloneValue(entry_alloc, item);
+        errdefer provider_json.freeValue(entry_alloc, cloned);
+        try items_in_entry_alloc.append(cloned);
+    }
+    // Free the temporary copies in `allocator`.
+    for (response_items.items) |item| provider_json.freeValue(allocator, item);
+    response_items.deinit();
+
+    setEntryContinuation(entry, body_clone, id_owned, items_in_entry_alloc);
+}
+
+/// Builds the list of response items the server effectively emitted for
+/// `output`, filtering out `function_call_output` items (which the server
+/// expects the next request to re-supply as part of the delta input).
+/// Returned array is owned by the caller.
+fn buildResponseItemsForContinuation(
+    allocator: std.mem.Allocator,
+    output: types.AssistantMessage,
+) !std.json.Array {
+    var input = std.json.Array.init(allocator);
+    errdefer {
+        for (input.items) |item| provider_json.freeValue(allocator, item);
+        input.deinit();
+    }
+    if (types.shouldReplayAssistantInProviderContext(output)) {
+        // message_index = 0 is fine because we only use the items for
+        // equality comparison; the synthesized `msg_0` id is stable.
+        try appendAssistantInputItems(allocator, &input, output, 0);
+    }
+    // Filter out function_call_output (defensive — assistant outputs
+    // shouldn't carry them, but the TS reference does the filter so we
+    // mirror it exactly).
+    var filtered = std.json.Array.init(allocator);
+    errdefer {
+        for (filtered.items) |item| provider_json.freeValue(allocator, item);
+        filtered.deinit();
+    }
+    for (input.items) |item| {
+        if (item == .object) {
+            if (item.object.get("type")) |type_value| {
+                if (type_value == .string and std.mem.eql(u8, type_value.string, "function_call_output")) {
+                    provider_json.freeValue(allocator, item);
+                    continue;
+                }
+            }
+        }
+        try filtered.append(item);
+    }
+    // `input` borrowed items into `filtered`; deinit only the array shell.
+    input.deinit();
+    input = filtered;
+    return input;
+}
+
 /// Outcome of a single WebSocket attempt by `streamProductionAutoWebSocket`.
 const WebSocketAttempt = union(enum) {
     /// The WebSocket completed normally and pushed a terminal `done` event.
@@ -879,6 +1416,14 @@ fn streamProductionWebSocket(
     );
 }
 
+/// Returns true when the current call should consult the WebSocket
+/// connection cache. Mirrors TS `useCachedContext` (transport is
+/// `.websocket_cached` or `.auto`). The plain `.websocket` transport is
+/// always single-shot.
+fn callUsesCachedContext(transport: types.Transport) bool {
+    return transport == .websocket_cached or transport == .auto;
+}
+
 fn runCodexWebSocketAttempt(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -908,12 +1453,131 @@ fn runCodexWebSocketAttempt(
         try header_list.append(allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
     }
 
-    // Build the WS request body envelope: {"type":"response.create", ...payload}.
+    const transport_value: types.Transport = if (options) |stream_options| stream_options.transport else .auto;
+    const session_id_opt: ?[]const u8 = blk: {
+        const opts = options orelse break :blk null;
+        const id = opts.session_id orelse break :blk null;
+        if (id.len == 0) break :blk null;
+        break :blk id;
+    };
+    const want_cache = callUsesCachedContext(transport_value) and session_id_opt != null;
+
+    // Decide cache vs single-shot. `cached_entry` is non-null iff the
+    // current call uses (or installs) a cached connection. `single_shot`
+    // is non-null otherwise, in which case it must be deinit'd on return.
+    var cached_entry: ?*WebSocketCacheEntry = null;
+    var single_shot: ?websocket_client.Client = null;
+    var keep_cached_on_release: bool = false;
+    var single_shot_owned: bool = false;
+    defer {
+        if (cached_entry) |entry| {
+            releaseCacheEntry(session_id_opt.?, entry, keep_cached_on_release, io);
+        }
+        if (single_shot_owned) {
+            if (single_shot) |*c| c.deinit();
+        }
+    }
+
+    // If we want a cached connection, peek; on `.free` try to grab it;
+    // on `.busy_skip` fall through to a fresh (uncached) single-shot
+    // connection just for this call.
+    var reused_cached = false;
+    if (want_cache) {
+        const session_id = session_id_opt.?;
+        const state = peekCacheBusyState(session_id, io);
+        switch (state) {
+            .free => if (acquireExistingEntry(session_id, io)) |entry| {
+                cached_entry = entry;
+                reused_cached = true;
+            } else {
+                // Raced to expiry between peek and acquire; open fresh.
+            },
+            .busy_skip => {
+                // Open a fresh, uncached single-shot connection.
+            },
+            .fresh => {},
+        }
+    }
+
+    // Open a new connection if we didn't reuse one. If `want_cache` is
+    // true (and we're not in busy_skip), install the new client into the
+    // cache after a successful connect.
+    if (cached_entry == null) {
+        // Try to open a fresh client.
+        const new_client = websocket_client.Client.connect(.{
+            .allocator = allocator,
+            .io = io,
+            .url = ws_url,
+            .headers = header_list.items,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => switch (mode) {
+                .hard_fail => {
+                    const error_message = try std.fmt.allocPrint(
+                        allocator,
+                        "WebSocket connect failed: {s}",
+                        .{@errorName(err)},
+                    );
+                    defer allocator.free(error_message);
+                    try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
+                    return .done;
+                },
+                .auto => return WebSocketAttempt{ .fallback = .{ .err = err } },
+            },
+        };
+
+        // If the connection was successful, decide whether to install in
+        // the cache. We install when: `.websocket_cached` or `.auto` AND
+        // the cache state was `.free`/`.fresh` (not `.busy_skip`).
+        const should_install = want_cache and blk: {
+            const state = peekCacheBusyState(session_id_opt.?, io);
+            // Re-check: install only if no other entry exists or it
+            // expired. If `.busy_skip`, do not install — let the prior
+            // owner keep its entry.
+            break :blk state != .busy_skip;
+        };
+        if (should_install) {
+            const heap_client = std.heap.page_allocator.create(websocket_client.Client) catch |err| {
+                var mutable = new_client;
+                mutable.deinit();
+                return err;
+            };
+            heap_client.* = new_client;
+            const entry = installCacheEntry(session_id_opt.?, heap_client, io) catch |err| {
+                // Install failed; tear down the heap client.
+                heap_client.deinit();
+                std.heap.page_allocator.destroy(heap_client);
+                return err;
+            };
+            cached_entry = entry;
+        } else {
+            single_shot = new_client;
+            single_shot_owned = true;
+        }
+    }
+
+    // Resolve the active client pointer.
+    const active_client: *websocket_client.Client = if (cached_entry) |entry| entry.client else &single_shot.?;
+
+    // Compute the request body (full vs delta-rewritten).
+    var rewritten_body: ?std.json.Value = null;
+    defer if (rewritten_body) |v| provider_json.freeValue(allocator, v);
+    var body_for_send = payload;
+    if (reused_cached) {
+        if (cached_entry) |entry| {
+            if (try buildCachedWebSocketRequestBody(allocator, entry, payload)) |delta_body| {
+                rewritten_body = delta_body;
+                body_for_send = delta_body;
+            }
+        }
+    }
+
+    // Build the WS request body envelope: {"type":"response.create", ...body_for_send}.
     var envelope = try initObject(allocator);
     defer provider_json.freeValue(allocator, .{ .object = envelope });
     try envelope.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "response.create") });
-    if (payload == .object) {
-        var iterator = payload.object.iterator();
+    if (body_for_send == .object) {
+        var iterator = body_for_send.object.iterator();
         while (iterator.next()) |entry| {
             try envelope.put(
                 allocator,
@@ -926,30 +1590,7 @@ fn runCodexWebSocketAttempt(
     const envelope_json = try std.json.Stringify.valueAlloc(allocator, envelope_value, .{});
     defer allocator.free(envelope_json);
 
-    var client = websocket_client.Client.connect(.{
-        .allocator = allocator,
-        .io = io,
-        .url = ws_url,
-        .headers = header_list.items,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => switch (mode) {
-            .hard_fail => {
-                const error_message = try std.fmt.allocPrint(
-                    allocator,
-                    "WebSocket connect failed: {s}",
-                    .{@errorName(err)},
-                );
-                defer allocator.free(error_message);
-                try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
-                return .done;
-            },
-            .auto => return WebSocketAttempt{ .fallback = .{ .err = err } },
-        },
-    };
-    defer client.deinit();
-
-    client.sendText(envelope_json) catch |err| switch (mode) {
+    active_client.sendText(envelope_json) catch |err| switch (mode) {
         .hard_fail => {
             const error_message = try std.fmt.allocPrint(
                 allocator,
@@ -963,8 +1604,30 @@ fn runCodexWebSocketAttempt(
         .auto => return WebSocketAttempt{ .fallback = .{ .err = err } },
     };
 
-    return try processCodexWebSocketStream(allocator, &client, stream_ptr, model, options, mode);
+    const ctx = CodexWebSocketContext{
+        .cached_entry = cached_entry,
+        .original_request_body = payload,
+        .want_cache = want_cache,
+    };
+    const outcome = try processCodexWebSocketStream(allocator, active_client, stream_ptr, model, options, mode, ctx);
+    // On a clean `.done` outcome, if we owned a cache entry, keep it
+    // alive. All other outcomes evict the entry so transient errors
+    // don't leak a half-broken socket.
+    switch (outcome) {
+        .done => keep_cached_on_release = (cached_entry != null),
+        else => keep_cached_on_release = false,
+    }
+    return outcome;
 }
+
+const CodexWebSocketContext = struct {
+    cached_entry: ?*WebSocketCacheEntry = null,
+    /// Original (un-rewritten) request body for this call. We record this
+    /// into the continuation snapshot so the next call's body equality
+    /// check compares against the user-visible body, not the delta one.
+    original_request_body: std.json.Value = .null,
+    want_cache: bool = false,
+};
 
 fn processCodexWebSocketStream(
     allocator: std.mem.Allocator,
@@ -973,6 +1636,7 @@ fn processCodexWebSocketStream(
     model: types.Model,
     options: ?types.StreamOptions,
     mode: WsAttemptMode,
+    ctx: CodexWebSocketContext,
 ) !WebSocketAttempt {
     var output = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
@@ -1114,6 +1778,14 @@ fn processCodexWebSocketStream(
     finalize.calculateCost(model, &output.usage);
     const effective_service_tier = resolveCodexServiceTier(response_service_tier, request_service_tier);
     applyServiceTierPricing(&output.usage, effective_service_tier, model);
+
+    // Snapshot the continuation state BEFORE handing `output` to the
+    // stream (stream takes ownership of the AssistantMessage on .end).
+    if (ctx.want_cache) {
+        if (ctx.cached_entry) |entry| {
+            try updateCacheContinuation(allocator, entry, ctx.original_request_body, output);
+        }
+    }
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -3617,4 +4289,432 @@ test "openai-codex-responses websocket transport sends response.create frame wit
     try std.testing.expect(parsed.value == .object);
     try std.testing.expectEqualStrings("response.create", parsed.value.object.get("type").?.string);
     try std.testing.expectEqualStrings("gpt-5.1-codex", parsed.value.object.get("model").?.string);
+}
+
+// ============================================================================
+// J.5 — WebSocket cached transport (port of TS `websocketSessionCache`).
+// ============================================================================
+
+const CODEX_RESP_COMPLETED_FRAME =
+    "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cached\",\"status\":\"completed\"," ++
+    "\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}";
+
+fn newCachedTestModel(base_url: []const u8) types.Model {
+    return .{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+}
+
+fn drainCodexStream(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream) void {
+    while (stream.next()) |event| {
+        if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+        freeEventOwned(allocator, event);
+        if (event.event_type == .done or event.event_type == .error_event) break;
+    }
+}
+
+test "buildCachedWebSocketRequestBody returns null when continuation is unset" {
+    const allocator = std.testing.allocator;
+    var entry = WebSocketCacheEntry{
+        .allocator = allocator,
+        .client = undefined,
+        .busy = true,
+        .last_used_ns = 0,
+        .continuation = null,
+    };
+
+    var body_object = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = body_object });
+    try body_object.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+
+    const result = try buildCachedWebSocketRequestBody(allocator, &entry, .{ .object = body_object });
+    try std.testing.expect(result == null);
+}
+
+test "buildCachedWebSocketRequestBody rewrites body when input is a prefix extension" {
+    const allocator = std.testing.allocator;
+
+    // Prior body: { model, input: [user_a] }
+    var prior_body_obj = try initObject(allocator);
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    var prior_input = std.json.Array.init(allocator);
+    try prior_input.append(.{ .string = try allocator.dupe(u8, "user_a") });
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = prior_input });
+
+    // Prior response items: [assistant_a]
+    var prior_response = std.json.Array.init(allocator);
+    try prior_response.append(.{ .string = try allocator.dupe(u8, "assistant_a") });
+
+    var entry = WebSocketCacheEntry{
+        .allocator = allocator,
+        .client = undefined,
+        .busy = true,
+        .last_used_ns = 0,
+        .continuation = .{
+            .last_request_body = .{ .object = prior_body_obj },
+            .last_response_id = try allocator.dupe(u8, "resp_prior"),
+            .last_response_items = prior_response,
+        },
+    };
+    defer if (entry.continuation) |*c| c.deinit(allocator);
+
+    // New body: { model, input: [user_a, assistant_a, user_b] }
+    var new_body_obj = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = new_body_obj });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    var new_input = std.json.Array.init(allocator);
+    try new_input.append(.{ .string = try allocator.dupe(u8, "user_a") });
+    try new_input.append(.{ .string = try allocator.dupe(u8, "assistant_a") });
+    try new_input.append(.{ .string = try allocator.dupe(u8, "user_b") });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = new_input });
+
+    const result_opt = try buildCachedWebSocketRequestBody(allocator, &entry, .{ .object = new_body_obj });
+    try std.testing.expect(result_opt != null);
+    const result = result_opt.?;
+    defer provider_json.freeValue(allocator, result);
+
+    try std.testing.expectEqualStrings("resp_prior", result.object.get("previous_response_id").?.string);
+    const delta = result.object.get("input").?.array;
+    try std.testing.expectEqual(@as(usize, 1), delta.items.len);
+    try std.testing.expectEqualStrings("user_b", delta.items[0].string);
+}
+
+test "buildCachedWebSocketRequestBody returns null when input is not a prefix extension" {
+    const allocator = std.testing.allocator;
+
+    var prior_body_obj = try initObject(allocator);
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    var prior_input = std.json.Array.init(allocator);
+    try prior_input.append(.{ .string = try allocator.dupe(u8, "user_a") });
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = prior_input });
+
+    var prior_response = std.json.Array.init(allocator);
+    try prior_response.append(.{ .string = try allocator.dupe(u8, "assistant_a") });
+
+    var entry = WebSocketCacheEntry{
+        .allocator = allocator,
+        .client = undefined,
+        .busy = true,
+        .last_used_ns = 0,
+        .continuation = .{
+            .last_request_body = .{ .object = prior_body_obj },
+            .last_response_id = try allocator.dupe(u8, "resp_prior"),
+            .last_response_items = prior_response,
+        },
+    };
+    defer if (entry.continuation) |*c| c.deinit(allocator);
+
+    // New input differs at index 0 — not a prefix extension.
+    var new_body_obj = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = new_body_obj });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    var new_input = std.json.Array.init(allocator);
+    try new_input.append(.{ .string = try allocator.dupe(u8, "user_DIFFERENT") });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = new_input });
+
+    const result = try buildCachedWebSocketRequestBody(allocator, &entry, .{ .object = new_body_obj });
+    try std.testing.expect(result == null);
+    try std.testing.expect(entry.continuation == null); // mismatch clears continuation
+}
+
+test "buildCachedWebSocketRequestBody returns null when non-input fields change" {
+    const allocator = std.testing.allocator;
+
+    var prior_body_obj = try initObject(allocator);
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = 0.5 });
+    const prior_input = std.json.Array.init(allocator);
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = prior_input });
+
+    var prior_response = std.json.Array.init(allocator);
+    try prior_response.append(.{ .string = try allocator.dupe(u8, "assistant_a") });
+
+    var entry = WebSocketCacheEntry{
+        .allocator = allocator,
+        .client = undefined,
+        .busy = true,
+        .last_used_ns = 0,
+        .continuation = .{
+            .last_request_body = .{ .object = prior_body_obj },
+            .last_response_id = try allocator.dupe(u8, "resp_prior"),
+            .last_response_items = prior_response,
+        },
+    };
+    defer if (entry.continuation) |*c| c.deinit(allocator);
+
+    // New body: temperature changed.
+    var new_body_obj = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = new_body_obj });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = 0.9 });
+    var new_input = std.json.Array.init(allocator);
+    try new_input.append(.{ .string = try allocator.dupe(u8, "assistant_a") });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = new_input });
+
+    const result = try buildCachedWebSocketRequestBody(allocator, &entry, .{ .object = new_body_obj });
+    try std.testing.expect(result == null);
+    try std.testing.expect(entry.continuation == null);
+}
+
+test "WebSocketConnectionCache peek returns .fresh for missing session" {
+    const io = std.testing.io;
+    closeOpenAICodexWebSocketSessions(null, io);
+    defer closeOpenAICodexWebSocketSessions(null, io);
+    try std.testing.expectEqual(CacheBusyState.fresh, peekCacheBusyState("no-such-session", io));
+}
+
+test "buildCachedWebSocketRequestBody returns null when prior input is not a strict prefix" {
+    const allocator = std.testing.allocator;
+
+    // Prior body: { model, input: [a, b] }
+    var prior_body_obj = try initObject(allocator);
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    const prior_input_local = std.json.Array.init(allocator);
+    var prior_input = prior_input_local;
+    try prior_input.append(.{ .string = try allocator.dupe(u8, "a") });
+    try prior_input.append(.{ .string = try allocator.dupe(u8, "b") });
+    try prior_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = prior_input });
+
+    var prior_response = std.json.Array.init(allocator);
+    try prior_response.append(.{ .string = try allocator.dupe(u8, "r1") });
+
+    var entry = WebSocketCacheEntry{
+        .allocator = allocator,
+        .client = undefined,
+        .busy = true,
+        .last_used_ns = 0,
+        .continuation = .{
+            .last_request_body = .{ .object = prior_body_obj },
+            .last_response_id = try allocator.dupe(u8, "rid"),
+            .last_response_items = prior_response,
+        },
+    };
+    defer if (entry.continuation) |*c| c.deinit(allocator);
+
+    // New input length (2) < baseline (prior_input(2) + prior_response(1) = 3).
+    var new_body_obj = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = new_body_obj });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, "gpt-5.1-codex") });
+    var new_input = std.json.Array.init(allocator);
+    try new_input.append(.{ .string = try allocator.dupe(u8, "a") });
+    try new_input.append(.{ .string = try allocator.dupe(u8, "b") });
+    try new_body_obj.put(allocator, try allocator.dupe(u8, "input"), .{ .array = new_input });
+
+    const result = try buildCachedWebSocketRequestBody(allocator, &entry, .{ .object = new_body_obj });
+    try std.testing.expect(result == null);
+}
+
+test "WebSocketConnectionCache integration: two .websocket_cached calls reuse one socket" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    // Script: handle exactly ONE TCP connection that carries two
+    // request/response cycles. The cache must reuse the same socket.
+    const response_frames_1 = [_]test_websocket_server.FrameDirective{
+        .{ .text = CODEX_RESP_COMPLETED_FRAME },
+    };
+    const response_frames_2 = [_]test_websocket_server.FrameDirective{
+        .{ .text = CODEX_RESP_COMPLETED_FRAME },
+    };
+    const script = [_]test_websocket_server.Step{
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &response_frames_1 },
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &response_frames_2 },
+        .{ .close = .{ .code = 1000, .reason = "done" } },
+    };
+
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .script = &script,
+        .max_connections = 1,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const session_id = "ws-cached-reuse-session";
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    defer closeOpenAICodexWebSocketSessions(session_id, io);
+
+    const model = newCachedTestModel(base_url);
+
+    // First call — opens and installs the cached connection.
+    {
+        var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+            .api_key = api_key,
+            .transport = .websocket_cached,
+            .session_id = session_id,
+        });
+        defer stream.deinit();
+        drainCodexStream(allocator, &stream);
+    }
+
+    try std.testing.expect(hasCachedWebSocketSessionForTesting(session_id, io));
+
+    // Second call — should reuse the same socket. If a new TCP connect
+    // were attempted, the server would reject it (max_connections=1) and
+    // the call would fail.
+    {
+        var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+            .api_key = api_key,
+            .transport = .websocket_cached,
+            .session_id = session_id,
+        });
+        defer stream.deinit();
+        drainCodexStream(allocator, &stream);
+    }
+
+    // closeOpenAICodexWebSocketSessions tears down the cached socket so
+    // the server thread can exit on the next wait_close/close step.
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    try std.testing.expect(!hasCachedWebSocketSessionForTesting(session_id, io));
+    server.awaitDone();
+
+    // Verify the server captured two response.create frames.
+    const captured = server.capturedFrames();
+    try std.testing.expectEqual(@as(usize, 2), captured.len);
+}
+
+test "closeOpenAICodexWebSocketSessions(session_id) removes the cached entry" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const response_frames = [_]test_websocket_server.FrameDirective{
+        .{ .text = CODEX_RESP_COMPLETED_FRAME },
+    };
+    const script = [_]test_websocket_server.Step{
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &response_frames },
+        .{ .wait_close = {} },
+    };
+
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .script = &script,
+        .max_connections = 1,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const session_id = "ws-cached-close-session";
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    defer closeOpenAICodexWebSocketSessions(session_id, io);
+
+    const model = newCachedTestModel(base_url);
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .websocket_cached,
+        .session_id = session_id,
+    });
+    defer stream.deinit();
+    drainCodexStream(allocator, &stream);
+
+    try std.testing.expect(hasCachedWebSocketSessionForTesting(session_id, io));
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    try std.testing.expect(!hasCachedWebSocketSessionForTesting(session_id, io));
+    server.awaitDone();
+}
+
+test "WebSocketConnectionCache TTL: expired entry forces fresh connection" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    // Two independent connection scripts — one per call. If TTL didn't
+    // expire, the second call would reuse and only 1 connection would
+    // be observed (which would deadlock the second script).
+    const response_frames_a = [_]test_websocket_server.FrameDirective{
+        .{ .text = CODEX_RESP_COMPLETED_FRAME },
+    };
+    const response_frames_b = [_]test_websocket_server.FrameDirective{
+        .{ .text = CODEX_RESP_COMPLETED_FRAME },
+    };
+    const script_a = [_]test_websocket_server.Step{
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &response_frames_a },
+        .{ .wait_close = {} },
+    };
+    const script_b = [_]test_websocket_server.Step{
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &response_frames_b },
+        .{ .close = .{ .code = 1000, .reason = "done" } },
+    };
+    const scripts = [_][]const test_websocket_server.Step{ &script_a, &script_b };
+
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .per_connection_scripts = &scripts,
+        .max_connections = 2,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const session_id = "ws-cached-ttl-session";
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    defer closeOpenAICodexWebSocketSessions(session_id, io);
+
+    setWebSocketCacheNowOverrideForTesting(0, io);
+    defer setWebSocketCacheNowOverrideForTesting(null, io);
+
+    const model = newCachedTestModel(base_url);
+    {
+        var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+            .api_key = api_key,
+            .transport = .websocket_cached,
+            .session_id = session_id,
+        });
+        defer stream.deinit();
+        drainCodexStream(allocator, &stream);
+    }
+
+    try std.testing.expect(hasCachedWebSocketSessionForTesting(session_id, io));
+
+    // Advance time past the TTL — the cached entry must be evicted on
+    // the next peek/acquire.
+    const ttl_plus_one = SESSION_WEBSOCKET_CACHE_TTL_NS + 1;
+    setWebSocketCacheNowOverrideForTesting(ttl_plus_one, io);
+
+    {
+        var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+            .api_key = api_key,
+            .transport = .websocket_cached,
+            .session_id = session_id,
+        });
+        defer stream.deinit();
+        drainCodexStream(allocator, &stream);
+    }
+
+    closeOpenAICodexWebSocketSessions(session_id, io);
+    server.awaitDone();
 }
