@@ -329,9 +329,7 @@ pub fn resolveProviderErrorMessage(err: anyerror, provider: []const u8) []const 
 }
 
 pub fn providerDisplayName(provider: []const u8) []const u8 {
-    if (auth.findSupportedProviderByAuthType(provider, .api_key)) |supported| return supported.name;
-    if (auth.findSupportedProvider(provider)) |supported| return supported.name;
-    return provider;
+    return provider_info.displayNameFor(provider) orelse provider;
 }
 
 pub fn providerAuthStatusLabel(status: ProviderAuthStatus) []const u8 {
