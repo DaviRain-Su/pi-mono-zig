@@ -524,6 +524,12 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
+    const request_service_tier: ?[]const u8 = if (options) |stream_options|
+        stream_options.providerOptions("responses").service_tier
+    else
+        null;
+    var response_service_tier: ?[]const u8 = null;
+
     var handler = CodexResponsesSseLoopHandler{
         .allocator = allocator,
         .stream_ptr = stream_ptr,
@@ -532,6 +538,8 @@ fn parseSseStreamLines(
         .content_blocks = &content_blocks,
         .tool_calls = &tool_calls,
         .model = model,
+        .request_service_tier = request_service_tier,
+        .response_service_tier = &response_service_tier,
     };
     const loop_result = try sse_loop.run(CodexResponsesSseLoopHandler, &handler, streaming, options);
     if (loop_result == .stopped and !handler.normal_completion) {
@@ -543,6 +551,8 @@ fn parseSseStreamLines(
     // Tool calls live inline in output.content; legacy field intentionally null.
 
     finalize.calculateCost(model, &output.usage);
+    const effective_service_tier = resolveCodexServiceTier(response_service_tier, request_service_tier);
+    applyServiceTierPricing(&output.usage, effective_service_tier, model);
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -565,6 +575,8 @@ const CodexResponsesSseLoopHandler = struct {
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     model: types.Model,
+    request_service_tier: ?[]const u8,
+    response_service_tier: *?[]const u8,
     normal_completion: bool = false,
 
     pub fn extractDataLine(_: *CodexResponsesSseLoopHandler, line: []const u8) ?[]const u8 {
@@ -584,6 +596,8 @@ const CodexResponsesSseLoopHandler = struct {
             .content_blocks = self.content_blocks,
             .tool_calls = self.tool_calls,
             .model = self.model,
+            .request_service_tier = self.request_service_tier,
+            .response_service_tier = self.response_service_tier,
         };
         const result = try processCodexResponsesSseData(&state, data);
         switch (result) {
@@ -617,6 +631,8 @@ const CodexResponsesSseState = struct {
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     model: types.Model,
+    request_service_tier: ?[]const u8,
+    response_service_tier: *?[]const u8,
 };
 
 fn processCodexResponsesSseData(state: *CodexResponsesSseState, data: []const u8) !CodexResponsesSseDataResult {
@@ -779,7 +795,7 @@ fn handleCodexTerminalEvent(
 ) !?CodexResponsesSseDataResult {
     if (std.mem.eql(u8, event_type, "response.done") or std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
         if (value.object.get("response")) |response_value| {
-            try updateCompletedResponse(state.allocator, state.output, response_value, state.model);
+            try updateCompletedResponse(state.allocator, state.output, response_value, state.model, state.response_service_tier);
         }
         return .complete_loop;
     }
@@ -1006,6 +1022,7 @@ fn updateCompletedResponse(
     output: *types.AssistantMessage,
     response_value: std.json.Value,
     model: types.Model,
+    response_service_tier_out: *?[]const u8,
 ) !void {
     if (response_value != .object) return;
     try updateResponseIdFromResponseObject(allocator, output, response_value);
@@ -1015,9 +1032,60 @@ fn updateCompletedResponse(
         finalize.calculateCost(model, &output.usage);
     }
 
+    if (extractStringField(response_value, "service_tier")) |tier| {
+        response_service_tier_out.* = tier;
+    }
+
     if (extractStringField(response_value, "status")) |status| {
         output.stop_reason = mapStopReason(status);
     }
+}
+
+/// Port of TS `resolveCodexServiceTier` in `packages/ai/src/providers/openai-codex-responses.ts`.
+/// If response echoes "default" but request asked for "flex"/"priority", use the request value.
+fn resolveCodexServiceTier(
+    response_service_tier: ?[]const u8,
+    request_service_tier: ?[]const u8,
+) ?[]const u8 {
+    if (response_service_tier) |response_tier| {
+        if (std.mem.eql(u8, response_tier, "default")) {
+            if (request_service_tier) |request_tier| {
+                if (std.mem.eql(u8, request_tier, "flex") or std.mem.eql(u8, request_tier, "priority")) {
+                    return request_tier;
+                }
+            }
+        }
+        return response_tier;
+    }
+    return request_service_tier;
+}
+
+/// Port of TS `applyServiceTierPricing` in `packages/ai/src/providers/openai-codex-responses.ts`.
+/// Multipliers: flex=0.5, priority=2 (or 2.5 for model id "gpt-5.5"). Applied after
+/// `finalize.calculateCost` on `response.completed`/`response.done`.
+fn applyServiceTierPricing(
+    usage: *types.Usage,
+    service_tier: ?[]const u8,
+    model: types.Model,
+) void {
+    const multiplier = getServiceTierCostMultiplier(model, service_tier);
+    if (multiplier == 1.0) return;
+
+    usage.cost.input *= multiplier;
+    usage.cost.output *= multiplier;
+    usage.cost.cache_read *= multiplier;
+    usage.cost.cache_write *= multiplier;
+    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+}
+
+fn getServiceTierCostMultiplier(model: types.Model, service_tier: ?[]const u8) f64 {
+    const tier = service_tier orelse return 1.0;
+    if (std.mem.eql(u8, tier, "flex")) return 0.5;
+    if (std.mem.eql(u8, tier, "priority")) {
+        if (std.mem.eql(u8, model.id, "gpt-5.5")) return 2.5;
+        return 2.0;
+    }
+    return 1.0;
 }
 
 fn parseUsage(value: std.json.Value) types.Usage {
@@ -2200,4 +2268,125 @@ test "buildRequestPayload omits empty tools array" {
     defer provider_json.freeValue(allocator, payload);
 
     try std.testing.expect(payload.object.get("tools") == null);
+}
+
+fn runCodexServiceTierPricingTest(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    service_tier: ?[]const u8,
+    response_service_tier_json: []const u8,
+    expected_input: f64,
+    expected_output: f64,
+    expected_cache_read: f64,
+    expected_total: f64,
+) !void {
+    const io = std.Io.failing;
+
+    const completed_event = try std.fmt.allocPrint(
+        allocator,
+        "data: {{\"type\":\"response.done\",\"response\":{{\"id\":\"resp_tier\",\"status\":\"completed\"{s},\"usage\":{{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12,\"input_tokens_details\":{{\"cached_tokens\":2}}}}}}}}\n",
+        .{response_service_tier_json},
+    );
+    defer allocator.free(completed_event);
+
+    const body_prefix =
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tier\"}}\n" ++
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n";
+
+    const body = try std.fmt.allocPrint(allocator, "{s}{s}", .{ body_prefix, completed_event });
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    const model = types.Model{
+        .id = model_id,
+        .name = "Codex Test Model",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .cost = .{ .input = 1.0, .output = 2.0, .cache_read = 0.5 },
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const options = types.StreamOptions{
+        .provider = .{ .responses = .{ .service_tier = service_tier } },
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, options);
+
+    while (stream_instance.next()) |event| {
+        if (event.event_type != .done) {
+            freeEventOwned(allocator, event);
+            continue;
+        }
+        try std.testing.expect(event.message != null);
+        try std.testing.expectApproxEqAbs(expected_input, event.message.?.usage.cost.input, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_output, event.message.?.usage.cost.output, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_cache_read, event.message.?.usage.cost.cache_read, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_total, event.message.?.usage.cost.total, 0.0000001);
+        freeAssistantMessageOwned(allocator, event.message.?);
+        return;
+    }
+    return error.ExpectedDoneEvent;
+}
+
+test "Codex parseSseStreamLines applies no service_tier multiplier when unset" {
+    try runCodexServiceTierPricingTest(std.testing.allocator, "gpt-5.1-codex", null, "", 0.000005, 0.000010, 0.000001, 0.000016);
+}
+
+test "Codex parseSseStreamLines halves cost for service_tier=flex" {
+    try runCodexServiceTierPricingTest(std.testing.allocator, "gpt-5.1-codex", "flex", "", 0.0000025, 0.0000050, 0.0000005, 0.0000080);
+}
+
+test "Codex parseSseStreamLines doubles cost for service_tier=priority on non-gpt-5.5 model" {
+    try runCodexServiceTierPricingTest(std.testing.allocator, "gpt-5.1-codex", "priority", "", 0.000010, 0.000020, 0.000002, 0.000032);
+}
+
+test "Codex parseSseStreamLines uses 2.5x multiplier for service_tier=priority on gpt-5.5" {
+    try runCodexServiceTierPricingTest(std.testing.allocator, "gpt-5.5", "priority", "", 0.0000125, 0.0000250, 0.0000025, 0.0000400);
+}
+
+test "Codex parseSseStreamLines treats auto service_tier as no multiplier" {
+    try runCodexServiceTierPricingTest(std.testing.allocator, "gpt-5.1-codex", "auto", "", 0.000005, 0.000010, 0.000001, 0.000016);
+}
+
+test "Codex parseSseStreamLines prefers request service_tier when response echoes default" {
+    // request says priority on gpt-5.5, response echoes default -> still 2.5x
+    try runCodexServiceTierPricingTest(
+        std.testing.allocator,
+        "gpt-5.5",
+        "priority",
+        ",\"service_tier\":\"default\"",
+        0.0000125,
+        0.0000250,
+        0.0000025,
+        0.0000400,
+    );
+}
+
+test "Codex parseSseStreamLines uses response service_tier when set explicitly" {
+    // request unset, response says flex -> 0.5x
+    try runCodexServiceTierPricingTest(
+        std.testing.allocator,
+        "gpt-5.1-codex",
+        null,
+        ",\"service_tier\":\"flex\"",
+        0.0000025,
+        0.0000050,
+        0.0000005,
+        0.0000080,
+    );
 }

@@ -363,6 +363,12 @@ fn parseSseStreamLines(
 
     stream_ptr.push(.{ .event_type = .start });
 
+    const request_service_tier: ?[]const u8 = if (options) |stream_options|
+        stream_options.providerOptions("responses").service_tier
+    else
+        null;
+    var response_service_tier: ?[]const u8 = null;
+
     var handler = OpenAIResponsesSseLoopHandler{
         .allocator = allocator,
         .stream_ptr = stream_ptr,
@@ -373,6 +379,8 @@ fn parseSseStreamLines(
         .content_blocks = &content_blocks,
         .tool_calls = &tool_calls,
         .model = model,
+        .request_service_tier = request_service_tier,
+        .response_service_tier = &response_service_tier,
     };
     const loop_result = try sse_loop.run(OpenAIResponsesSseLoopHandler, &handler, streaming, options);
     if (loop_result == .stopped and !handler.normal_completion) {
@@ -386,6 +394,8 @@ fn parseSseStreamLines(
     // Tool calls live inline in output.content; legacy field intentionally null.
 
     finalize.calculateCost(model, &output.usage);
+    const effective_service_tier = response_service_tier orelse request_service_tier;
+    applyServiceTierPricing(&output.usage, effective_service_tier, model);
 
     stream_ptr.push(.{
         .event_type = .done,
@@ -410,6 +420,8 @@ const OpenAIResponsesSseLoopHandler = struct {
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     model: types.Model,
+    request_service_tier: ?[]const u8,
+    response_service_tier: *?[]const u8,
     normal_completion: bool = false,
 
     pub fn extractDataLine(_: *OpenAIResponsesSseLoopHandler, line: []const u8) ?[]const u8 {
@@ -431,6 +443,8 @@ const OpenAIResponsesSseLoopHandler = struct {
             .content_blocks = self.content_blocks,
             .tool_calls = self.tool_calls,
             .model = self.model,
+            .request_service_tier = self.request_service_tier,
+            .response_service_tier = self.response_service_tier,
         };
         const result = try processOpenAIResponsesSseData(&state, data);
         switch (result) {
@@ -468,6 +482,8 @@ const OpenAIResponsesSseState = struct {
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     model: types.Model,
+    request_service_tier: ?[]const u8,
+    response_service_tier: *?[]const u8,
 };
 
 fn processOpenAIResponsesSseData(state: *OpenAIResponsesSseState, data: []const u8) !OpenAIResponsesSseDataResult {
@@ -506,7 +522,7 @@ fn processOpenAIResponsesSseData(state: *OpenAIResponsesSseState, data: []const 
 
     if (std.mem.eql(u8, event_type, "response.completed") or std.mem.eql(u8, event_type, "response.incomplete")) {
         if (value.object.get("response")) |response_value| {
-            try updateCompletedResponse(allocator, state.output, response_value, state.model);
+            try updateCompletedResponse(allocator, state.output, response_value, state.model, state.response_service_tier);
         }
         return .complete_loop;
     }
@@ -1750,6 +1766,7 @@ fn updateCompletedResponse(
     output: *types.AssistantMessage,
     response_value: std.json.Value,
     model: types.Model,
+    response_service_tier_out: *?[]const u8,
 ) !void {
     if (response_value != .object) return;
     try updateResponseIdFromResponseObject(allocator, output, response_value);
@@ -1759,9 +1776,41 @@ fn updateCompletedResponse(
         finalize.calculateCost(model, &output.usage);
     }
 
+    if (extractStringField(response_value, "service_tier")) |tier| {
+        response_service_tier_out.* = tier;
+    }
+
     if (extractStringField(response_value, "status")) |status| {
         output.stop_reason = mapStopReason(status);
     }
+}
+
+/// Port of TS `applyServiceTierPricing` in `packages/ai/src/providers/openai-responses.ts`.
+/// Multipliers: flex=0.5, priority=2 (or 2.5 for model id "gpt-5.5"). Applied after
+/// `finalize.calculateCost` on `response.completed`.
+fn applyServiceTierPricing(
+    usage: *types.Usage,
+    service_tier: ?[]const u8,
+    model: types.Model,
+) void {
+    const multiplier = getServiceTierCostMultiplier(model, service_tier);
+    if (multiplier == 1.0) return;
+
+    usage.cost.input *= multiplier;
+    usage.cost.output *= multiplier;
+    usage.cost.cache_read *= multiplier;
+    usage.cost.cache_write *= multiplier;
+    usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
+}
+
+fn getServiceTierCostMultiplier(model: types.Model, service_tier: ?[]const u8) f64 {
+    const tier = service_tier orelse return 1.0;
+    if (std.mem.eql(u8, tier, "flex")) return 0.5;
+    if (std.mem.eql(u8, tier, "priority")) {
+        if (std.mem.eql(u8, model.id, "gpt-5.5")) return 2.5;
+        return 2.0;
+    }
+    return 1.0;
 }
 
 fn parseUsage(value: std.json.Value) types.Usage {
@@ -3899,4 +3948,91 @@ test "parseSseStreamLines finalizes partial text before top-level error terminal
     try std.testing.expectEqualStrings("resp_top_error", terminal.message.?.response_id.?);
     try std.testing.expect(stream.next() == null);
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
+}
+
+fn runServiceTierPricingTest(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    service_tier: ?[]const u8,
+    expected_input: f64,
+    expected_output: f64,
+    expected_cache_read: f64,
+    expected_total: f64,
+) !void {
+    const io = std.Io.failing;
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tier\"}}\n" ++
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tier\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n" ++
+            "data: [DONE]\n",
+    );
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    const model = types.Model{
+        .id = model_id,
+        .name = "Test Model",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .cost = .{ .input = 1.0, .output = 2.0, .cache_read = 0.5 },
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    const options = types.StreamOptions{
+        .provider = .{ .responses = .{ .service_tier = service_tier } },
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, options);
+
+    while (stream.next()) |event| {
+        if (event.event_type != .done) {
+            freeEventOwned(allocator, event);
+            continue;
+        }
+        try std.testing.expect(event.message != null);
+        try std.testing.expectApproxEqAbs(expected_input, event.message.?.usage.cost.input, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_output, event.message.?.usage.cost.output, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_cache_read, event.message.?.usage.cost.cache_read, 0.0000001);
+        try std.testing.expectApproxEqAbs(expected_total, event.message.?.usage.cost.total, 0.0000001);
+        freeAssistantMessageOwned(allocator, event.message.?);
+        return;
+    }
+    return error.ExpectedDoneEvent;
+}
+
+test "parseSseStreamLines applies no service_tier multiplier when unset" {
+    // input=5 (after subtracting 2 cached), output=5, cache_read=2 ; cost.input=1.0, output=2.0, cache_read=0.5
+    // base costs: 5e-6, 10e-6, 1e-6 ; total = 16e-6
+    try runServiceTierPricingTest(std.testing.allocator, "gpt-5-mini", null, 0.000005, 0.000010, 0.000001, 0.000016);
+}
+
+test "parseSseStreamLines halves cost for service_tier=flex" {
+    try runServiceTierPricingTest(std.testing.allocator, "gpt-5-mini", "flex", 0.0000025, 0.0000050, 0.0000005, 0.0000080);
+}
+
+test "parseSseStreamLines doubles cost for service_tier=priority on non-gpt-5.5 model" {
+    try runServiceTierPricingTest(std.testing.allocator, "gpt-5-mini", "priority", 0.000010, 0.000020, 0.000002, 0.000032);
+}
+
+test "parseSseStreamLines uses 2.5x multiplier for service_tier=priority on gpt-5.5" {
+    try runServiceTierPricingTest(std.testing.allocator, "gpt-5.5", "priority", 0.0000125, 0.0000250, 0.0000025, 0.0000400);
+}
+
+test "parseSseStreamLines treats auto service_tier as no multiplier" {
+    try runServiceTierPricingTest(std.testing.allocator, "gpt-5-mini", "auto", 0.000005, 0.000010, 0.000001, 0.000016);
 }
