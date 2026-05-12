@@ -3816,3 +3816,47 @@ test "Bedrock abort terminal finalizes active binary partial blocks" {
     try std.testing.expectEqualStrings(terminal.message.?.error_message.?, stream.result().?.error_message.?);
     try std.testing.expect(stream.next() == null);
 }
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const model = types.Model{
+        .id = "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        .name = "Claude Bedrock",
+        .api = "bedrock-converse-stream",
+        .provider = "amazon-bedrock",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 4096,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    var stream = try BedrockProvider.stream(
+        allocator,
+        io,
+        model,
+        context,
+        .{ .provider = .{ .bedrock = .{ .bearer_token = "placeholder" } } },
+    );
+    defer stream.deinit();
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("bedrock-converse-stream", error_event.message.?.api);
+    try std.testing.expectEqualStrings("amazon-bedrock", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("anthropic.claude-3-7-sonnet-20250219-v1:0", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
