@@ -1,10 +1,14 @@
 //! Test-only WebSocket server harness, parallel to `TestStatusServer`.
 //!
-//! Listens on a loopback TCP port (random, OS-chosen), accepts ONE client
-//! connection, performs the RFC 6455 upgrade handshake (or rejects it with a
-//! caller-specified HTTP status), then writes a caller-provided sequence of
-//! pre-encoded WebSocket frames (text/binary/ping/close/raw bytes). Lets
-//! tests optionally capture the first client text frame for assertion.
+//! Listens on a loopback TCP port (random, OS-chosen) and accepts up to
+//! `Config.max_connections` sequential client connections. For each
+//! connection it performs the RFC 6455 upgrade handshake (or rejects it
+//! with a caller-specified HTTP status), then executes a scripted sequence
+//! of expect/send/close steps. The script can be supplied directly via
+//! `Config.script` / `Config.per_connection_scripts`, or implicitly via the
+//! legacy `frames_to_send` + `capture_first_client_frame` +
+//! `close_after_frames` fields (which are converted to a script at start
+//! time).
 //!
 //! Used by the Mission J integration tests for `websocket_client.zig`.
 
@@ -33,6 +37,25 @@ pub const FrameDirective = union(enum) {
     raw_bytes: []const u8,
 };
 
+/// A single scripted step on the server side of a connection. Steps are
+/// executed in order; if any step fails (I/O, validator, etc.) the
+/// connection is torn down silently — tests assert on the client side.
+pub const Step = union(enum) {
+    /// Read one text/binary frame from the client, capture its payload,
+    /// and optionally validate the payload. If the validator returns
+    /// false, the step fails.
+    expect_client_frame: struct {
+        payload_validator: ?*const fn ([]const u8) bool = null,
+    },
+    /// Write the listed frames to the client in order.
+    send_frames: []const FrameDirective,
+    /// Read frames from the client until a close frame arrives. Captured
+    /// data frames are appended to `captured_frames`.
+    wait_close,
+    /// Send a server-initiated close frame.
+    close: CloseInfo,
+};
+
 pub const Config = struct {
     /// If set, the server validates the request-line path and returns 404 if
     /// it doesn't match.
@@ -41,20 +64,33 @@ pub const Config = struct {
     /// value match). If any check fails, the server responds with 400 and
     /// closes.
     expected_headers: []const ExpectedHeader = &.{},
-    /// If true, the server reads exactly one text/binary frame from the
-    /// client after the handshake and stores its payload (text or binary
-    /// bytes) for `capturedFrame()`.
+    /// Legacy: if true, the server reads exactly one text/binary frame from
+    /// the client after the handshake and stores its payload for
+    /// `capturedFrame()`. Ignored if `script` or `per_connection_scripts` is
+    /// set.
     capture_first_client_frame: bool = false,
-    /// Pre-encoded frames the server sends after the handshake, in order.
+    /// Legacy: pre-encoded frames the server sends after the handshake, in
+    /// order. Ignored if `script` or `per_connection_scripts` is set.
     frames_to_send: []const FrameDirective = &.{},
-    /// If non-null, the server sends a final close frame with this info
-    /// after `frames_to_send`. If null, the server just closes the TCP
-    /// connection.
+    /// Legacy: if non-null, the server sends a final close frame with this
+    /// info after `frames_to_send`. Ignored if `script` or
+    /// `per_connection_scripts` is set.
     close_after_frames: ?CloseInfo = null,
     /// If set, the server skips the 101 upgrade entirely and instead sends
     /// a minimal HTTP error response with this status code. Useful for
     /// testing the client's HandshakeFailed error path.
     reject_with_status: ?u16 = null,
+    /// Optional script run once per connection. Overrides the legacy
+    /// frames_to_send / capture_first_client_frame / close_after_frames
+    /// fields. If null, falls back to a synthesized script from those
+    /// legacy fields.
+    script: ?[]const Step = null,
+    /// Optional per-connection scripts. The Nth connection runs the script
+    /// at index `N % per_connection_scripts.len`. Overrides `script`.
+    per_connection_scripts: ?[]const []const Step = null,
+    /// Maximum number of sequential connections the server will accept
+    /// before exiting. Default 1 preserves single-connection semantics.
+    max_connections: usize = 1,
 };
 
 pub const TestWebSocketServer = struct {
@@ -63,7 +99,7 @@ pub const TestWebSocketServer = struct {
     server: std.Io.net.Server,
     config: Config,
     thread: ?std.Thread = null,
-    captured: ?[]u8 = null,
+    captured_frames: std.ArrayList([]u8) = .empty,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -89,10 +125,8 @@ pub const TestWebSocketServer = struct {
     pub fn deinit(self: *TestWebSocketServer) void {
         self.server.deinit(self.io);
         if (self.thread) |thread| thread.join();
-        if (self.captured) |bytes| {
-            self.allocator.free(bytes);
-            self.captured = null;
-        }
+        for (self.captured_frames.items) |bytes| self.allocator.free(bytes);
+        self.captured_frames.deinit(self.allocator);
     }
 
     pub fn url(self: *const TestWebSocketServer, allocator: std.mem.Allocator) ![]u8 {
@@ -106,13 +140,23 @@ pub const TestWebSocketServer = struct {
         );
     }
 
-    /// Returns the payload of the first text/binary frame received from the
-    /// client, if `Config.capture_first_client_frame` was set. The returned
-    /// slice is owned by the server and freed in `deinit`. Callers must
-    /// ensure the server thread has completed (via `awaitDone` or by
-    /// draining the WS conversation to close) before calling this.
+    /// Returns the payload of the first text/binary frame captured by any
+    /// `expect_client_frame` / `wait_close` step (or by the legacy
+    /// `capture_first_client_frame` flag), or null if none were captured.
+    /// Callers must drain the WS conversation (or call `awaitDone`) before
+    /// reading this — captured state is only stable once the server
+    /// thread has joined.
     pub fn capturedFrame(self: *const TestWebSocketServer) ?[]const u8 {
-        return self.captured;
+        if (self.captured_frames.items.len == 0) return null;
+        return self.captured_frames.items[0];
+    }
+
+    /// Returns all captured client frames in arrival order, across all
+    /// connections. The returned slice and its elements are owned by the
+    /// server and freed in `deinit`. Same caller contract as
+    /// `capturedFrame`.
+    pub fn capturedFrames(self: *const TestWebSocketServer) []const []u8 {
+        return self.captured_frames.items;
     }
 
     /// Joins the server thread so all writes/reads on the server side have
@@ -130,21 +174,29 @@ pub const TestWebSocketServer = struct {
     // ---------------------------------------------------------------------
 
     fn run(self: *TestWebSocketServer) void {
-        const stream = self.server.accept(self.io) catch |err| switch (err) {
-            error.SocketNotListening, error.Canceled => return,
-            else => std.debug.panic("test websocket server accept failed: {}", .{err}),
-        };
-        defer stream.close(self.io);
+        var conn_index: usize = 0;
+        while (conn_index < self.config.max_connections) : (conn_index += 1) {
+            const stream = self.server.accept(self.io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => return,
+                else => std.debug.panic("test websocket server accept failed: {}", .{err}),
+            };
+            defer stream.close(self.io);
 
-        self.handleConnection(stream) catch |err| switch (err) {
-            // Treat any I/O / protocol failure during the conversation as
-            // benign — tests assert on the client side, and the server side
-            // just needs to clean up. We deliberately don't panic on these.
-            else => {},
-        };
+            self.handleConnection(stream, conn_index) catch |err| switch (err) {
+                // Treat any I/O / protocol failure during the conversation
+                // as benign — tests assert on the client side, and the
+                // server side just needs to clean up. We deliberately
+                // don't panic on these.
+                else => {},
+            };
+        }
     }
 
-    fn handleConnection(self: *TestWebSocketServer, stream: std.Io.net.Stream) !void {
+    fn handleConnection(
+        self: *TestWebSocketServer,
+        stream: std.Io.net.Stream,
+        conn_index: usize,
+    ) !void {
         var read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(std.testing.io, &read_buffer);
         var write_buffer: [4096]u8 = undefined;
@@ -193,19 +245,82 @@ pub const TestWebSocketServer = struct {
         );
         try writer.interface.flush();
 
-        if (self.config.capture_first_client_frame) {
-            const payload = readClientDataFrame(self.allocator, &reader.interface) catch null;
-            if (payload) |bytes| {
-                self.captured = bytes;
+        try self.runScript(&reader.interface, &writer.interface, conn_index);
+    }
+
+    fn runScript(
+        self: *TestWebSocketServer,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        conn_index: usize,
+    ) !void {
+        if (self.config.per_connection_scripts) |scripts| {
+            if (scripts.len == 0) return;
+            const script = scripts[conn_index % scripts.len];
+            try self.executeSteps(reader, writer, script);
+            return;
+        }
+        if (self.config.script) |script| {
+            try self.executeSteps(reader, writer, script);
+            return;
+        }
+        try self.executeLegacy(reader, writer);
+    }
+
+    fn executeSteps(
+        self: *TestWebSocketServer,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        steps: []const Step,
+    ) !void {
+        for (steps) |step| {
+            switch (step) {
+                .expect_client_frame => |spec| {
+                    const payload = try readClientDataFrame(self.allocator, reader);
+                    errdefer self.allocator.free(payload);
+                    if (spec.payload_validator) |validate| {
+                        if (!validate(payload)) return error.ClientFrameRejected;
+                    }
+                    try self.captured_frames.append(self.allocator, payload);
+                },
+                .send_frames => |frames| {
+                    for (frames) |directive| try writeDirective(writer, directive);
+                },
+                .wait_close => {
+                    while (true) {
+                        const result = readClientFrameAny(self.allocator, reader);
+                        if (result) |outcome| {
+                            switch (outcome) {
+                                .data => |bytes| try self.captured_frames.append(self.allocator, bytes),
+                                .close => return,
+                            }
+                        } else |err| {
+                            return err;
+                        }
+                    }
+                },
+                .close => |info| try writeServerCloseFrame(writer, info.code, info.reason),
             }
+        }
+    }
+
+    fn executeLegacy(
+        self: *TestWebSocketServer,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+    ) !void {
+        if (self.config.capture_first_client_frame) {
+            if (readClientDataFrame(self.allocator, reader)) |bytes| {
+                try self.captured_frames.append(self.allocator, bytes);
+            } else |_| {}
         }
 
         for (self.config.frames_to_send) |directive| {
-            try writeDirective(&writer.interface, directive);
+            try writeDirective(writer, directive);
         }
 
         if (self.config.close_after_frames) |info| {
-            try writeServerCloseFrame(&writer.interface, info.code, info.reason);
+            try writeServerCloseFrame(writer, info.code, info.reason);
         }
     }
 
@@ -289,11 +404,34 @@ pub const TestWebSocketServer = struct {
     /// Reads one masked client data frame (text or binary) and returns its
     /// unmasked payload, allocated out of `allocator`. Control frames are
     /// skipped; fragmentation is NOT supported here (tests send single
-    /// unfragmented frames).
+    /// unfragmented frames). Returns `error.UnexpectedClose` if the client
+    /// sends a close frame instead.
     fn readClientDataFrame(
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
     ) ![]u8 {
+        while (true) {
+            const outcome = try readClientFrameAny(allocator, reader);
+            switch (outcome) {
+                .data => |bytes| return bytes,
+                .close => return error.UnexpectedClose,
+            }
+        }
+    }
+
+    const ClientFrameOutcome = union(enum) {
+        data: []u8,
+        close,
+    };
+
+    /// Like `readClientDataFrame`, but instead of returning
+    /// `error.UnexpectedClose` when a close frame is observed, yields a
+    /// `.close` outcome so callers (e.g. `wait_close`) can terminate
+    /// gracefully.
+    fn readClientFrameAny(
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+    ) !ClientFrameOutcome {
         while (true) {
             const header0 = try reader.takeByte();
             const header1 = try reader.takeByte();
@@ -317,10 +455,12 @@ pub const TestWebSocketServer = struct {
                 for (payload, 0..) |*b, i| b.* ^= mask[i & 3];
             }
 
-            // text=0x1, binary=0x2: yield. Anything else: free and continue.
-            if (fin and (opcode == 0x1 or opcode == 0x2)) return payload;
+            if (fin and (opcode == 0x1 or opcode == 0x2)) return .{ .data = payload };
+            if (opcode == 0x8) {
+                allocator.free(payload);
+                return .close;
+            }
             allocator.free(payload);
-            if (opcode == 0x8) return error.UnexpectedClose;
         }
     }
 
@@ -487,4 +627,151 @@ test "TestWebSocketServer rejects upgrade with custom status" {
         .url = ws_url,
     });
     try std.testing.expectError(websocket_client.Error.HandshakeFailed, result);
+}
+
+test "TestWebSocketServer handles multiple sequential connections" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const conn_a_frames = [_]FrameDirective{.{ .text = "conn-a" }};
+    const conn_b_frames = [_]FrameDirective{.{ .text = "conn-b" }};
+    const script_a = [_]Step{
+        .{ .send_frames = &conn_a_frames },
+        .{ .close = .{ .code = 1000, .reason = "a" } },
+    };
+    const script_b = [_]Step{
+        .{ .send_frames = &conn_b_frames },
+        .{ .close = .{ .code = 1000, .reason = "b" } },
+    };
+    const scripts = [_][]const Step{ &script_a, &script_b };
+
+    var server = try TestWebSocketServer.init(allocator, io, .{
+        .per_connection_scripts = &scripts,
+        .max_connections = 2,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+
+    const expected = [_][]const u8{ "conn-a", "conn-b" };
+    for (expected) |expected_text| {
+        var client = try websocket_client.Client.connect(.{
+            .allocator = allocator,
+            .io = io,
+            .url = ws_url,
+        });
+        defer client.deinit();
+
+        const text_frame = (try client.next()).?;
+        defer text_frame.deinit(allocator);
+        try std.testing.expectEqualStrings(expected_text, text_frame.text);
+
+        const close_frame = (try client.next()).?;
+        defer close_frame.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 1000), close_frame.close.code);
+    }
+
+    server.awaitDone();
+}
+
+test "TestWebSocketServer executes script with interleaved client/server frames" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const greeting = [_]FrameDirective{.{ .text = "hello" }};
+    const ack = [_]FrameDirective{.{ .text = "ack" }};
+    const script = [_]Step{
+        .{ .send_frames = &greeting },
+        .{ .expect_client_frame = .{} },
+        .{ .send_frames = &ack },
+        .{ .close = .{ .code = 1000, .reason = "done" } },
+    };
+
+    var server = try TestWebSocketServer.init(allocator, io, .{
+        .script = &script,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+
+    var client = try websocket_client.Client.connect(.{
+        .allocator = allocator,
+        .io = io,
+        .url = ws_url,
+    });
+    defer client.deinit();
+
+    {
+        const frame = (try client.next()).?;
+        defer frame.deinit(allocator);
+        try std.testing.expectEqualStrings("hello", frame.text);
+    }
+
+    try client.sendText("client-says-hi");
+
+    {
+        const frame = (try client.next()).?;
+        defer frame.deinit(allocator);
+        try std.testing.expectEqualStrings("ack", frame.text);
+    }
+
+    {
+        const frame = (try client.next()).?;
+        defer frame.deinit(allocator);
+        try std.testing.expectEqual(@as(u16, 1000), frame.close.code);
+        try std.testing.expectEqualStrings("done", frame.close.reason);
+    }
+
+    server.awaitDone();
+    const captured = server.capturedFrames();
+    try std.testing.expectEqual(@as(usize, 1), captured.len);
+    try std.testing.expectEqualStrings("client-says-hi", captured[0]);
+}
+
+test "TestWebSocketServer captures multiple client frames in order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const script = [_]Step{
+        .{ .expect_client_frame = .{} },
+        .{ .expect_client_frame = .{} },
+        .{ .expect_client_frame = .{} },
+        .{ .close = .{ .code = 1000, .reason = "" } },
+    };
+
+    var server = try TestWebSocketServer.init(allocator, io, .{
+        .script = &script,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+
+    var client = try websocket_client.Client.connect(.{
+        .allocator = allocator,
+        .io = io,
+        .url = ws_url,
+    });
+    defer client.deinit();
+
+    try client.sendText("first");
+    try client.sendText("second");
+    try client.sendText("third");
+
+    while (try client.next()) |frame| {
+        defer frame.deinit(allocator);
+        if (frame == .close) break;
+    }
+    server.awaitDone();
+
+    const captured = server.capturedFrames();
+    try std.testing.expectEqual(@as(usize, 3), captured.len);
+    try std.testing.expectEqualStrings("first", captured[0]);
+    try std.testing.expectEqualStrings("second", captured[1]);
+    try std.testing.expectEqualStrings("third", captured[2]);
 }
