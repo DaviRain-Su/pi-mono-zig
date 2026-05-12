@@ -4,6 +4,7 @@ const http_client = @import("../http_client.zig");
 const event_stream = @import("../event_stream.zig");
 const websocket_client = @import("../websocket_client.zig");
 const abort_helper = @import("../shared/abort_signal.zig");
+const diagnostics_helper = @import("../shared/diagnostics.zig");
 const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
@@ -26,6 +27,129 @@ const deinitCurrentBlock = responses_api.deinitCurrentBlock;
 const extractReasoningSummary = responses_api.extractReasoningSummary;
 const finalizeCurrentBlock = responses_api.finalizeCurrentBlock;
 const updateCurrentMessagePart = responses_api.updateCurrentMessagePart;
+
+// ============================================================================
+// WebSocket -> SSE Fallback Registry (port of TS PR #4133)
+// ============================================================================
+//
+// Per-process registry of session_ids whose WebSocket connection failed with a
+// transport-class error. Subsequent `transport: .auto` calls with the same
+// session_id skip the WebSocket attempt and go straight to SSE. This mirrors
+// `websocketSseFallbackSessions` in `packages/ai/src/providers/openai-codex-responses.ts`.
+//
+// Application/protocol errors from the Codex server (`response.failed`, top
+// level `error` JSON events) are classified as non-transport errors and do
+// NOT populate the registry — they propagate as terminal error_events on the
+// stream so callers can retry the same transport.
+
+const WebSocketFallbackRegistry = struct {
+    var mutex: std.Io.Mutex = .init;
+    var initialized: bool = false;
+    var sessions: std.StringHashMap(void) = undefined;
+
+    fn ensureInitialized() void {
+        if (!initialized) {
+            sessions = std.StringHashMap(void).init(std.heap.page_allocator);
+            initialized = true;
+        }
+    }
+
+    fn isActiveLocked(session_id: []const u8) bool {
+        ensureInitialized();
+        return sessions.contains(session_id);
+    }
+
+    fn recordLocked(session_id: []const u8) !void {
+        ensureInitialized();
+        if (sessions.contains(session_id)) return;
+        const owned = try std.heap.page_allocator.dupe(u8, session_id);
+        errdefer std.heap.page_allocator.free(owned);
+        try sessions.put(owned, {});
+    }
+
+    fn clearLocked(session_id: ?[]const u8) void {
+        ensureInitialized();
+        if (session_id) |id| {
+            if (sessions.fetchRemove(id)) |removed| {
+                std.heap.page_allocator.free(removed.key);
+            }
+        } else {
+            var iterator = sessions.iterator();
+            while (iterator.next()) |entry| {
+                std.heap.page_allocator.free(entry.key_ptr.*);
+            }
+            sessions.clearRetainingCapacity();
+        }
+    }
+};
+
+/// Returns true when a previous WebSocket attempt for this `session_id`
+/// failed with a transport-class error and `transport: .auto` callers should
+/// skip the WebSocket attempt.
+pub fn isWebSocketSseFallbackActive(session_id: ?[]const u8, io: std.Io) bool {
+    const id = session_id orelse return false;
+    if (id.len == 0) return false;
+    WebSocketFallbackRegistry.mutex.lockUncancelable(io);
+    defer WebSocketFallbackRegistry.mutex.unlock(io);
+    return WebSocketFallbackRegistry.isActiveLocked(id);
+}
+
+/// Marks `session_id` as having experienced a WebSocket transport failure.
+/// Subsequent `transport: .auto` calls for the same session will skip the
+/// WebSocket attempt and use SSE directly. Best-effort: OOM is swallowed
+/// because the SSE fallback can still proceed without the registry entry.
+pub fn recordWebSocketFailure(session_id: ?[]const u8, io: std.Io) void {
+    const id = session_id orelse return;
+    if (id.len == 0) return;
+    WebSocketFallbackRegistry.mutex.lockUncancelable(io);
+    defer WebSocketFallbackRegistry.mutex.unlock(io);
+    WebSocketFallbackRegistry.recordLocked(id) catch {};
+}
+
+/// Removes `session_id` from the registry. Pass null to clear all entries.
+/// Used by tests; mirrors `resetOpenAICodexWebSocketDebugStats`.
+pub fn resetWebSocketFallbackRegistry(session_id: ?[]const u8, io: std.Io) void {
+    WebSocketFallbackRegistry.mutex.lockUncancelable(io);
+    defer WebSocketFallbackRegistry.mutex.unlock(io);
+    WebSocketFallbackRegistry.clearLocked(session_id);
+}
+
+/// Classify a setup/transport error as a Codex non-transport error.
+/// Mirrors TS `isCodexNonTransportError`: returns true for protocol/API
+/// errors that should NOT trigger SSE fallback (`response.failed`,
+/// top-level `error` JSON events arrive via `error.CodexApiError` /
+/// `error.CodexProtocolError`). Returns false for WebSocket transport
+/// errors (handshake, frame, TLS, connection close, etc.).
+fn isCodexNonTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.CodexApiError, error.CodexProtocolError => true,
+        else => false,
+    };
+}
+
+/// Outcome of a single WebSocket attempt by `streamProductionAutoWebSocket`.
+const WebSocketAttempt = union(enum) {
+    /// The WebSocket completed normally and pushed a terminal `done` event.
+    /// The caller must not attempt SSE fallback.
+    done,
+    /// The WebSocket attempt failed before any event reached the consumer.
+    /// The caller may fall back to SSE.
+    fallback: FallbackInfo,
+    /// The WebSocket attempt failed after events were already pushed to the
+    /// consumer. The caller must NOT fall back (would duplicate events) and
+    /// must instead emit a terminal `error_event`.
+    started_then_failed: FallbackInfo,
+    /// The Codex server reported an application/protocol-level failure
+    /// (`response.failed` / `error` event). The terminal error event was
+    /// already pushed; the caller must NOT fall back.
+    api_error,
+    /// The caller's abort signal was set; the stream has been terminated.
+    aborted,
+
+    const FallbackInfo = struct {
+        err: anyerror,
+    };
+};
 
 pub const OpenAICodexResponsesProvider = struct {
     const BaseProvider = provider_stream.DefineProvider("openai-codex-responses", streamProduction);
@@ -95,8 +219,42 @@ pub const OpenAICodexResponsesProvider = struct {
             return;
         }
 
+        const session_id_for_registry: ?[]const u8 = if (options) |opts| opts.session_id else null;
+        const ws_disabled_for_session = transport == .auto and
+            isWebSocketSseFallbackActive(session_id_for_registry, io);
+
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
+
+        var fallback_diagnostic: ?types.AssistantMessageDiagnostic = null;
+        defer if (fallback_diagnostic) |d| freeOwnedDiagnostic(allocator, d);
+
+        if (transport == .auto and !ws_disabled_for_session) {
+            const attempt = try runCodexWebSocketAttempt(
+                allocator,
+                io,
+                model,
+                options,
+                normalized_token,
+                account_id,
+                payload,
+                stream_instance,
+                .auto,
+            );
+            switch (attempt) {
+                .done, .aborted, .api_error, .started_then_failed => return,
+                .fallback => |info| {
+                    recordWebSocketFailure(session_id_for_registry, io);
+                    fallback_diagnostic = buildTransportFailureDiagnostic(
+                        allocator,
+                        info.err,
+                        false,
+                        json_body.len,
+                    ) catch null;
+                    // Fall through to SSE attempt below.
+                },
+            }
+        }
 
         const url = try resolveCodexUrl(allocator, model.base_url);
         defer allocator.free(url);
@@ -146,7 +304,16 @@ pub const OpenAICodexResponsesProvider = struct {
             return;
         }
 
-        try parseSseStreamLines(allocator, stream_instance, &response, model, options);
+        const consumed_diagnostic = fallback_diagnostic;
+        fallback_diagnostic = null;
+        try parseSseStreamLinesWithDiagnostic(
+            allocator,
+            stream_instance,
+            &response,
+            model,
+            options,
+            consumed_diagnostic,
+        );
     }
 };
 
@@ -521,6 +688,27 @@ fn parseSseStreamLines(
     model: types.Model,
     options: ?types.StreamOptions,
 ) !void {
+    return parseSseStreamLinesWithDiagnostic(
+        allocator,
+        stream_ptr,
+        streaming,
+        model,
+        options,
+        null,
+    );
+}
+
+fn parseSseStreamLinesWithDiagnostic(
+    allocator: std.mem.Allocator,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    streaming: *http_client.StreamingResponse,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    prefilled_diagnostic: ?types.AssistantMessageDiagnostic,
+) !void {
+    var diagnostic_owner = prefilled_diagnostic;
+    errdefer if (diagnostic_owner) |d| freeOwnedDiagnostic(allocator, d);
+
     var output = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
         .api = model.api,
@@ -530,6 +718,11 @@ fn parseSseStreamLines(
         .stop_reason = .stop,
         .timestamp = 0,
     };
+
+    if (diagnostic_owner) |d| {
+        try diagnostics_helper.appendAssistantMessageDiagnostic(allocator, &output, d);
+        diagnostic_owner = null;
+    }
 
     var content_blocks = std.ArrayList(types.ContentBlock).empty;
     defer content_blocks.deinit(allocator);
@@ -579,6 +772,90 @@ fn parseSseStreamLines(
     stream_ptr.end(output);
 }
 
+/// Build a `provider_transport_failure` diagnostic mirroring TS:
+/// `{ configuredTransport, fallbackTransport, eventsEmitted, phase, requestBytes }`.
+fn buildTransportFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    events_emitted: bool,
+    request_bytes: usize,
+) !types.AssistantMessageDiagnostic {
+    var details = try provider_json.initObject(allocator);
+    var details_owned = true;
+    errdefer if (details_owned) provider_json.freeValue(allocator, .{ .object = details });
+
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "configuredTransport"),
+        .{ .string = try allocator.dupe(u8, "auto") },
+    );
+    if (!events_emitted) {
+        try details.put(
+            allocator,
+            try allocator.dupe(u8, "fallbackTransport"),
+            .{ .string = try allocator.dupe(u8, "sse") },
+        );
+    }
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "eventsEmitted"),
+        .{ .bool = events_emitted },
+    );
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "phase"),
+        .{ .string = try allocator.dupe(u8, if (events_emitted)
+            "after_message_stream_start"
+        else
+            "before_message_stream_start") },
+    );
+    try details.put(
+        allocator,
+        try allocator.dupe(u8, "requestBytes"),
+        .{ .integer = @intCast(request_bytes) },
+    );
+
+    // Avoid copying `details` through `cloneValue`: build the diagnostic
+    // directly and hand the object map's ownership to the diagnostic.
+    const type_owned = try allocator.dupe(u8, "provider_transport_failure");
+    errdefer allocator.free(type_owned);
+    const error_info = try diagnostics_helper.extractDiagnosticError(allocator, err);
+    errdefer {
+        if (error_info.name) |name| allocator.free(name);
+        allocator.free(error_info.message);
+        if (error_info.stack) |stack| allocator.free(stack);
+        if (error_info.code) |code| provider_json.freeValue(allocator, code);
+    }
+
+    const diagnostic: types.AssistantMessageDiagnostic = .{
+        .type = type_owned,
+        .timestamp = 0,
+        .error_info = error_info,
+        .details = .{ .object = details },
+    };
+    details_owned = false;
+    return diagnostic;
+}
+
+fn freeOwnedDiagnostic(allocator: std.mem.Allocator, diagnostic: types.AssistantMessageDiagnostic) void {
+    allocator.free(diagnostic.type);
+    if (diagnostic.error_info) |info| {
+        if (info.name) |name| allocator.free(name);
+        allocator.free(info.message);
+        if (info.stack) |stack| allocator.free(stack);
+        if (info.code) |code| provider_json.freeValue(allocator, code);
+    }
+    if (diagnostic.details) |details| provider_json.freeValue(allocator, details);
+}
+
+const WsAttemptMode = enum {
+    /// `.websocket` / `.websocket_cached` transports — failures are terminal.
+    hard_fail,
+    /// `.auto` transport — transport-class failures return a fallback signal
+    /// (no terminal event) so the caller can retry over SSE.
+    auto,
+};
+
 fn streamProductionWebSocket(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -589,6 +866,30 @@ fn streamProductionWebSocket(
     payload: std.json.Value,
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
+    _ = try runCodexWebSocketAttempt(
+        allocator,
+        io,
+        model,
+        options,
+        normalized_token,
+        account_id,
+        payload,
+        stream_ptr,
+        .hard_fail,
+    );
+}
+
+fn runCodexWebSocketAttempt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    normalized_token: []const u8,
+    account_id: []const u8,
+    payload: std.json.Value,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    mode: WsAttemptMode,
+) !WebSocketAttempt {
     const http_url = try resolveCodexUrl(allocator, model.base_url);
     defer allocator.free(http_url);
     const ws_url = try buildWebSocketUrl(allocator, http_url);
@@ -632,31 +933,37 @@ fn streamProductionWebSocket(
         .headers = header_list.items,
     }) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => {
-            const error_message = try std.fmt.allocPrint(
-                allocator,
-                "WebSocket connect failed: {s}",
-                .{@errorName(err)},
-            );
-            defer allocator.free(error_message);
-            try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
-            return;
+        else => switch (mode) {
+            .hard_fail => {
+                const error_message = try std.fmt.allocPrint(
+                    allocator,
+                    "WebSocket connect failed: {s}",
+                    .{@errorName(err)},
+                );
+                defer allocator.free(error_message);
+                try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
+                return .done;
+            },
+            .auto => return WebSocketAttempt{ .fallback = .{ .err = err } },
         },
     };
     defer client.deinit();
 
-    client.sendText(envelope_json) catch |err| {
-        const error_message = try std.fmt.allocPrint(
-            allocator,
-            "WebSocket send failed: {s}",
-            .{@errorName(err)},
-        );
-        defer allocator.free(error_message);
-        try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
-        return;
+    client.sendText(envelope_json) catch |err| switch (mode) {
+        .hard_fail => {
+            const error_message = try std.fmt.allocPrint(
+                allocator,
+                "WebSocket send failed: {s}",
+                .{@errorName(err)},
+            );
+            defer allocator.free(error_message);
+            try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
+            return .done;
+        },
+        .auto => return WebSocketAttempt{ .fallback = .{ .err = err } },
     };
 
-    try processCodexWebSocketStream(allocator, &client, stream_ptr, model, options);
+    return try processCodexWebSocketStream(allocator, &client, stream_ptr, model, options, mode);
 }
 
 fn processCodexWebSocketStream(
@@ -665,7 +972,8 @@ fn processCodexWebSocketStream(
     stream_ptr: *event_stream.AssistantMessageEventStream,
     model: types.Model,
     options: ?types.StreamOptions,
-) !void {
+    mode: WsAttemptMode,
+) !WebSocketAttempt {
     var output = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
         .api = model.api,
@@ -685,7 +993,16 @@ fn processCodexWebSocketStream(
     var current_block: ?CurrentBlock = null;
     defer if (current_block) |*block| deinitCurrentBlock(allocator, block);
 
-    stream_ptr.push(.{ .event_type = .start });
+    // In hard_fail mode the consumer must observe `.start` before any other
+    // events, matching the existing `.websocket` contract. In auto mode we
+    // defer `.start` until the first text frame arrives so a connect-time
+    // failure can still cleanly fall back to SSE without leaking a stray
+    // `start` into the downstream stream.
+    var started = false;
+    if (mode == .hard_fail) {
+        stream_ptr.push(.{ .event_type = .start });
+        started = true;
+    }
 
     const request_service_tier: ?[]const u8 = if (options) |stream_options|
         stream_options.providerOptions("responses").service_tier
@@ -709,14 +1026,23 @@ fn processCodexWebSocketStream(
     while (true) {
         if (abort_helper.isRequestedFromOptions(options)) {
             try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
-            return;
+            return if (mode == .auto) WebSocketAttempt.aborted else WebSocketAttempt.done;
         }
 
         const frame_opt = client.next() catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => {
-                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
-                return;
+            else => switch (mode) {
+                .hard_fail => {
+                    try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                    return WebSocketAttempt.done;
+                },
+                .auto => {
+                    if (started) {
+                        try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                        return WebSocketAttempt{ .started_then_failed = .{ .err = err } };
+                    }
+                    return WebSocketAttempt{ .fallback = .{ .err = err } };
+                },
             },
         };
         const frame = frame_opt orelse break;
@@ -724,6 +1050,10 @@ fn processCodexWebSocketStream(
 
         switch (frame) {
             .text => |bytes| {
+                if (mode == .auto and !started) {
+                    stream_ptr.push(.{ .event_type = .start });
+                    started = true;
+                }
                 const result = try processCodexResponsesSseData(&state, bytes);
                 switch (result) {
                     .continue_loop => {},
@@ -731,7 +1061,10 @@ fn processCodexWebSocketStream(
                         saw_completion = true;
                         break;
                     },
-                    .stop_loop => return,
+                    // .stop_loop: a Codex application/protocol error already
+                    // pushed a terminal `error_event`. Do NOT fall back —
+                    // mirror TS `isCodexNonTransportError` semantics.
+                    .stop_loop => return if (mode == .auto) WebSocketAttempt.api_error else WebSocketAttempt.done,
                 }
             },
             .binary => {
@@ -743,16 +1076,36 @@ fn processCodexWebSocketStream(
     }
 
     if (!saw_completion) {
-        try emitRuntimeFailure(
-            allocator,
-            stream_ptr,
-            &output,
-            &current_block,
-            &content_blocks,
-            &tool_calls,
-            error.WebSocketClosedBeforeCompletion,
-        );
-        return;
+        const err = error.WebSocketClosedBeforeCompletion;
+        switch (mode) {
+            .hard_fail => {
+                try emitRuntimeFailure(
+                    allocator,
+                    stream_ptr,
+                    &output,
+                    &current_block,
+                    &content_blocks,
+                    &tool_calls,
+                    err,
+                );
+                return WebSocketAttempt.done;
+            },
+            .auto => {
+                if (started) {
+                    try emitRuntimeFailure(
+                        allocator,
+                        stream_ptr,
+                        &output,
+                        &current_block,
+                        &content_blocks,
+                        &tool_calls,
+                        err,
+                    );
+                    return WebSocketAttempt{ .started_then_failed = .{ .err = err } };
+                }
+                return WebSocketAttempt{ .fallback = .{ .err = err } };
+            },
+        }
     }
 
     try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
@@ -767,6 +1120,7 @@ fn processCodexWebSocketStream(
         .message = output,
     });
     stream_ptr.end(output);
+    return WebSocketAttempt.done;
 }
 
 fn resolveWebSocketRequestId(
@@ -2081,7 +2435,10 @@ test "stream HTTP status error is terminal sanitized event" {
         },
     };
 
-    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{ .api_key = api_key });
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{
+        .api_key = api_key,
+        .transport = .sse,
+    });
     defer stream.deinit();
 
     const event = stream.next().?;
@@ -2194,6 +2551,7 @@ test "stream preserves partial Codex Responses text before mid-stream abort term
         .api_key = api_key,
         .signal = &abort_signal,
         .on_response = &AbortAfterResponse.callback,
+        .transport = .sse,
     });
     defer stream.deinit();
 
@@ -2426,6 +2784,7 @@ test "stream onResponse failure is terminal error event" {
     var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, context, .{
         .api_key = api_key,
         .on_response = Callback.fail,
+        .transport = .sse,
     });
     defer stream.deinit();
 
@@ -2797,6 +3156,408 @@ test "openai-codex-responses websocket transport propagates handshake failure as
     try std.testing.expect(event.message.?.error_message.?.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "WebSocket connect failed") != null);
     try std.testing.expect(stream.next() == null);
+}
+
+// ============================================================================
+// J.4 — WebSocket failure recording + SSE fallback (port of TS PR #4133)
+// ============================================================================
+
+/// A test server that accepts TWO sequential TCP connections on one port:
+///
+/// 1. First connection: reads an HTTP request. If it's a WebSocket upgrade
+///    (looks for "Upgrade: websocket"), it responds with a configurable
+///    HTTP rejection status (default 403) — exercising the
+///    `error.HandshakeFailed` transport-class branch. If it isn't a WS
+///    upgrade, it responds with the SSE body immediately (so single-attempt
+///    SSE-only tests can also use this server).
+/// 2. Second connection: replies with the SSE body.
+///
+/// This is the smallest harness that lets `transport: .auto` go through its
+/// WS-then-SSE fallback path in a single test without restructuring the
+/// existing WS-only / SSE-only test fixtures.
+const FallbackTestServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    server: std.Io.net.Server,
+    ws_reject_status: u16,
+    sse_body: []const u8,
+    sse_status: u16 = 200,
+    thread: ?std.Thread = null,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        ws_reject_status: u16,
+        sse_body: []const u8,
+        sse_status: u16,
+    ) !FallbackTestServer {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .server = try std.Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true }),
+            .ws_reject_status = ws_reject_status,
+            .sse_body = sse_body,
+            .sse_status = sse_status,
+        };
+    }
+
+    fn start(self: *FallbackTestServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *FallbackTestServer) void {
+        self.server.deinit(self.io);
+        if (self.thread) |thread| thread.join();
+    }
+
+    fn url(self: *const FallbackTestServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn run(self: *FallbackTestServer) void {
+        var conn_count: usize = 0;
+        while (conn_count < 2) : (conn_count += 1) {
+            const stream = self.server.accept(self.io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => return,
+                else => return,
+            };
+            self.handleConnection(stream) catch {};
+            stream.close(self.io);
+        }
+    }
+
+    fn handleConnection(self: *FallbackTestServer, stream: std.Io.net.Stream) !void {
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(std.testing.io, &read_buffer);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+
+        const request_bytes = try readHttpRequestHead(self.allocator, &reader.interface);
+        defer self.allocator.free(request_bytes);
+
+        const is_ws_upgrade =
+            std.ascii.indexOfIgnoreCase(request_bytes, "upgrade: websocket") != null;
+
+        if (is_ws_upgrade) {
+            const reason: []const u8 = switch (self.ws_reject_status) {
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                404 => "Not Found",
+                else => "Error",
+            };
+            try writer.interface.print(
+                "HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                .{ self.ws_reject_status, reason },
+            );
+            try writer.interface.flush();
+            return;
+        }
+
+        // Drain any POST body (we don't need to parse it for these tests).
+        // The request head already consumed up to \r\n\r\n.
+
+        const status_reason: []const u8 = switch (self.sse_status) {
+            200 => "OK",
+            400 => "Bad Request",
+            500 => "Internal Server Error",
+            else => "Error",
+        };
+        try writer.interface.print(
+            "HTTP/1.1 {d} {s}\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            .{ self.sse_status, status_reason },
+        );
+        // Emit body as one chunk + 0\r\n\r\n terminator.
+        try writer.interface.print("{x}\r\n", .{self.sse_body.len});
+        try writer.interface.writeAll(self.sse_body);
+        try writer.interface.writeAll("\r\n0\r\n\r\n");
+        try writer.interface.flush();
+    }
+};
+
+fn readHttpRequestHead(allocator: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    var tail: [4]u8 = .{ 0, 0, 0, 0 };
+    var count: usize = 0;
+    while (true) {
+        const byte = try reader.takeByte();
+        try buf.append(allocator, byte);
+        tail[count % tail.len] = byte;
+        count += 1;
+        if (buf.items.len > 16 * 1024) return error.RequestHeaderTooLarge;
+        if (count >= 4) {
+            const start_idx = count % tail.len;
+            const ordered = [_]u8{
+                tail[start_idx],
+                tail[(start_idx + 1) % tail.len],
+                tail[(start_idx + 2) % tail.len],
+                tail[(start_idx + 3) % tail.len],
+            };
+            if (std.mem.eql(u8, &ordered, "\r\n\r\n")) break;
+        }
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+const SSE_BODY_OK_HELLO =
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fb\"}}\n" ++
+    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_fb\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n" ++
+    "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n" ++
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello via sse\"}\n" ++
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_fb\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello via sse\"}]}}\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fb\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n";
+
+test "transport=auto + ws handshake refused engages SSE fallback and emits diagnostic" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    var server = try FallbackTestServer.init(allocator, io, 403, SSE_BODY_OK_HELLO, 200);
+    defer server.deinit();
+    try server.start();
+
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    // Use a unique session id so the per-process registry doesn't pollute
+    // other tests.
+    const session_id = "fallback-session-handshake-refused";
+    resetWebSocketFallbackRegistry(session_id, io);
+    defer resetWebSocketFallbackRegistry(session_id, io);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .auto,
+        .session_id = session_id,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+
+    const delta = stream.next().?;
+    defer freeEventOwned(allocator, delta);
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("hello via sse", delta.delta.?);
+
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("hello via sse", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+
+    // provider_transport_failure diagnostic must be attached.
+    const diagnostics = done.message.?.diagnostics orelse return error.TestExpectedTransportDiagnostic;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings("provider_transport_failure", diagnostics[0].type);
+    const details = diagnostics[0].details orelse return error.TestExpectedDiagnosticDetails;
+    try std.testing.expect(details == .object);
+    try std.testing.expectEqualStrings("auto", details.object.get("configuredTransport").?.string);
+    try std.testing.expectEqualStrings("sse", details.object.get("fallbackTransport").?.string);
+    try std.testing.expectEqual(false, details.object.get("eventsEmitted").?.bool);
+    try std.testing.expectEqualStrings("before_message_stream_start", details.object.get("phase").?.string);
+
+    try std.testing.expect(stream.next() == null);
+    freeAssistantMessageOwned(allocator, done.message.?);
+
+    // Registry must have been populated.
+    try std.testing.expect(isWebSocketSseFallbackActive(session_id, io));
+}
+
+test "transport=auto + second call after ws failure skips websocket and uses SSE directly" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    // Pre-populate the registry to simulate a prior WS failure for this session.
+    const session_id = "fallback-session-second-call";
+    resetWebSocketFallbackRegistry(session_id, io);
+    defer resetWebSocketFallbackRegistry(session_id, io);
+    recordWebSocketFailure(session_id, io);
+    try std.testing.expect(isWebSocketSseFallbackActive(session_id, io));
+
+    // Server only handles ONE connection: the SSE POST. If the provider tried
+    // to upgrade to WS first the test would deadlock or surface a different
+    // event ordering.
+    var server = try FallbackTestServer.init(allocator, io, 403, SSE_BODY_OK_HELLO, 200);
+    defer server.deinit();
+    try server.start();
+
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .auto,
+        .session_id = session_id,
+    });
+    defer stream.deinit();
+
+    // Drain until done.
+    var observed_text_end = false;
+    while (stream.next()) |event| {
+        if (event.event_type == .done) {
+            try std.testing.expect(event.message != null);
+            try std.testing.expectEqualStrings("hello via sse", event.message.?.content[0].text.text);
+            // No fallback diagnostic — there was no WS attempt this call.
+            try std.testing.expect(event.message.?.diagnostics == null);
+            freeAssistantMessageOwned(allocator, event.message.?);
+            break;
+        }
+        if (event.event_type == .text_end) {
+            observed_text_end = true;
+            try std.testing.expectEqualStrings("hello via sse", event.content.?);
+        }
+        freeEventOwned(allocator, event);
+    }
+    try std.testing.expect(observed_text_end);
+}
+
+test "transport=auto + server response.failed JSON is terminal, NO fallback registration" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    // WS server that ACCEPTS the upgrade and sends a `response.failed`
+    // application error frame, then closes. This must NOT trigger the SSE
+    // fallback path and must NOT populate the registry.
+    const frames = [_]test_websocket_server.FrameDirective{
+        .{ .text = "{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"upstream failed\"}}}" },
+    };
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .frames_to_send = &frames,
+        .close_after_frames = .{ .code = 1000, .reason = "done" },
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const session_id = "fallback-session-api-error";
+    resetWebSocketFallbackRegistry(session_id, io);
+    defer resetWebSocketFallbackRegistry(session_id, io);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .auto,
+        .session_id = session_id,
+    });
+    defer stream.deinit();
+
+    // The WS conversation began, so `.start` arrives first.
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+
+    // Drain until error_event.
+    var saw_error = false;
+    while (stream.next()) |event| {
+        if (event.event_type == .error_event) {
+            saw_error = true;
+            try std.testing.expect(event.error_message != null);
+            try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "upstream failed") != null);
+            if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+            break;
+        }
+        if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+        freeEventOwned(allocator, event);
+    }
+    try std.testing.expect(saw_error);
+    try std.testing.expect(stream.next() == null);
+
+    // Application/protocol errors must NOT populate the registry.
+    try std.testing.expect(!isWebSocketSseFallbackActive(session_id, io));
+}
+
+test "WebSocket fallback registry helpers track per-session state" {
+    const io = std.testing.io;
+    const sid_a = "registry-test-session-a";
+    const sid_b = "registry-test-session-b";
+    resetWebSocketFallbackRegistry(sid_a, io);
+    resetWebSocketFallbackRegistry(sid_b, io);
+    defer resetWebSocketFallbackRegistry(sid_a, io);
+    defer resetWebSocketFallbackRegistry(sid_b, io);
+
+    try std.testing.expect(!isWebSocketSseFallbackActive(sid_a, io));
+    try std.testing.expect(!isWebSocketSseFallbackActive(sid_b, io));
+    try std.testing.expect(!isWebSocketSseFallbackActive(null, io));
+    try std.testing.expect(!isWebSocketSseFallbackActive("", io));
+
+    recordWebSocketFailure(sid_a, io);
+    try std.testing.expect(isWebSocketSseFallbackActive(sid_a, io));
+    try std.testing.expect(!isWebSocketSseFallbackActive(sid_b, io));
+
+    // Recording the same session twice is idempotent.
+    recordWebSocketFailure(sid_a, io);
+    try std.testing.expect(isWebSocketSseFallbackActive(sid_a, io));
+
+    // null / empty session_id are no-ops.
+    recordWebSocketFailure(null, io);
+    recordWebSocketFailure("", io);
+
+    resetWebSocketFallbackRegistry(sid_a, io);
+    try std.testing.expect(!isWebSocketSseFallbackActive(sid_a, io));
+}
+
+test "isCodexNonTransportError distinguishes application from transport errors" {
+    try std.testing.expect(isCodexNonTransportError(error.CodexApiError));
+    try std.testing.expect(isCodexNonTransportError(error.CodexProtocolError));
+    try std.testing.expect(!isCodexNonTransportError(error.HandshakeFailed));
+    try std.testing.expect(!isCodexNonTransportError(error.ConnectionClosed));
+    try std.testing.expect(!isCodexNonTransportError(error.TlsFailure));
+    try std.testing.expect(!isCodexNonTransportError(error.InvalidHandshakeResponse));
+    try std.testing.expect(!isCodexNonTransportError(error.MaskedServerFrame));
+    try std.testing.expect(!isCodexNonTransportError(error.InvalidFrame));
+    try std.testing.expect(!isCodexNonTransportError(error.FrameTooLarge));
+    try std.testing.expect(!isCodexNonTransportError(error.WebSocketClosedBeforeCompletion));
 }
 
 test "openai-codex-responses websocket transport sends response.create frame with correct body" {
