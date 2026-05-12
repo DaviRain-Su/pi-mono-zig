@@ -108,33 +108,42 @@ pub const KimiProvider = struct {
 
 };
 
-const CurrentBlock = union(enum) {
-    text: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-    },
-    thinking: struct {
-        event_index: usize,
-        text: std.ArrayList(u8),
-    },
-    tool_call: struct {
-        event_index: usize,
-        id: std.ArrayList(u8),
-        name: std.ArrayList(u8),
-        partial_args: std.ArrayList(u8),
-    },
+const ActiveTextBlock = struct {
+    event_index: usize,
+    text: std.ArrayList(u8),
 };
 
-fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
-    switch (block.*) {
-        .text => |*text| text.text.deinit(allocator),
-        .thinking => |*thinking| thinking.text.deinit(allocator),
-        .tool_call => |*tool_call| {
-            tool_call.id.deinit(allocator);
-            tool_call.name.deinit(allocator);
-            tool_call.partial_args.deinit(allocator);
-        },
-    }
+const ActiveThinkingBlock = struct {
+    event_index: usize,
+    text: std.ArrayList(u8),
+};
+
+const ActiveToolCallBlock = struct {
+    event_index: usize,
+    id: std.ArrayList(u8),
+    name: std.ArrayList(u8),
+    partial_args: std.ArrayList(u8),
+};
+
+const StreamingBlockKind = enum { text, thinking, tool_call };
+
+const StreamingBlockOrderEntry = struct {
+    kind: StreamingBlockKind,
+    tool_call_index: ?usize = null,
+};
+
+fn deinitActiveTextBlock(allocator: std.mem.Allocator, block: *ActiveTextBlock) void {
+    block.text.deinit(allocator);
+}
+
+fn deinitActiveThinkingBlock(allocator: std.mem.Allocator, block: *ActiveThinkingBlock) void {
+    block.text.deinit(allocator);
+}
+
+fn deinitActiveToolCallBlock(allocator: std.mem.Allocator, block: *ActiveToolCallBlock) void {
+    block.id.deinit(allocator);
+    block.name.deinit(allocator);
+    block.partial_args.deinit(allocator);
 }
 
 pub fn buildRequestPayload(
@@ -457,8 +466,8 @@ fn parseSseStreamLines(
     var tool_calls = std.ArrayList(types.ToolCall).empty;
     defer tool_calls.deinit(allocator);
 
-    var current_block: ?CurrentBlock = null;
-    defer if (current_block) |*block| deinitCurrentBlock(allocator, block);
+    var state = KimiStreamState.init();
+    defer state.deinit(allocator);
 
     stream_ptr.push(.{ .event_type = .start });
 
@@ -466,7 +475,7 @@ fn parseSseStreamLines(
         .allocator = allocator,
         .stream_ptr = stream_ptr,
         .output = &output,
-        .current_block = &current_block,
+        .state = &state,
         .content_blocks = &content_blocks,
         .tool_calls = &tool_calls,
     };
@@ -475,7 +484,7 @@ fn parseSseStreamLines(
         return;
     }
 
-    try finishCurrentBlock(allocator, &current_block, &content_blocks, &tool_calls, stream_ptr);
+    try finishStreamingBlocks(allocator, &state, &content_blocks, &tool_calls, stream_ptr);
 
     try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve, .coerce_stop_reason_for_tool_calls = true });
     // Tool calls live inline in output.content; legacy field intentionally null.
@@ -488,11 +497,30 @@ fn parseSseStreamLines(
     stream_ptr.end(output);
 }
 
+const KimiStreamState = struct {
+    text_block: ?ActiveTextBlock = null,
+    thinking_block: ?ActiveThinkingBlock = null,
+    active_tool_calls: std.ArrayList(ActiveToolCallBlock) = .empty,
+    block_order: std.ArrayList(StreamingBlockOrderEntry) = .empty,
+
+    fn init() KimiStreamState {
+        return .{};
+    }
+
+    fn deinit(self: *KimiStreamState, allocator: std.mem.Allocator) void {
+        if (self.text_block) |*block| deinitActiveTextBlock(allocator, block);
+        if (self.thinking_block) |*block| deinitActiveThinkingBlock(allocator, block);
+        for (self.active_tool_calls.items) |*tool_call| deinitActiveToolCallBlock(allocator, tool_call);
+        self.active_tool_calls.deinit(allocator);
+        self.block_order.deinit(allocator);
+    }
+};
+
 const KimiSseLoopHandler = struct {
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
-    current_block: *?CurrentBlock,
+    state: *KimiStreamState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
 
@@ -509,7 +537,7 @@ const KimiSseLoopHandler = struct {
             self.allocator,
             self.stream_ptr,
             self.output,
-            self.current_block,
+            self.state,
             self.content_blocks,
             self.tool_calls,
             data,
@@ -521,7 +549,7 @@ const KimiSseLoopHandler = struct {
             self.allocator,
             self.stream_ptr,
             self.output,
-            self.current_block,
+            self.state,
             self.content_blocks,
             self.tool_calls,
             err,
@@ -533,7 +561,7 @@ fn processKimiSseData(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
-    current_block: *?CurrentBlock,
+    state: *KimiStreamState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     data: []const u8,
@@ -541,7 +569,7 @@ fn processKimiSseData(
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
-            try emitRuntimeFailure(allocator, stream_ptr, output, current_block, content_blocks, tool_calls, err);
+            try emitRuntimeFailure(allocator, stream_ptr, output, state, content_blocks, tool_calls, err);
             return false;
         },
     };
@@ -585,17 +613,17 @@ fn processKimiSseData(
 
     if (delta.object.get("reasoning_content")) |reasoning_value| {
         if (reasoning_value == .string and reasoning_value.string.len > 0) {
-            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, reasoning_value.string, true);
+            try appendThinkingDelta(allocator, state, stream_ptr, reasoning_value.string);
         }
     } else if (delta.object.get("reasoning")) |reasoning_value| {
         if (reasoning_value == .string and reasoning_value.string.len > 0) {
-            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, reasoning_value.string, true);
+            try appendThinkingDelta(allocator, state, stream_ptr, reasoning_value.string);
         }
     }
 
     if (delta.object.get("content")) |content_value| {
         if (content_value == .string and content_value.string.len > 0) {
-            try appendTextDelta(allocator, current_block, content_blocks, tool_calls, stream_ptr, content_value.string, false);
+            try appendTextDelta(allocator, state, stream_ptr, content_value.string);
         }
     }
 
@@ -627,53 +655,38 @@ fn processKimiSseData(
                     break :blk null;
                 } else null;
 
-                const needs_new_block = blk: {
-                    if (current_block.* == null) break :blk true;
-                    if (current_block.*.? != .tool_call) break :blk true;
-                    if (tool_call_id) |id| {
-                        const current_id = std.mem.trim(u8, current_block.*.?.tool_call.id.items, " ");
-                        if (current_id.len > 0 and !std.mem.eql(u8, current_id, id)) break :blk true;
-                    }
-                    break :blk false;
-                };
+                // Mirrors the TS Chat Completions parser (`ensureTextBlock` /
+                // `ensureToolCallBlock` in `packages/ai/src/providers/openai-completions.ts`):
+                // the active text block is never closed by an incoming tool-call delta.
+                // A subsequent text delta resumes the SAME text block (same content_index)
+                // so that text -> tool -> text streams coalesce into one text block plus
+                // one tool_call block instead of splitting around the tool. Mirrors the
+                // E.4 fix in openai_chat_sse.zig (commit 3050a003) for the Kimi provider.
+                const active_tool_call = try ensureActiveToolCallBlock(
+                    allocator,
+                    state,
+                    stream_ptr,
+                    tool_call_id,
+                );
 
-                if (needs_new_block) {
-                    try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
-                    current_block.* = .{ .tool_call = .{
-                        .event_index = content_blocks.items.len,
-                        .id = std.ArrayList(u8).empty,
-                        .name = std.ArrayList(u8).empty,
-                        .partial_args = std.ArrayList(u8).empty,
-                    } };
-                    stream_ptr.push(.{
-                        .event_type = .toolcall_start,
-                        .content_index = @intCast(content_blocks.items.len),
-                    });
+                if (tool_call_id) |id| {
+                    active_tool_call.id.clearRetainingCapacity();
+                    try active_tool_call.id.appendSlice(allocator, id);
                 }
-
-                if (current_block.*) |*block| {
-                    if (block.* == .tool_call) {
-                        if (tool_call_id) |id| {
-                            block.tool_call.id.clearRetainingCapacity();
-                            try block.tool_call.id.appendSlice(allocator, id);
-                        }
-                        if (tool_call_name) |name| {
-                            block.tool_call.name.clearRetainingCapacity();
-                            try block.tool_call.name.appendSlice(allocator, name);
-                        }
-                        const event_delta = if (tool_call_arguments) |arguments| blk: {
-                            try block.tool_call.partial_args.appendSlice(allocator, arguments);
-                            break :blk try allocator.dupe(u8, arguments);
-                        } else null;
-
-                        stream_ptr.push(.{
-                            .event_type = .toolcall_delta,
-                            .content_index = @intCast(block.tool_call.event_index),
-                            .delta = event_delta,
-                            .owns_delta = event_delta != null,
-                        });
-                    }
+                if (tool_call_name) |name| {
+                    active_tool_call.name.clearRetainingCapacity();
+                    try active_tool_call.name.appendSlice(allocator, name);
                 }
+                const event_delta = if (tool_call_arguments) |arguments| blk: {
+                    try active_tool_call.partial_args.appendSlice(allocator, arguments);
+                    break :blk try allocator.dupe(u8, arguments);
+                } else null;
+                stream_ptr.push(.{
+                    .event_type = .toolcall_delta,
+                    .content_index = @intCast(active_tool_call.event_index),
+                    .delta = event_delta,
+                    .owns_delta = event_delta != null,
+                });
             }
         }
     }
@@ -684,12 +697,12 @@ fn processKimiSseData(
 fn finalizeOutputFromPartials(
     allocator: std.mem.Allocator,
     output: *types.AssistantMessage,
-    current_block: *?CurrentBlock,
+    state: *KimiStreamState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
-    try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
+    try finishStreamingBlocks(allocator, state, content_blocks, tool_calls, stream_ptr);
     try finalize.finalizeOutput(allocator, output, .{ .content_blocks = content_blocks, .tool_calls = tool_calls }, .{ .content_transfer = .when_output_empty, .total_tokens = .preserve, .coerce_stop_reason_for_tool_calls = false });
     // Tool calls live inline in output.content; legacy field intentionally null.
     // tool_calls is borrow-only bookkeeping.
@@ -699,101 +712,146 @@ fn emitRuntimeFailure(
     allocator: std.mem.Allocator,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     output: *types.AssistantMessage,
-    current_block: *?CurrentBlock,
+    state: *KimiStreamState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     err: anyerror,
 ) !void {
-    try finalizeOutputFromPartials(allocator, output, current_block, content_blocks, tool_calls, stream_ptr);
+    try finalizeOutputFromPartials(allocator, output, state, content_blocks, tool_calls, stream_ptr);
     provider_error.emitTerminalRuntimeFailure(stream_ptr, output, err);
 }
 
 fn appendTextDelta(
     allocator: std.mem.Allocator,
-    current_block: *?CurrentBlock,
-    content_blocks: *std.ArrayList(types.ContentBlock),
-    tool_calls: *std.ArrayList(types.ToolCall),
+    state: *KimiStreamState,
     stream_ptr: *event_stream.AssistantMessageEventStream,
     delta: []const u8,
-    is_thinking: bool,
 ) !void {
-    if (current_block.* == null or !matchesCurrentBlock(current_block.*.?, is_thinking)) {
-        try finishCurrentBlock(allocator, current_block, content_blocks, tool_calls, stream_ptr);
-        current_block.* = if (is_thinking)
-            .{ .thinking = .{ .event_index = content_blocks.items.len, .text = std.ArrayList(u8).empty } }
-        else
-            .{ .text = .{ .event_index = content_blocks.items.len, .text = std.ArrayList(u8).empty } };
+    if (state.text_block == null) {
+        const event_index = state.block_order.items.len;
+        state.text_block = .{ .event_index = event_index, .text = std.ArrayList(u8).empty };
+        try state.block_order.append(allocator, .{ .kind = .text });
         stream_ptr.push(.{
-            .event_type = if (is_thinking) .thinking_start else .text_start,
-            .content_index = @intCast(content_blocks.items.len),
+            .event_type = .text_start,
+            .content_index = @intCast(event_index),
         });
     }
-
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                try text.text.appendSlice(allocator, delta);
-                stream_ptr.push(.{
-                    .event_type = .text_delta,
-                    .content_index = @intCast(text.event_index),
-                    .delta = try allocator.dupe(u8, delta),
-                    .owns_delta = true,
-                });
-            },
-            .thinking => |*thinking| {
-                try thinking.text.appendSlice(allocator, delta);
-                stream_ptr.push(.{
-                    .event_type = .thinking_delta,
-                    .content_index = @intCast(thinking.event_index),
-                    .delta = try allocator.dupe(u8, delta),
-                    .owns_delta = true,
-                });
-            },
-            .tool_call => unreachable,
-        }
+    if (state.text_block) |*block| {
+        try block.text.appendSlice(allocator, delta);
+        stream_ptr.push(.{
+            .event_type = .text_delta,
+            .content_index = @intCast(block.event_index),
+            .delta = try allocator.dupe(u8, delta),
+            .owns_delta = true,
+        });
     }
 }
 
-fn matchesCurrentBlock(block: CurrentBlock, is_thinking: bool) bool {
-    return switch (block) {
-        .text => !is_thinking,
-        .thinking => is_thinking,
-        .tool_call => false,
-    };
+fn appendThinkingDelta(
+    allocator: std.mem.Allocator,
+    state: *KimiStreamState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    delta: []const u8,
+) !void {
+    if (state.thinking_block == null) {
+        const event_index = state.block_order.items.len;
+        state.thinking_block = .{ .event_index = event_index, .text = std.ArrayList(u8).empty };
+        try state.block_order.append(allocator, .{ .kind = .thinking });
+        stream_ptr.push(.{
+            .event_type = .thinking_start,
+            .content_index = @intCast(event_index),
+        });
+    }
+    if (state.thinking_block) |*block| {
+        try block.text.appendSlice(allocator, delta);
+        stream_ptr.push(.{
+            .event_type = .thinking_delta,
+            .content_index = @intCast(block.event_index),
+            .delta = try allocator.dupe(u8, delta),
+            .owns_delta = true,
+        });
+    }
 }
 
-fn finishCurrentBlock(
+fn ensureActiveToolCallBlock(
     allocator: std.mem.Allocator,
-    current_block: *?CurrentBlock,
+    state: *KimiStreamState,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    id: ?[]const u8,
+) !*ActiveToolCallBlock {
+    if (state.active_tool_calls.items.len > 0) {
+        const last_index = state.active_tool_calls.items.len - 1;
+        const last = &state.active_tool_calls.items[last_index];
+        const reuse = blk: {
+            if (id) |incoming_id| {
+                const current_id = std.mem.trim(u8, last.id.items, " ");
+                if (current_id.len == 0) break :blk true;
+                break :blk std.mem.eql(u8, current_id, incoming_id);
+            }
+            break :blk true;
+        };
+        if (reuse) return last;
+    }
+
+    const event_index = state.block_order.items.len;
+    const tool_call_index = state.active_tool_calls.items.len;
+    try state.active_tool_calls.append(allocator, .{
+        .event_index = event_index,
+        .id = std.ArrayList(u8).empty,
+        .name = std.ArrayList(u8).empty,
+        .partial_args = std.ArrayList(u8).empty,
+    });
+    try state.block_order.append(allocator, .{ .kind = .tool_call, .tool_call_index = tool_call_index });
+    stream_ptr.push(.{
+        .event_type = .toolcall_start,
+        .content_index = @intCast(event_index),
+    });
+    return &state.active_tool_calls.items[tool_call_index];
+}
+
+fn finishStreamingBlocks(
+    allocator: std.mem.Allocator,
+    state: *KimiStreamState,
     content_blocks: *std.ArrayList(types.ContentBlock),
     tool_calls: *std.ArrayList(types.ToolCall),
     stream_ptr: *event_stream.AssistantMessageEventStream,
 ) !void {
-    if (current_block.*) |*block| {
-        switch (block.*) {
-            .text => |*text| {
-                const owned = try allocator.dupe(u8, text.text.items);
-                try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
-                stream_ptr.push(.{
-                    .event_type = .text_end,
-                    .content_index = @intCast(text.event_index),
-                    .content = owned,
-                });
+    for (state.block_order.items) |entry| {
+        switch (entry.kind) {
+            .text => {
+                if (state.text_block) |*block| {
+                    const owned = try allocator.dupe(u8, block.text.items);
+                    try content_blocks.append(allocator, .{ .text = .{ .text = owned } });
+                    stream_ptr.push(.{
+                        .event_type = .text_end,
+                        .content_index = @intCast(block.event_index),
+                        .content = owned,
+                    });
+                    deinitActiveTextBlock(allocator, block);
+                    state.text_block = null;
+                }
             },
-            .thinking => |*thinking| {
-                const owned = try allocator.dupe(u8, thinking.text.items);
-                try content_blocks.append(allocator, .{ .thinking = .{
-                    .thinking = owned,
-                    .signature = null,
-                    .redacted = false,
-                } });
-                stream_ptr.push(.{
-                    .event_type = .thinking_end,
-                    .content_index = @intCast(thinking.event_index),
-                    .content = owned,
-                });
+            .thinking => {
+                if (state.thinking_block) |*block| {
+                    const owned = try allocator.dupe(u8, block.text.items);
+                    try content_blocks.append(allocator, .{ .thinking = .{
+                        .thinking = owned,
+                        .signature = null,
+                        .redacted = false,
+                    } });
+                    stream_ptr.push(.{
+                        .event_type = .thinking_end,
+                        .content_index = @intCast(block.event_index),
+                        .content = owned,
+                    });
+                    deinitActiveThinkingBlock(allocator, block);
+                    state.thinking_block = null;
+                }
             },
-            .tool_call => |*tool_call| {
+            .tool_call => {
+                const tool_call_index = entry.tool_call_index orelse continue;
+                if (tool_call_index >= state.active_tool_calls.items.len) continue;
+                const tool_call = &state.active_tool_calls.items[tool_call_index];
                 const stored_tool_call: types.ToolCall = blk: {
                     const id = try allocator.dupe(u8, std.mem.trim(u8, tool_call.id.items, " "));
                     errdefer allocator.free(id);
@@ -815,9 +873,11 @@ fn finishCurrentBlock(
                 });
             },
         }
-        deinitCurrentBlock(allocator, block);
-        current_block.* = null;
     }
+
+    for (state.active_tool_calls.items) |*tool_call| deinitActiveToolCallBlock(allocator, tool_call);
+    state.active_tool_calls.clearRetainingCapacity();
+    state.block_order.clearRetainingCapacity();
 }
 
 fn isAbortRequested(options: ?types.StreamOptions) bool {
@@ -1041,18 +1101,20 @@ test "parseSseStream emits kimi thinking and text events" {
     try std.testing.expectEqual(types.EventType.thinking_delta, event3.event_type);
     try std.testing.expectEqualStrings("Need tool", event3.delta.?);
 
+    // Block-close events are emitted at end-of-stream via finishStreamingBlocks,
+    // so thinking_end no longer precedes the next text_start.
     const event4 = stream_instance.next().?;
     defer freeEvent(allocator, event4);
-    try std.testing.expectEqual(types.EventType.thinking_end, event4.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, event4.event_type);
 
     const event5 = stream_instance.next().?;
     defer freeEvent(allocator, event5);
-    try std.testing.expectEqual(types.EventType.text_start, event5.event_type);
+    try std.testing.expectEqual(types.EventType.text_delta, event5.event_type);
+    try std.testing.expectEqualStrings("Done", event5.delta.?);
 
     const event6 = stream_instance.next().?;
     defer freeEvent(allocator, event6);
-    try std.testing.expectEqual(types.EventType.text_delta, event6.event_type);
-    try std.testing.expectEqualStrings("Done", event6.delta.?);
+    try std.testing.expectEqual(types.EventType.thinking_end, event6.event_type);
 
     const event7 = stream_instance.next().?;
     defer freeEvent(allocator, event7);
@@ -1122,6 +1184,98 @@ test "parseSseStream keeps Kimi compact data-line tolerance under shared SSE loo
 test "parseChunk rejects malformed provider control envelopes without JSON repair" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.SyntaxError, parseChunk(allocator, "{\"id\":\"chunk\" trailing"));
+}
+
+test "parseSseStream coalesces kimi text-tool-text into a single text block" {
+    // Port of TS PR #4228 (commit 6b271842) / openai_chat_sse.zig E.4 (commit
+    // 3050a003): text deltas separated by tool-call deltas must reuse the same
+    // text block (same content_index) rather than splitting around the tool call.
+    const allocator = std.testing.allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"cmpl_kimi_coalesce\",\"choices\":[{\"delta\":{\"content\":\"before \"}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_weather\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"}}]}}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{\"content\":\"after\"},\"finish_reason\":\"tool_calls\"}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    var streaming = http_client.StreamingResponse{ .status = 200, .body = body, .buffer = .empty, .allocator = allocator };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream, &streaming, model, null);
+
+    const start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start.event_type);
+
+    const text_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_start.content_index.?);
+
+    const first_text_delta = stream.next().?;
+    defer first_text_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.text_delta, first_text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), first_text_delta.content_index.?);
+    try std.testing.expectEqualStrings("before ", first_text_delta.delta.?);
+
+    // Tool-call delta must NOT close the text block.
+    const tool_start = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
+
+    const tool_delta = stream.next().?;
+    defer tool_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+
+    // Subsequent text delta resumes the SAME text block (no new text_start,
+    // same content_index 0).
+    const second_text_delta = stream.next().?;
+    defer second_text_delta.deinitTransient(allocator);
+    try std.testing.expectEqual(types.EventType.text_delta, second_text_delta.event_type);
+    try std.testing.expectEqual(@as(u32, 0), second_text_delta.content_index.?);
+    try std.testing.expectEqualStrings("after", second_text_delta.delta.?);
+
+    // End-of-stream finalization closes the text block first (it was opened
+    // before the tool call), then the tool call, matching the TS `finishBlock`
+    // order over `blocks`.
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before after", text_end.content.?);
+
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
+    try std.testing.expectEqualStrings("call_weather", tool_end.tool_call.?.id);
+    try std.testing.expectEqualStrings("Berlin", tool_end.tool_call.?.arguments.object.get("city").?.string);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expectEqualStrings("before after", done.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("call_weather", done.message.?.content[1].tool_call.id);
+    try std.testing.expectEqualStrings("Berlin", done.message.?.content[1].tool_call.arguments.object.get("city").?.string);
+    try std.testing.expect(stream.next() == null);
+
+    freeAssistantMessageOwned(allocator, done.message.?);
 }
 
 test "parseSseStream emits kimi tool call events across fragmented deltas" {
@@ -1249,19 +1403,15 @@ test "parseSseStream preserves kimi content indexes across thinking tool text bl
     const thinking_delta = stream.next().?;
     try std.testing.expectEqual(types.EventType.thinking_delta, thinking_delta.event_type);
     try std.testing.expectEqual(@as(u32, 0), thinking_delta.content_index.?);
-    const thinking_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
-    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
 
+    // Block-close events are emitted at end-of-stream via finishStreamingBlocks,
+    // mirroring the TS `finishBlock` order. Tool/text starts happen first.
     const tool_start = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
     const tool_delta = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
-    const tool_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
-    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
 
     const text_start = stream.next().?;
     try std.testing.expectEqual(types.EventType.text_start, text_start.event_type);
@@ -1270,6 +1420,14 @@ test "parseSseStream preserves kimi content indexes across thinking tool text bl
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
     try std.testing.expectEqual(@as(u32, 2), text_delta.content_index.?);
     try std.testing.expectEqualStrings("After tool", text_delta.delta.?);
+
+    // End-of-stream finalization in block_order order: thinking(0), tool(1), text(2).
+    const thinking_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.thinking_end, thinking_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), thinking_end.content_index.?);
+    const tool_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
+    try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
     const text_end = stream.next().?;
     try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
     try std.testing.expectEqual(@as(u32, 2), text_end.content_index.?);
@@ -1485,17 +1643,20 @@ test "parseSseStreamLines finalizes Kimi text and tool call on EOF mid-block" {
     try std.testing.expectEqual(types.EventType.text_delta, text_delta.event_type);
     try std.testing.expectEqual(@as(u32, 0), text_delta.content_index.?);
     try std.testing.expectEqualStrings("before tool", text_delta.delta.?);
-    const text_end = stream.next().?;
-    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
-    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
-    try std.testing.expectEqualStrings("before tool", text_end.content.?);
 
+    // Tool-call delta no longer closes the text block; text_end is emitted at
+    // EOF via finishStreamingBlocks instead.
     const tool_start = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_start, tool_start.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_start.content_index.?);
     const tool_delta = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_delta, tool_delta.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_delta.content_index.?);
+
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqual(@as(u32, 0), text_end.content_index.?);
+    try std.testing.expectEqualStrings("before tool", text_end.content.?);
     const tool_end = stream.next().?;
     try std.testing.expectEqual(types.EventType.toolcall_end, tool_end.event_type);
     try std.testing.expectEqual(@as(u32, 1), tool_end.content_index.?);
