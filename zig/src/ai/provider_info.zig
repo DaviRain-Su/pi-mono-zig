@@ -96,6 +96,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
     .{
         .id = "github-copilot",
+        .display_name = "GitHub Copilot",
         .default_model = "gpt-5.4",
         .missing_api_key_message = "GitHub Copilot credentials required.\nRun /login github-copilot, or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.",
         .default_api = "openai-responses",
@@ -110,6 +111,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
     .{
         .id = "google-gemini-cli",
+        .display_name = "Google Cloud Code Assist (Gemini CLI)",
         .missing_api_key_message = "Google Cloud Code Assist credentials required.\nRun /login google-gemini-cli. Paid tiers may also require GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID.",
         .default_api = "google-gemini-cli",
     },
@@ -138,6 +140,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
     .{
         .id = "kimi",
+        .display_name = "Kimi",
         .missing_api_key_message = "Kimi credentials required.\nSet MOONSHOT_API_KEY, pass --api-key, or run /login kimi.",
         .env_var = "MOONSHOT_API_KEY",
         .default_api = "kimi-completions",
@@ -224,6 +227,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
     .{
         .id = "openai-codex",
+        .display_name = "OpenAI Codex",
         .default_model = "gpt-5.5",
         .missing_api_key_message = "OpenAI Codex credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-codex for ChatGPT Plus/Pro subscription auth.",
         .env_var = "OPENAI_API_KEY",
@@ -231,6 +235,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
     .{
         .id = "openai-responses",
+        .display_name = "OpenAI Responses",
         .missing_api_key_message = "OpenAI Responses credentials required.\nSet OPENAI_API_KEY, pass --api-key, or run /login openai-responses to save a key.",
         .env_var = "OPENAI_API_KEY",
         .default_api = "openai-responses",
@@ -361,16 +366,16 @@ test "providerInfoFor returns null for unknown providers" {
 
 test "providers with partial coverage expose null fields" {
     const github = providerInfoFor("github-copilot").?;
-    try std.testing.expectEqual(@as(?[]const u8, null), github.display_name);
+    try std.testing.expectEqualStrings("GitHub Copilot", github.display_name.?);
     try std.testing.expectEqualStrings("gpt-5.4", github.default_model.?);
 
     const gemini_cli = providerInfoFor("google-gemini-cli").?;
-    try std.testing.expectEqual(@as(?[]const u8, null), gemini_cli.display_name);
+    try std.testing.expectEqualStrings("Google Cloud Code Assist (Gemini CLI)", gemini_cli.display_name.?);
     try std.testing.expectEqual(@as(?[]const u8, null), gemini_cli.default_model);
     try std.testing.expect(gemini_cli.missing_api_key_message != null);
 
     const responses = providerInfoFor("openai-responses").?;
-    try std.testing.expectEqual(@as(?[]const u8, null), responses.display_name);
+    try std.testing.expectEqualStrings("OpenAI Responses", responses.display_name.?);
     try std.testing.expectEqual(@as(?[]const u8, null), responses.default_model);
 }
 

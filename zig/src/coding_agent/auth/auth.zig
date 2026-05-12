@@ -87,44 +87,73 @@ pub const OAUTH_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "google-gemini-cli", .name = "Google Cloud Code Assist (Gemini CLI)", .auth_type = .oauth },
 };
 
+/// Build an API-key `ProviderInfo` row whose `name` is sourced from
+/// `ai.provider_info.PROVIDERS` rather than hand-typed here. Falls back to the
+/// provider id if no `provider_info` row exists (the comptime cross-check
+/// below rejects that case at build time, so this is defensive only).
+fn apiKeyLoginProvider(comptime id: []const u8) ProviderInfo {
+    return .{
+        .id = id,
+        .name = ai.provider_info.displayNameFor(id) orelse id,
+        .auth_type = .api_key,
+    };
+}
+
 pub const API_KEY_LOGIN_PROVIDERS = [_]ProviderInfo{
-    .{ .id = "anthropic", .name = "Anthropic", .auth_type = .api_key },
-    .{ .id = "amazon-bedrock", .name = "Amazon Bedrock", .auth_type = .api_key },
-    .{ .id = "azure-openai-responses", .name = "Azure OpenAI Responses", .auth_type = .api_key },
-    .{ .id = "cerebras", .name = "Cerebras", .auth_type = .api_key },
-    .{ .id = "deepseek", .name = "DeepSeek", .auth_type = .api_key },
-    .{ .id = "cloudflare-ai-gateway", .name = "Cloudflare AI Gateway", .auth_type = .api_key },
-    .{ .id = "cloudflare-workers-ai", .name = "Cloudflare Workers AI", .auth_type = .api_key },
-    .{ .id = "fireworks", .name = "Fireworks", .auth_type = .api_key },
-    .{ .id = "google", .name = "Google Gemini", .auth_type = .api_key },
-    .{ .id = "google-vertex", .name = "Google Vertex AI", .auth_type = .api_key },
-    .{ .id = "groq", .name = "Groq", .auth_type = .api_key },
-    .{ .id = "huggingface", .name = "Hugging Face", .auth_type = .api_key },
-    .{ .id = "kimi", .name = "Kimi", .auth_type = .api_key },
-    .{ .id = "kimi-coding", .name = "Kimi For Coding", .auth_type = .api_key },
-    .{ .id = "kimi-code-openai", .name = "Kimi Code (OpenAI Compatible)", .auth_type = .api_key },
-    .{ .id = "mistral", .name = "Mistral", .auth_type = .api_key },
-    .{ .id = "minimax", .name = "MiniMax", .auth_type = .api_key },
-    .{ .id = "minimax-cn", .name = "MiniMax (China)", .auth_type = .api_key },
-    .{ .id = "moonshotai", .name = "Moonshot AI", .auth_type = .api_key },
-    .{ .id = "moonshotai-cn", .name = "Moonshot AI (China)", .auth_type = .api_key },
-    .{ .id = "opencode", .name = "OpenCode Zen", .auth_type = .api_key },
-    .{ .id = "opencode-go", .name = "OpenCode Go", .auth_type = .api_key },
-    .{ .id = "openai", .name = "OpenAI", .auth_type = .api_key },
-    .{ .id = "openai-codex", .name = "OpenAI Codex", .auth_type = .api_key },
-    .{ .id = "openai-responses", .name = "OpenAI Responses", .auth_type = .api_key },
-    .{ .id = "openrouter", .name = "OpenRouter", .auth_type = .api_key },
-    .{ .id = "together", .name = "Together AI", .auth_type = .api_key },
-    .{ .id = "vercel-ai-gateway", .name = "Vercel AI Gateway", .auth_type = .api_key },
-    .{ .id = "xai", .name = "xAI", .auth_type = .api_key },
-    .{ .id = "xiaomi", .name = "Xiaomi MiMo", .auth_type = .api_key },
-    .{ .id = "xiaomi-token-plan-cn", .name = "Xiaomi MiMo Token Plan (China)", .auth_type = .api_key },
-    .{ .id = "xiaomi-token-plan-ams", .name = "Xiaomi MiMo Token Plan (Amsterdam)", .auth_type = .api_key },
-    .{ .id = "xiaomi-token-plan-sgp", .name = "Xiaomi MiMo Token Plan (Singapore)", .auth_type = .api_key },
-    .{ .id = "zai", .name = "ZAI", .auth_type = .api_key },
+    apiKeyLoginProvider("anthropic"),
+    apiKeyLoginProvider("amazon-bedrock"),
+    apiKeyLoginProvider("azure-openai-responses"),
+    apiKeyLoginProvider("cerebras"),
+    apiKeyLoginProvider("deepseek"),
+    apiKeyLoginProvider("cloudflare-ai-gateway"),
+    apiKeyLoginProvider("cloudflare-workers-ai"),
+    apiKeyLoginProvider("fireworks"),
+    apiKeyLoginProvider("google"),
+    apiKeyLoginProvider("google-vertex"),
+    apiKeyLoginProvider("groq"),
+    apiKeyLoginProvider("huggingface"),
+    apiKeyLoginProvider("kimi"),
+    apiKeyLoginProvider("kimi-coding"),
+    apiKeyLoginProvider("kimi-code-openai"),
+    apiKeyLoginProvider("mistral"),
+    apiKeyLoginProvider("minimax"),
+    apiKeyLoginProvider("minimax-cn"),
+    apiKeyLoginProvider("moonshotai"),
+    apiKeyLoginProvider("moonshotai-cn"),
+    apiKeyLoginProvider("opencode"),
+    apiKeyLoginProvider("opencode-go"),
+    apiKeyLoginProvider("openai"),
+    apiKeyLoginProvider("openai-codex"),
+    apiKeyLoginProvider("openai-responses"),
+    apiKeyLoginProvider("openrouter"),
+    apiKeyLoginProvider("together"),
+    apiKeyLoginProvider("vercel-ai-gateway"),
+    apiKeyLoginProvider("xai"),
+    apiKeyLoginProvider("xiaomi"),
+    apiKeyLoginProvider("xiaomi-token-plan-cn"),
+    apiKeyLoginProvider("xiaomi-token-plan-ams"),
+    apiKeyLoginProvider("xiaomi-token-plan-sgp"),
+    apiKeyLoginProvider("zai"),
 };
 
 pub const SUPPORTED_PROVIDERS = OAUTH_LOGIN_PROVIDERS ++ API_KEY_LOGIN_PROVIDERS;
+
+// Compile-time cross-check: every login-provider id (api-key, oauth, oauth
+// registry) must have a corresponding row in ai.provider_info.PROVIDERS so
+// downstream consumers can resolve display names and other metadata from a
+// single source of truth.
+comptime {
+    for (API_KEY_LOGIN_PROVIDERS) |row| {
+        if (ai.provider_info.providerInfoFor(row.id) == null) {
+            @compileError("auth login-provider \"" ++ row.id ++ "\" has no provider_info row");
+        }
+    }
+    for (OAUTH_LOGIN_PROVIDERS) |row| {
+        if (ai.provider_info.providerInfoFor(row.id) == null) {
+            @compileError("auth login-provider \"" ++ row.id ++ "\" has no provider_info row");
+        }
+    }
+}
 
 pub const OAuthCredential = struct {
     access: []u8,
@@ -248,10 +277,7 @@ pub fn findSupportedProviderByAuthType(provider_id: []const u8, auth_type: Provi
 }
 
 pub fn getApiKeyProviderDisplayName(provider_id: []const u8) []const u8 {
-    for (API_KEY_LOGIN_PROVIDERS) |provider| {
-        if (std.mem.eql(u8, provider.id, provider_id)) return provider.name;
-    }
-    return provider_id;
+    return ai.provider_info.displayNameFor(provider_id) orelse provider_id;
 }
 
 /// Per-provider auth specials lifted out of scattered `std.mem.eql` chains.
@@ -404,6 +430,16 @@ const OAUTH_LOGIN_PROVIDERS_REGISTRY = [_]OAuthLoginProvider{
         .require_client_secret = true,
     },
 };
+
+// Compile-time cross-check: every OAuth registry id must have a row in
+// ai.provider_info.PROVIDERS.
+comptime {
+    for (OAUTH_LOGIN_PROVIDERS_REGISTRY) |row| {
+        if (ai.provider_info.providerInfoFor(row.id) == null) {
+            @compileError("auth OAuth registry id \"" ++ row.id ++ "\" has no provider_info row");
+        }
+    }
+}
 
 pub fn startBrowserLogin(
     allocator: std.mem.Allocator,
