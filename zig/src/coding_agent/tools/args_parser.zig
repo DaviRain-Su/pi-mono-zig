@@ -21,14 +21,36 @@ pub const IntConstraint = enum {
 ///   * `pub const json_aliases = .{ .field_name = .{ "alias1", "alias2", ... } };`
 ///     The first alias that resolves in the JSON object wins.
 ///   * `pub const json_int_constraints = .{ .field_name = .positive };`
+///   * `pub const json_owned = .{ .field_a, .field_b };`
+///     Each named field (must be `[]const u8` or `?[]const u8`) is
+///     `allocator.dupe`d off the JSON tree so the resulting Args can
+///     outlive the parse tree. On error mid-parse, already-duped fields
+///     are freed automatically. Callers that consumed Args successfully
+///     should release the duped strings via `deinitOwnedArgs`.
+///
+/// Note: a `json_owned` entry that names a non-existent field, or names
+/// a field whose type is not `[]const u8` / `?[]const u8`, is a compile
+/// error (caught by `checkOwnedFields`).
 pub fn parseArgsFromJson(
     comptime T: type,
     allocator: std.mem.Allocator,
     value: std.json.Value,
 ) !T {
-    _ = allocator; // borrowed strings reference the JSON tree; reserved for future use
+    comptime checkOwnedFields(T);
     if (value != .object) return error.InvalidToolArguments;
     const object = value.object;
+
+    const owned_count = comptime ownedFieldCount(T);
+    // When `owned_count == 0` we still need a real slice so the errdefer
+    // arithmetic compiles; an empty slot array is fine.
+    var owned_slots: [if (owned_count == 0) 1 else owned_count][]u8 = undefined;
+    var owned_used: usize = 0;
+    errdefer {
+        if (owned_count > 0) {
+            var i: usize = 0;
+            while (i < owned_used) : (i += 1) allocator.free(owned_slots[i]);
+        }
+    }
 
     const fields = @typeInfo(T).@"struct".fields;
     var result: T = undefined;
@@ -52,7 +74,26 @@ pub fn parseArgsFromJson(
         }
 
         if (raw) |raw_val| {
-            @field(result, field.name) = try extractField(FieldT, raw_val, constraint);
+            const extracted = try extractField(FieldT, raw_val, constraint);
+            if (comptime isOwnedField(T, field.name)) {
+                if (comptime @typeInfo(FieldT) == .optional) {
+                    if (extracted) |s| {
+                        const duped = try allocator.dupe(u8, s);
+                        owned_slots[owned_used] = duped;
+                        owned_used += 1;
+                        @field(result, field.name) = duped;
+                    } else {
+                        @field(result, field.name) = null;
+                    }
+                } else {
+                    const duped = try allocator.dupe(u8, extracted);
+                    owned_slots[owned_used] = duped;
+                    owned_used += 1;
+                    @field(result, field.name) = duped;
+                }
+            } else {
+                @field(result, field.name) = extracted;
+            }
         } else if (comptime field.defaultValue() != null) {
             @field(result, field.name) = comptime field.defaultValue().?;
         } else if (comptime @typeInfo(FieldT) == .optional) {
@@ -62,6 +103,23 @@ pub fn parseArgsFromJson(
         }
     }
     return result;
+}
+
+/// Free the strings duped into Args by `parseArgsFromJson` per `json_owned`.
+/// Safe to call on Args whose `T` does not declare `json_owned` (no-op).
+pub fn deinitOwnedArgs(comptime T: type, allocator: std.mem.Allocator, args: T) void {
+    comptime checkOwnedFields(T);
+    if (!@hasDecl(T, "json_owned")) return;
+    const owned_tuple = T.json_owned;
+    inline for (@typeInfo(@TypeOf(owned_tuple)).@"struct".fields) |tf| {
+        const name = comptime @tagName(@field(owned_tuple, tf.name));
+        const FieldT = comptime fieldType(T, name);
+        if (comptime @typeInfo(FieldT) == .optional) {
+            if (@field(args, name)) |s| allocator.free(s);
+        } else {
+            allocator.free(@field(args, name));
+        }
+    }
 }
 
 fn hasAliasDecl(comptime T: type, comptime name: [:0]const u8) bool {
@@ -74,6 +132,57 @@ fn fieldIntConstraint(comptime T: type, comptime name: [:0]const u8) IntConstrai
     const decls = T.json_int_constraints;
     if (!@hasField(@TypeOf(decls), name)) return .non_negative;
     return @field(decls, name);
+}
+
+fn fieldType(comptime T: type, comptime name: []const u8) type {
+    inline for (@typeInfo(T).@"struct".fields) |f| {
+        if (comptime std.mem.eql(u8, f.name, name)) return f.type;
+    }
+    @compileError("parseArgsFromJson: field '" ++ name ++ "' not found on " ++ @typeName(T));
+}
+
+fn isOwnedField(comptime T: type, comptime name: []const u8) bool {
+    if (!@hasDecl(T, "json_owned")) return false;
+    const owned_tuple = T.json_owned;
+    inline for (@typeInfo(@TypeOf(owned_tuple)).@"struct".fields) |tf| {
+        const candidate = @tagName(@field(owned_tuple, tf.name));
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+fn ownedFieldCount(comptime T: type) usize {
+    if (!@hasDecl(T, "json_owned")) return 0;
+    return @typeInfo(@TypeOf(T.json_owned)).@"struct".fields.len;
+}
+
+fn checkOwnedFields(comptime T: type) void {
+    if (!@hasDecl(T, "json_owned")) return;
+    const owned_tuple = T.json_owned;
+    inline for (@typeInfo(@TypeOf(owned_tuple)).@"struct".fields) |tf| {
+        const name = @tagName(@field(owned_tuple, tf.name));
+        var found = false;
+        inline for (@typeInfo(T).@"struct".fields) |f| {
+            if (comptime std.mem.eql(u8, f.name, name)) {
+                found = true;
+                const FieldT = f.type;
+                const ok = switch (@typeInfo(FieldT)) {
+                    .pointer => |ptr| ptr.size == .slice and ptr.child == u8,
+                    .optional => |opt| switch (@typeInfo(opt.child)) {
+                        .pointer => |ptr| ptr.size == .slice and ptr.child == u8,
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (!ok) {
+                    @compileError("json_owned: field '" ++ name ++ "' on " ++ @typeName(T) ++ " must be []const u8 or ?[]const u8");
+                }
+            }
+        }
+        if (!found) {
+            @compileError("json_owned: field '" ++ name ++ "' does not exist on " ++ @typeName(T));
+        }
+    }
 }
 
 fn extractField(comptime FieldT: type, value: std.json.Value, constraint: IntConstraint) !FieldT {
@@ -218,4 +327,89 @@ test "parseArgsFromJson rejects type mismatch" {
     defer freeObject(object);
     try putInt(&object, "path", 42);
     try std.testing.expectError(error.InvalidToolArguments, parseArgsFromJson(Args, std.testing.allocator, .{ .object = object }));
+}
+
+// Comptime guard sketch (intentionally not executed — would fail to compile):
+//   const Bad = struct { count: usize, pub const json_owned = .{ .count }; };
+//   _ = parseArgsFromJson(Bad, alloc, val);  // @compileError: must be []const u8 or ?[]const u8
+//   const Missing = struct { path: []const u8, pub const json_owned = .{ .nope }; };
+//   _ = parseArgsFromJson(Missing, alloc, val);  // @compileError: field does not exist
+
+test "parseArgsFromJson dupes json_owned fields independently of JSON tree" {
+    const Args = struct {
+        path: []const u8,
+        pub const json_owned = .{.path};
+    };
+
+    var object = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    try putString(&object, "path", "original.txt");
+
+    const parsed = try parseArgsFromJson(Args, std.testing.allocator, .{ .object = object });
+    defer deinitOwnedArgs(Args, std.testing.allocator, parsed);
+
+    // Tear down the JSON tree; the duped path must still be valid.
+    freeObject(object);
+
+    try std.testing.expectEqualStrings("original.txt", parsed.path);
+}
+
+test "deinitOwnedArgs frees json_owned strings (no leak)" {
+    const Args = struct {
+        path: []const u8,
+        other: ?[]const u8 = null,
+        pub const json_owned = .{ .path, .other };
+    };
+
+    var object = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    try putString(&object, "path", "a.zig");
+    try putString(&object, "other", "b.zig");
+    defer freeObject(object);
+
+    const parsed = try parseArgsFromJson(Args, std.testing.allocator, .{ .object = object });
+    deinitOwnedArgs(Args, std.testing.allocator, parsed);
+    // testing.allocator will assert no leaks on test teardown
+}
+
+test "parseArgsFromJson errdefer frees partial json_owned on later field failure" {
+    const Args = struct {
+        path: []const u8,
+        other: []const u8,
+        pub const json_owned = .{ .path, .other };
+    };
+
+    var object = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    defer freeObject(object);
+    try putString(&object, "path", "ok.zig");
+    // `other` field is a wrong type; this forces failure AFTER `path` was duped.
+    try putInt(&object, "other", 7);
+
+    try std.testing.expectError(
+        error.InvalidToolArguments,
+        parseArgsFromJson(Args, std.testing.allocator, .{ .object = object }),
+    );
+    // testing.allocator will fail the test if the partial `path` dupe leaked.
+}
+
+test "optional ?[]const u8 json_owned field handles null without alloc" {
+    const Args = struct {
+        path: []const u8,
+        other: ?[]const u8 = null,
+        pub const json_owned = .{ .path, .other };
+    };
+
+    var object = try std.json.ObjectMap.init(std.testing.allocator, &.{}, &.{});
+    try putString(&object, "path", "p.zig");
+    defer freeObject(object);
+
+    const parsed = try parseArgsFromJson(Args, std.testing.allocator, .{ .object = object });
+    defer deinitOwnedArgs(Args, std.testing.allocator, parsed);
+
+    try std.testing.expectEqualStrings("p.zig", parsed.path);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed.other);
+}
+
+test "deinitOwnedArgs is a no-op when T has no json_owned decl" {
+    const Args = struct { path: []const u8 };
+    // Just verify it compiles and runs without freeing anything.
+    deinitOwnedArgs(Args, std.testing.allocator, .{ .path = "static" });
 }
