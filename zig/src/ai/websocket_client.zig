@@ -528,7 +528,7 @@ fn resolveHostAddress(
     var slots: [16]std.Io.net.HostName.LookupResult = undefined;
     var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&slots);
     const host_name = std.Io.net.HostName.init(host) catch return Error.InvalidUrl;
-    host_name.lookup(io, &queue, .{}) catch return Error.InvalidUrl;
+    host_name.lookup(io, &queue, .{ .port = port }) catch return Error.InvalidUrl;
 
     while (true) {
         var item: [1]std.Io.net.HostName.LookupResult = undefined;
@@ -590,7 +590,7 @@ fn openTransport(
 
         var bundle: std.crypto.Certificate.Bundle = .empty;
         defer bundle.deinit(allocator);
-        var ca_lock: std.Io.RwLock = .{};
+        var ca_lock: std.Io.RwLock = .init;
         bundle.rescan(allocator, io, std.Io.Clock.real.now(io)) catch return Error.TlsFailure;
 
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;

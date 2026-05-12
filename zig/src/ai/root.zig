@@ -32,6 +32,7 @@ pub const shared = struct {
     pub const typebox_helpers = @import("shared/typebox_helpers.zig");
     pub const validation = @import("shared/validation.zig");
     pub const provider_error = @import("shared/provider_error.zig");
+    pub const test_websocket_server = @import("shared/test_websocket_server.zig");
     pub const provider_json = @import("shared/provider_json.zig");
     pub const provider_stream = @import("shared/provider_stream.zig");
     pub const responses_api = @import("shared/responses_api.zig");
@@ -175,6 +176,7 @@ test {
     _ = @import("shared/typebox_helpers.zig");
     _ = @import("shared/validation.zig");
     _ = @import("shared/provider_error.zig");
+    _ = @import("shared/test_websocket_server.zig");
     _ = @import("shared/provider_json.zig");
     _ = @import("shared/provider_stream.zig");
     _ = @import("shared/responses_api.zig");
