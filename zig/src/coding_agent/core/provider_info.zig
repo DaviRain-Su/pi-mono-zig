@@ -12,6 +12,7 @@ pub const displayNameFor = ai.provider_info.displayNameFor;
 pub const defaultModelFor = ai.provider_info.defaultModelFor;
 pub const missingApiKeyMessageFor = ai.provider_info.missingApiKeyMessageFor;
 pub const envVarFor = ai.provider_info.envVarFor;
+pub const preferInitialFor = ai.provider_info.preferInitialFor;
 
 test {
     _ = ai.provider_info;

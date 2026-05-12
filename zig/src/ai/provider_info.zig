@@ -29,6 +29,10 @@ pub const ProviderInfo = struct {
     /// runtime cross-check test below asserts every populated row agrees with
     /// the registry table.
     default_api: ?types.Api = null,
+    /// When `findInitialDefaultModel` would otherwise pick this provider as
+    /// the boot-time default, prefer the provider named here first (if its
+    /// credentials are also configured). `null` means no preference.
+    prefer_initial: ?[]const u8 = null,
 };
 
 pub const PROVIDERS: []const ProviderInfo = &.{
@@ -152,6 +156,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "Kimi Code (OpenAI Compatible) credentials required.\nSet KIMI_API_KEY, pass --api-key, or run /login kimi-code-openai.",
         .env_var = "KIMI_API_KEY",
         .default_api = "openai-completions",
+        .prefer_initial = "kimi-coding",
     },
     .{
         .id = "kimi-coding",
@@ -349,6 +354,11 @@ pub fn envVarFor(id: []const u8) ?[]const u8 {
 pub fn defaultApiFor(id: []const u8) ?types.Api {
     const info = providerInfoFor(id) orelse return null;
     return info.default_api;
+}
+
+pub fn preferInitialFor(id: []const u8) ?[]const u8 {
+    const info = providerInfoFor(id) orelse return null;
+    return info.prefer_initial;
 }
 
 test "providerInfoFor returns canonical row for a known provider" {

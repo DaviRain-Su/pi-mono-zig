@@ -648,10 +648,9 @@ fn preferredInitialDefaultProvider(
     provider: []const u8,
     configured_credentials: ConfiguredCredentials,
 ) !?ai.model_registry.ProviderConfig {
-    if (std.mem.eql(u8, provider, "kimi-code-openai")) {
-        if (try hasProviderCredentials(allocator, env_map, "kimi-coding", configured_credentials)) {
-            return ai.model_registry.getProviderConfig("kimi-coding");
-        }
+    const preferred = provider_info.preferInitialFor(provider) orelse return null;
+    if (try hasProviderCredentials(allocator, env_map, preferred, configured_credentials)) {
+        return ai.model_registry.getProviderConfig(preferred);
     }
     return null;
 }
