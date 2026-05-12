@@ -3952,3 +3952,41 @@ fn reportSseFuzzTerminalMismatch(
     }
     std.debug.print("\n", .{});
 }
+
+test "stream returns error_event on setup failure instead of throwing" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+    const model = types.Model{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "http://127.0.0.1:1",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+    const context = types.Context{
+        .messages = &[_]types.Message{
+            .{ .user = .{
+                .content = &[_]types.ContentBlock{.{ .text = .{ .text = "Hello" } }},
+                .timestamp = 1,
+            } },
+        },
+    };
+    var stream = try AnthropicProvider.stream(allocator, io, model, context, .{ .api_key = "test-key" });
+    defer stream.deinit();
+    const error_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
+    try std.testing.expect(error_event.message != null);
+    try std.testing.expect(error_event.error_message != null);
+    try std.testing.expect(error_event.error_message.?.len > 0);
+    try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+    try std.testing.expectEqualStrings("anthropic-messages", error_event.message.?.api);
+    try std.testing.expectEqualStrings("anthropic", error_event.message.?.provider);
+    try std.testing.expectEqualStrings("claude-3-7-sonnet-latest", error_event.message.?.model);
+    try std.testing.expect(stream.next() == null);
+    const result = stream.result().?;
+    try std.testing.expectEqualStrings(error_event.message.?.error_message.?, result.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, result.stop_reason);
+}
