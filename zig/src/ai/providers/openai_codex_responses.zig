@@ -2,6 +2,8 @@ const std = @import("std");
 const types = @import("../types.zig");
 const http_client = @import("../http_client.zig");
 const event_stream = @import("../event_stream.zig");
+const websocket_client = @import("../websocket_client.zig");
+const abort_helper = @import("../shared/abort_signal.zig");
 const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
@@ -13,6 +15,7 @@ const stop_reason_mod = @import("../shared/stop_reason.zig");
 const openai = @import("openai.zig");
 const openai_responses = @import("openai_responses.zig");
 const test_stream_server = @import("test_stream_server.zig");
+const test_websocket_server = @import("../shared/test_websocket_server.zig");
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 const DEFAULT_CODEX_SYSTEM_PROMPT = "You are a helpful assistant.";
@@ -75,6 +78,21 @@ pub const OpenAICodexResponsesProvider = struct {
                     payload = replacement;
                 }
             }
+        }
+
+        const transport = if (options) |stream_options| stream_options.transport else .auto;
+        if (transport == .websocket or transport == .websocket_cached) {
+            try streamProductionWebSocket(
+                allocator,
+                io,
+                model,
+                options,
+                normalized_token,
+                account_id,
+                payload,
+                stream_instance,
+            );
+            return;
         }
 
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
@@ -559,6 +577,272 @@ fn parseSseStreamLines(
         .message = output,
     });
     stream_ptr.end(output);
+}
+
+fn streamProductionWebSocket(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    normalized_token: []const u8,
+    account_id: []const u8,
+    payload: std.json.Value,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+) !void {
+    const http_url = try resolveCodexUrl(allocator, model.base_url);
+    defer allocator.free(http_url);
+    const ws_url = try buildWebSocketUrl(allocator, http_url);
+    defer allocator.free(ws_url);
+
+    const request_id = try resolveWebSocketRequestId(allocator, io, options);
+    defer allocator.free(request_id);
+
+    var headers = try buildWebSocketRequestHeaders(allocator, model, options, normalized_token, account_id, request_id);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    var header_list = std.ArrayList(websocket_client.Header).empty;
+    defer header_list.deinit(allocator);
+    var headers_iter = headers.iterator();
+    while (headers_iter.next()) |entry| {
+        try header_list.append(allocator, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+    }
+
+    // Build the WS request body envelope: {"type":"response.create", ...payload}.
+    var envelope = try initObject(allocator);
+    defer provider_json.freeValue(allocator, .{ .object = envelope });
+    try envelope.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "response.create") });
+    if (payload == .object) {
+        var iterator = payload.object.iterator();
+        while (iterator.next()) |entry| {
+            try envelope.put(
+                allocator,
+                try allocator.dupe(u8, entry.key_ptr.*),
+                try provider_json.cloneValue(allocator, entry.value_ptr.*),
+            );
+        }
+    }
+    const envelope_value: std.json.Value = .{ .object = envelope };
+    const envelope_json = try std.json.Stringify.valueAlloc(allocator, envelope_value, .{});
+    defer allocator.free(envelope_json);
+
+    var client = websocket_client.Client.connect(.{
+        .allocator = allocator,
+        .io = io,
+        .url = ws_url,
+        .headers = header_list.items,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            const error_message = try std.fmt.allocPrint(
+                allocator,
+                "WebSocket connect failed: {s}",
+                .{@errorName(err)},
+            );
+            defer allocator.free(error_message);
+            try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
+            return;
+        },
+    };
+    defer client.deinit();
+
+    client.sendText(envelope_json) catch |err| {
+        const error_message = try std.fmt.allocPrint(
+            allocator,
+            "WebSocket send failed: {s}",
+            .{@errorName(err)},
+        );
+        defer allocator.free(error_message);
+        try provider_error.pushTerminalStreamError(allocator, stream_ptr, model, error_message);
+        return;
+    };
+
+    try processCodexWebSocketStream(allocator, &client, stream_ptr, model, options);
+}
+
+fn processCodexWebSocketStream(
+    allocator: std.mem.Allocator,
+    client: *websocket_client.Client,
+    stream_ptr: *event_stream.AssistantMessageEventStream,
+    model: types.Model,
+    options: ?types.StreamOptions,
+) !void {
+    var output = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = types.Usage.init(),
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    var content_blocks = std.ArrayList(types.ContentBlock).empty;
+    defer content_blocks.deinit(allocator);
+
+    var tool_calls = std.ArrayList(types.ToolCall).empty;
+    defer tool_calls.deinit(allocator);
+
+    var current_block: ?CurrentBlock = null;
+    defer if (current_block) |*block| deinitCurrentBlock(allocator, block);
+
+    stream_ptr.push(.{ .event_type = .start });
+
+    const request_service_tier: ?[]const u8 = if (options) |stream_options|
+        stream_options.providerOptions("responses").service_tier
+    else
+        null;
+    var response_service_tier: ?[]const u8 = null;
+
+    var state = CodexResponsesSseState{
+        .allocator = allocator,
+        .stream_ptr = stream_ptr,
+        .output = &output,
+        .current_block = &current_block,
+        .content_blocks = &content_blocks,
+        .tool_calls = &tool_calls,
+        .model = model,
+        .request_service_tier = request_service_tier,
+        .response_service_tier = &response_service_tier,
+    };
+
+    var saw_completion = false;
+    while (true) {
+        if (abort_helper.isRequestedFromOptions(options)) {
+            try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, error.RequestAborted);
+            return;
+        }
+
+        const frame_opt = client.next() catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                try emitRuntimeFailure(allocator, stream_ptr, &output, &current_block, &content_blocks, &tool_calls, err);
+                return;
+            },
+        };
+        const frame = frame_opt orelse break;
+        defer frame.deinit(allocator);
+
+        switch (frame) {
+            .text => |bytes| {
+                const result = try processCodexResponsesSseData(&state, bytes);
+                switch (result) {
+                    .continue_loop => {},
+                    .complete_loop => {
+                        saw_completion = true;
+                        break;
+                    },
+                    .stop_loop => return,
+                }
+            },
+            .binary => {
+                // Codex doesn't send binary frames; ignore defensively.
+            },
+            .pong => {},
+            .close => break,
+        }
+    }
+
+    if (!saw_completion) {
+        try emitRuntimeFailure(
+            allocator,
+            stream_ptr,
+            &output,
+            &current_block,
+            &content_blocks,
+            &tool_calls,
+            error.WebSocketClosedBeforeCompletion,
+        );
+        return;
+    }
+
+    try finalizeCurrentBlock(allocator, null, &current_block, &content_blocks, &tool_calls, stream_ptr);
+    try finalize.finalizeOutput(allocator, &output, .{ .content_blocks = &content_blocks, .tool_calls = &tool_calls }, .{ .content_transfer = .always, .total_tokens = .preserve_or_full_usage, .coerce_stop_reason_for_tool_calls = true });
+
+    finalize.calculateCost(model, &output.usage);
+    const effective_service_tier = resolveCodexServiceTier(response_service_tier, request_service_tier);
+    applyServiceTierPricing(&output.usage, effective_service_tier, model);
+
+    stream_ptr.push(.{
+        .event_type = .done,
+        .message = output,
+    });
+    stream_ptr.end(output);
+}
+
+fn resolveWebSocketRequestId(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    if (options) |stream_options| {
+        if (stream_options.session_id) |session_id| {
+            if (session_id.len > 0) return try allocator.dupe(u8, session_id);
+        }
+    }
+
+    var random_bytes: [4]u8 = undefined;
+    io.random(&random_bytes);
+    const random_value = std.mem.readInt(u32, &random_bytes, .big);
+    const ts = std.Io.Clock.real.now(io);
+    return try std.fmt.allocPrint(allocator, "codex_{d}_{x:0>8}", .{ ts, random_value });
+}
+
+fn buildWebSocketRequestHeaders(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    options: ?types.StreamOptions,
+    normalized_token: []const u8,
+    account_id: []const u8,
+    request_id: []const u8,
+) !std.StringHashMap([]const u8) {
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    errdefer deinitOwnedHeaders(allocator, &headers);
+
+    try mergeHeaders(allocator, &headers, model.headers);
+    if (options) |stream_options| {
+        try mergeHeaders(allocator, &headers, stream_options.headers);
+    }
+
+    // Mirror buildWebSocketHeaders() in the TS implementation: drop SSE-only
+    // headers, then set the WS-specific ones.
+    _ = removeHeaderCaseInsensitive(allocator, &headers, "accept");
+    _ = removeHeaderCaseInsensitive(allocator, &headers, "content-type");
+    _ = removeHeaderCaseInsensitive(allocator, &headers, "OpenAI-Beta");
+    _ = removeHeaderCaseInsensitive(allocator, &headers, "openai-beta");
+
+    try putOwnedHeader(allocator, &headers, "OpenAI-Beta", "responses_websockets=2026-02-06");
+    try putOwnedHeader(allocator, &headers, "originator", "pi");
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{normalized_token});
+    defer allocator.free(auth_header);
+    try putOwnedHeader(allocator, &headers, "Authorization", auth_header);
+    try putOwnedHeader(allocator, &headers, "chatgpt-account-id", account_id);
+    try putOwnedHeader(allocator, &headers, "x-client-request-id", request_id);
+    try putOwnedHeader(allocator, &headers, "session_id", request_id);
+
+    return headers;
+}
+
+fn removeHeaderCaseInsensitive(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    name: []const u8,
+) bool {
+    var key_to_remove: ?[]const u8 = null;
+    var iterator = headers.iterator();
+    while (iterator.next()) |entry| {
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+            key_to_remove = entry.key_ptr.*;
+            break;
+        }
+    }
+    if (key_to_remove) |key| {
+        if (headers.fetchRemove(key)) |removed| {
+            allocator.free(removed.key);
+            allocator.free(removed.value);
+            return true;
+        }
+    }
+    return false;
 }
 
 const CodexResponsesSseDataResult = enum {
@@ -2389,4 +2673,187 @@ test "Codex parseSseStreamLines uses response service_tier when set explicitly" 
         0.0000005,
         0.0000080,
     );
+}
+
+fn baseUrlFromTestWsUrl(allocator: std.mem.Allocator, ws_url: []const u8) ![]u8 {
+    // server.url() returns ws://127.0.0.1:<port>/codex/responses; resolveCodexUrl
+    // will keep it intact, and buildWebSocketUrl will swap http:// back to ws://.
+    return try std.mem.replaceOwned(u8, allocator, ws_url, "ws://", "http://");
+}
+
+test "openai-codex-responses websocket transport streams events to terminal completion" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const frames = [_]test_websocket_server.FrameDirective{
+        .{ .text = "{\"type\":\"response.created\",\"response\":{\"id\":\"resp_ws\"}}" },
+        .{ .text = "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_ws\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}" },
+        .{ .text = "{\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}" },
+        .{ .text = "{\"type\":\"response.output_text.delta\",\"delta\":\"hello over ws\"}" },
+        .{ .text = "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_ws\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello over ws\"}]}}" },
+        .{ .text = "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ws\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}" },
+    };
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .frames_to_send = &frames,
+        .close_after_frames = .{ .code = 1000, .reason = "done" },
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .websocket,
+    });
+    defer stream.deinit();
+
+    try std.testing.expectEqual(types.EventType.start, stream.next().?.event_type);
+    try std.testing.expectEqual(types.EventType.text_start, stream.next().?.event_type);
+
+    const delta = stream.next().?;
+    defer freeEventOwned(allocator, delta);
+    try std.testing.expectEqual(types.EventType.text_delta, delta.event_type);
+    try std.testing.expectEqualStrings("hello over ws", delta.delta.?);
+
+    const text_end = stream.next().?;
+    try std.testing.expectEqual(types.EventType.text_end, text_end.event_type);
+    try std.testing.expectEqualStrings("hello over ws", text_end.content.?);
+
+    const done = stream.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expect(done.message != null);
+    try std.testing.expectEqualStrings("resp_ws", done.message.?.response_id.?);
+    try std.testing.expectEqualStrings("hello over ws", done.message.?.content[0].text.text);
+    try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
+    try std.testing.expect(stream.next() == null);
+    freeAssistantMessageOwned(allocator, done.message.?);
+}
+
+test "openai-codex-responses websocket transport propagates handshake failure as error_event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .reject_with_status = 403,
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .websocket,
+    });
+    defer stream.deinit();
+
+    const event = stream.next().?;
+    defer allocator.free(event.error_message.?);
+    try std.testing.expectEqual(types.EventType.error_event, event.event_type);
+    try std.testing.expect(event.message != null);
+    try std.testing.expectEqualStrings("openai-codex-responses", event.message.?.api);
+    try std.testing.expectEqualStrings("openai-codex", event.message.?.provider);
+    try std.testing.expectEqualStrings("gpt-5.1-codex", event.message.?.model);
+    try std.testing.expectEqual(types.StopReason.error_reason, event.message.?.stop_reason);
+    try std.testing.expect(event.message.?.error_message.?.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, event.error_message.?, "WebSocket connect failed") != null);
+    try std.testing.expect(stream.next() == null);
+}
+
+test "openai-codex-responses websocket transport sends response.create frame with correct body" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const frames = [_]test_websocket_server.FrameDirective{
+        .{ .text = "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_capture\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}" },
+    };
+    var server = try test_websocket_server.TestWebSocketServer.init(allocator, io, .{
+        .expected_path = "/codex/responses",
+        .capture_first_client_frame = true,
+        .frames_to_send = &frames,
+        .close_after_frames = .{ .code = 1000, .reason = "done" },
+    });
+    defer server.deinit();
+    try server.start();
+
+    const ws_url = try server.url(allocator);
+    defer allocator.free(ws_url);
+    const base_url = try baseUrlFromTestWsUrl(allocator, ws_url);
+    defer allocator.free(base_url);
+
+    const api_key = try buildTestCodexApiKey(allocator, "acc_test");
+    defer allocator.free(api_key);
+
+    const model = types.Model{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = base_url,
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 400000,
+        .max_tokens = 128000,
+    };
+
+    var stream = try OpenAICodexResponsesProvider.stream(allocator, io, model, .{ .messages = &[_]types.Message{} }, .{
+        .api_key = api_key,
+        .transport = .websocket,
+    });
+    defer stream.deinit();
+
+    // Drain events to ensure server completes and captures the client frame.
+    while (stream.next()) |event| {
+        if (event.message) |message| freeAssistantMessageOwned(allocator, message);
+        freeEventOwned(allocator, event);
+        if (event.event_type == .done or event.event_type == .error_event) break;
+    }
+
+    server.awaitDone();
+    const captured = server.capturedFrame() orelse return error.TestExpectedCapturedFrame;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, captured, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("response.create", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("gpt-5.1-codex", parsed.value.object.get("model").?.string);
 }
