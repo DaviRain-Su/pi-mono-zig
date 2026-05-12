@@ -336,10 +336,21 @@ fn processGoogleSseData(
                                 else
                                     try emptyJsonObject(allocator);
 
-                                const tool_call_id = if (function_call_value.object.get("id")) |id_value|
-                                    if (id_value == .string and id_value.string.len > 0) try allocator.dupe(u8, id_value.string) else try generateToolCallId(allocator, generated_tool_call_count)
-                                else
-                                    try generateToolCallId(allocator, generated_tool_call_count);
+                                const tool_call_id = blk: {
+                                    if (function_call_value.object.get("id")) |id_value| {
+                                        if (id_value == .string and id_value.string.len > 0) {
+                                            var collides = false;
+                                            for (content_blocks.items) |existing_block| {
+                                                if (existing_block == .tool_call and std.mem.eql(u8, existing_block.tool_call.id, id_value.string)) {
+                                                    collides = true;
+                                                    break;
+                                                }
+                                            }
+                                            if (!collides) break :blk try allocator.dupe(u8, id_value.string);
+                                        }
+                                    }
+                                    break :blk try generateToolCallId(allocator, generated_tool_call_count);
+                                };
 
                                 const thought_signature = if (part.object.get("thoughtSignature")) |signature_value|
                                     if (signature_value == .string and signature_value.string.len > 0) try allocator.dupe(u8, signature_value.string) else null
@@ -1306,6 +1317,69 @@ test "parse stream emits text events" {
     try std.testing.expectEqual(@as(u32, 5), done.message.?.usage.output);
 }
 
+test "parse stream regenerates duplicate functionCall ids" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"dup-id\",\"name\":\"get_weather\",\"args\":{\"city\":\"Berlin\"}}},{\"functionCall\":{\"id\":\"dup-id\",\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}}],\"role\":\"model\"},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com/v1beta",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1048576,
+        .max_tokens = 65535,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    try std.testing.expectEqual(types.EventType.start, stream_instance.next().?.event_type);
+
+    const first_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, first_start.event_type);
+    try std.testing.expectEqual(@as(u32, 0), first_start.content_index.?);
+    const first_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, first_delta.event_type);
+    const first_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, first_end.event_type);
+    try std.testing.expectEqualStrings("dup-id", first_end.tool_call.?.id);
+
+    const second_start = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_start, second_start.event_type);
+    try std.testing.expectEqual(@as(u32, 1), second_start.content_index.?);
+    const second_delta = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_delta, second_delta.event_type);
+    const second_end = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.toolcall_end, second_end.event_type);
+    try std.testing.expect(!std.mem.eql(u8, "dup-id", second_end.tool_call.?.id));
+
+    const done = stream_instance.next().?;
+    try std.testing.expectEqual(types.EventType.done, done.event_type);
+    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
+    try std.testing.expect(done.message.?.content[0] == .tool_call);
+    try std.testing.expect(done.message.?.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("dup-id", done.message.?.content[0].tool_call.id);
+    try std.testing.expect(!std.mem.eql(u8, "dup-id", done.message.?.content[1].tool_call.id));
+}
 test "parse stream emits thinking and tool call events" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
