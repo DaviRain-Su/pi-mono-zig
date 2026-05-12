@@ -123,42 +123,64 @@ fn pathExists(_: std.mem.Allocator, path: []const u8) bool {
     return true;
 }
 
-const PROVIDER_ENV_VARS = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "openai", "OPENAI_API_KEY" },
-    .{ "openai-responses", "OPENAI_API_KEY" },
-    .{ "openai-codex", "OPENAI_API_KEY" },
-    .{ "azure-openai-responses", "AZURE_OPENAI_API_KEY" },
-    .{ "deepseek", "DEEPSEEK_API_KEY" },
-    .{ "google", "GEMINI_API_KEY" },
-    .{ "groq", "GROQ_API_KEY" },
-    .{ "cerebras", "CEREBRAS_API_KEY" },
-    .{ "xai", "XAI_API_KEY" },
-    .{ "openrouter", "OPENROUTER_API_KEY" },
-    .{ "vercel-ai-gateway", "AI_GATEWAY_API_KEY" },
-    .{ "zai", "ZAI_API_KEY" },
-    .{ "mistral", "MISTRAL_API_KEY" },
-    .{ "minimax", "MINIMAX_API_KEY" },
-    .{ "minimax-cn", "MINIMAX_CN_API_KEY" },
-    .{ "moonshotai", "MOONSHOT_API_KEY" },
-    .{ "moonshotai-cn", "MOONSHOT_API_KEY" },
-    .{ "huggingface", "HF_TOKEN" },
-    .{ "fireworks", "FIREWORKS_API_KEY" },
-    .{ "together", "TOGETHER_API_KEY" },
-    .{ "opencode", "OPENCODE_API_KEY" },
-    .{ "opencode-go", "OPENCODE_API_KEY" },
-    .{ "kimi", "MOONSHOT_API_KEY" },
-    .{ "kimi-coding", "KIMI_API_KEY" },
-    .{ "kimi-code-openai", "KIMI_API_KEY" },
-    .{ "cloudflare-workers-ai", "CLOUDFLARE_API_KEY" },
-    .{ "cloudflare-ai-gateway", "CLOUDFLARE_API_KEY" },
-    .{ "xiaomi", "XIAOMI_API_KEY" },
-    .{ "xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY" },
-    .{ "xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
-    .{ "xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY" },
-});
-
 fn resolveEnvVar(provider: []const u8) ?[]const u8 {
-    return PROVIDER_ENV_VARS.get(provider);
+    return @import("provider_info.zig").envVarFor(provider);
+}
+
+test "resolveEnvVar returns previously-known single-key mappings" {
+    const KnownMapping = struct { provider: []const u8, env_var: []const u8 };
+    const known = [_]KnownMapping{
+        .{ .provider = "openai", .env_var = "OPENAI_API_KEY" },
+        .{ .provider = "openai-responses", .env_var = "OPENAI_API_KEY" },
+        .{ .provider = "openai-codex", .env_var = "OPENAI_API_KEY" },
+        .{ .provider = "azure-openai-responses", .env_var = "AZURE_OPENAI_API_KEY" },
+        .{ .provider = "deepseek", .env_var = "DEEPSEEK_API_KEY" },
+        .{ .provider = "google", .env_var = "GEMINI_API_KEY" },
+        .{ .provider = "groq", .env_var = "GROQ_API_KEY" },
+        .{ .provider = "cerebras", .env_var = "CEREBRAS_API_KEY" },
+        .{ .provider = "xai", .env_var = "XAI_API_KEY" },
+        .{ .provider = "openrouter", .env_var = "OPENROUTER_API_KEY" },
+        .{ .provider = "vercel-ai-gateway", .env_var = "AI_GATEWAY_API_KEY" },
+        .{ .provider = "zai", .env_var = "ZAI_API_KEY" },
+        .{ .provider = "mistral", .env_var = "MISTRAL_API_KEY" },
+        .{ .provider = "minimax", .env_var = "MINIMAX_API_KEY" },
+        .{ .provider = "minimax-cn", .env_var = "MINIMAX_CN_API_KEY" },
+        .{ .provider = "moonshotai", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "moonshotai-cn", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "huggingface", .env_var = "HF_TOKEN" },
+        .{ .provider = "fireworks", .env_var = "FIREWORKS_API_KEY" },
+        .{ .provider = "together", .env_var = "TOGETHER_API_KEY" },
+        .{ .provider = "opencode", .env_var = "OPENCODE_API_KEY" },
+        .{ .provider = "opencode-go", .env_var = "OPENCODE_API_KEY" },
+        .{ .provider = "kimi", .env_var = "MOONSHOT_API_KEY" },
+        .{ .provider = "kimi-coding", .env_var = "KIMI_API_KEY" },
+        .{ .provider = "kimi-code-openai", .env_var = "KIMI_API_KEY" },
+        .{ .provider = "cloudflare-workers-ai", .env_var = "CLOUDFLARE_API_KEY" },
+        .{ .provider = "cloudflare-ai-gateway", .env_var = "CLOUDFLARE_API_KEY" },
+        .{ .provider = "xiaomi", .env_var = "XIAOMI_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-cn", .env_var = "XIAOMI_TOKEN_PLAN_CN_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-ams", .env_var = "XIAOMI_TOKEN_PLAN_AMS_API_KEY" },
+        .{ .provider = "xiaomi-token-plan-sgp", .env_var = "XIAOMI_TOKEN_PLAN_SGP_API_KEY" },
+    };
+
+    for (known) |entry| {
+        const resolved = resolveEnvVar(entry.provider) orelse {
+            std.debug.print("missing env var for provider: {s}\n", .{entry.provider});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqualStrings(entry.env_var, resolved);
+    }
+
+    const multi_cred = [_][]const u8{
+        "amazon-bedrock",
+        "anthropic",
+        "github-copilot",
+        "google-vertex",
+        "google-gemini-cli",
+    };
+    for (multi_cred) |provider| {
+        try std.testing.expectEqual(@as(?[]const u8, null), resolveEnvVar(provider));
+    }
 }
 
 test "getEnvApiKey resolves known providers and returns null when missing" {
