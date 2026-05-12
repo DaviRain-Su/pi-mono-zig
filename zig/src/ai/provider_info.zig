@@ -12,6 +12,13 @@ const model_registry = @import("model_registry.zig");
 ///                             with multiple/alternative auth env vars this is
 ///                             null and the missing_api_key_message text is
 ///                             the canonical guidance.)
+///   - env_vars               (ordered fallback list for providers whose API
+///                             key may come from one of several env vars,
+///                             tried in declaration order. Only meaningful
+///                             when the resolution reduces to a flat ordered
+///                             lookup; providers with conditional/ADC/AWS
+///                             auth logic keep their bespoke code path in
+///                             `env_api_keys.zig`.)
 ///
 /// Adding a new provider in coding_agent now requires one row in PROVIDERS
 /// instead of four separate edits. Fields that a provider does not carry are
@@ -23,6 +30,13 @@ pub const ProviderInfo = struct {
     default_model: ?[]const u8 = null,
     missing_api_key_message: ?[]const u8 = null,
     env_var: ?[]const u8 = null,
+    /// Ordered list of fallback env vars to consult, in declaration order.
+    /// The first var with a non-empty value wins. Used by providers whose
+    /// API-key resolution is a flat ordered lookup over multiple env vars
+    /// (e.g. anthropic, github-copilot). Providers with conditional logic
+    /// (ADC files, AWS profiles, etc.) leave this `null` and keep their
+    /// bespoke branch in `env_api_keys.zig`.
+    env_vars: ?[]const []const u8 = null,
     /// Default `Api` identifier used to talk to this provider. Mirrors the
     /// canonical `(provider, api)` pairs in `model_registry.builtInProviderConfigs()`.
     /// `null` for providers that have no built-in `model_registry` entry; the
@@ -48,6 +62,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .display_name = "Anthropic",
         .default_model = "claude-opus-4-7",
         .missing_api_key_message = "Anthropic credentials required.\nSet ANTHROPIC_OAUTH_TOKEN or ANTHROPIC_API_KEY, pass --api-key, or run /login anthropic.",
+        .env_vars = &.{ "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY" },
         .default_api = "anthropic-messages",
     },
     .{
@@ -103,6 +118,7 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .display_name = "GitHub Copilot",
         .default_model = "gpt-5.4",
         .missing_api_key_message = "GitHub Copilot credentials required.\nRun /login github-copilot, or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN.",
+        .env_vars = &.{ "COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN" },
         .default_api = "openai-responses",
     },
     .{
@@ -349,6 +365,11 @@ pub fn missingApiKeyMessageFor(id: []const u8) ?[]const u8 {
 pub fn envVarFor(id: []const u8) ?[]const u8 {
     const info = providerInfoFor(id) orelse return null;
     return info.env_var;
+}
+
+pub fn envVarsFor(id: []const u8) ?[]const []const u8 {
+    const info = providerInfoFor(id) orelse return null;
+    return info.env_vars;
 }
 
 pub fn defaultApiFor(id: []const u8) ?types.Api {

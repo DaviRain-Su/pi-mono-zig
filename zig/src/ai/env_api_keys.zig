@@ -27,19 +27,8 @@ pub fn getEnvApiKeyFromMap(
     env_map: *const std.process.Environ.Map,
     provider: []const u8,
 ) !?[]u8 {
-    if (std.mem.eql(u8, provider, "github-copilot")) {
-        return try firstEnvValue(allocator, env_map, &[_][]const u8{
-            "COPILOT_GITHUB_TOKEN",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-        });
-    }
-
-    if (std.mem.eql(u8, provider, "anthropic")) {
-        return try firstEnvValue(allocator, env_map, &[_][]const u8{
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-        });
+    if (@import("provider_info.zig").envVarsFor(provider)) |env_vars| {
+        return try firstEnvValue(allocator, env_map, env_vars);
     }
 
     if (std.mem.eql(u8, provider, "google-vertex")) {
@@ -398,6 +387,69 @@ test "getEnvApiKey uses default Vertex ADC path under HOME" {
     const value = try getEnvApiKeyFromMap(allocator, &env_map, "google-vertex");
     defer if (value) |resolved| allocator.free(resolved);
     try std.testing.expectEqualStrings(AUTHENTICATED_SENTINEL, value.?);
+}
+
+test "getEnvApiKey honors ordered env-var fallback for anthropic and github-copilot" {
+    const allocator = std.testing.allocator;
+
+    // anthropic: ANTHROPIC_OAUTH_TOKEN wins over ANTHROPIC_API_KEY when both set.
+    {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("ANTHROPIC_OAUTH_TOKEN", "oauth-token");
+        try env_map.put("ANTHROPIC_API_KEY", "api-key");
+
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, "anthropic");
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expectEqualStrings("oauth-token", value.?);
+    }
+
+    // anthropic: falls through to ANTHROPIC_API_KEY when OAUTH token absent.
+    {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("ANTHROPIC_API_KEY", "api-key-only");
+
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, "anthropic");
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expectEqualStrings("api-key-only", value.?);
+    }
+
+    // github-copilot: COPILOT_GITHUB_TOKEN wins over GH_TOKEN and GITHUB_TOKEN.
+    {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("COPILOT_GITHUB_TOKEN", "copilot");
+        try env_map.put("GH_TOKEN", "gh");
+        try env_map.put("GITHUB_TOKEN", "github");
+
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expectEqualStrings("copilot", value.?);
+    }
+
+    // github-copilot: GH_TOKEN wins over GITHUB_TOKEN when COPILOT_GITHUB_TOKEN absent.
+    {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("GH_TOKEN", "gh");
+        try env_map.put("GITHUB_TOKEN", "github");
+
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expectEqualStrings("gh", value.?);
+    }
+
+    // github-copilot: falls through to GITHUB_TOKEN as last resort.
+    {
+        var env_map = std.process.Environ.Map.init(allocator);
+        defer env_map.deinit();
+        try env_map.put("GITHUB_TOKEN", "github-only");
+
+        const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
+        defer if (value) |resolved| allocator.free(resolved);
+        try std.testing.expectEqualStrings("github-only", value.?);
+    }
 }
 
 fn makeEnvApiKeyTestPath(allocator: std.mem.Allocator, tmp: anytype, name: []const u8) ![]u8 {
