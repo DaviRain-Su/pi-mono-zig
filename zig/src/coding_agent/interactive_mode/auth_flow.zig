@@ -128,9 +128,6 @@ pub fn beginLoginFlow(
         defer allocator.free(intro);
         try app_state.appendInfo(intro);
         try app_state.appendInfo(browser_session.auth_url);
-        if (browser_session.kind == .google_gemini_cli) {
-            try app_state.appendInfo("You will be prompted for a Google Cloud project ID after the redirect is accepted.");
-        }
         try app_state.setStatus(if (callback_listener != null)
             "Waiting for localhost callback. You can paste the callback URL manually, or Esc to cancel"
         else
@@ -152,7 +149,6 @@ fn callbackProviderKind(kind: auth.BrowserLoginKind) auth.OAuthCallbackProviderK
     return switch (kind) {
         .anthropic => .anthropic,
         .openai_codex => .openai_codex,
-        .google_gemini_cli => .google_gemini_cli,
     };
 }
 
@@ -261,46 +257,9 @@ pub fn submitAuthFlowInput(
             }
 
             switch (redirect.session.kind) {
-                .anthropic, .openai_codex => {
-                    var credential = try auth.completeBrowserLogin(allocator, io, &redirect.session, trimmed);
-                    defer credential.deinit(allocator);
-                    try persistLoginCredential(
-                        allocator,
-                        io,
-                        env_map,
-                        session,
-                        current_provider,
-                        redirect.session.provider_id,
-                        redirect.session.provider_name,
-                        &credential,
-                        options,
-                        app_state,
-                        auth_flow,
-                        live_resources,
-                    );
-                },
-                .google_gemini_cli => {
-                    const exchange = try auth.exchangeGoogleAuthorizationCode(allocator, io, &redirect.session, trimmed);
-                    if (auth_flow.*) |*value| value.deinit(allocator);
-                    auth_flow.* = .{ .google_project = .{ .exchange = exchange } };
-                    try app_state.setStatus("Enter the Google Cloud project ID for Code Assist and press Enter");
-                },
+                .anthropic, .openai_codex => {}
             }
-        },
-        .google_project => |google_project| {
-            if (trimmed.len == 0) {
-                const env_project = env_map.get("GOOGLE_CLOUD_PROJECT") orelse env_map.get("GOOGLE_CLOUD_PROJECT_ID");
-                if (env_project == null) {
-                    try app_state.setStatus("Enter a Google Cloud project ID or set GOOGLE_CLOUD_PROJECT");
-                    return;
-                }
-            }
-
-            const project_id = if (trimmed.len > 0)
-                trimmed
-            else
-                env_map.get("GOOGLE_CLOUD_PROJECT") orelse env_map.get("GOOGLE_CLOUD_PROJECT_ID") orelse "";
-            var credential = try auth.finalizeGoogleCredential(allocator, &google_project.exchange, project_id);
+            var credential = try auth.completeBrowserLogin(allocator, io, &redirect.session, trimmed);
             defer credential.deinit(allocator);
             try persistLoginCredential(
                 allocator,
@@ -308,8 +267,8 @@ pub fn submitAuthFlowInput(
                 env_map,
                 session,
                 current_provider,
-                google_project.provider_id,
-                google_project.provider_name,
+                redirect.session.provider_id,
+                redirect.session.provider_name,
                 &credential,
                 options,
                 app_state,

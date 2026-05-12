@@ -58,7 +58,6 @@ const known_test_roots = [_][]const u8{
 const long_function_allowlist = [_]AllowlistedLongFunction{
     .{ .path = "src/ai/providers/azure_openai_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/google.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
-    .{ .path = "src/ai/providers/google_gemini_cli.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/kimi.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/mistral.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/openai.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },

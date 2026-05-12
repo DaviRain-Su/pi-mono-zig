@@ -238,14 +238,12 @@ pub const AuthOverlay = struct {
 
 pub const AuthFlow = union(enum) {
     browser_redirect: PendingBrowserRedirect,
-    google_project: PendingGoogleProject,
     copilot_device: auth.CopilotDeviceLogin,
     api_key: PendingApiKeyEntry,
 
     pub fn deinit(self: *AuthFlow, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .browser_redirect => |*value| value.deinit(allocator),
-            .google_project => |*value| value.deinit(allocator),
             .copilot_device => |*value| value.deinit(allocator),
             .api_key => |*value| value.deinit(allocator),
         }
@@ -260,17 +258,6 @@ pub const PendingBrowserRedirect = struct {
     pub fn deinit(self: *PendingBrowserRedirect, allocator: std.mem.Allocator) void {
         if (self.callback_listener) |listener| listener.destroy();
         self.session.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const PendingGoogleProject = struct {
-    provider_id: []const u8 = "google-gemini-cli",
-    provider_name: []const u8 = "Google Cloud Code Assist (Gemini CLI)",
-    exchange: auth.GoogleExchangeResult,
-
-    pub fn deinit(self: *PendingGoogleProject, allocator: std.mem.Allocator) void {
-        self.exchange.deinit(allocator);
         self.* = undefined;
     }
 };

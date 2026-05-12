@@ -31,9 +31,7 @@
 //!   - `oauth_default_client_id`  — built-in public OAuth client id for
 //!                                  providers shipping a hard-coded "public"
 //!                                  OAuth app (Anthropic, GitHub Copilot,
-//!                                  OpenAI Codex). Null for providers that
-//!                                  rely on user-supplied client ids via
-//!                                  `oauth-clients.json`.
+//!                                  OpenAI Codex).
 //!
 //! Where bespoke logic lives
 //! -------------------------
@@ -97,11 +95,8 @@ pub const ProviderInfo = struct {
     prefer_initial: ?[]const u8 = null,
     /// Built-in public OAuth client id shipped with the binary for providers
     /// that expose a hard-coded "public" OAuth application (Anthropic Claude
-    /// Pro/Max, GitHub Copilot, OpenAI Codex). Providers whose OAuth flow
-    /// requires an end-user-supplied client id (e.g. google-gemini-cli with a
-    /// user-owned GCP project) leave this `null` and rely on the on-disk
-    /// `oauth-clients.json` config; the auth-layer cross-check test asserts
-    /// agreement between this field and the `AuthProviderInfo` table.
+    /// Pro/Max, GitHub Copilot, OpenAI Codex); the auth-layer cross-check test
+    /// asserts agreement between this field and the `AuthProviderInfo` table.
     oauth_default_client_id: ?[]const u8 = null,
 };
 
@@ -186,12 +181,6 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "Google Gemini credentials required.\nSet GEMINI_API_KEY, pass --api-key, or run /login google to save a key.",
         .env_var = "GEMINI_API_KEY",
         .default_api = "google-generative-ai",
-    },
-    .{
-        .id = "google-gemini-cli",
-        .display_name = "Google Cloud Code Assist (Gemini CLI)",
-        .missing_api_key_message = "Google Cloud Code Assist credentials required.\nRun /login google-gemini-cli. Paid tiers may also require GOOGLE_CLOUD_PROJECT or GOOGLE_CLOUD_PROJECT_ID.",
-        .default_api = "google-gemini-cli",
     },
     .{
         .id = "google-vertex",
@@ -464,11 +453,6 @@ test "providers with partial coverage expose null fields" {
     try std.testing.expectEqualStrings("GitHub Copilot", github.display_name.?);
     try std.testing.expectEqualStrings("gpt-5.4", github.default_model.?);
 
-    const gemini_cli = providerInfoFor("google-gemini-cli").?;
-    try std.testing.expectEqualStrings("Google Cloud Code Assist (Gemini CLI)", gemini_cli.display_name.?);
-    try std.testing.expectEqual(@as(?[]const u8, null), gemini_cli.default_model);
-    try std.testing.expect(gemini_cli.missing_api_key_message != null);
-
     const responses = providerInfoFor("openai-responses").?;
     try std.testing.expectEqualStrings("OpenAI Responses", responses.display_name.?);
     try std.testing.expectEqual(@as(?[]const u8, null), responses.default_model);
@@ -495,7 +479,6 @@ test "oauthDefaultClientIdFor returns the canonical public client ids" {
         "app_EMoamEEZ73f0CkXaXp7hrann",
         oauthDefaultClientIdFor("openai-codex").?,
     );
-    try std.testing.expectEqual(@as(?[]const u8, null), oauthDefaultClientIdFor("google-gemini-cli"));
     try std.testing.expectEqual(@as(?[]const u8, null), oauthDefaultClientIdFor("openai"));
 }
 

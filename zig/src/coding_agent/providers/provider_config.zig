@@ -1065,35 +1065,6 @@ test "listAvailableModels surfaces provider catalog parity auth states" {
     }
 }
 
-test "listAvailableModels does not treat GEMINI_API_KEY as google-gemini-cli auth" {
-    const allocator = std.testing.allocator;
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("GEMINI_API_KEY", "gemini-key");
-
-    const current_model = ai.model_registry.find("faux", "faux-1").?;
-    const models = try listAvailableModels(allocator, &env_map, current_model, .{});
-    defer allocator.free(models);
-
-    var saw_google = false;
-    var saw_google_gemini_cli = false;
-
-    for (models) |entry| {
-        if (std.mem.eql(u8, entry.provider, "google") and std.mem.eql(u8, entry.model_id, "gemini-2.5-pro")) {
-            saw_google = true;
-            try std.testing.expect(entry.available);
-        }
-        if (std.mem.eql(u8, entry.provider, "google-gemini-cli") and std.mem.eql(u8, entry.model_id, "gemini-3.1-pro-preview")) {
-            saw_google_gemini_cli = true;
-            try std.testing.expect(!entry.available);
-        }
-    }
-
-    try std.testing.expect(saw_google);
-    try std.testing.expect(saw_google_gemini_cli);
-}
-
 test "listAvailableModels treats configured credentials as available" {
     const allocator = std.testing.allocator;
 
@@ -1259,12 +1230,6 @@ test "blank configured credentials do not make models selectable" {
         try std.testing.expect(!std.mem.eql(u8, entry.provider, "faux"));
     }
     try std.testing.expectEqual(@as(usize, 0), configured.len);
-}
-
-test "resolveProviderErrorMessage guides google-gemini-cli users to login" {
-    const message = resolveProviderErrorMessage(error.MissingApiKey, "google-gemini-cli");
-    try std.testing.expect(std.mem.indexOf(u8, message, "/login google-gemini-cli") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "GOOGLE_CLOUD_PROJECT") != null);
 }
 
 test "resolveProviderErrorMessage includes provider-specific env and login guidance" {

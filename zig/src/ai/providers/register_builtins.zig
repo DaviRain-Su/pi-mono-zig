@@ -7,7 +7,6 @@ const anthropic = @import("anthropic.zig");
 const azure_openai_responses = @import("azure_openai_responses.zig");
 const bedrock = @import("bedrock.zig");
 const google = @import("google.zig");
-const google_gemini_cli = @import("google_gemini_cli.zig");
 const google_vertex = @import("google_vertex.zig");
 const kimi = @import("kimi.zig");
 const mistral = @import("mistral.zig");
@@ -58,7 +57,6 @@ const BuiltInApi = enum {
     @"azure-openai-responses",
     @"openai-codex-responses",
     @"google-generative-ai",
-    @"google-gemini-cli",
     @"google-vertex",
     @"bedrock-converse-stream",
 };
@@ -118,13 +116,6 @@ const PROVIDER_METADATA = [_]ProviderMetadata{
         .default_provider = .{
             .stream = google.GoogleProvider.stream,
             .stream_simple = google.GoogleProvider.streamSimple,
-        },
-    },
-    .{
-        .api = "google-gemini-cli",
-        .default_provider = .{
-            .stream = google_gemini_cli.GoogleGeminiCliProvider.stream,
-            .stream_simple = google_gemini_cli.GoogleGeminiCliProvider.streamSimple,
         },
     },
     .{
@@ -492,17 +483,6 @@ const TEST_MODEL_SPECS = [_]TestModelSpec{
         .max_tokens = 65536,
     },
     TestModelSpec{
-        .api = "google-gemini-cli",
-        .provider = "google-gemini-cli",
-        .model_id = "gemini-cli-pro",
-        .name = "Gemini CLI Pro",
-        .base_url = "https://cloudcode-pa.googleapis.com",
-        .reasoning = true,
-        .input_types = &[_][]const u8{ "text", "image" },
-        .context_window = 1048576,
-        .max_tokens = 65536,
-    },
-    TestModelSpec{
         .api = "google-vertex",
         .provider = "google-vertex",
         .model_id = "gemini-2.5-pro",
@@ -586,14 +566,6 @@ fn validateHandoffPayload(allocator: std.mem.Allocator, model: types.Model, cont
         return;
     }
 
-    if (std.mem.eql(u8, model.api, "google-gemini-cli")) {
-        const payload = try google_gemini_cli.buildRequestPayload(allocator, model, context, "project-1", null);
-        const request = payload.object.get("request") orelse return error.MissingField;
-        try std.testing.expect(request == .object);
-        try expectJsonArrayField(request, "contents");
-        return;
-    }
-
     if (std.mem.eql(u8, model.api, "mistral-conversations")) {
         const payload = try mistral.buildRequestPayload(allocator, model, context, null);
         try expectJsonArrayField(payload, "messages");
@@ -605,7 +577,7 @@ fn validateHandoffPayload(allocator: std.mem.Allocator, model: types.Model, cont
 }
 
 test "built-in api list matches TypeScript registry count" {
-    try std.testing.expectEqual(@as(usize, 11), expectedBuiltInApiCount());
+    try std.testing.expectEqual(@as(usize, 10), expectedBuiltInApiCount());
     try std.testing.expectEqual(expectedBuiltInApiCount(), expectedBuiltInApis().len);
 
     const expected_order = [_][]const u8{
@@ -617,7 +589,6 @@ test "built-in api list matches TypeScript registry count" {
         "azure-openai-responses",
         "openai-codex-responses",
         "google-generative-ai",
-        "google-gemini-cli",
         "google-vertex",
         "bedrock-converse-stream",
     };

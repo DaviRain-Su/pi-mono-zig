@@ -29,7 +29,6 @@ const provider_stream_contract_matrix = [_]ProviderStreamContractCase{
     .{ .label = "Azure OpenAI Responses", .api = "azure-openai-responses", .provider = "azure-openai-responses", .model = "azure-gpt-5-mini" },
     .{ .label = "OpenAI Codex Responses", .api = "openai-codex-responses", .provider = "openai-codex", .model = "codex-mini-latest" },
     .{ .label = "Google Generative AI", .api = "google-generative-ai", .provider = "google", .model = "gemini-2.5-pro" },
-    .{ .label = "Google Gemini CLI", .api = "google-gemini-cli", .provider = "google-gemini-cli", .model = "gemini-2.5-pro" },
     .{ .label = "Google Vertex", .api = "google-vertex", .provider = "google-vertex", .model = "gemini-2.5-pro" },
     .{ .label = "Amazon Bedrock", .api = "bedrock-converse-stream", .provider = "amazon-bedrock", .model = "anthropic.claude-3-7-sonnet-20250219-v1:0" },
     .{ .label = "Faux", .api = "faux", .provider = "faux", .model = "faux-contract-model", .built_in = false },

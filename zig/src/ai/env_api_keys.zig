@@ -167,7 +167,6 @@ test "resolveEnvVar returns previously-known single-key mappings" {
         "anthropic",
         "github-copilot",
         "google-vertex",
-        "google-gemini-cli",
     };
     for (multi_cred) |provider| {
         try std.testing.expectEqual(@as(?[]const u8, null), resolveEnvVar(provider));
@@ -275,7 +274,6 @@ test "getEnvApiKey resolves known providers and returns null when missing" {
 
     const missing_cases = [_][]const u8{
         "google-antigravity",
-        "google-gemini-cli",
         "faux",
         "missing-provider",
     };

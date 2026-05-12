@@ -663,9 +663,8 @@ test "run preserves OAuth client config while migrating legacy oauth tokens" {
         std.testing.io,
         oauth_path,
         \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "legacy-client-id",
-        \\    "client_secret": "legacy-client-secret"
+        \\  "github-copilot": {
+        \\    "client_id": "legacy-client-id"
         \\  },
         \\  "anthropic": {
         \\    "access": "oauth-access",
@@ -680,9 +679,8 @@ test "run preserves OAuth client config while migrating legacy oauth tokens" {
         std.testing.io,
         safe_client_config_path,
         \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "safe-client-id",
-        \\    "client_secret": "safe-client-secret"
+        \\  "github-copilot": {
+        \\    "client_id": "safe-client-id"
         \\  }
         \\}
     ,
@@ -699,17 +697,14 @@ test "run preserves OAuth client config while migrating legacy oauth tokens" {
     const oauth_bytes = (try readOptionalFile(allocator, std.testing.io, oauth_path)).?;
     defer allocator.free(oauth_bytes);
     try std.testing.expect(std.mem.indexOf(u8, oauth_bytes, "legacy-client-id") != null);
-    try std.testing.expect(std.mem.indexOf(u8, oauth_bytes, "legacy-client-secret") != null);
 
     const safe_client_bytes = (try readOptionalFile(allocator, std.testing.io, safe_client_config_path)).?;
     defer allocator.free(safe_client_bytes);
     try std.testing.expect(std.mem.indexOf(u8, safe_client_bytes, "safe-client-id") != null);
-    try std.testing.expect(std.mem.indexOf(u8, safe_client_bytes, "safe-client-secret") != null);
 
     const auth_value = try auth.readStoredCredentialsObject(allocator, std.testing.io, auth_path);
     defer common.deinitJsonValue(allocator, auth_value);
     try std.testing.expect(auth_value == .object);
-    try std.testing.expect(auth_value.object.get("google-gemini-cli") == null);
     const anthropic_entry = auth_value.object.get("anthropic").?;
     try std.testing.expectEqualStrings("oauth", anthropic_entry.object.get("type").?.string);
     try std.testing.expectEqualStrings("oauth-access", anthropic_entry.object.get("access").?.string);

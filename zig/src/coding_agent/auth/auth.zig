@@ -33,15 +33,6 @@ const OPENAI_CODEX_SCOPES = "openid profile email offline_access";
 const OPENAI_CODEX_ORIGINATOR = "pi";
 const OPENAI_CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
 
-const GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GOOGLE_REDIRECT_URI = "http://localhost:8085/oauth2callback";
-const GOOGLE_SCOPES = [_][]const u8{
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-};
-
 const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GITHUB_COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token";
@@ -63,7 +54,6 @@ const OAuthRefreshEndpoints = struct {
     anthropic_token_url: []const u8 = ANTHROPIC_TOKEN_URL,
     github_copilot_token_url: []const u8 = GITHUB_COPILOT_TOKEN_URL,
     openai_codex_token_url: []const u8 = OPENAI_CODEX_TOKEN_URL,
-    google_token_url: []const u8 = GOOGLE_TOKEN_URL,
 };
 
 pub const OAuthClientCredentials = struct {
@@ -92,7 +82,6 @@ pub const OAUTH_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "anthropic", .name = "Anthropic (Claude Pro/Max)", .auth_type = .oauth },
     .{ .id = "openai-codex", .name = "ChatGPT Plus/Pro (Codex Subscription)", .auth_type = .oauth },
     .{ .id = "github-copilot", .name = "GitHub Copilot", .auth_type = .oauth },
-    .{ .id = "google-gemini-cli", .name = "Google Cloud Code Assist (Gemini CLI)", .auth_type = .oauth },
 };
 
 /// Build an API-key `ProviderInfo` row whose `name` is sourced from
@@ -205,7 +194,6 @@ pub const ResolvedApiKey = struct {
 pub const BrowserLoginKind = enum {
     anthropic,
     openai_codex,
-    google_gemini_cli,
 };
 
 pub const BrowserLoginSession = struct {
@@ -258,18 +246,6 @@ pub const CopilotPollResult = union(enum) {
     }
 };
 
-pub const GoogleExchangeResult = struct {
-    access_token: []u8,
-    refresh_token: []u8,
-    expires: i64,
-
-    pub fn deinit(self: *GoogleExchangeResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.access_token);
-        allocator.free(self.refresh_token);
-        self.* = undefined;
-    }
-};
-
 pub fn findSupportedProvider(provider_id: []const u8) ?ProviderInfo {
     for (SUPPORTED_PROVIDERS) |provider| {
         if (std.mem.eql(u8, provider.id, provider_id)) return provider;
@@ -296,35 +272,20 @@ const AuthProviderInfo = struct {
     id: []const u8,
     /// Built-in public OAuth client id; when set, no on-disk client config is required.
     default_public_client_id: ?[]const u8 = null,
-    /// Alternate root-object key in `oauth-clients.json` (e.g. "google" for
-    /// `google-gemini-cli`, "github" for `github-copilot`).
+    /// Alternate root-object key in `oauth-clients.json` (e.g. "github" for
+    /// `github-copilot`).
     oauth_config_alias_key: ?[]const u8 = null,
     /// JSON snippet shown when client config is missing.
     oauth_config_snippet: ?[]const u8 = null,
     /// When true, the OAuth state parameter is a random hex value instead of
     /// being derived from the PKCE verifier.
     uses_hex_oauth_state: bool = false,
-    /// When true, the authorize URL `scope` parameter is built dynamically from
-    /// `GOOGLE_SCOPES` instead of using the descriptor's static `scope` field.
-    uses_dynamic_google_scopes: bool = false,
-    /// When true, stored OAuth credentials must include a `project_id` and the
-    /// resolved API key is a JSON blob carrying `token` + `projectId`.
-    requires_project_id: bool = false,
 };
 
 const ANTHROPIC_OAUTH_SNIPPET =
     \\{
     \\  "anthropic": {
     \\    "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-    \\  }
-    \\}
-;
-
-const GOOGLE_OAUTH_SNIPPET =
-    \\{
-    \\  "google-gemini-cli": {
-    \\    "client_id": "YOUR_GOOGLE_CLIENT_ID",
-    \\    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET"
     \\  }
     \\}
 ;
@@ -353,13 +314,6 @@ const AUTH_PROVIDERS = [_]AuthProviderInfo{
         .id = "openai-codex",
         .default_public_client_id = DEFAULT_OPENAI_CODEX_CLIENT_ID,
         .uses_hex_oauth_state = true,
-    },
-    .{
-        .id = "google-gemini-cli",
-        .oauth_config_alias_key = "google",
-        .oauth_config_snippet = GOOGLE_OAUTH_SNIPPET,
-        .uses_dynamic_google_scopes = true,
-        .requires_project_id = true,
     },
 };
 
@@ -407,7 +361,6 @@ const OAuthLoginProvider = struct {
     extra_params: []const u8 = "",
     /// When set, the initial `code=true` parameter is added.
     has_code_param: bool = false,
-    /// When true, client_secret is required (Google).
     require_client_secret: bool = false,
 };
 
@@ -427,15 +380,6 @@ const OAUTH_LOGIN_PROVIDERS_REGISTRY = [_]OAuthLoginProvider{
         .redirect_uri = OPENAI_CODEX_REDIRECT_URI,
         .scope = OPENAI_CODEX_SCOPES,
         .extra_params = "&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=" ++ OPENAI_CODEX_ORIGINATOR,
-    },
-    .{
-        .id = "google-gemini-cli",
-        .kind = .google_gemini_cli,
-        .authorize_url = GOOGLE_AUTHORIZE_URL,
-        .redirect_uri = GOOGLE_REDIRECT_URI,
-        .scope = "", // built dynamically from GOOGLE_SCOPES
-        .extra_params = "&access_type=offline&prompt=consent",
-        .require_client_secret = true,
     },
 };
 
@@ -479,14 +423,6 @@ pub fn startOpenAICodexBrowserLogin(
     return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[1]);
 }
 
-pub fn startGoogleBrowserLogin(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-) !BrowserLoginSession {
-    return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[2]);
-}
-
 fn startBrowserLoginForDescriptor(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -516,10 +452,7 @@ fn startBrowserLoginForDescriptor(
     const encoded_redirect_uri = try formEncode(allocator, desc.redirect_uri);
     defer allocator.free(encoded_redirect_uri);
 
-    const scope_text = if (auth_info != null and auth_info.?.uses_dynamic_google_scopes)
-        try std.mem.join(allocator, " ", &GOOGLE_SCOPES)
-    else
-        try allocator.dupe(u8, desc.scope);
+    const scope_text = try allocator.dupe(u8, desc.scope);
     defer allocator.free(scope_text);
 
     const encoded_scope = try formEncode(allocator, scope_text);
@@ -568,75 +501,6 @@ pub fn completeBrowserLogin(
     return switch (session.kind) {
         .anthropic => .{ .oauth = try exchangeAnthropicAuthorizationCode(allocator, io, session, input) },
         .openai_codex => .{ .oauth = try exchangeOpenAICodexAuthorizationCode(allocator, io, session, input) },
-        .google_gemini_cli => return error.MissingProjectId,
-    };
-}
-
-pub fn exchangeGoogleAuthorizationCode(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    session: *const BrowserLoginSession,
-    input: []const u8,
-) !GoogleExchangeResult {
-    return exchangeGoogleAuthorizationCodeWithTokenUrl(allocator, io, session, input, GOOGLE_TOKEN_URL);
-}
-
-fn exchangeGoogleAuthorizationCodeWithTokenUrl(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    session: *const BrowserLoginSession,
-    input: []const u8,
-    token_url: []const u8,
-) !GoogleExchangeResult {
-    if (session.kind != .google_gemini_cli) return error.UnsupportedProvider;
-    const parsed = try parseAuthorizationInput(allocator, input);
-    defer parsed.deinit(allocator);
-
-    const state = parsed.state orelse return error.InvalidOAuthState;
-    if (!std.mem.eql(u8, state, session.state)) return error.InvalidOAuthState;
-
-    const code = parsed.code orelse return error.MissingAuthorizationCode;
-    const body = try buildFormBody(allocator, &.{
-        .{ .name = "client_id", .value = session.oauth_client.client_id },
-        .{ .name = "client_secret", .value = session.oauth_client.client_secret orelse return error.MissingOAuthClientSecret },
-        .{ .name = "code", .value = code },
-        .{ .name = "grant_type", .value = "authorization_code" },
-        .{ .name = "redirect_uri", .value = GOOGLE_REDIRECT_URI },
-        .{ .name = "code_verifier", .value = session.verifier },
-    });
-    defer allocator.free(body);
-
-    const response_body = try postForm(allocator, io, token_url, body, null);
-    defer allocator.free(response_body);
-
-    var parsed_response = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return error.InvalidAuthResponse;
-    defer parsed_response.deinit();
-    if (parsed_response.value != .object) return error.InvalidAuthResponse;
-
-    const access_token = getObjectString(parsed_response.value.object, "access_token") orelse return error.MissingAccessToken;
-    const refresh_token = getObjectString(parsed_response.value.object, "refresh_token") orelse return error.MissingRefreshToken;
-    const expires_in = getObjectInt(parsed_response.value.object, "expires_in") orelse return error.InvalidAuthResponse;
-
-    return .{
-        .access_token = try allocator.dupe(u8, access_token),
-        .refresh_token = try allocator.dupe(u8, refresh_token),
-        .expires = computeExpiresAtMs(expires_in, io),
-    };
-}
-
-pub fn finalizeGoogleCredential(
-    allocator: std.mem.Allocator,
-    exchange: *const GoogleExchangeResult,
-    project_id: []const u8,
-) !StoredCredential {
-    if (std.mem.trim(u8, project_id, &std.ascii.whitespace).len == 0) return error.MissingProjectId;
-    return .{
-        .oauth = .{
-            .access = try allocator.dupe(u8, exchange.access_token),
-            .refresh = try allocator.dupe(u8, exchange.refresh_token),
-            .expires = exchange.expires,
-            .project_id = try allocator.dupe(u8, std.mem.trim(u8, project_id, &std.ascii.whitespace)),
-        },
     };
 }
 
@@ -745,11 +609,7 @@ pub fn buildApiKeyFromStoredEntry(
         }
         if (std.mem.eql(u8, value, "oauth")) {
             const access = getObjectString(object, "access") orelse getObjectString(object, "access_token") orelse return null;
-            const info = authInfoFor(provider_id);
-            if (info != null and info.?.requires_project_id) {
-                const project_id = getObjectString(object, "projectId") orelse getObjectString(object, "project_id") orelse return null;
-                return try buildGoogleStoredApiKey(allocator, access, project_id);
-            }
+            _ = provider_id;
             return try allocator.dupe(u8, access);
         }
     }
@@ -1567,9 +1427,7 @@ fn refreshOAuthCredentialWithEndpoints(
     if (std.mem.eql(u8, provider_id, "openai-codex")) {
         return refreshOpenAICodexStoredTokenWithUrl(allocator, io, credential.refresh, endpoints.openai_codex_token_url);
     }
-    if (std.mem.eql(u8, provider_id, "google-gemini-cli")) {
-        return refreshGoogleStoredTokenWithUrl(allocator, io, env_map, credential, endpoints.google_token_url);
-    }
+    _ = env_map;
     return error.UnsupportedProvider;
 }
 
@@ -1619,32 +1477,6 @@ fn refreshOpenAICodexStoredTokenWithUrl(
     const account_id = try extractOpenAICodexAccountId(allocator, credential.access);
     defer allocator.free(account_id);
     return credential;
-}
-
-fn refreshGoogleStoredTokenWithUrl(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    env_map: *const std.process.Environ.Map,
-    credential: *const OAuthCredential,
-    token_url: []const u8,
-) !OAuthCredential {
-    var oauth_client = try loadOAuthClientCredentials(allocator, io, env_map, "google-gemini-cli", true);
-    defer oauth_client.deinit(allocator);
-
-    const body = try buildFormBody(allocator, &.{
-        .{ .name = "client_id", .value = oauth_client.client_id },
-        .{ .name = "client_secret", .value = oauth_client.client_secret orelse return error.MissingOAuthClientSecret },
-        .{ .name = "grant_type", .value = "refresh_token" },
-        .{ .name = "refresh_token", .value = credential.refresh },
-    });
-    defer allocator.free(body);
-
-    const response_body = try postForm(allocator, io, token_url, body, null);
-    defer allocator.free(response_body);
-    var refreshed = try parseOAuthRefreshResponse(allocator, io, response_body, .with_skew);
-    errdefer refreshed.deinit(allocator);
-    refreshed.project_id = if (credential.project_id) |project_id| try allocator.dupe(u8, project_id) else null;
-    return refreshed;
 }
 
 const RefreshExpiryMode = enum {
@@ -1893,17 +1725,13 @@ fn parseStoredOAuthCredential(
     const access = getObjectStringAny(object, &[_][]const u8{ "access", "access_token" }) orelse return null;
     const refresh = getObjectStringAny(object, &[_][]const u8{ "refresh", "refresh_token" }) orelse "";
     const expires = getObjectInt(object, "expires") orelse 0;
-    const info = authInfoFor(provider_id);
-    const project_id = if (info != null and info.?.requires_project_id)
-        getObjectStringAny(object, &[_][]const u8{ "projectId", "project_id" }) orelse return null
-    else
-        null;
+    _ = provider_id;
 
     return .{
         .access = try allocator.dupe(u8, access),
         .refresh = try allocator.dupe(u8, refresh),
         .expires = expires,
-        .project_id = if (project_id) |value| try allocator.dupe(u8, value) else null,
+        .project_id = null,
     };
 }
 
@@ -1912,25 +1740,8 @@ fn buildApiKeyFromOAuthCredential(
     provider_id: []const u8,
     credential: *const OAuthCredential,
 ) ![]u8 {
-    const info = authInfoFor(provider_id);
-    if (info != null and info.?.requires_project_id) {
-        const project_id = credential.project_id orelse return error.MissingProjectId;
-        return try buildGoogleStoredApiKey(allocator, credential.access, project_id);
-    }
+    _ = provider_id;
     return try allocator.dupe(u8, credential.access);
-}
-
-fn buildGoogleStoredApiKey(allocator: std.mem.Allocator, access: []const u8, project_id: []const u8) ![]u8 {
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    defer {
-        const cleanup_value: std.json.Value = .{ .object = object };
-        common.deinitJsonValue(allocator, cleanup_value);
-    }
-
-    try common.putString(allocator, &object, "token", access);
-    try common.putString(allocator, &object, "projectId", project_id);
-    const value: std.json.Value = .{ .object = object };
-    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn extractOpenAICodexAccountId(allocator: std.mem.Allocator, token: []const u8) ![]const u8 {
@@ -2183,62 +1994,6 @@ test "auth provider client ids agree with ai.provider_info.PROVIDERS" {
     }
 }
 
-test "startGoogleBrowserLogin loads client config from safe non-legacy file" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
-    defer allocator.free(agent_dir);
-    const legacy_oauth_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth.json" });
-    defer allocator.free(legacy_oauth_path);
-    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth-clients.json" });
-    defer allocator.free(client_config_path);
-
-    try common.writeFileAbsolute(
-        std.testing.io,
-        legacy_oauth_path,
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "legacy-oauth-json-client",
-        \\    "client_secret": "legacy-oauth-json-secret"
-        \\  }
-        \\}
-    ,
-        true,
-    );
-    try common.writeFileAbsolute(
-        std.testing.io,
-        client_config_path,
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "safe-client-id",
-        \\    "client_secret": "safe-client-secret"
-        \\  }
-        \\}
-    ,
-        true,
-    );
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-
-    var session = try startGoogleBrowserLogin(allocator, std.testing.io, &env_map);
-    defer session.deinit(allocator);
-
-    try std.testing.expectEqual(BrowserLoginKind.google_gemini_cli, session.kind);
-    try std.testing.expectEqualStrings("google-gemini-cli", session.provider_id);
-    try std.testing.expectEqualStrings("safe-client-id", session.oauth_client.client_id);
-    try std.testing.expectEqualStrings("safe-client-secret", session.oauth_client.client_secret.?);
-    try std.testing.expect(std.mem.startsWith(u8, session.auth_url, GOOGLE_AUTHORIZE_URL));
-    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=safe-client-id") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "legacy-oauth-json-client") == null);
-    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Foauth2callback") != null);
-}
-
 test "OpenAI Codex OAuth token exchange uses fake callback and local token endpoint" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2299,68 +2054,6 @@ test "OpenAI Codex OAuth token exchange uses fake callback and local token endpo
             io,
             &session,
             "http://localhost:1455/auth/callback?code=fake-code&state=wrong-state",
-            token_url,
-        ),
-    );
-}
-
-test "Google OAuth token exchange accepts fake loopback callback and local token endpoint" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
-    defer allocator.free(agent_dir);
-    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CLIENT_CONFIG_FILE_NAME });
-    defer allocator.free(client_config_path);
-    try common.writeFileAbsolute(
-        io,
-        client_config_path,
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "google-client-id",
-        \\    "client_secret": "google-client-secret"
-        \\  }
-        \\}
-    ,
-        true,
-    );
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-
-    var session = try startGoogleBrowserLogin(allocator, io, &env_map);
-    defer session.deinit(allocator);
-
-    var server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"google-access\",\"refresh_token\":\"google-refresh\",\"expires_in\":3600}");
-    defer server.deinit();
-    try server.start();
-    const token_url = try server.url(allocator);
-    defer allocator.free(token_url);
-
-    const callback = try std.fmt.allocPrint(
-        allocator,
-        "http://localhost:8085/oauth2callback?code=fake-code&state={s}",
-        .{session.state},
-    );
-    defer allocator.free(callback);
-
-    var exchange = try exchangeGoogleAuthorizationCodeWithTokenUrl(allocator, io, &session, callback, token_url);
-    defer exchange.deinit(allocator);
-    try std.testing.expectEqualStrings("google-access", exchange.access_token);
-    try std.testing.expectEqualStrings("google-refresh", exchange.refresh_token);
-    try std.testing.expect(exchange.expires > 0);
-
-    try std.testing.expectError(
-        error.InvalidOAuthState,
-        exchangeGoogleAuthorizationCodeWithTokenUrl(
-            allocator,
-            io,
-            &session,
-            "http://localhost:8085/oauth2callback?code=fake-code&state=wrong-state",
             token_url,
         ),
     );
@@ -2459,34 +2152,15 @@ test "formatOAuthClientConfigError references safe client config guidance" {
     const message = (try formatOAuthClientConfigError(
         allocator,
         &env_map,
-        "google-gemini-cli",
-        error.MissingOAuthClientSecret,
+        "github-copilot",
+        error.MissingOAuthClientId,
     )).?;
     defer allocator.free(message);
 
     try std.testing.expect(std.mem.indexOf(u8, message, "oauth.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "oauth-clients.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, message, "auth.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "\"client_secret\"") != null);
-}
-
-test "buildApiKeyFromStoredEntry encodes google oauth credentials as provider json" {
-    const allocator = std.testing.allocator;
-
-    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    defer {
-        const cleanup_value: std.json.Value = .{ .object = object };
-        common.deinitJsonValue(allocator, cleanup_value);
-    }
-    try common.putString(allocator, &object, "type", "oauth");
-    try common.putString(allocator, &object, "access", "access-token");
-    try common.putString(allocator, &object, "projectId", "project-123");
-
-    const api_key = (try buildApiKeyFromStoredEntry(allocator, "google-gemini-cli", object)).?;
-    defer allocator.free(api_key);
-
-    try std.testing.expect(std.mem.indexOf(u8, api_key, "\"token\":\"access-token\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, api_key, "\"projectId\":\"project-123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "\"client_id\"") != null);
 }
 
 test "valid stored OAuth credentials resolve without refresh for supported families" {
@@ -2539,20 +2213,6 @@ test "valid stored OAuth credentials resolve without refresh for supported famil
     defer allocator.free(codex_key);
     try std.testing.expectEqualStrings("codex-access", codex_key);
 
-    var google = try makeOAuthTestObject(allocator, "google-access", "google-refresh", future_expires, "project-123");
-    defer deinitOAuthTestObject(allocator, &google);
-    const google_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
-        allocator,
-        io,
-        &env_map,
-        null,
-        "google-gemini-cli",
-        google,
-        .{ .google_token_url = "http://127.0.0.1:1" },
-    )).?;
-    defer allocator.free(google_key);
-    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"token\":\"google-access\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"projectId\":\"project-123\"") != null);
 }
 
 test "expired stored OAuth credentials refresh before use and persist refreshed tokens" {
@@ -2564,20 +2224,6 @@ test "expired stored OAuth credentials refresh before use and persist refreshed 
 
     const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
     defer allocator.free(agent_dir);
-    const google_client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, OAUTH_CLIENT_CONFIG_FILE_NAME });
-    defer allocator.free(google_client_config_path);
-    try common.writeFileAbsolute(
-        io,
-        google_client_config_path,
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "google-client-id",
-        \\    "client_secret": "google-client-secret"
-        \\  }
-        \\}
-    ,
-        true,
-    );
 
     var env_map = std.process.Environ.Map.init(allocator);
     defer env_map.deinit();
@@ -2651,33 +2297,11 @@ test "expired stored OAuth credentials refresh before use and persist refreshed 
     defer allocator.free(codex_key);
     try std.testing.expectEqualStrings(codex_access, codex_key);
 
-    var google_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"google-new\",\"refresh_token\":\"google-refresh-new\",\"expires_in\":3600}");
-    defer google_server.deinit();
-    try google_server.start();
-    const google_url = try google_server.url(allocator);
-    defer allocator.free(google_url);
-    var google = try makeOAuthTestObject(allocator, "google-old", "google-refresh-old", 0, "project-123");
-    defer deinitOAuthTestObject(allocator, &google);
-    const google_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
-        allocator,
-        io,
-        &env_map,
-        auth_path,
-        "google-gemini-cli",
-        google,
-        .{ .google_token_url = google_url },
-    )).?;
-    defer allocator.free(google_key);
-    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"token\":\"google-new\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, google_key, "\"projectId\":\"project-123\"") != null);
-
     const persisted = try std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024));
     defer allocator.free(persisted);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "anthropic-new") != null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "copilot-new") != null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, codex_access) != null);
-    try std.testing.expect(std.mem.indexOf(u8, persisted, "google-new") != null);
-    try std.testing.expect(std.mem.indexOf(u8, persisted, "project-123") != null);
 }
 
 test "isApiKeyLoginProvider keeps built-in API key providers separate from OAuth-only providers" {
@@ -2711,7 +2335,7 @@ test "API key login metadata includes provider catalog parity providers" {
         .{ .provider = "xiaomi-token-plan-sgp", .display_name = "Xiaomi MiMo Token Plan (Singapore)" },
     };
 
-    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "google-gemini-cli" };
+    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot" };
     for (cases) |case| {
         try std.testing.expect(isApiKeyLoginProvider(case.provider, oauth_provider_ids[0..], null));
         try std.testing.expectEqualStrings(case.display_name, getApiKeyProviderDisplayName(case.provider));
@@ -2841,12 +2465,12 @@ test "upsertStoredCredential and listStoredProviders persist oauth state" {
     };
     defer credential.deinit(allocator);
 
-    try upsertStoredCredential(allocator, std.testing.io, auth_path, "google-gemini-cli", &credential);
+    try upsertStoredCredential(allocator, std.testing.io, auth_path, "anthropic", &credential);
     const providers = try listStoredProviders(allocator, std.testing.io, auth_path);
     defer allocator.free(providers);
 
     try std.testing.expectEqual(@as(usize, 1), providers.len);
-    try std.testing.expectEqualStrings("google-gemini-cli", providers[0].id);
+    try std.testing.expectEqualStrings("anthropic", providers[0].id);
     const stat = try std.Io.Dir.statFile(.cwd(), std.testing.io, auth_path, .{});
     if (@hasDecl(@TypeOf(stat.permissions), "toMode")) {
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);

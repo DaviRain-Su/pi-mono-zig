@@ -60,7 +60,6 @@ pub const providers = struct {
     pub const anthropic = @import("providers/anthropic.zig");
     pub const google = @import("providers/google.zig");
     pub const google_shared = @import("providers/google_shared.zig");
-    pub const google_gemini_cli = @import("providers/google_gemini_cli.zig");
     pub const google_vertex = @import("providers/google_vertex.zig");
     pub const mistral = @import("providers/mistral.zig");
     pub const bedrock = @import("providers/bedrock.zig");
@@ -134,7 +133,6 @@ test {
     _ = @import("providers/provider_smoke_test.zig");
     _ = @import("providers/provider_tool_call_ownership_matrix_test.zig");
     _ = @import("providers/google.zig");
-    _ = @import("providers/google_gemini_cli.zig");
     _ = @import("providers/google_vertex.zig");
     _ = @import("providers/mistral.zig");
     _ = @import("providers/bedrock.zig");

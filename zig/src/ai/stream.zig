@@ -1285,7 +1285,6 @@ test "ISS-505 built-in representative provider families convert setup failures i
         .{ .api = "kimi-completions", .provider = "kimi" },
         .{ .api = "mistral-conversations", .provider = "mistral" },
         .{ .api = "google-generative-ai", .provider = "google" },
-        .{ .api = "google-gemini-cli", .provider = "google-gemini-cli" },
         .{ .api = "google-vertex", .provider = "google-vertex" },
         .{ .api = "bedrock-converse-stream", .provider = "amazon-bedrock" },
     };

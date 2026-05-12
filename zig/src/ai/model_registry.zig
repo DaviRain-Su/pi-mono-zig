@@ -866,7 +866,6 @@ const THINKING_MAP_OFF_UNSUPPORTED = types.ThinkingLevelMap{ .off = .unsupported
 
 const CURATED_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "kimi", .api = "kimi-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },
-    .{ .provider = "google-gemini-cli", .api = "google-gemini-cli", .base_url = "https://cloudcode-pa.googleapis.com", .default_model_id = "gemini-3.1-pro-preview" },
     .{ .provider = "openai-responses", .api = "openai-responses", .base_url = "https://api.openai.com/v1", .default_model_id = "gpt-5-mini" },
     .{ .provider = "faux", .api = "faux", .base_url = "http://localhost:0", .default_model_id = "faux-1" },
 };
@@ -874,7 +873,6 @@ const CURATED_PROVIDER_CONFIGS = [_]ProviderConfig{
 const CURATED_MODELS = [_]ModelDefinition{
     .{ .provider = "kimi", .id = "moonshot-v1-8k", .name = "Moonshot v1 8K", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 8192 },
     .{ .provider = "kimi", .id = "kimi-k2.6", .name = "Kimi K2.6", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 256000, .max_tokens = 32768 },
-    .{ .provider = "google-gemini-cli", .id = "gemini-3.1-pro-preview", .name = "Gemini CLI 3.1 Pro Preview", .reasoning = true, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 1048576, .max_tokens = 65536 },
     .{ .provider = "openai-responses", .id = "gpt-5-mini", .name = "GPT-5 Mini", .reasoning = true, .thinking_level_map = THINKING_MAP_OFF_UNSUPPORTED, .input_types = TEXT_AND_IMAGE_INPUTS[0..], .context_window = 200000, .max_tokens = 16384 },
     .{ .provider = "faux", .id = "faux-1", .name = "Faux 1", .reasoning = false, .input_types = TEXT_INPUTS[0..], .context_window = 8192, .max_tokens = 4096 },
 };

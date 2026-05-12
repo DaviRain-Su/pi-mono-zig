@@ -2385,116 +2385,6 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.openai.com/oauth/authorize") != null);
 }
 
-test "beginLoginFlow gives google client config guidance without legacy oauth config path" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
-    defer allocator.free(agent_dir);
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-
-    var state = try AppState.init(allocator, std.testing.io);
-    defer state.deinit();
-
-    auth_flow_mod.test_auth_flow = null;
-    defer if (auth_flow_mod.test_auth_flow) |*value| {
-        value.deinit(allocator);
-        auth_flow_mod.test_auth_flow = null;
-    };
-
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &auth_flow_mod.test_auth_flow);
-
-    try std.testing.expect(auth_flow_mod.test_auth_flow == null);
-
-    state.mutex.lockUncancelable(state.io);
-    defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "oauth-clients.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "auth.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "legacy oauth.json is ignored") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "\"google-gemini-cli\"") != null);
-}
-
-test "beginLoginFlow starts google oauth flow with fake safe client config" {
-    const allocator = std.testing.allocator;
-
-    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
-    defer oauth_callback_lock.release(std.testing.io);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
-    defer allocator.free(agent_dir);
-    const client_config_path = try std.fs.path.join(allocator, &[_][]const u8{ agent_dir, "oauth-clients.json" });
-    defer allocator.free(client_config_path);
-    try common.writeFileAbsolute(
-        std.testing.io,
-        client_config_path,
-        \\{
-        \\  "google-gemini-cli": {
-        \\    "client_id": "fake-google-client",
-        \\    "client_secret": "fake-google-secret"
-        \\  }
-        \\}
-    ,
-        true,
-    );
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-
-    var state = try AppState.init(allocator, std.testing.io);
-    defer state.deinit();
-
-    auth_flow_mod.test_auth_flow = null;
-    defer if (auth_flow_mod.test_auth_flow) |*value| {
-        value.deinit(allocator);
-        auth_flow_mod.test_auth_flow = null;
-    };
-    var browser_open_capture = BrowserOpenCapture{};
-    const previous_browser_open_context = auth_flow_mod.open_browser_context;
-    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
-    auth_flow_mod.open_browser_context = &browser_open_capture;
-    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
-    defer {
-        auth_flow_mod.open_browser_context = previous_browser_open_context;
-        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
-    }
-    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
-    auth_flow_mod.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
-    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
-
-    try beginLoginFlow(allocator, std.testing.io, &env_map, "google-gemini-cli", null, &state, &auth_flow_mod.test_auth_flow);
-    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
-
-    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
-    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
-    try std.testing.expectEqual(auth.BrowserLoginKind.google_gemini_cli, auth_flow_mod.test_auth_flow.?.browser_redirect.session.kind);
-    try std.testing.expectEqualStrings("google-gemini-cli", auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_id);
-    try std.testing.expectEqualStrings("fake-google-client", auth_flow_mod.test_auth_flow.?.browser_redirect.session.oauth_client.client_id);
-    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener != null);
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
-        "/oauth2callback",
-    ));
-    try std.testing.expect(browser_open_capture.called);
-    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2Flocalhost%3A8085%2Foauth2callback") != null);
-
-    state.mutex.lockUncancelable(state.io);
-    defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Google Cloud Code Assist (Gemini CLI) login started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "accounts.google.com/o/oauth2/v2/auth") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "client_id=fake-google-client") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[3].text, "Google Cloud project ID") != null);
-}
-
 test "beginLoginFlow starts API key prompt state for built-in provider" {
     const allocator = std.testing.allocator;
 
@@ -6576,7 +6466,6 @@ fn callbackProviderKindForTest(kind: auth.BrowserLoginKind) auth.OAuthCallbackPr
     return switch (kind) {
         .anthropic => .anthropic,
         .openai_codex => .openai_codex,
-        .google_gemini_cli => .google_gemini_cli,
     };
 }
 

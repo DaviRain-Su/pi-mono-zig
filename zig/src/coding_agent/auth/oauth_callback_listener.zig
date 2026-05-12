@@ -3,14 +3,12 @@ const std = @import("std");
 pub const ProviderKind = enum {
     anthropic,
     openai_codex,
-    google_gemini_cli,
 };
 
 pub fn defaultCallbackPath(kind: ProviderKind) []const u8 {
     return switch (kind) {
         .anthropic => "/callback",
         .openai_codex => "/auth/callback",
-        .google_gemini_cli => "/oauth2callback",
     };
 }
 
@@ -18,7 +16,6 @@ pub fn defaultCallbackPort(kind: ProviderKind) u16 {
     return switch (kind) {
         .anthropic => 53692,
         .openai_codex => 1455,
-        .google_gemini_cli => 8085,
     };
 }
 
@@ -367,7 +364,7 @@ fn rawHttpGet(allocator: std.mem.Allocator, io: std.Io, port: u16, target: []con
 
 test "OAuth callback listener accepts provider paths and captures callback URL" {
     const allocator = std.testing.allocator;
-    const cases = [_]ProviderKind{ .anthropic, .openai_codex, .google_gemini_cli };
+    const cases = [_]ProviderKind{ .anthropic, .openai_codex };
 
     for (cases) |kind| {
         var listener = try OAuthCallbackListener.createForTesting(allocator, std.testing.io, kind, "expected-state", 0);
