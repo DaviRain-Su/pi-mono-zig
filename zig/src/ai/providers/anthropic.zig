@@ -2302,6 +2302,7 @@ fn processAnthropicSseEvent(
                 }
                 if (message_value.object.get("usage")) |usage_value| {
                     updateUsage(&output.usage, usage_value);
+                    finalize.calculateCost(model, &output.usage);
                 }
             }
         }
@@ -3617,6 +3618,58 @@ test "anthropic stream ending after message_start without message_stop yields te
     try std.testing.expectEqualStrings("Anthropic stream ended before message_stop", terminal.error_message.?);
     try std.testing.expect(terminal.message != null);
     try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+
+    try std.testing.expect(stream.next() == null);
+}
+
+test "anthropic message_start populates usage cost so premature termination error reports non-zero cost" {
+    const allocator = std.heap.page_allocator;
+    const io = std.testing.io;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_priced\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1000000,\"output_tokens\":500000,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\n";
+    var server = try provider_error.TestStatusServer.init(io, 200, "OK", "", body);
+    defer server.deinit();
+    try server.start();
+
+    const url = try server.url(allocator);
+    defer allocator.free(url);
+
+    const priced_model: types.Model = .{
+        .id = "claude-3-7-sonnet-latest",
+        .name = "Claude",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = url,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+    };
+
+    var stream = try AnthropicProvider.stream(
+        allocator,
+        io,
+        priced_model,
+        streamErrorContractAnthropicContext(),
+        .{ .api_key = "test-key" },
+    );
+    defer stream.deinit();
+
+    const start_event = stream.next().?;
+    try std.testing.expectEqual(types.EventType.start, start_event.event_type);
+
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Anthropic stream ended before message_stop", terminal.error_message.?);
+    try std.testing.expect(terminal.message != null);
+    const usage = terminal.message.?.usage;
+    try std.testing.expectEqual(@as(u32, 1_000_000), usage.input);
+    try std.testing.expectEqual(@as(u32, 500_000), usage.output);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), usage.cost.input, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.5), usage.cost.output, 1e-9);
+    try std.testing.expect(usage.cost.total > 0);
 
     try std.testing.expect(stream.next() == null);
 }
