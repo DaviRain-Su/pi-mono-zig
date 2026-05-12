@@ -1,3 +1,51 @@
+//! provider_info — single source of truth for per-provider metadata.
+//!
+//! Purpose
+//! -------
+//! One row per provider in `PROVIDERS` describes every piece of static
+//! metadata the coding_agent layer needs to talk to that provider: display
+//! name, default model, default API id, default OAuth client id, the
+//! missing-credentials message we surface, and the env-var fallback chain
+//! used to populate an API key. Adding a provider is one row plus the
+//! provider-specific streaming code; no edits to four parallel lookup
+//! tables.
+//!
+//! Schema
+//! ------
+//! `ProviderInfo` fields (all but `id` optional):
+//!   - `id`                       — canonical provider id string.
+//!   - `display_name`             — human-readable label for UI and `/login`.
+//!   - `default_model`            — model id picked when no `--model` is given.
+//!   - `env_var`                  — single primary env-var hint (used when
+//!                                  the provider has exactly one env key).
+//!   - `env_vars`                 — ordered priority list of env keys; the
+//!                                  first non-empty value wins. Use when the
+//!                                  provider has flat OR-fallback auth (e.g.
+//!                                  anthropic, github-copilot).
+//!   - `missing_api_key_message`  — surfaced when credential lookup fails.
+//!   - `default_api`              — default `Api` identifier for streaming;
+//!                                  cross-checked against `model_registry`.
+//!   - `prefer_initial`           — at boot, when this provider is otherwise
+//!                                  the default, prefer the named provider
+//!                                  first if its credentials are configured.
+//!   - `oauth_default_client_id`  — built-in public OAuth client id for
+//!                                  providers shipping a hard-coded "public"
+//!                                  OAuth app (Anthropic, GitHub Copilot,
+//!                                  OpenAI Codex). Null for providers that
+//!                                  rely on user-supplied client ids via
+//!                                  `oauth-clients.json`.
+//!
+//! Where bespoke logic lives
+//! -------------------------
+//! `provider_info` only encodes data that reduces to flat lookups. Per-
+//! provider conditional auth (Google ADC filesystem probes; Amazon Bedrock
+//! multi-credential AND-conjunction across AWS_*; sentinel-return semantics)
+//! continues to live in `env_api_keys.zig`. Per-provider streaming, header
+//! construction, and event parsing continue to live in `providers/<id>.zig`.
+//! Cross-check tests in this file assert agreement between `PROVIDERS` and
+//! the `model_registry` / auth-layer tables so the row table cannot silently
+//! drift.
+
 const std = @import("std");
 const types = @import("types.zig");
 const model_registry = @import("model_registry.zig");
