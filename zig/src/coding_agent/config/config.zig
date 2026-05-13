@@ -1241,7 +1241,13 @@ fn stripJsonComments(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         if (c == '/' and i + 1 < input.len) {
             const next = input[i + 1];
             if (next == '/') {
-                // Line comment: skip until newline (newline itself preserved).
+                // Line comment: drop preceding horizontal whitespace on the
+                // same line, then skip until newline (newline itself preserved).
+                while (no_comments.items.len > 0) {
+                    const previous = no_comments.items[no_comments.items.len - 1];
+                    if (previous != ' ' and previous != '\t') break;
+                    no_comments.items.len -= 1;
+                }
                 i += 2;
                 while (i < input.len and input[i] != '\n') : (i += 1) {}
                 continue;
