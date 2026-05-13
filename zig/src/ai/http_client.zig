@@ -1617,6 +1617,14 @@ const TestRedirectServer = struct {
     }
 };
 
+fn expectOldConnectionProbeSucceeded(io: std.Io, succeeded: *std.atomic.Value(bool)) !void {
+    const deadline_ns = std.Io.Clock.now(.awake, io).nanoseconds + 2 * std.time.ns_per_s;
+    while (!succeeded.load(.seq_cst) and std.Io.Clock.now(.awake, io).nanoseconds < deadline_ns) {
+        std.Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    }
+    try std.testing.expect(succeeded.load(.seq_cst));
+}
+
 const TestTlsHandshakeStallServer = struct {
     io: std.Io,
     server: std.Io.net.Server,
@@ -2195,8 +2203,7 @@ test "requestStreaming timeout interrupts redirected response header stall witho
     try std.testing.expectError(HttpError.Timeout, streaming);
     try std.testing.expect(elapsed_ms < target_server.stall_ms);
 
-    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
-    try std.testing.expect(old_connection_probe_succeeded.load(.seq_cst));
+    try expectOldConnectionProbeSucceeded(io, &old_connection_probe_succeeded);
 }
 
 test "requestStreaming uses timeout-aware localhost connection path" {
@@ -2326,8 +2333,7 @@ test "requestStreaming abort interrupts redirected response header stall without
     try std.testing.expectError(HttpError.RequestAborted, streaming);
     try std.testing.expect(elapsed_ms < target_server.stall_ms);
 
-    std.Io.sleep(io, .fromMilliseconds(300), .awake) catch {};
-    try std.testing.expect(old_connection_probe_succeeded.load(.seq_cst));
+    try expectOldConnectionProbeSucceeded(io, &old_connection_probe_succeeded);
 }
 
 test "requestStreaming times out during TLS handshake stall" {
