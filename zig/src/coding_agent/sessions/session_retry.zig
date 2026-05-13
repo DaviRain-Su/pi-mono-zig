@@ -45,6 +45,7 @@ pub fn isRetryableError(message: ai.AssistantMessage, context_window: u32) bool 
         string_utils.containsIgnoreCase(error_message, "connection lost") or
         string_utils.containsIgnoreCase(error_message, "socket hang up") or
         string_utils.containsIgnoreCase(error_message, "fetch failed") or
+        string_utils.containsIgnoreCase(error_message, "stream ended before message_stop") or
         string_utils.containsIgnoreCase(error_message, "timeout") or
         string_utils.containsIgnoreCase(error_message, "timed out") or
         string_utils.containsIgnoreCase(error_message, "429") or
@@ -65,4 +66,33 @@ pub fn exponentialBackoffMs(base_delay_ms: u64, attempt: u32) u64 {
 pub fn sleepMilliseconds(io: std.Io, delay_ms: u64) !void {
     const clamped = @min(delay_ms, @as(u64, std.math.maxInt(i64)));
     try std.Io.sleep(io, .fromMilliseconds(@intCast(clamped)), .awake);
+}
+
+fn retryTestMessage(error_message: ?[]const u8, stop_reason: ai.StopReason) ai.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = "anthropic",
+        .provider = "anthropic",
+        .model = "claude-sonnet-4-20250514",
+        .usage = ai.Usage.init(),
+        .stop_reason = stop_reason,
+        .error_message = error_message,
+        .timestamp = 0,
+    };
+}
+
+test "retry classifier treats Anthropic message_stop stream endings as retryable" {
+    const message = retryTestMessage("Anthropic STREAM ENDED BEFORE MESSAGE_STOP", .error_reason);
+    try std.testing.expect(isRetryableError(message, 200000));
+}
+
+test "retry classifier keeps non retryable errors false" {
+    const plain_error = retryTestMessage("invalid request", .error_reason);
+    try std.testing.expect(!isRetryableError(plain_error, 200000));
+
+    const successful_message = retryTestMessage("stream ended before message_stop", .stop);
+    try std.testing.expect(!isRetryableError(successful_message, 200000));
+
+    const missing_error_message = retryTestMessage(null, .error_reason);
+    try std.testing.expect(!isRetryableError(missing_error_message, 200000));
 }
