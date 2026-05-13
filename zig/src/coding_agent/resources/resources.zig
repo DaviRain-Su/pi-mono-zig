@@ -9,348 +9,62 @@ const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
-pub const SourceScope = enum {
-    temporary,
-    project,
-    user,
-};
+const resource_types = @import("types.zig");
+const resource_commands = @import("commands.zig");
+const resource_diagnostics = @import("diagnostics.zig");
+const resource_environment = @import("environment.zig");
+const resource_frontmatter = @import("frontmatter.zig");
+const resource_files = @import("file_helpers.zig");
 
-pub const SourceOrigin = enum {
-    top_level,
-    package,
-};
+pub const SourceScope = resource_types.SourceScope;
+pub const SourceOrigin = resource_types.SourceOrigin;
+pub const SourceProvenanceBinding = resource_types.SourceProvenanceBinding;
+pub const ResourceKind = resource_types.ResourceKind;
+pub const Diagnostic = resource_types.Diagnostic;
+pub const SourceInfo = resource_types.SourceInfo;
+pub const ResolvedResource = resource_types.ResolvedResource;
+pub const ResolvedPaths = resource_types.ResolvedPaths;
+pub const LockedWasmPackage = resource_types.LockedWasmPackage;
+pub const LockedWasmPackageResolution = resource_types.LockedWasmPackageResolution;
+pub const LockedNativePackage = resource_types.LockedNativePackage;
+pub const LockedNativePackageResolution = resource_types.LockedNativePackageResolution;
+pub const PackageSourceConfig = resource_types.PackageSourceConfig;
+pub const SettingsResources = resource_types.SettingsResources;
+pub const ExtensionDiscoveredResources = resource_types.ExtensionDiscoveredResources;
+pub const LoadedExtension = resource_types.LoadedExtension;
+pub const Skill = resource_types.Skill;
+pub const PromptTemplate = resource_types.PromptTemplate;
+pub const ThemeColor = resource_types.ThemeColor;
+pub const ThemeToken = resource_types.ThemeToken;
+pub const StyleSpec = resource_types.StyleSpec;
+pub const ThemeColors = resource_types.ThemeColors;
+pub const Theme = resource_types.Theme;
+pub const ResourceBundle = resource_types.ResourceBundle;
+pub const ResolveResourcesOptions = resource_types.ResolveResourcesOptions;
 
-pub const SourceProvenanceBinding = struct {
-    lock_entry_key: []u8,
-    source_identity: []u8,
-    package_root: []u8,
-    package_root_sha256: []u8,
-    artifact_sha256: ?[]u8 = null,
+pub const formatSkillsForPrompt = resource_commands.formatSkillsForPrompt;
+pub const parseCommandArgs = resource_commands.parseCommandArgs;
+pub const freeParsedArgs = resource_commands.freeParsedArgs;
+pub const substituteArgs = resource_commands.substituteArgs;
+pub const expandPromptTemplate = resource_commands.expandPromptTemplate;
+pub const expandSkillCommand = resource_commands.expandSkillCommand;
+pub const resolveThemeIndex = resource_environment.resolveThemeIndex;
+pub const findThemeIndex = resource_environment.findThemeIndex;
+pub const redactDiagnosticValue = resource_diagnostics.redactDiagnosticValue;
 
-    pub fn clone(self: SourceProvenanceBinding, allocator: std.mem.Allocator) !SourceProvenanceBinding {
-        return .{
-            .lock_entry_key = try allocator.dupe(u8, self.lock_entry_key),
-            .source_identity = try allocator.dupe(u8, self.source_identity),
-            .package_root = try allocator.dupe(u8, self.package_root),
-            .package_root_sha256 = try allocator.dupe(u8, self.package_root_sha256),
-            .artifact_sha256 = if (self.artifact_sha256) |value| try allocator.dupe(u8, value) else null,
-        };
-    }
-
-    pub fn deinit(self: *SourceProvenanceBinding, allocator: std.mem.Allocator) void {
-        allocator.free(self.lock_entry_key);
-        allocator.free(self.source_identity);
-        allocator.free(self.package_root);
-        allocator.free(self.package_root_sha256);
-        if (self.artifact_sha256) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-pub const ResourceKind = enum {
-    extension,
-    skill,
-    prompt,
-    theme,
-
-    fn directoryName(self: ResourceKind) []const u8 {
-        return switch (self) {
-            .extension => "extensions",
-            .skill => "skills",
-            .prompt => "prompts",
-            .theme => "themes",
-        };
-    }
-
-    fn fileExtension(self: ResourceKind) []const u8 {
-        return switch (self) {
-            .extension => ".ts",
-            .skill => ".md",
-            .prompt => ".md",
-            .theme => ".json",
-        };
-    }
-
-    fn singularName(self: ResourceKind) []const u8 {
-        return switch (self) {
-            .extension => "extension",
-            .skill => "skill",
-            .prompt => "prompt",
-            .theme => "theme",
-        };
-    }
-};
-
-pub const Diagnostic = struct {
-    kind: []u8,
-    message: []u8,
-    path: ?[]u8 = null,
-
-    pub fn deinit(self: *Diagnostic, allocator: std.mem.Allocator) void {
-        allocator.free(self.kind);
-        allocator.free(self.message);
-        if (self.path) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-pub const SourceInfo = struct {
-    path: []u8,
-    source: []u8,
-    scope: SourceScope,
-    origin: SourceOrigin,
-    base_dir: ?[]u8 = null,
-    provenance: ?SourceProvenanceBinding = null,
-
-    pub fn clone(self: SourceInfo, allocator: std.mem.Allocator) !SourceInfo {
-        return .{
-            .path = try allocator.dupe(u8, self.path),
-            .source = try allocator.dupe(u8, self.source),
-            .scope = self.scope,
-            .origin = self.origin,
-            .base_dir = if (self.base_dir) |value| try allocator.dupe(u8, value) else null,
-            .provenance = if (self.provenance) |value| try value.clone(allocator) else null,
-        };
-    }
-
-    pub fn deinit(self: *SourceInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        allocator.free(self.source);
-        if (self.base_dir) |value| allocator.free(value);
-        if (self.provenance) |*value| value.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const ResolvedResource = struct {
-    path: []u8,
-    enabled: bool,
-    source_info: SourceInfo,
-    discovery_index: usize = 0,
-
-    pub fn deinit(self: *ResolvedResource, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        self.source_info.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const ResolvedPaths = struct {
-    extensions: []ResolvedResource,
-    skills: []ResolvedResource,
-    prompts: []ResolvedResource,
-    themes: []ResolvedResource,
-    diagnostics: []Diagnostic,
-
-    pub fn deinit(self: *ResolvedPaths, allocator: std.mem.Allocator) void {
-        deinitResolvedSlice(allocator, self.extensions);
-        deinitResolvedSlice(allocator, self.skills);
-        deinitResolvedSlice(allocator, self.prompts);
-        deinitResolvedSlice(allocator, self.themes);
-        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
-        allocator.free(self.diagnostics);
-        self.* = undefined;
-    }
-};
-
-pub const LockedWasmPackage = struct {
-    source_info: SourceInfo,
-    manifest: ext_manifest.Manifest,
-    lock_entry: provenance_lockfile.LockEntry,
-
-    pub fn deinit(self: *LockedWasmPackage, allocator: std.mem.Allocator) void {
-        self.source_info.deinit(allocator);
-        self.manifest.deinit(allocator);
-        self.lock_entry.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const LockedWasmPackageResolution = struct {
-    packages: []LockedWasmPackage,
-    diagnostics: []Diagnostic,
-
-    pub fn deinit(self: *LockedWasmPackageResolution, allocator: std.mem.Allocator) void {
-        for (self.packages) |*package| package.deinit(allocator);
-        allocator.free(self.packages);
-        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
-        allocator.free(self.diagnostics);
-        self.* = undefined;
-    }
-};
-
-pub const LockedNativePackage = struct {
-    source_info: SourceInfo,
-    manifest: native_manifest.Manifest,
-    lock_entry: provenance_lockfile.LockEntry,
-
-    pub fn deinit(self: *LockedNativePackage, allocator: std.mem.Allocator) void {
-        self.source_info.deinit(allocator);
-        self.manifest.deinit(allocator);
-        self.lock_entry.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const LockedNativePackageResolution = struct {
-    packages: []LockedNativePackage,
-    diagnostics: []Diagnostic,
-
-    pub fn deinit(self: *LockedNativePackageResolution, allocator: std.mem.Allocator) void {
-        for (self.packages) |*package| package.deinit(allocator);
-        allocator.free(self.packages);
-        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
-        allocator.free(self.diagnostics);
-        self.* = undefined;
-    }
-};
-
-pub const PackageSourceConfig = struct {
-    source: []u8,
-    extensions: ?[]const []const u8 = null,
-    skills: ?[]const []const u8 = null,
-    prompts: ?[]const []const u8 = null,
-    themes: ?[]const []const u8 = null,
-
-    pub fn clone(self: PackageSourceConfig, allocator: std.mem.Allocator) !PackageSourceConfig {
-        return .{
-            .source = try allocator.dupe(u8, self.source),
-            .extensions = try cloneStringList(allocator, self.extensions),
-            .skills = try cloneStringList(allocator, self.skills),
-            .prompts = try cloneStringList(allocator, self.prompts),
-            .themes = try cloneStringList(allocator, self.themes),
-        };
-    }
-
-    pub fn deinit(self: *PackageSourceConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.source);
-        freeStringList(allocator, self.extensions);
-        freeStringList(allocator, self.skills);
-        freeStringList(allocator, self.prompts);
-        freeStringList(allocator, self.themes);
-        self.* = undefined;
-    }
-};
-
-pub const SettingsResources = struct {
-    packages: ?[]const PackageSourceConfig = null,
-    extensions: ?[]const []const u8 = null,
-    skills: ?[]const []const u8 = null,
-    prompts: ?[]const []const u8 = null,
-    themes: ?[]const []const u8 = null,
-    theme: ?[]const u8 = null,
-};
-
-pub const ExtensionDiscoveredResources = struct {
-    extension_path: []const u8,
-    source_info: SourceInfo,
-    skill_paths: []const []const u8 = &.{},
-    prompt_paths: []const []const u8 = &.{},
-    theme_paths: []const []const u8 = &.{},
-};
-
-pub const LoadedExtension = struct {
-    path: []u8,
-    source_info: SourceInfo,
-
-    pub fn deinit(self: *LoadedExtension, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        self.source_info.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const Skill = struct {
-    name: []u8,
-    description: []u8,
-    file_path: []u8,
-    base_dir: []u8,
-    source_info: SourceInfo,
-    disable_model_invocation: bool = false,
-
-    pub fn deinit(self: *Skill, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.description);
-        allocator.free(self.file_path);
-        allocator.free(self.base_dir);
-        self.source_info.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const PromptTemplate = struct {
-    name: []u8,
-    description: []u8,
-    argument_hint: ?[]u8 = null,
-    content: []u8,
-    file_path: []u8,
-    source_info: SourceInfo,
-
-    pub fn deinit(self: *PromptTemplate, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.description);
-        if (self.argument_hint) |value| allocator.free(value);
-        allocator.free(self.content);
-        allocator.free(self.file_path);
-        self.source_info.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const ThemeColor = theme_mod.ThemeColor;
-pub const ThemeToken = theme_mod.ThemeToken;
-pub const StyleSpec = theme_mod.StyleSpec;
-pub const ThemeColors = theme_mod.ThemeColors;
-pub const Theme = theme_mod.Theme;
-
-pub const ResourceBundle = struct {
-    extensions: []LoadedExtension,
-    skills: []Skill,
-    prompt_templates: []PromptTemplate,
-    themes: []Theme,
-    selected_theme_index: usize,
-    diagnostics: []Diagnostic,
-    config_errors: []config_errors.ConfigError = &.{},
-    terminal_name: []u8,
-
-    pub fn deinit(self: *ResourceBundle, allocator: std.mem.Allocator) void {
-        for (self.extensions) |*item| item.deinit(allocator);
-        allocator.free(self.extensions);
-        for (self.skills) |*item| item.deinit(allocator);
-        allocator.free(self.skills);
-        for (self.prompt_templates) |*item| item.deinit(allocator);
-        allocator.free(self.prompt_templates);
-        for (self.themes) |*item| item.deinit(allocator);
-        allocator.free(self.themes);
-        for (self.diagnostics) |*item| item.deinit(allocator);
-        allocator.free(self.diagnostics);
-        config_errors.deinitSlice(allocator, self.config_errors);
-        allocator.free(self.terminal_name);
-        self.* = undefined;
-    }
-
-    pub fn selectedTheme(self: *const ResourceBundle) *const Theme {
-        return &self.themes[@min(self.selected_theme_index, self.themes.len - 1)];
-    }
-};
-
-pub const ResolveResourcesOptions = struct {
-    cwd: []const u8,
-    agent_dir: []const u8,
-    global: SettingsResources = .{},
-    project: SettingsResources = .{},
-    cli_extensions: []const []const u8 = &.{},
-    cli_skills: []const []const u8 = &.{},
-    cli_prompts: []const []const u8 = &.{},
-    cli_themes: []const []const u8 = &.{},
-    runtime_theme: ?[]const u8 = null,
-    env_map: ?*const std.process.Environ.Map = null,
-    include_default_extensions: bool = true,
-    include_default_skills: bool = true,
-    include_default_prompts: bool = true,
-    include_default_themes: bool = true,
-    extension_discoveries: []const ExtensionDiscoveredResources = &.{},
-};
+const makeDiagnostic = resource_diagnostics.makeDiagnostic;
+const cloneDiagnostic = resource_diagnostics.cloneDiagnostic;
+const deinitDiagnosticsList = resource_diagnostics.deinitDiagnosticsList;
+const parseFrontmatter = resource_frontmatter.parseFrontmatter;
+const firstNonEmptyLine = resource_frontmatter.firstNonEmptyLine;
+const resolvePath = resource_files.resolvePath;
+const pathExists = resource_files.pathExists;
+const readOptionalFile = resource_files.readOptionalFile;
+const resourceEnvValue = resource_environment.resourceEnvValue;
+const detectTerminalName = resource_environment.detectTerminalName;
+const deinitSkills = resource_types.deinitSkills;
+const deinitPromptTemplates = resource_types.deinitPromptTemplates;
+const deinitThemes = resource_types.deinitThemes;
 
 pub fn resolveConfiguredResources(
     allocator: std.mem.Allocator,
@@ -628,285 +342,6 @@ pub fn loadResourceBundle(
         .config_errors = owned_config_errors,
         .terminal_name = terminal_name,
     };
-}
-
-fn envThemeName(env_map: ?*const std.process.Environ.Map) ?[]const u8 {
-    const raw = if (env_map) |map| map.get("PI_THEME") else return null;
-    const value = raw orelse return null;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else null;
-}
-
-pub fn resolveThemeIndex(
-    themes: []const Theme,
-    env_map: ?*const std.process.Environ.Map,
-    runtime_theme: ?[]const u8,
-    project_theme: ?[]const u8,
-    global_theme: ?[]const u8,
-) usize {
-    const candidates = [_]?[]const u8{
-        envThemeName(env_map),
-        runtime_theme,
-        project_theme,
-        global_theme,
-        detectDefaultThemeName(env_map),
-    };
-    for (candidates) |candidate| {
-        if (findThemeIndex(themes, candidate)) |index| return index;
-    }
-    return 0;
-}
-
-fn detectDefaultThemeName(env_map: ?*const std.process.Environ.Map) []const u8 {
-    const colorfgbg = resourceEnvValue(env_map, "COLORFGBG");
-    const value = colorfgbg orelse return "dark";
-
-    var parts = std.mem.splitScalar(u8, value, ';');
-    _ = parts.next() orelse return "dark";
-    const bg_text = parts.next() orelse return "dark";
-    const bg = std.fmt.parseInt(u8, std.mem.trim(u8, bg_text, " \t\r\n"), 10) catch return "dark";
-    return if (bg < 8) "dark" else "light";
-}
-
-fn resourceEnvValue(env_map: ?*const std.process.Environ.Map, comptime key: [:0]const u8) ?[]const u8 {
-    const raw = if (env_map) |map| map.get(key) else cEnvValue(key);
-    const value = raw orelse return null;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else null;
-}
-
-fn cEnvValue(comptime key: [:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(key) orelse return null;
-    return std.mem.span(value);
-}
-
-fn detectTerminalName(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) ![]u8 {
-    const map = env_map orelse return try allocator.dupe(u8, "term");
-
-    if (nonEmptyEnv(map, "TMUX") != null) return try allocator.dupe(u8, "tmux");
-
-    if (nonEmptyEnv(map, "TERM_PROGRAM")) |term_program| {
-        if (std.ascii.eqlIgnoreCase(term_program, "Apple_Terminal")) return try allocator.dupe(u8, "terminal");
-        if (std.ascii.eqlIgnoreCase(term_program, "iTerm.app")) return try allocator.dupe(u8, "iterm");
-        if (std.ascii.eqlIgnoreCase(term_program, "Ghostty")) return try allocator.dupe(u8, "ghostty");
-        if (std.ascii.eqlIgnoreCase(term_program, "WezTerm")) return try allocator.dupe(u8, "wezterm");
-        if (std.ascii.eqlIgnoreCase(term_program, "vscode")) return try allocator.dupe(u8, "vscode");
-        if (std.ascii.eqlIgnoreCase(term_program, "Hyper")) return try allocator.dupe(u8, "hyper");
-        if (std.ascii.eqlIgnoreCase(term_program, "tabby")) return try allocator.dupe(u8, "tabby");
-        if (std.ascii.eqlIgnoreCase(term_program, "kitty")) return try allocator.dupe(u8, "kitty");
-        if (std.ascii.eqlIgnoreCase(term_program, "Alacritty")) return try allocator.dupe(u8, "alacritty");
-
-        const lower = try allocator.alloc(u8, term_program.len);
-        return std.ascii.lowerString(lower, term_program);
-    }
-
-    if (nonEmptyEnv(map, "KITTY_WINDOW_ID") != null) return try allocator.dupe(u8, "kitty");
-    if (nonEmptyEnv(map, "ALACRITTY_LOG") != null) return try allocator.dupe(u8, "alacritty");
-    if (nonEmptyEnv(map, "WT_SESSION") != null) return try allocator.dupe(u8, "wt");
-
-    if (nonEmptyEnv(map, "ConEmuANSI")) |value| {
-        if (std.ascii.eqlIgnoreCase(value, "ON")) return try allocator.dupe(u8, "conemu");
-    }
-    if (nonEmptyEnv(map, "TERMINAL_EMULATOR")) |value| {
-        if (std.mem.startsWith(u8, value, "JetBrains")) return try allocator.dupe(u8, "jetbrains");
-    }
-
-    if (nonEmptyEnv(map, "TERM")) |term| {
-        if (std.mem.startsWith(u8, term, "alacritty")) return try allocator.dupe(u8, "alacritty");
-        if (std.mem.startsWith(u8, term, "xterm-kitty")) return try allocator.dupe(u8, "kitty");
-        if (std.mem.startsWith(u8, term, "screen")) return try allocator.dupe(u8, "screen");
-        if (std.mem.startsWith(u8, term, "tmux")) return try allocator.dupe(u8, "tmux");
-        if (std.mem.startsWith(u8, term, "xterm")) return try allocator.dupe(u8, "xterm");
-    }
-
-    return try allocator.dupe(u8, "term");
-}
-
-fn nonEmptyEnv(env_map: *const std.process.Environ.Map, key: []const u8) ?[]const u8 {
-    const value = env_map.get(key) orelse return null;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    return if (trimmed.len > 0) trimmed else null;
-}
-
-pub fn formatSkillsForPrompt(allocator: std.mem.Allocator, skills: []const Skill) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-
-    var visible_count: usize = 0;
-    for (skills) |skill| {
-        if (!skill.disable_model_invocation) visible_count += 1;
-    }
-    if (visible_count == 0) return allocator.dupe(u8, "");
-
-    try builder.appendSlice(allocator, "\n\nThe following skills provide specialized instructions for specific tasks.\n");
-    try builder.appendSlice(allocator, "Use the read tool to load a skill's file when the task matches its description.\n");
-    try builder.appendSlice(allocator, "When a skill file references a relative path, resolve it against the skill directory and use that absolute path in tool commands.\n\n");
-    try builder.appendSlice(allocator, "<available_skills>\n");
-
-    for (skills) |skill| {
-        if (skill.disable_model_invocation) continue;
-        try builder.appendSlice(allocator, "  <skill>\n");
-        const escaped_name = try escapeXmlAlloc(allocator, skill.name);
-        defer allocator.free(escaped_name);
-        const name_line = try std.fmt.allocPrint(allocator, "    <name>{s}</name>\n", .{escaped_name});
-        defer allocator.free(name_line);
-        try builder.appendSlice(allocator, name_line);
-        const escaped_description = try escapeXmlAlloc(allocator, skill.description);
-        defer allocator.free(escaped_description);
-        const description_line = try std.fmt.allocPrint(allocator, "    <description>{s}</description>\n", .{escaped_description});
-        defer allocator.free(description_line);
-        try builder.appendSlice(allocator, description_line);
-        const escaped_location = try escapeXmlAlloc(allocator, skill.file_path);
-        defer allocator.free(escaped_location);
-        const location_line = try std.fmt.allocPrint(allocator, "    <location>{s}</location>\n", .{escaped_location});
-        defer allocator.free(location_line);
-        try builder.appendSlice(allocator, location_line);
-        try builder.appendSlice(allocator, "  </skill>\n");
-    }
-    try builder.appendSlice(allocator, "</available_skills>");
-    return try builder.toOwnedSlice(allocator);
-}
-
-pub fn parseCommandArgs(allocator: std.mem.Allocator, args_string: []const u8) ![]const []const u8 {
-    var args = std.ArrayList([]const u8).empty;
-    errdefer args.deinit(allocator);
-    var current = std.ArrayList(u8).empty;
-    defer current.deinit(allocator);
-    var in_quote: ?u8 = null;
-
-    for (args_string) |char| {
-        if (in_quote) |quote| {
-            if (char == quote) {
-                in_quote = null;
-            } else {
-                try current.append(allocator, char);
-            }
-            continue;
-        }
-
-        switch (char) {
-            '"', '\'' => in_quote = char,
-            ' ', '\t' => if (current.items.len > 0) {
-                try args.append(allocator, try current.toOwnedSlice(allocator));
-                current = .empty;
-            },
-            else => try current.append(allocator, char),
-        }
-    }
-
-    if (current.items.len > 0) {
-        try args.append(allocator, try current.toOwnedSlice(allocator));
-    }
-
-    return try args.toOwnedSlice(allocator);
-}
-
-pub const freeParsedArgs = @import("../slice_utils.zig").freeStringSlice;
-
-pub fn substituteArgs(allocator: std.mem.Allocator, content: []const u8, args: []const []const u8) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < content.len) {
-        if (content[i] != '$') {
-            try builder.append(allocator, content[i]);
-            i += 1;
-            continue;
-        }
-
-        if (std.mem.startsWith(u8, content[i..], "$ARGUMENTS")) {
-            try appendJoinedArgs(allocator, &builder, args, 0, null);
-            i += "$ARGUMENTS".len;
-            continue;
-        }
-        if (std.mem.startsWith(u8, content[i..], "$@")) {
-            try appendJoinedArgs(allocator, &builder, args, 0, null);
-            i += 2;
-            continue;
-        }
-        if (std.mem.startsWith(u8, content[i..], "${@:")) {
-            if (parseSlicePlaceholder(content[i..])) |placeholder| {
-                try appendJoinedArgs(allocator, &builder, args, placeholder.start_index, placeholder.length);
-                i += placeholder.consumed_len;
-                continue;
-            }
-        }
-
-        if (i + 1 < content.len and std.ascii.isDigit(content[i + 1])) {
-            var end = i + 1;
-            while (end < content.len and std.ascii.isDigit(content[end])) : (end += 1) {}
-            const index = try std.fmt.parseInt(usize, content[i + 1 .. end], 10);
-            if (index > 0 and index <= args.len) {
-                try builder.appendSlice(allocator, args[index - 1]);
-            }
-            i = end;
-            continue;
-        }
-
-        try builder.append(allocator, '$');
-        i += 1;
-    }
-
-    return try builder.toOwnedSlice(allocator);
-}
-
-pub fn expandPromptTemplate(allocator: std.mem.Allocator, text: []const u8, templates: []const PromptTemplate) ![]u8 {
-    if (text.len == 0 or text[0] != '/') return allocator.dupe(u8, text);
-    const space_index = std.mem.indexOfScalar(u8, text, ' ');
-    const template_name = if (space_index) |value| text[1..value] else text[1..];
-    const args_string = if (space_index) |value| text[value + 1 ..] else "";
-    for (templates) |template| {
-        if (!std.mem.eql(u8, template.name, template_name)) continue;
-        const args = try parseCommandArgs(allocator, args_string);
-        defer freeParsedArgs(allocator, args);
-        return substituteArgs(allocator, template.content, args);
-    }
-    return allocator.dupe(u8, text);
-}
-
-pub fn expandSkillCommand(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    text: []const u8,
-    skills: []const Skill,
-) ![]u8 {
-    if (!std.mem.startsWith(u8, text, "/skill:")) return allocator.dupe(u8, text);
-
-    const space_index = std.mem.indexOfScalar(u8, text, ' ');
-    const skill_name = if (space_index) |value| text["/skill:".len..value] else text["/skill:".len..];
-    const args = if (space_index) |value| std.mem.trim(u8, text[value + 1 ..], " \t\r\n") else "";
-
-    for (skills) |skill| {
-        if (!std.mem.eql(u8, skill.name, skill_name)) continue;
-
-        const bytes = readOptionalFile(allocator, io, skill.file_path) catch {
-            return allocator.dupe(u8, text);
-        };
-        defer if (bytes) |value| allocator.free(value);
-        if (bytes == null) return allocator.dupe(u8, text);
-
-        const parsed = parseFrontmatter(allocator, bytes.?) catch {
-            return allocator.dupe(u8, text);
-        };
-        defer parsed.deinit(allocator);
-
-        const body = std.mem.trim(u8, parsed.body, " \t\r\n");
-        if (args.len > 0) {
-            return std.fmt.allocPrint(
-                allocator,
-                "<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>\n\n{s}",
-                .{ skill.name, skill.file_path, skill.base_dir, body, args },
-            );
-        }
-        return std.fmt.allocPrint(
-            allocator,
-            "<skill name=\"{s}\" location=\"{s}\">\nReferences are relative to {s}.\n\n{s}\n</skill>",
-            .{ skill.name, skill.file_path, skill.base_dir, body },
-        );
-    }
-
-    return allocator.dupe(u8, text);
 }
 
 fn defaultThemeStyles() [@typeInfo(ThemeToken).@"enum".fields.len]StyleSpec {
@@ -2401,56 +1836,6 @@ fn loadThemeFromFile(
     return theme;
 }
 
-const FrontmatterParseResult = struct {
-    name: ?[]u8 = null,
-    description: ?[]u8 = null,
-    argument_hint: ?[]u8 = null,
-    disable_model_invocation: bool = false,
-    body: []u8,
-
-    fn deinit(self: *const FrontmatterParseResult, allocator: std.mem.Allocator) void {
-        if (self.name) |value| allocator.free(value);
-        if (self.description) |value| allocator.free(value);
-        if (self.argument_hint) |value| allocator.free(value);
-        allocator.free(self.body);
-    }
-};
-
-fn parseFrontmatter(allocator: std.mem.Allocator, content: []const u8) !FrontmatterParseResult {
-    if (!std.mem.startsWith(u8, content, "---")) {
-        return .{ .body = try allocator.dupe(u8, content) };
-    }
-
-    const line_break = std.mem.indexOfScalar(u8, content, '\n') orelse return .{ .body = try allocator.dupe(u8, content) };
-    const marker = "\n---";
-    const end_index = std.mem.indexOfPos(u8, content, line_break + 1, marker) orelse return .{ .body = try allocator.dupe(u8, content) };
-    const header = content[line_break + 1 .. end_index];
-    var result = FrontmatterParseResult{
-        .body = try allocator.dupe(u8, std.mem.trim(u8, content[end_index + marker.len ..], "\r\n")),
-    };
-    errdefer result.deinit(allocator);
-
-    var lines = std.mem.splitScalar(u8, header, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \r\t");
-        if (line.len == 0 or line[0] == '#') continue;
-        const colon_index = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const key = std.mem.trim(u8, line[0..colon_index], " \t");
-        const value = std.mem.trim(u8, line[colon_index + 1 ..], " \t\"");
-        if (std.mem.eql(u8, key, "name")) {
-            result.name = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "description")) {
-            result.description = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "argument-hint")) {
-            result.argument_hint = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, key, "disable-model-invocation")) {
-            result.disable_model_invocation = std.mem.eql(u8, value, "true");
-        }
-    }
-
-    return result;
-}
-
 fn parseSource(source: []const u8) ParsedSource {
     if (std.mem.startsWith(u8, source, "npm:")) {
         const spec = std.mem.trim(u8, source["npm:".len..], " ");
@@ -2525,23 +1910,6 @@ fn gitInstallPath(
     return std.fs.path.join(allocator, &[_][]const u8{ base, hex });
 }
 
-fn resolvePath(allocator: std.mem.Allocator, base_dir: []const u8, input: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(input)) return allocator.dupe(u8, input);
-    return std.fs.path.resolve(allocator, &[_][]const u8{ base_dir, input });
-}
-
-fn pathExists(io: std.Io, path: []const u8) bool {
-    _ = std.Io.Dir.statFile(.cwd(), io, path, .{}) catch return false;
-    return true;
-}
-
-fn readOptionalFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
-    return std.Io.Dir.readFileAlloc(.cwd(), io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-}
-
 fn userAgentsSkillsDir(allocator: std.mem.Allocator, env_map: ?*const std.process.Environ.Map) !?[]u8 {
     const home = resourceEnvValue(env_map, "HOME") orelse return null;
     return @as(?[]u8, try std.fs.path.join(allocator, &[_][]const u8{ home, ".agents", "skills" }));
@@ -2594,88 +1962,6 @@ fn findGitRepoRoot(allocator: std.mem.Allocator, io: std.Io, start_dir: []const 
     return null;
 }
 
-fn makeDiagnostic(allocator: std.mem.Allocator, kind: []const u8, message: []const u8, path: []const u8) !Diagnostic {
-    const redacted_message = try redactDiagnosticValue(allocator, message);
-    errdefer allocator.free(redacted_message);
-    const redacted_path = try redactDiagnosticValue(allocator, path);
-    errdefer allocator.free(redacted_path);
-    return .{
-        .kind = try allocator.dupe(u8, kind),
-        .message = redacted_message,
-        .path = redacted_path,
-    };
-}
-
-pub fn redactDiagnosticValue(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var index: usize = 0;
-    while (index < value.len) {
-        if (startsWithIgnoreCase(value[index..], "Bearer ")) {
-            try out.writer.writeAll("Bearer [REDACTED]");
-            index = skipUntilDelimiter(value, index + "Bearer ".len);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "api_key=")) {
-            try out.writer.writeAll("api_key=[REDACTED]");
-            index = skipUntilDelimiter(value, index + "api_key=".len);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "access_token=")) {
-            try out.writer.writeAll("access_token=[REDACTED]");
-            index = skipUntilDelimiter(value, index + "access_token=".len);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "token=")) {
-            try out.writer.writeAll("token=[REDACTED]");
-            index = skipUntilDelimiter(value, index + "token=".len);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "x-api-key:")) {
-            try out.writer.writeAll("x-api-key: [REDACTED]");
-            index = skipUntilDelimiter(value, index + "x-api-key:".len);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "sk-")) {
-            try out.writer.writeAll("[REDACTED]");
-            index = skipUntilDelimiter(value, index);
-            continue;
-        }
-        if (startsWithIgnoreCase(value[index..], "secret")) {
-            try out.writer.writeAll("[REDACTED]");
-            index += "secret".len;
-            continue;
-        }
-        try out.writer.writeByte(value[index]);
-        index += 1;
-    }
-    return out.toOwnedSlice();
-}
-
-fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
-    if (value.len < prefix.len) return false;
-    return std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
-}
-
-fn skipUntilDelimiter(value: []const u8, start: usize) usize {
-    var index = start;
-    while (index < value.len) : (index += 1) {
-        switch (value[index]) {
-            ' ', '\t', '\r', '\n', '&', '"', '\'', ',', ')' => return index,
-            else => {},
-        }
-    }
-    return index;
-}
-
-fn cloneDiagnostic(allocator: std.mem.Allocator, diagnostic: Diagnostic) !Diagnostic {
-    return .{
-        .kind = try allocator.dupe(u8, diagnostic.kind),
-        .message = try allocator.dupe(u8, diagnostic.message),
-        .path = if (diagnostic.path) |value| try allocator.dupe(u8, value) else null,
-    };
-}
-
 fn hasSupportedExtensionFile(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".js");
 }
@@ -2683,15 +1969,6 @@ fn hasSupportedExtensionFile(path: []const u8) bool {
 fn trimExtension(name: []const u8, extension: []const u8) []const u8 {
     if (std.mem.endsWith(u8, name, extension)) return name[0 .. name.len - extension.len];
     return name;
-}
-
-fn firstNonEmptyLine(text: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \r\t");
-        if (trimmed.len > 0) return trimmed;
-    }
-    return null;
 }
 
 fn parseThemeToken(name: []const u8) ?ThemeToken {
@@ -2811,58 +2088,6 @@ test "roles m0 parseThemeToken accepts role token names" {
     try std.testing.expectEqual(ThemeToken.role_tool_result, parseThemeToken("roleToolResult").?);
 }
 
-pub fn findThemeIndex(themes: []const Theme, name: ?[]const u8) ?usize {
-    const theme_name = name orelse return null;
-    for (themes, 0..) |theme, index| {
-        if (std.mem.eql(u8, theme.name, theme_name)) return index;
-    }
-    return null;
-}
-
-const SlicePlaceholder = struct {
-    start_index: usize,
-    length: ?usize,
-    consumed_len: usize,
-};
-
-fn parseSlicePlaceholder(text: []const u8) ?SlicePlaceholder {
-    var index: usize = "${@:".len;
-    var end = index;
-    while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
-    if (end == index or end >= text.len) return null;
-    const start_value = std.fmt.parseInt(usize, text[index..end], 10) catch return null;
-    var length: ?usize = null;
-    index = end;
-    if (index < text.len and text[index] == ':') {
-        index += 1;
-        end = index;
-        while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
-        if (end == index) return null;
-        length = std.fmt.parseInt(usize, text[index..end], 10) catch return null;
-        index = end;
-    }
-    if (index >= text.len or text[index] != '}') return null;
-    return .{
-        .start_index = if (start_value == 0) 0 else start_value - 1,
-        .length = length,
-        .consumed_len = index + 1,
-    };
-}
-
-fn appendJoinedArgs(
-    allocator: std.mem.Allocator,
-    builder: *std.ArrayList(u8),
-    args: []const []const u8,
-    start_index: usize,
-    length: ?usize,
-) !void {
-    const end_index = if (length) |value| @min(args.len, start_index + value) else args.len;
-    for (args[start_index..end_index], 0..) |arg, index| {
-        if (index > 0) try builder.append(allocator, ' ');
-        try builder.appendSlice(allocator, arg);
-    }
-}
-
 fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), value: []const u8, foreground: bool) !void {
     if (tui.style.parseNamedColor(value)) |named| {
         const prefix = if (foreground) "\x1b[3" else "\x1b[4";
@@ -2884,22 +2109,6 @@ fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), va
     }
 }
 
-fn escapeXmlAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var builder = std.ArrayList(u8).empty;
-    errdefer builder.deinit(allocator);
-    for (text) |char| {
-        switch (char) {
-            '&' => try builder.appendSlice(allocator, "&amp;"),
-            '<' => try builder.appendSlice(allocator, "&lt;"),
-            '>' => try builder.appendSlice(allocator, "&gt;"),
-            '"' => try builder.appendSlice(allocator, "&quot;"),
-            '\'' => try builder.appendSlice(allocator, "&apos;"),
-            else => try builder.append(allocator, char),
-        }
-    }
-    return try builder.toOwnedSlice(allocator);
-}
-
 fn parseStringArrayOwned(allocator: std.mem.Allocator, value: ?std.json.Value) !?[][]u8 {
     const actual = value orelse return null;
     if (actual != .array) return null;
@@ -2912,19 +2121,6 @@ fn parseStringArrayOwned(allocator: std.mem.Allocator, value: ?std.json.Value) !
     }
     return try items.toOwnedSlice(allocator);
 }
-
-fn cloneStringList(allocator: std.mem.Allocator, input: ?[]const []const u8) !?[]const []const u8 {
-    const items = input orelse return null;
-    var list = std.ArrayList([]const u8).empty;
-    errdefer {
-        for (list.items) |item| allocator.free(item);
-        list.deinit(allocator);
-    }
-    for (items) |item| try list.append(allocator, try allocator.dupe(u8, item));
-    return try list.toOwnedSlice(allocator);
-}
-
-const freeStringList = @import("../slice_utils.zig").freeOptionalStringSlice;
 
 const freeOwnedStringArray = @import("../slice_utils.zig").freeStringSlice;
 
@@ -3089,11 +2285,6 @@ fn sliceConst(items: [][]u8) []const []const u8 {
     return @ptrCast(items);
 }
 
-fn deinitResolvedSlice(allocator: std.mem.Allocator, items: []ResolvedResource) void {
-    for (items) |*item| item.deinit(allocator);
-    allocator.free(items);
-}
-
 fn deinitResolvedList(allocator: std.mem.Allocator, items: *std.ArrayList(ResolvedResource)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.deinit(allocator);
@@ -3114,21 +2305,6 @@ fn deinitLoadedExtensionsList(allocator: std.mem.Allocator, items: *std.ArrayLis
     items.deinit(allocator);
 }
 
-fn deinitSkills(allocator: std.mem.Allocator, items: []Skill) void {
-    for (items) |*item| item.deinit(allocator);
-    allocator.free(items);
-}
-
-fn deinitPromptTemplates(allocator: std.mem.Allocator, items: []PromptTemplate) void {
-    for (items) |*item| item.deinit(allocator);
-    allocator.free(items);
-}
-
-fn deinitThemes(allocator: std.mem.Allocator, items: []Theme) void {
-    for (items) |*item| item.deinit(allocator);
-    allocator.free(items);
-}
-
 fn deinitSkillsList(allocator: std.mem.Allocator, items: *std.ArrayList(Skill)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.deinit(allocator);
@@ -3140,11 +2316,6 @@ fn deinitPromptTemplatesList(allocator: std.mem.Allocator, items: *std.ArrayList
 }
 
 fn deinitThemesList(allocator: std.mem.Allocator, items: *std.ArrayList(Theme)) void {
-    for (items.items) |*item| item.deinit(allocator);
-    items.deinit(allocator);
-}
-
-fn deinitDiagnosticsList(allocator: std.mem.Allocator, items: *std.ArrayList(Diagnostic)) void {
     for (items.items) |*item| item.deinit(allocator);
     items.deinit(allocator);
 }
