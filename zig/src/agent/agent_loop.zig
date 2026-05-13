@@ -7,6 +7,7 @@ const accumulator = @import("accumulator.zig");
 const content_clone = @import("content_clone.zig");
 const tool_execution = @import("tool_execution.zig");
 const streaming = @import("streaming.zig");
+const test_streams = @import("agent_loop_test_streams.zig");
 
 pub const AgentLoopError = types.AgentLoopError;
 
@@ -519,201 +520,6 @@ fn passthroughConvertToLlmForTest(
     return @constCast(messages);
 }
 
-fn ownedDeltaStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = allocator;
-    const text = try result_allocator.dupe(u8, "streamed response");
-    const content = try result_allocator.alloc(ai.ContentBlock, 1);
-    content[0] = .{ .text = .{ .text = text } };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    stream.push(.{ .event_type = .start });
-    stream.push(.{ .event_type = .text_start, .content_index = 0 });
-    stream.push(.{
-        .event_type = .text_delta,
-        .content_index = 0,
-        .delta = try allocator.dupe(u8, "streamed "),
-        .owns_delta = true,
-    });
-    stream.push(.{
-        .event_type = .text_delta,
-        .content_index = 0,
-        .delta = try allocator.dupe(u8, "response"),
-        .owns_delta = true,
-    });
-    stream.push(.{ .event_type = .text_end, .content_index = 0 });
-    stream.push(.{
-        .event_type = .done,
-        .message = .{
-            .content = content,
-            .api = model.api,
-            .provider = model.provider,
-            .model = model.id,
-            .usage = ai.Usage.init(),
-            .stop_reason = .stop,
-            .timestamp = 1,
-        },
-    });
-    return stream;
-}
-
-fn toolCallStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = allocator;
-    var args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    try args_object.put(
-        result_allocator,
-        try result_allocator.dupe(u8, "command"),
-        .{ .string = try result_allocator.dupe(u8, "echo hi") },
-    );
-    const tool_calls = try result_allocator.alloc(ai.ToolCall, 1);
-    tool_calls[0] = .{
-        .id = try result_allocator.dupe(u8, "tool-1"),
-        .name = try result_allocator.dupe(u8, "bash"),
-        .arguments = .{ .object = args_object },
-    };
-    var content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    try content_args_object.put(
-        result_allocator,
-        try result_allocator.dupe(u8, "command"),
-        .{ .string = try result_allocator.dupe(u8, "echo hi") },
-    );
-    const content = try result_allocator.alloc(ai.ContentBlock, 1);
-    content[0] = .{ .tool_call = .{
-        .id = try result_allocator.dupe(u8, "tool-1"),
-        .name = try result_allocator.dupe(u8, "bash"),
-        .arguments = .{ .object = content_args_object },
-    } };
-    const final_message = ai.AssistantMessage{
-        .content = content,
-        .tool_calls = tool_calls,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .tool_use,
-        .timestamp = 1,
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    stream.push(.{ .event_type = .start, .message = final_message });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 0 });
-    stream.push(.{ .event_type = .toolcall_delta, .content_index = 0, .delta = "{\"command\":\"echo hi\"}" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 0, .tool_call = tool_calls[0] });
-    stream.push(.{ .event_type = .done, .message = final_message });
-    return stream;
-}
-
-fn crossPartialUpdateStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = allocator;
-    var content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    try content_args_object.put(
-        result_allocator,
-        try result_allocator.dupe(u8, "query"),
-        .{ .string = try result_allocator.dupe(u8, "partial") },
-    );
-    const content = try result_allocator.alloc(ai.ContentBlock, 3);
-    content[0] = .{ .thinking = .{ .thinking = try result_allocator.dupe(u8, "plan first") } };
-    content[1] = .{ .text = .{ .text = try result_allocator.dupe(u8, "prior text") } };
-    content[2] = .{ .tool_call = .{
-        .id = try result_allocator.dupe(u8, "call_1"),
-        .name = try result_allocator.dupe(u8, "lookup"),
-        .arguments = .{ .object = content_args_object },
-    } };
-    const final_message = ai.AssistantMessage{
-        .content = content,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .tool_use,
-        .timestamp = 1,
-    };
-    const template = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .stop,
-        .timestamp = 1,
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    stream.push(.{ .event_type = .start, .message = template });
-    stream.push(.{ .event_type = .thinking_start, .content_index = 0 });
-    stream.push(.{ .event_type = .thinking_delta, .content_index = 0, .delta = "plan " });
-    stream.push(.{ .event_type = .thinking_delta, .content_index = 0, .delta = "first" });
-    stream.push(.{ .event_type = .thinking_end, .content_index = 0, .content = "plan first" });
-    stream.push(.{ .event_type = .text_start, .content_index = 1 });
-    stream.push(.{ .event_type = .text_delta, .content_index = 1, .delta = "prior " });
-    stream.push(.{ .event_type = .text_delta, .content_index = 1, .delta = "text" });
-    stream.push(.{ .event_type = .text_end, .content_index = 1, .content = "prior text" });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 2 });
-    stream.push(.{ .event_type = .toolcall_delta, .content_index = 2, .delta = "{\"query\":\"par" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 2, .tool_call = content[2].tool_call });
-    stream.push(.{ .event_type = .done, .message = final_message });
-    return stream;
-}
-
-fn iss400OutOfOrderStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const template = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .stop,
-        .timestamp = 1,
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    errdefer stream.deinit();
-
-    // Append directly so this agent-layer regression can exercise defensive
-    // accumulator cleanup without the debug EventOrderingGuard panicking first.
-    try stream.queue.append(allocator, .{ .event_type = .start, .message = template });
-    try stream.queue.append(allocator, .{ .event_type = .text_start, .content_index = 0 });
-    try stream.queue.append(allocator, .{
-        .event_type = .text_delta,
-        .content_index = 0,
-        .delta = "partial text",
-    });
-    try stream.queue.append(allocator, .{
-        .event_type = .thinking_delta,
-        .content_index = 0,
-        .delta = "wrong kind",
-    });
-    try stream.queue.append(allocator, .{ .event_type = .done, .message = template });
-    return stream;
-}
-
 const PartialUpdateCrossCapture = struct {
     saw_thinking_delta: bool = false,
     saw_thinking_end: bool = false,
@@ -877,196 +683,6 @@ fn writeToolCallSnapshot(
     const args_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
     defer allocator.free(args_json);
     try writer.print("id={s},name={s},args={s}", .{ tool_call.id, tool_call.name, args_json });
-}
-
-fn malformedPartialToolCallStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const result_allocator = allocator;
-    const content_args_object = try std.json.ObjectMap.init(result_allocator, &.{}, &.{});
-    const content = try result_allocator.alloc(ai.ContentBlock, 2);
-    content[0] = .{ .text = .{ .text = try result_allocator.dupe(u8, "before tool") } };
-    content[1] = .{ .tool_call = .{
-        .id = try result_allocator.dupe(u8, "call_bad_args"),
-        .name = try result_allocator.dupe(u8, "lookup"),
-        .arguments = .{ .object = content_args_object },
-    } };
-    const final_message = ai.AssistantMessage{
-        .content = content,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .tool_use,
-        .timestamp = 1,
-    };
-    const template = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .stop,
-        .timestamp = 1,
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    stream.push(.{ .event_type = .start, .message = template });
-    stream.push(.{ .event_type = .text_start, .content_index = 0 });
-    stream.push(.{ .event_type = .text_delta, .content_index = 0, .delta = "before tool" });
-    stream.push(.{ .event_type = .text_end, .content_index = 0, .content = "before tool" });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
-    stream.push(.{ .event_type = .toolcall_delta, .content_index = 1, .delta = "not-json" });
-    stream.push(.{ .event_type = .toolcall_end, .content_index = 1, .tool_call = content[1].tool_call });
-    stream.push(.{ .event_type = .done, .message = final_message });
-    return stream;
-}
-
-fn abortedPartialToolCallStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    options: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    if (options) |stream_options| {
-        if (stream_options.signal) |signal| @constCast(signal).store(true, .seq_cst);
-    }
-
-    const template = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .stop,
-        .timestamp = 1,
-    };
-    const final_message = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .aborted,
-        .error_message = "Request was aborted",
-        .timestamp = 2,
-    };
-    const borrowed_final_tool = ai.ToolCall{
-        .id = "abort-tool",
-        .name = "lookup",
-        .arguments = .{ .string = "borrowed final args" },
-        .thought_signature = "borrowed signature",
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    errdefer stream.deinit();
-    stream.push(.{ .event_type = .start, .message = template });
-    stream.push(.{ .event_type = .text_start, .content_index = 0 });
-    stream.push(.{
-        .event_type = .text_delta,
-        .content_index = 0,
-        .delta = "partial before abort",
-    });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
-    stream.push(.{
-        .event_type = .toolcall_delta,
-        .content_index = 1,
-        .delta = "{\"query\":\"owned partial\"}",
-    });
-    stream.push(.{
-        .event_type = .toolcall_end,
-        .content_index = 1,
-        .tool_call = borrowed_final_tool,
-    });
-    stream.push(.{
-        .event_type = .error_event,
-        .message = final_message,
-        .error_message = final_message.error_message,
-    });
-    return stream;
-}
-
-fn runtimeErrorToolCallStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    _: ai.Context,
-    _: ?ai.types.SimpleStreamOptions,
-    _: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const template = ai.AssistantMessage{
-        .content = &[_]ai.ContentBlock{},
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .stop,
-        .timestamp = 1,
-    };
-
-    const partial_tool = ai.ToolCall{
-        .id = "runtime-error-partial",
-        .name = "echo",
-        .arguments = .{ .string = "borrowed partial args" },
-        .thought_signature = "borrowed runtime signature",
-    };
-
-    const terminal_args = try jsonStringObject(allocator, "value", "should-not-run");
-    const terminal_tool_calls = try allocator.alloc(ai.ToolCall, 1);
-    terminal_tool_calls[0] = .{
-        .id = try allocator.dupe(u8, "runtime-error-terminal"),
-        .name = try allocator.dupe(u8, "echo"),
-        .arguments = terminal_args,
-    };
-    const terminal_content = try allocator.alloc(ai.ContentBlock, 2);
-    terminal_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "partial before runtime error") } };
-    terminal_content[1] = .{ .tool_call = terminal_tool_calls[0] };
-
-    const final_message = ai.AssistantMessage{
-        .content = terminal_content,
-        .tool_calls = terminal_tool_calls,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
-        .usage = ai.Usage.init(),
-        .stop_reason = .error_reason,
-        .error_message = "ProviderParseFailure",
-        .timestamp = 2,
-    };
-
-    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
-    errdefer stream.deinit();
-    stream.push(.{ .event_type = .start, .message = template });
-    stream.push(.{ .event_type = .text_start, .content_index = 0 });
-    stream.push(.{
-        .event_type = .text_delta,
-        .content_index = 0,
-        .delta = "partial before runtime error",
-    });
-    stream.push(.{ .event_type = .toolcall_start, .content_index = 1 });
-    stream.push(.{
-        .event_type = .toolcall_delta,
-        .content_index = 1,
-        .delta = "{\"value\":\"should-not-run\"}",
-    });
-    stream.push(.{
-        .event_type = .toolcall_end,
-        .content_index = 1,
-        .tool_call = partial_tool,
-    });
-    stream.push(.{
-        .event_type = .error_event,
-        .message = final_message,
-        .error_message = final_message.error_message,
-    });
-    return stream;
 }
 
 const MalformedPartialArgsCapture = struct {
@@ -1395,32 +1011,12 @@ fn reentrantToolExecute(
         fixture,
         countReentrantNestedEvent,
         signal,
-        ownedDeltaStreamForAgentLoopTest,
+        test_streams.ownedDeltaStreamForAgentLoopTest,
     );
 
     try std.testing.expectEqual(@as(usize, 2), nested_result.len);
     try std.testing.expectEqualStrings("streamed response", nested_result[1].assistant.content[0].text.text);
     return try textToolResult(allocator, "nested: streamed response");
-}
-
-const ReentrantOuterStreamContext = struct {
-    call_count: usize = 0,
-};
-
-fn reentrantOuterStreamForAgentLoopTest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: ai.Model,
-    context: ai.Context,
-    options: ?ai.types.SimpleStreamOptions,
-    stream_context: ?*anyopaque,
-) !ai.event_stream.AssistantMessageEventStream {
-    const fixture: *ReentrantOuterStreamContext = @ptrCast(@alignCast(stream_context.?));
-    fixture.call_count += 1;
-    if (fixture.call_count == 1) {
-        return try toolCallStreamForAgentLoopTest(allocator, io, model, context, options, null);
-    }
-    return try ownedDeltaStreamForAgentLoopTest(allocator, io, model, context, options, null);
 }
 
 const PendingQueueTestState = struct {
@@ -1971,7 +1567,7 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
         .execute_context = fixture,
         .execute = countedEchoToolExecute,
     };
-    var stream_context = ReentrantOuterStreamContext{};
+    var stream_context = test_streams.ReentrantOuterStreamContext{};
     var capture = ToolExecutionCapture.init(std.testing.allocator);
     defer capture.deinit();
 
@@ -1994,7 +1590,7 @@ test "ISS-405 tool execution and result messages follow assistant message_end" {
         &capture,
         captureToolEvent,
         null,
-        reentrantOuterStreamForAgentLoopTest,
+        test_streams.reentrantOuterStreamForAgentLoopTest,
     );
 
     try std.testing.expectEqual(@as(usize, 4), result.len);
@@ -2315,7 +1911,7 @@ test "ISS-408 nested agent loop does not corrupt outer streaming state" {
         .execute_context = &tool_context,
         .execute = reentrantToolExecute,
     };
-    var stream_context = ReentrantOuterStreamContext{};
+    var stream_context = test_streams.ReentrantOuterStreamContext{};
 
     const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
     const result = try runAgentLoop(
@@ -2336,7 +1932,7 @@ test "ISS-408 nested agent loop does not corrupt outer streaming state" {
         null,
         ignoreEvent,
         null,
-        reentrantOuterStreamForAgentLoopTest,
+        test_streams.reentrantOuterStreamForAgentLoopTest,
     );
 
     try std.testing.expectEqual(@as(usize, 4), result.len);
@@ -2438,7 +2034,7 @@ test "streamAssistantResponse frees owned streaming deltas after consumption" {
         null,
         ignoreEvent,
         null,
-        ownedDeltaStreamForAgentLoopTest,
+        test_streams.ownedDeltaStreamForAgentLoopTest,
     );
     defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
@@ -2475,7 +2071,7 @@ test "route-a m1 streamAssistantResponse emits toolcall message updates" {
         &capture,
         captureToolEvent,
         null,
-        toolCallStreamForAgentLoopTest,
+        test_streams.toolCallStreamForAgentLoopTest,
     );
     defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
@@ -2528,7 +2124,7 @@ test "VAL-CROSS-004 streamAssistantResponse accumulates ordered partial content 
         &capture,
         capturePartialUpdateCrossEvent,
         null,
-        crossPartialUpdateStreamForAgentLoopTest,
+        test_streams.crossPartialUpdateStreamForAgentLoopTest,
     );
     defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
@@ -2573,7 +2169,7 @@ test "VAL-REVIEW-M8-001 streaming message_update snapshots cover partial tool-ca
         &capture,
         captureStreamingUpdateSnapshotEvent,
         null,
-        crossPartialUpdateStreamForAgentLoopTest,
+        test_streams.crossPartialUpdateStreamForAgentLoopTest,
     );
     defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
@@ -2628,7 +2224,7 @@ test "VAL-CROSS-004 partial tool-call malformed arguments fall back to empty obj
         &capture,
         captureMalformedPartialArgsEvent,
         null,
-        malformedPartialToolCallStreamForAgentLoopTest,
+        test_streams.malformedPartialToolCallStreamForAgentLoopTest,
     );
     defer ai.types.freeAssistantMessage(std.testing.allocator, assistant);
 
@@ -2667,7 +2263,7 @@ test "ISS-401 aborted stream cleans partial accumulator tool state" {
         &capture,
         countMessageUpdateEvent,
         &aborted,
-        abortedPartialToolCallStreamForAgentLoopTest,
+        test_streams.abortedPartialToolCallStreamForAgentLoopTest,
     );
 
     try std.testing.expect(aborted.load(.seq_cst));
@@ -2725,7 +2321,7 @@ test "ISS-401 runtime error stream cleans partial tool state and skips terminal 
         &capture,
         captureToolEvent,
         null,
-        runtimeErrorToolCallStreamForAgentLoopTest,
+        test_streams.runtimeErrorToolCallStreamForAgentLoopTest,
     );
 
     try std.testing.expectEqual(@as(usize, 2), result.len);
@@ -3246,7 +2842,7 @@ test "ISS-400 stream rejection cleans partial accumulator state without terminal
             &capture,
             countMessageUpdateEvent,
             null,
-            iss400OutOfOrderStreamForAgentLoopTest,
+            test_streams.iss400OutOfOrderStreamForAgentLoopTest,
         ),
     );
     try std.testing.expectEqual(@as(usize, 2), capture.message_update_count);
