@@ -32,6 +32,75 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Resolve Zig 0.16.0 package
+        id: zig-package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION=0.16.0
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) ARCH=x86_64-linux ;;
+            Linux-ARM64) ARCH=aarch64-linux ;;
+            *) echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2; exit 1 ;;
+          esac
+          echo "version=${ZIG_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "arch=${ARCH}" >> "${GITHUB_OUTPUT}"
+          echo "install-dir=${HOME}/.zig/${ZIG_VERSION}-${ARCH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache Zig 0.16.0
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.zig-package.outputs.install-dir }}
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ steps.zig-package.outputs.version }}-${{ steps.zig-package.outputs.arch }}
+
+      - name: Setup Zig 0.16.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIG_VERSION="${{ steps.zig-package.outputs.version }}"
+          ARCH="${{ steps.zig-package.outputs.arch }}"
+          INSTALL_DIR="${{ steps.zig-package.outputs.install-dir }}"
+          if [ -x "${INSTALL_DIR}/zig" ]; then
+            ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+            if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
+              echo "Expected cached Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
+              exit 1
+            fi
+            echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+            echo "${ACTUAL_VERSION}"
+            exit 0
+          fi
+
+          TARBALL="zig-${ARCH}-${ZIG_VERSION}.tar.xz"
+          case "${ARCH}" in
+            x86_64-linux)  EXPECTED_SHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+            aarch64-linux) EXPECTED_SHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+            *) echo "No Zig ${ZIG_VERSION} checksum configured for ${ARCH}" >&2; exit 1 ;;
+          esac
+
+          DEST="${RUNNER_TEMP}/${TARBALL}"
+          curl --fail --show-error --location \
+            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 15 --max-time 180 \
+            --output "${DEST}" \
+            "https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}"
+          ACTUAL_SHA="$(sha256sum "${DEST}" | awk '{print $1}')"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "Checksum mismatch: expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}" >&2
+            exit 1
+          fi
+          tar -tJf "${DEST}" >/dev/null
+          mkdir -p "${INSTALL_DIR}"
+          tar -xJf "${DEST}" -C "${INSTALL_DIR}" --strip-components=1
+          rm -f "${DEST}"
+          echo "${INSTALL_DIR}" >> "${GITHUB_PATH}"
+          ACTUAL_VERSION="$("${INSTALL_DIR}/zig" version)"
+          if [ "${ACTUAL_VERSION}" != "${ZIG_VERSION}" ]; then
+            echo "Expected Zig ${ZIG_VERSION}, got ${ACTUAL_VERSION}" >&2
+            exit 1
+          fi
+          echo "${ACTUAL_VERSION}"
+
       - name: Build
         run: npm run build
 
