@@ -28,6 +28,9 @@ describe("AgentSession dynamic provider registration", () => {
 
 	async function createSession(extensionFactories: ExtensionFactory[]) {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
+		settingsManager.setExtensionPolicy("typescript:inline:inline:<inline:1>", {
+			approvedGrants: ["model.call"],
+		});
 		const sessionManager = SessionManager.inMemory();
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");

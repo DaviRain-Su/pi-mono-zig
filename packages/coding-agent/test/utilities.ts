@@ -11,6 +11,7 @@ import { getOAuthApiKey } from "@earendil-works/pi-ai/oauth";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { createEventBus } from "../src/core/event-bus.js";
+import type { ExtensionPolicy } from "../src/core/extension-policy.js";
 import type { Extension, ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -179,6 +180,7 @@ export interface TestSessionContext {
 export interface CreateTestExtensionsResultInput {
 	factory: ExtensionFactory;
 	path?: string;
+	effectivePolicy?: ExtensionPolicy;
 }
 
 export async function createTestExtensionsResult(
@@ -193,7 +195,8 @@ export async function createTestExtensionsResult(
 		const factory = typeof input === "function" ? input : input.factory;
 		const extensionPath =
 			typeof input === "function" ? `<inline:${index + 1}>` : (input.path ?? `<inline:${index + 1}>`);
-		extensions.push(await loadExtensionFromFactory(factory, cwd, eventBus, runtime, extensionPath));
+		const effectivePolicy = typeof input === "function" ? undefined : input.effectivePolicy;
+		extensions.push(await loadExtensionFromFactory(factory, cwd, eventBus, runtime, extensionPath, effectivePolicy));
 	}
 
 	return {

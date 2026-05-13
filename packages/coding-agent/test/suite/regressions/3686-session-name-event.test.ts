@@ -25,8 +25,11 @@ describe("regression #3686: session name changes emit an event", () => {
 		let api: ExtensionAPI | undefined;
 		const harness = await createHarness({
 			extensionFactories: [
-				(pi) => {
-					api = pi;
+				{
+					factory: (pi) => {
+						api = pi;
+					},
+					effectivePolicy: { approvedGrants: ["session.write"] },
 				},
 			],
 		});

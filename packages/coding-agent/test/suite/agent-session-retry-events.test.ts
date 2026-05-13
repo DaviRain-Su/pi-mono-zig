@@ -221,6 +221,7 @@ describe("AgentSession retry and event characterization", () => {
 		harness.setResponses([fauxAssistantMessage("done")]);
 
 		await harness.session.prompt("hi");
+		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		expect(order).toEqual([
 			"extension:message_start:user",

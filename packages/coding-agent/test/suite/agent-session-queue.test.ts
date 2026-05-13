@@ -3,15 +3,17 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import {
+	createHarness,
+	getAssistantTexts,
+	getMessageText,
+	getUserTexts,
+	type Harness,
+	type HarnessOptions,
+} from "./harness.js";
 
 async function createWaitingHarness(
-	options: {
-		tools?: AgentTool[];
-		extensionFactories?: Harness["session"]["extensionRunner"] extends never
-			? never
-			: Array<(pi: ExtensionAPI) => void>;
-	} = {},
+	options: { tools?: AgentTool[]; extensionFactories?: HarnessOptions["extensionFactories"] } = {},
 ): Promise<{
 	harness: Harness;
 	releaseToolExecution: () => void;
@@ -93,8 +95,11 @@ describe("AgentSession queue characterization", () => {
 		let extensionApi: ExtensionAPI | undefined;
 		const waiting = await createWaitingHarness({
 			extensionFactories: [
-				(pi) => {
-					extensionApi = pi;
+				{
+					factory: (pi) => {
+						extensionApi = pi;
+					},
+					effectivePolicy: { approvedGrants: ["session.write"] },
 				},
 			],
 		});

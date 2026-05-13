@@ -240,8 +240,11 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
 		const extensionsResult = await createTestExtensionsResult([
-			(pi) => {
-				(globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi = pi;
+			{
+				factory: (pi) => {
+					(globalThis as typeof globalThis & { testExtensionApi?: unknown }).testExtensionApi = pi;
+				},
+				effectivePolicy: { approvedGrants: ["session.write"] },
 			},
 			(pi) => {
 				pi.on("input", async (event) => {

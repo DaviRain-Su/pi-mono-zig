@@ -2,7 +2,9 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DefaultPackageManager } from "../../../src/core/package-manager.js";
 import { DefaultResourceLoader } from "../../../src/core/resource-loader.js";
+import { SettingsManager } from "../../../src/core/settings-manager.js";
 
 describe("issue #2781 skill collision precedence: user skills should override package skills", () => {
 	let tempDir: string;
@@ -52,18 +54,19 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 		return skillPath;
 	}
 
-	function createSettingsWithPackage(pkgDir: string, scope: "user" | "project"): void {
-		const settingsDir = scope === "user" ? agentDir : join(cwd, ".pi");
-		mkdirSync(settingsDir, { recursive: true });
-		writeFileSync(join(settingsDir, "settings.json"), JSON.stringify({ packages: [pkgDir] }, null, 2));
+	async function createSettingsWithPackage(pkgDir: string, scope: "user" | "project"): Promise<SettingsManager> {
+		const settingsManager = SettingsManager.create(cwd, agentDir);
+		const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+		await packageManager.installAndPersist(pkgDir, { local: scope === "project" });
+		return settingsManager;
 	}
 
 	it("user auto-discovered skill should override package skill with same name", async () => {
 		const pkgDir = createPackageWithSkill("web-fetch", "Package web-fetch skill");
 		const userSkillPath = createUserSkill("web-fetch", "User web-fetch override");
-		createSettingsWithPackage(pkgDir, "user");
+		const settingsManager = await createSettingsWithPackage(pkgDir, "user");
 
-		const loader = new DefaultResourceLoader({ cwd, agentDir });
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await loader.reload();
 
 		const { skills } = loader.getSkills();
@@ -76,9 +79,9 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 	it("project auto-discovered skill should override package skill with same name", async () => {
 		const pkgDir = createPackageWithSkill("web-fetch", "Package web-fetch skill");
 		const projectSkillPath = createProjectSkill("web-fetch", "Project web-fetch override");
-		createSettingsWithPackage(pkgDir, "user");
+		const settingsManager = await createSettingsWithPackage(pkgDir, "user");
 
-		const loader = new DefaultResourceLoader({ cwd, agentDir });
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await loader.reload();
 
 		const { skills } = loader.getSkills();
@@ -92,9 +95,9 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 		const pkgDir = createPackageWithSkill("web-fetch", "Package web-fetch skill");
 		createUserSkill("web-fetch", "User web-fetch override");
 		const projectSkillPath = createProjectSkill("web-fetch", "Project web-fetch override");
-		createSettingsWithPackage(pkgDir, "user");
+		const settingsManager = await createSettingsWithPackage(pkgDir, "user");
 
-		const loader = new DefaultResourceLoader({ cwd, agentDir });
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await loader.reload();
 
 		const { skills } = loader.getSkills();
@@ -107,9 +110,9 @@ describe("issue #2781 skill collision precedence: user skills should override pa
 	it("collision diagnostics should report package skill as loser when user skill wins", async () => {
 		const pkgDir = createPackageWithSkill("web-fetch", "Package web-fetch skill");
 		createUserSkill("web-fetch", "User web-fetch override");
-		createSettingsWithPackage(pkgDir, "user");
+		const settingsManager = await createSettingsWithPackage(pkgDir, "user");
 
-		const loader = new DefaultResourceLoader({ cwd, agentDir });
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await loader.reload();
 
 		const { diagnostics } = loader.getSkills();
