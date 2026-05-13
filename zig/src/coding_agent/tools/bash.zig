@@ -11,6 +11,7 @@ const PRIVATE_LOG_FILE_PERMISSIONS: std.Io.File.Permissions = if (@hasDecl(std.I
     std.Io.File.Permissions.fromMode(0o600)
 else
     .default_file;
+const BASH_UPDATE_THROTTLE_MS: i128 = 100;
 
 pub const BashArgs = struct {
     command: []const u8,
@@ -242,14 +243,14 @@ pub const BashTool = struct {
         var timed_out = false;
         var aborted = false;
         var last_reported_generation: u64 = 0;
-        var last_progress_report_ns = started_at;
+        var last_progress_report_ns = started_at - (BASH_UPDATE_THROTTLE_MS * std.time.ns_per_ms);
 
         while (!wait_state.done.load(.seq_cst)) {
             if (on_update != null) {
                 const now_ns = std.Io.Clock.now(.awake, self.io).nanoseconds;
                 const generation = reader_state.generation.load(.seq_cst);
-                const should_emit = generation != last_reported_generation or
-                    now_ns - last_progress_report_ns >= 200 * std.time.ns_per_ms;
+                const should_emit = generation != last_reported_generation and
+                    now_ns - last_progress_report_ns >= BASH_UPDATE_THROTTLE_MS * std.time.ns_per_ms;
                 if (should_emit) {
                     const snapshot = try reader_state.snapshot(allocator);
                     defer allocator.free(snapshot);
@@ -508,48 +509,16 @@ fn emitStreamingUpdate(
 fn buildStreamingPreview(
     allocator: std.mem.Allocator,
     output: []const u8,
-    elapsed_ns: i128,
+    _: i128,
 ) ![]u8 {
     var truncation_result = try truncate.truncateTail(allocator, output, .{});
     defer truncation_result.deinit(allocator);
 
-    var preview = if (truncation_result.content.len == 0)
-        try allocator.dupe(u8, "Running...")
+    const preview = if (truncation_result.content.len == 0)
+        try allocator.dupe(u8, "")
     else
         try allocator.dupe(u8, truncation_result.content);
-
-    if (truncation_result.truncated) {
-        const note = if (truncation_result.truncated_by.? == .lines)
-            try std.fmt.allocPrint(
-                allocator,
-                "\n\n[Streaming last {d} of {d} lines while command runs]",
-                .{ truncation_result.output_lines, truncation_result.total_lines },
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "\n\n[Streaming last {d} lines ({d} byte window) while command runs]",
-                .{ truncation_result.output_lines, truncate.DEFAULT_MAX_BYTES },
-            );
-        defer allocator.free(note);
-
-        const with_note = try std.mem.concat(allocator, u8, &[_][]const u8{ preview, note });
-        defer allocator.free(with_note);
-        allocator.free(preview);
-        preview = try allocator.dupe(u8, with_note);
-    }
-
-    const elapsed_ms: u64 = @intCast(@divTrunc(@max(elapsed_ns, 0), std.time.ns_per_ms));
-    const elapsed_note = try std.fmt.allocPrint(
-        allocator,
-        "\n\n[Running... {d}.{d:0>1}s elapsed]",
-        .{ elapsed_ms / std.time.ms_per_s, (elapsed_ms % std.time.ms_per_s) / 100 },
-    );
-    defer allocator.free(elapsed_note);
-
-    const rendered = try std.mem.concat(allocator, u8, &[_][]const u8{ preview, elapsed_note });
-    allocator.free(preview);
-    return rendered;
+    return preview;
 }
 
 const SecureTempFile = struct {
@@ -707,17 +676,55 @@ test "bash tool streams partial output updates for long-running commands" {
     try std.testing.expect(collector.updates.items.len >= 2);
 
     var saw_first_only = false;
-    var saw_running_note = false;
     for (collector.updates.items) |update| {
-        if (std.mem.indexOf(u8, update, "Running...") != null) saw_running_note = true;
         if (std.mem.indexOf(u8, update, "first") != null and std.mem.indexOf(u8, update, "third") == null) {
             saw_first_only = true;
         }
     }
 
     try std.testing.expect(saw_first_only);
-    try std.testing.expect(saw_running_note);
     try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "third") != null);
+}
+
+test "bash tool streams updates before final completion and preserves combined output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var collector = StreamingUpdateCollector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var result = try BashTool.init(absolute_path, std.testing.io).executeWithUpdates(
+        std.testing.allocator,
+        .{
+            .command = "printf 'stdout-1\\n'; sleep 0.15; printf 'stderr-1\\n' >&2; sleep 0.15; printf 'stdout-2\\n'",
+        },
+        null,
+        &collector,
+        collectStreamingUpdate,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(collector.updates.items.len >= 2);
+    try std.testing.expectEqualStrings(
+        "stdout-1\nstderr-1\nstdout-2\n",
+        result.content[0].text.text,
+    );
+
+    var saw_update_before_completion = false;
+    for (collector.updates.items) |update| {
+        if (std.mem.indexOf(u8, update, "stdout-1") != null and
+            std.mem.indexOf(u8, update, "stdout-2") == null)
+        {
+            saw_update_before_completion = true;
+        }
+    }
+    try std.testing.expect(saw_update_before_completion);
 }
 
 test "bash tool captures stderr and exit code on failure" {
@@ -819,6 +826,44 @@ test "bash tool truncates large output and exposes the temp path" {
     }
 }
 
+test "bash tool long output preserves tail truncation with update callback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const joined_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer std.testing.allocator.free(joined_path);
+    const absolute_path = try makeAbsoluteTestPath(std.testing.allocator, joined_path);
+    defer std.testing.allocator.free(absolute_path);
+
+    var collector = StreamingUpdateCollector{ .allocator = std.testing.allocator };
+    defer collector.deinit();
+
+    var result = try BashTool.init(absolute_path, std.testing.io).executeWithUpdates(
+        std.testing.allocator,
+        .{ .command = "for i in $(seq 1 3000); do echo $i; if [ $((i % 500)) -eq 0 ]; then sleep 0.05; fi; done" },
+        null,
+        &collector,
+        collectStreamingUpdate,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(collector.updates.items.len > 0);
+    try std.testing.expect(result.details.?.truncation != null);
+    try std.testing.expect(result.details.?.truncation.?.truncated);
+    try std.testing.expectEqual(truncate.TruncatedBy.lines, result.details.?.truncation.?.truncated_by.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "3000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.content[0].text.text, "1\n2\n3") == null);
+
+    const full_output_path = result.details.?.full_output_path.?;
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, full_output_path) catch {};
+
+    const full_output = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, full_output_path, std.testing.allocator, .limited(32 * 1024));
+    defer std.testing.allocator.free(full_output);
+    try std.testing.expect(std.mem.indexOf(u8, full_output, "1\n2\n3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_output, "2998\n2999\n3000") != null);
+}
+
 test "buildStreamingPreview frees truncation buffers for truncated output" {
     var output = std.ArrayList(u8).empty;
     defer output.deinit(std.testing.allocator);
@@ -832,18 +877,8 @@ test "buildStreamingPreview frees truncation buffers for truncated output" {
     const preview = try buildStreamingPreview(std.testing.allocator, output.items, 1_500_000_000);
     defer std.testing.allocator.free(preview);
 
-    try std.testing.expect(std.mem.containsAtLeast(
-        u8,
-        preview,
-        1,
-        "[Streaming last",
-    ));
-    try std.testing.expect(std.mem.containsAtLeast(
-        u8,
-        preview,
-        1,
-        "[Running... 1.5s elapsed]",
-    ));
+    try std.testing.expect(std.mem.indexOf(u8, preview, "line 0") == null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "line 2000") != null);
 }
 
 test "detailsToJsonValue serializes bash metadata for downstream consumers" {
