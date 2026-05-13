@@ -50,6 +50,8 @@ const BlockEntry = struct {
 const AnthropicCompat = struct {
     supports_eager_tool_input_streaming: bool = true,
     supports_long_cache_retention: bool = true,
+    send_session_affinity_headers: bool = false,
+    supports_cache_control_on_tools: bool = true,
 };
 
 const ResolvedOptions = struct {
@@ -66,7 +68,6 @@ pub const AnthropicProvider = struct {
     pub const api = BaseProvider.api;
     pub const stream = BaseProvider.stream;
     pub const streamSimple = BaseProvider.streamSimple;
-
 
     fn streamProduction(
         allocator: std.mem.Allocator,
@@ -121,6 +122,7 @@ pub const AnthropicProvider = struct {
         try applyBaseAnthropicHeaders(allocator, &headers, model);
         try applyAuthHeaders(allocator, &headers, model, resolved_options.options);
         try applyDefaultAnthropicHeaders(allocator, &headers, model, context, resolved_options.options);
+        try applySessionAffinityHeaders(allocator, &headers, model, resolved_options.options);
         try mergeHeaders(allocator, &headers, model.headers);
         if (resolved_options.options) |stream_options| {
             try mergeHeaders(allocator, &headers, stream_options.headers);
@@ -166,7 +168,6 @@ pub const AnthropicProvider = struct {
 
         try parseSseStreamLines(allocator, stream_instance, &response, model, context, resolved_options.options);
     }
-
 };
 
 fn buildMessagesUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
@@ -240,7 +241,8 @@ pub fn buildRequestPayload(
     );
     try payload.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
 
-    const cache_control = try buildCacheControl(allocator, compat, if (options) |stream_options| stream_options.cache_retention else .short);
+    const cache_retention = resolveOptionsCacheRetention(options);
+    const cache_control = try buildCacheControl(allocator, compat, cache_retention);
     defer if (cache_control) |value| provider_json.freeValue(allocator, value);
 
     const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
@@ -253,7 +255,8 @@ pub fn buildRequestPayload(
     try payload.put(allocator, try allocator.dupe(u8, "messages"), messages_value);
 
     if (context.tools) |tools| {
-        const tools_value = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, cache_control);
+        const tool_cache_control = if (compat.supports_cache_control_on_tools) cache_control else null;
+        const tools_value = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, tool_cache_control);
         try payload.put(allocator, try allocator.dupe(u8, "tools"), tools_value);
     }
 
@@ -1559,6 +1562,46 @@ test "buildRequestPayload adds eager_input_streaming by default" {
     const first_tool = payload.object.get("tools").?.array.items[0];
     try std.testing.expect(first_tool == .object);
     try std.testing.expectEqual(true, first_tool.object.get("eager_input_streaming").?.bool);
+    const cache_control = first_tool.object.get("cache_control").?;
+    try std.testing.expect(cache_control == .object);
+    try std.testing.expectEqualStrings("ephemeral", cache_control.object.get("type").?.string);
+}
+
+test "fireworks compat omits unsupported tool cache control and eager streaming fields" {
+    const allocator = std.testing.allocator;
+
+    const tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    const tool_schema_value = std.json.Value{ .object = tool_schema };
+    defer provider_json.freeValue(allocator, tool_schema_value);
+
+    const tools = &[_]types.Tool{.{
+        .name = "lookup",
+        .description = "Look up a value",
+        .parameters = tool_schema_value,
+    }};
+
+    const model = types.Model{
+        .id = "accounts/fireworks/models/kimi-k2p6",
+        .name = "Kimi K2.6",
+        .api = "anthropic-messages",
+        .provider = "fireworks",
+        .base_url = "https://api.fireworks.ai/inference",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 262000,
+        .max_tokens = 262000,
+    };
+
+    const payload = try buildRequestPayload(allocator, model, .{
+        .messages = &[_]types.Message{},
+        .tools = tools,
+    }, null);
+    defer provider_json.freeValue(allocator, payload);
+
+    const first_tool = payload.object.get("tools").?.array.items[0];
+    try std.testing.expect(first_tool == .object);
+    try std.testing.expect(first_tool.object.get("eager_input_streaming") == null);
+    try std.testing.expect(first_tool.object.get("cache_control") == null);
 }
 
 test "github-copilot compat disables eager_input_streaming and enables legacy beta header" {
@@ -1643,6 +1686,90 @@ test "kimi-coding api-key headers preserve truthful client identity" {
     try std.testing.expect(headers.get("Authorization") == null);
     try std.testing.expect(headers.get("anthropic-beta") == null);
     try std.testing.expect(headers.get("anthropic-dangerous-direct-browser-access") == null);
+}
+
+test "fireworks session affinity header follows cache retention" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "accounts/fireworks/models/kimi-k2p6",
+        .name = "Kimi K2.6",
+        .api = "anthropic-messages",
+        .provider = "fireworks",
+        .base_url = "https://api.fireworks.ai/inference",
+        .reasoning = true,
+        .input_types = &[_][]const u8{ "text", "image" },
+        .context_window = 262000,
+        .max_tokens = 262000,
+    };
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try applySessionAffinityHeaders(allocator, &headers, model, .{
+        .session_id = "fireworks-session-1",
+        .cache_retention = .short,
+    });
+    try std.testing.expectEqualStrings("fireworks-session-1", headers.get("x-session-affinity").?);
+
+    var disabled_headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &disabled_headers);
+
+    try applySessionAffinityHeaders(allocator, &disabled_headers, model, .{
+        .session_id = "fireworks-session-2",
+        .cache_retention = .none,
+    });
+    try std.testing.expect(disabled_headers.get("x-session-affinity") == null);
+}
+
+test "non-fireworks anthropic session affinity defaults remain disabled" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try applySessionAffinityHeaders(allocator, &headers, model, .{
+        .session_id = "anthropic-session-1",
+        .cache_retention = .short,
+    });
+    try std.testing.expect(headers.get("x-session-affinity") == null);
+}
+
+test "cloudflare anthropic gateway session affinity defaults enabled" {
+    const allocator = std.testing.allocator;
+
+    const model = types.Model{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "cloudflare-ai-gateway",
+        .base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/anthropic",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 200000,
+        .max_tokens = 64000,
+    };
+
+    var headers = std.StringHashMap([]const u8).init(allocator);
+    defer deinitOwnedHeaders(allocator, &headers);
+
+    try applySessionAffinityHeaders(allocator, &headers, model, .{
+        .session_id = "cloudflare-anthropic-session",
+        .cache_retention = .short,
+    });
+    try std.testing.expectEqualStrings("cloudflare-anthropic-session", headers.get("x-session-affinity").?);
 }
 
 test "kimi-coding api-key payload does not inject Claude Code identity" {
@@ -2788,9 +2915,16 @@ fn handleContentBlockStop(
 }
 
 fn getAnthropicCompat(model: types.Model) AnthropicCompat {
+    const is_fireworks = std.mem.eql(u8, model.provider, "fireworks");
+    const is_cloudflare_ai_gateway_anthropic =
+        std.mem.eql(u8, model.provider, "cloudflare-ai-gateway") and
+        std.mem.indexOf(u8, model.base_url, "anthropic") != null;
+
     return .{
-        .supports_eager_tool_input_streaming = compatBoolField(model.compat, "supportsEagerToolInputStreaming") orelse true,
-        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse true,
+        .supports_eager_tool_input_streaming = compatBoolField(model.compat, "supportsEagerToolInputStreaming") orelse !is_fireworks,
+        .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !is_fireworks,
+        .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse (is_fireworks or is_cloudflare_ai_gateway_anthropic),
+        .supports_cache_control_on_tools = compatBoolField(model.compat, "supportsCacheControlOnTools") orelse !is_fireworks,
     };
 }
 
@@ -2811,6 +2945,25 @@ fn buildCacheControl(
         .supports_eager_tool_input_streaming = compat.supports_eager_tool_input_streaming,
         .supports_long_cache_retention = compat.supports_long_cache_retention,
     }, retention);
+}
+
+fn processCacheRetentionEnv() ?[]const u8 {
+    const value = std.c.getenv("PI_CACHE_RETENTION") orelse return null;
+    return std.mem.span(value);
+}
+
+fn resolveCacheRetention(cache_retention: types.CacheRetention, pi_cache_retention_env: ?[]const u8) types.CacheRetention {
+    return switch (cache_retention) {
+        .unset => if (pi_cache_retention_env) |value|
+            if (std.mem.eql(u8, value, "long")) .long else .short
+        else
+            .short,
+        .none, .short, .long => cache_retention,
+    };
+}
+
+fn resolveOptionsCacheRetention(options: ?types.StreamOptions) types.CacheRetention {
+    return resolveCacheRetention(if (options) |stream_options| stream_options.cache_retention else .unset, processCacheRetentionEnv());
 }
 
 fn buildSystemPromptValue(
@@ -2919,6 +3072,19 @@ fn applyDefaultAnthropicHeaders(
         try putOwnedHeader(allocator, headers, "user-agent", user_agent);
         try putOwnedHeader(allocator, headers, "x-app", "cli");
     }
+}
+
+fn applySessionAffinityHeaders(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    model: types.Model,
+    options: ?types.StreamOptions,
+) !void {
+    const stream_options = options orelse return;
+    const session_id = stream_options.session_id orelse return;
+    if (resolveOptionsCacheRetention(options) == .none) return;
+    if (!getAnthropicCompat(model).send_session_affinity_headers) return;
+    try putOwnedHeader(allocator, headers, "x-session-affinity", session_id);
 }
 
 fn shouldUseFineGrainedToolStreamingBeta(model: types.Model, context: types.Context) bool {
@@ -3224,8 +3390,6 @@ fn drainStreamAndFreeDoneMessage(
         if (event.message) |message| types.freeAssistantMessage(allocator, message);
     }
 }
-
-
 
 fn deinitJsonArrayItems(allocator: std.mem.Allocator, array: *std.json.Array) void {
     anthropic_json.deinitJsonArrayItems(allocator, array);

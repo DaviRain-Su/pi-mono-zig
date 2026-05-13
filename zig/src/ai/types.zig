@@ -461,6 +461,8 @@ pub const OpenAIResponsesCompat = struct {
 pub const AnthropicMessagesCompat = struct {
     supports_eager_tool_input_streaming: ?bool = null,
     supports_long_cache_retention: ?bool = null,
+    send_session_affinity_headers: ?bool = null,
+    supports_cache_control_on_tools: ?bool = null,
 };
 
 pub const OpenRouterRouting = struct {

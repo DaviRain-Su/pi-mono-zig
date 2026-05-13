@@ -923,6 +923,12 @@ test "built-in models are registered at startup" {
     const fireworks_provider = getProviderConfig("fireworks").?;
     try std.testing.expectEqualStrings("anthropic-messages", fireworks_provider.api);
     try std.testing.expectEqualStrings("accounts/fireworks/models/kimi-k2p6", fireworks_provider.default_model_id.?);
+
+    const fireworks_model = find("fireworks", "accounts/fireworks/models/kimi-k2p6").?;
+    try expectCompatBool(fireworks_model, "sendSessionAffinityHeaders", true);
+    try expectCompatBool(fireworks_model, "supportsEagerToolInputStreaming", false);
+    try expectCompatBool(fireworks_model, "supportsCacheControlOnTools", false);
+    try expectCompatBool(fireworks_model, "supportsLongCacheRetention", false);
 }
 
 test "generated catalog registers representative TypeScript models" {
