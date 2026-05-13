@@ -138,6 +138,11 @@ pub fn build(b: *std.Build) void {
         "tidy-fail-on-warning",
         "Make `zig build test-tidy` fail when tidy warnings are reported",
     ) orelse false;
+    const coding_agent_test_filters = b.option(
+        []const []const u8,
+        "coding-agent-test-filter",
+        "Only run coding-agent tests whose names contain this filter",
+    ) orelse &.{};
     const tidy_mod = b.createModule(.{
         .root_source_file = b.path("test/tidy.zig"),
         .target = target,
@@ -241,6 +246,7 @@ pub fn build(b: *std.Build) void {
 
     const coding_agent_tests = b.addTest(.{
         .root_module = coding_agent_mod,
+        .filters = coding_agent_test_filters,
     });
     addMacosWebViewSupport(b, coding_agent_tests, target);
     const run_coding_agent_tests = b.addRunArtifact(coding_agent_tests);

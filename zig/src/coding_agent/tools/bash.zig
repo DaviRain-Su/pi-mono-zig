@@ -701,7 +701,7 @@ test "bash tool streams updates before final completion and preserves combined o
     var result = try BashTool.init(absolute_path, std.testing.io).executeWithUpdates(
         std.testing.allocator,
         .{
-            .command = "printf 'stdout-1\\n'; sleep 0.15; printf 'stderr-1\\n' >&2; sleep 0.15; printf 'stdout-2\\n'",
+            .command = "printf 'stdout-1\\n'; sleep 0.15; printf 'stderr-1\\n' >&2; sleep 0.15; printf 'stdout-2\\n'; sleep 0.25",
         },
         null,
         &collector,

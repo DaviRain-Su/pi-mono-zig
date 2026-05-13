@@ -750,7 +750,7 @@ PY
 
 ts_rpc_run_section \
 	"Extension UI request writer exact byte coverage" \
-	zig build test-coding-agent -- --test-filter "TS RPC extension UI request writer matches TypeScript fixture bytes"
+	zig build -Dcoding-agent-test-filter="TS RPC extension UI request writer matches TypeScript fixture bytes" test-coding-agent
 
 ts_rpc_run_section "Direct bash exact byte diff" python3 <<'PY'
 import os
