@@ -9732,6 +9732,7 @@ export const MODELS = {
 			provider: "openrouter",
 			baseUrl: "https://openrouter.ai/api/v1",
 			reasoning: true,
+			thinkingLevelMap: {"off":null},
 			input: ["text"],
 			cost: {
 				input: 0.25,
