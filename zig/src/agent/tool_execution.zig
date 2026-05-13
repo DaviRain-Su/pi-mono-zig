@@ -38,7 +38,6 @@ pub const FinalizedToolCallOutcome = struct {
 /// - Partial arguments are exposed in the callback-scoped partial assistant
 ///   message only when another assistant block anchors the transcript row.
 ///   A standalone leading tool call is hidden from message.content until the
-
 const UpdateEmitterContext = struct {
     emit_context: ?*anyopaque,
     emit: types.AgentEventCallback,
@@ -368,7 +367,6 @@ pub fn executeToolCallsParallel(
     try emitParallelToolResultMessagesInSourceOrder(result_slots, emit_context, emit);
     return try collectParallelToolResultsInSourceOrder(allocator, result_slots);
 }
-
 
 pub fn prepareToolCall(
     allocator: std.mem.Allocator,
@@ -801,4 +799,555 @@ fn fillTaskCompletionOrder(order: []usize, tasks: []const ParallelToolTask) void
         }
         order[cursor] = task_index;
     }
+}
+
+fn testModel() ai.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test",
+        .provider = "test",
+        .base_url = "http://localhost",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+}
+
+fn testAssistantMessage() ai.AssistantMessage {
+    return .{
+        .content = &.{},
+        .api = "test",
+        .provider = "test",
+        .model = "test-model",
+        .usage = ai.Usage.init(),
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+    };
+}
+
+fn testConvertToLlm(
+    allocator: std.mem.Allocator,
+    messages: []const types.AgentMessage,
+    _: ?*anyopaque,
+) ![]ai.Message {
+    return try allocator.dupe(ai.Message, messages);
+}
+
+fn testConfig() types.AgentLoopConfig {
+    return .{
+        .model = testModel(),
+        .convert_to_llm = testConvertToLlm,
+    };
+}
+
+fn testJsonObjectWithString(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: []const u8,
+) !std.json.Value {
+    var object = try std.json.ObjectMap.init(allocator, &.{}, &.{});
+    try object.put(
+        allocator,
+        try allocator.dupe(u8, key),
+        .{ .string = try allocator.dupe(u8, value) },
+    );
+    return .{ .object = object };
+}
+
+fn testParseJson(allocator: std.mem.Allocator, source: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, source, .{});
+}
+
+fn testStringArg(args: std.json.Value, key: []const u8) ![]const u8 {
+    if (args != .object) return error.InvalidToolArguments;
+    const value = args.object.get(key) orelse return error.InvalidToolArguments;
+    if (value != .string) return error.InvalidToolArguments;
+    return value.string;
+}
+
+fn testTextToolResult(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    is_error: bool,
+) !types.AgentToolResult {
+    const content = try allocator.alloc(ai.ContentBlock, 1);
+    content[0] = .{
+        .text = .{
+            .text = try allocator.dupe(u8, text),
+        },
+    };
+    return .{
+        .content = content,
+        .details = null,
+        .is_error = is_error,
+    };
+}
+
+fn testDeinitToolResults(allocator: std.mem.Allocator, results: []const types.ToolResultMessage) void {
+    for (results) |result| {
+        content_clone.deinitContentBlocks(allocator, result.content);
+        allocator.free(result.content);
+    }
+    allocator.free(results);
+}
+
+const TestEventCapture = struct {
+    allocator: std.mem.Allocator,
+    events: std.ArrayList(types.AgentEvent) = .empty,
+
+    fn init(allocator: std.mem.Allocator) TestEventCapture {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *TestEventCapture) void {
+        self.events.deinit(self.allocator);
+    }
+};
+
+fn testCaptureEvent(context: ?*anyopaque, event: types.AgentEvent) !void {
+    const capture: *TestEventCapture = @ptrCast(@alignCast(context.?));
+    try capture.events.append(capture.allocator, event);
+}
+
+fn testIgnoreEvent(_: ?*anyopaque, _: types.AgentEvent) !void {}
+
+fn testToolResultOfEvent(event: types.AgentEvent) ?types.ToolResultMessage {
+    const message = event.message orelse return null;
+    return switch (message) {
+        .tool_result => |tool_result| tool_result,
+        else => null,
+    };
+}
+
+fn testEchoToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const value = try testStringArg(params, "value");
+    return try testTextToolResult(
+        allocator,
+        try std.fmt.allocPrint(allocator, "echoed: {s}", .{value}),
+        false,
+    );
+}
+
+const ParallelOrderFixture = struct {
+    second_completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    first_waited_for_second: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    execute_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn testOutOfOrderToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    params: std.json.Value,
+    tool_context: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const fixture: *ParallelOrderFixture = @ptrCast(@alignCast(tool_context orelse return error.MissingParallelOrderFixture));
+    _ = fixture.execute_count.fetchAdd(1, .seq_cst);
+
+    const value = try testStringArg(params, "value");
+    if (std.mem.eql(u8, value, "first")) {
+        var spins: usize = 0;
+        while (!fixture.second_completed.load(.seq_cst)) : (spins += 1) {
+            if (spins > 1_000_000) return error.SecondToolNeverCompleted;
+            std.Thread.yield() catch {};
+        }
+        fixture.first_waited_for_second.store(true, .seq_cst);
+    } else if (std.mem.eql(u8, value, "second")) {
+        fixture.second_completed.store(true, .seq_cst);
+    }
+
+    return try testTextToolResult(
+        allocator,
+        try std.fmt.allocPrint(allocator, "completed: {s}", .{value}),
+        false,
+    );
+}
+
+fn testErrorResultToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    _: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    return try testTextToolResult(allocator, "tool reported failure", true);
+}
+
+const AbortFixture = struct {
+    execute_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    saw_aborted_signal: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn testAbortAwareToolExecute(
+    allocator: std.mem.Allocator,
+    _: []const u8,
+    _: std.json.Value,
+    tool_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+    _: ?*anyopaque,
+    _: ?types.AgentToolUpdateCallback,
+) !types.AgentToolResult {
+    const fixture: *AbortFixture = @ptrCast(@alignCast(tool_context orelse return error.MissingAbortFixture));
+    _ = fixture.execute_count.fetchAdd(1, .seq_cst);
+
+    if (signal) |abort_signal| {
+        if (abort_signal.load(.seq_cst)) {
+            fixture.saw_aborted_signal.store(true, .seq_cst);
+            return try testTextToolResult(allocator, "aborted before run", true);
+        }
+    }
+
+    return try testTextToolResult(allocator, "not aborted", false);
+}
+
+test "findTool returns registered tool and null for unknown names" {
+    const tools = [_]types.AgentTool{
+        .{
+            .name = "read",
+            .description = "Read",
+            .label = "Read",
+            .parameters = .null,
+        },
+        .{
+            .name = "write",
+            .description = "Write",
+            .label = "Write",
+            .parameters = .null,
+        },
+    };
+
+    const found = findTool(tools[0..], "write") orelse return error.ExpectedTool;
+    try std.testing.expectEqualStrings("write", found.name);
+    try std.testing.expect(findTool(tools[0..], "missing") == null);
+}
+
+test "prepareToolCall validates tool existence and JSON arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const schema = try testParseJson(allocator,
+        \\{"type":"object","required":["value"],"properties":{"value":{"type":"string"}}}
+    );
+    const tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo",
+        .label = "Echo",
+        .parameters = schema.value,
+        .execute = testEchoToolExecute,
+    };
+    const context = types.AgentContext{
+        .system_prompt = "",
+        .messages = &.{},
+        .tools = &[_]types.AgentTool{tool},
+    };
+
+    var valid = try prepareToolCall(
+        allocator,
+        context,
+        testAssistantMessage(),
+        .{
+            .id = "tool-valid",
+            .name = "echo",
+            .arguments = try testJsonObjectWithString(allocator, "value", "ok"),
+        },
+        testConfig(),
+        null,
+    );
+    switch (valid) {
+        .prepared => |*prepared| {
+            defer prepared.deinit(allocator);
+            try std.testing.expectEqualStrings("echo", prepared.tool.name);
+            try std.testing.expectEqualStrings("ok", try testStringArg(prepared.args, "value"));
+        },
+        .immediate => return error.ExpectedPreparedToolCall,
+    }
+
+    const missing = try prepareToolCall(
+        allocator,
+        context,
+        testAssistantMessage(),
+        .{
+            .id = "tool-missing",
+            .name = "missing",
+            .arguments = .null,
+        },
+        testConfig(),
+        null,
+    );
+    switch (missing) {
+        .prepared => return error.ExpectedImmediateMissingTool,
+        .immediate => |immediate| {
+            try std.testing.expect(immediate.is_error);
+            try std.testing.expectEqualStrings("Tool missing not found", immediate.result.content[0].text.text);
+        },
+    }
+
+    const invalid = try prepareToolCall(
+        allocator,
+        context,
+        testAssistantMessage(),
+        .{
+            .id = "tool-invalid",
+            .name = "echo",
+            .arguments = .{ .string = "not an object" },
+        },
+        testConfig(),
+        null,
+    );
+    switch (invalid) {
+        .prepared => return error.ExpectedImmediateInvalidArguments,
+        .immediate => |immediate| {
+            try std.testing.expect(immediate.is_error);
+            try std.testing.expectEqualStrings("InvalidToolArguments", immediate.result.content[0].text.text);
+        },
+    }
+}
+
+test "executeToolCallsParallel preserves result order when tools complete out of order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const tool_calls = [_]ai.ToolCall{
+        .{
+            .id = "tool-1",
+            .name = "ordered",
+            .arguments = try testJsonObjectWithString(allocator, "value", "first"),
+        },
+        .{
+            .id = "tool-2",
+            .name = "ordered",
+            .arguments = try testJsonObjectWithString(allocator, "value", "second"),
+        },
+    };
+    var fixture = ParallelOrderFixture{};
+    const tool = types.AgentTool{
+        .name = "ordered",
+        .description = "Ordered",
+        .label = "Ordered",
+        .parameters = .null,
+        .execute_context = &fixture,
+        .execute = testOutOfOrderToolExecute,
+    };
+    var capture = TestEventCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        testAssistantMessage(),
+        tool_calls[0..],
+        testConfig(),
+        &capture,
+        testCaptureEvent,
+        null,
+    );
+    defer testDeinitToolResults(std.testing.allocator, results);
+
+    try std.testing.expect(fixture.first_waited_for_second.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.execute_count.load(.seq_cst));
+    try std.testing.expectEqualStrings("tool-1", results[0].tool_call_id);
+    try std.testing.expectEqualStrings("tool-2", results[1].tool_call_id);
+    try std.testing.expectEqualStrings("completed: first", results[0].content[0].text.text);
+    try std.testing.expectEqualStrings("completed: second", results[1].content[0].text.text);
+
+    var tool_end_ids = std.ArrayList([]const u8).empty;
+    defer tool_end_ids.deinit(std.testing.allocator);
+    var tool_message_ids = std.ArrayList([]const u8).empty;
+    defer tool_message_ids.deinit(std.testing.allocator);
+
+    for (capture.events.items) |event| {
+        switch (event.event_type) {
+            .tool_execution_end => try tool_end_ids.append(std.testing.allocator, event.tool_call_id orelse return error.MissingToolCallId),
+            .message_end => if (testToolResultOfEvent(event)) |tool_result| {
+                try tool_message_ids.append(std.testing.allocator, tool_result.tool_call_id);
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), tool_end_ids.items.len);
+    try std.testing.expectEqualStrings("tool-2", tool_end_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-1", tool_end_ids.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), tool_message_ids.items.len);
+    try std.testing.expectEqualStrings("tool-1", tool_message_ids.items[0]);
+    try std.testing.expectEqualStrings("tool-2", tool_message_ids.items[1]);
+}
+
+test "executeToolCallsParallel represents tool error results without crashing" {
+    const tool_calls = [_]ai.ToolCall{.{
+        .id = "tool-error",
+        .name = "erroring",
+        .arguments = .null,
+    }};
+    const tool = types.AgentTool{
+        .name = "erroring",
+        .description = "Returns an error result",
+        .label = "Erroring",
+        .parameters = .null,
+        .execute = testErrorResultToolExecute,
+    };
+    var capture = TestEventCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        testAssistantMessage(),
+        tool_calls[0..],
+        testConfig(),
+        &capture,
+        testCaptureEvent,
+        null,
+    );
+    defer testDeinitToolResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].is_error);
+    try std.testing.expectEqualStrings("tool reported failure", results[0].content[0].text.text);
+
+    var saw_end = false;
+    var saw_message = false;
+    for (capture.events.items) |event| {
+        if (event.event_type == .tool_execution_end) {
+            saw_end = true;
+            try std.testing.expectEqual(true, event.is_error.?);
+            try std.testing.expectEqualStrings("tool reported failure", event.result.?.content[0].text.text);
+        }
+        if (event.event_type == .message_end) {
+            if (testToolResultOfEvent(event)) |tool_result| {
+                saw_message = true;
+                try std.testing.expect(tool_result.is_error);
+                try std.testing.expectEqualStrings("tool-error", tool_result.tool_call_id);
+            }
+        }
+    }
+    try std.testing.expect(saw_end);
+    try std.testing.expect(saw_message);
+}
+
+test "executeToolCallsParallel forwards pre-set abort signal and terminates gracefully" {
+    const tool_calls = [_]ai.ToolCall{.{
+        .id = "tool-abort",
+        .name = "abort-aware",
+        .arguments = .null,
+    }};
+    var fixture = AbortFixture{};
+    const tool = types.AgentTool{
+        .name = "abort-aware",
+        .description = "Observes abort signal",
+        .label = "Abort",
+        .parameters = .null,
+        .execute_context = &fixture,
+        .execute = testAbortAwareToolExecute,
+    };
+    var signal = std.atomic.Value(bool).init(true);
+
+    const results = try executeToolCallsParallel(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        testAssistantMessage(),
+        tool_calls[0..],
+        testConfig(),
+        null,
+        testIgnoreEvent,
+        &signal,
+    );
+    defer testDeinitToolResults(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.execute_count.load(.seq_cst));
+    try std.testing.expect(fixture.saw_aborted_signal.load(.seq_cst));
+    try std.testing.expect(results[0].is_error);
+    try std.testing.expectEqualStrings("aborted before run", results[0].content[0].text.text);
+}
+
+test "finalizeExecutedToolCall emits finalized tool execution event shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const args = try testJsonObjectWithString(allocator, "value", "done");
+    const tool = types.AgentTool{
+        .name = "finalize",
+        .description = "Finalize",
+        .label = "Finalize",
+        .parameters = .null,
+    };
+    var prepared = PreparedToolCall{
+        .tool_call = .{
+            .id = "tool-final",
+            .name = "finalize",
+            .arguments = args,
+        },
+        .tool = tool,
+        .args = try provider_json.cloneValue(allocator, args),
+    };
+    defer prepared.deinit(allocator);
+
+    const executed = ExecutedToolCallOutcome{
+        .result = try testTextToolResult(allocator, "final output", false),
+        .is_error = false,
+    };
+    var capture = TestEventCapture.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const finalized = try finalizeExecutedToolCall(
+        allocator,
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{tool},
+        },
+        testAssistantMessage(),
+        &prepared,
+        executed,
+        false,
+        testConfig(),
+        &capture,
+        testCaptureEvent,
+        null,
+    );
+
+    try std.testing.expect(prepared.finalized);
+    try std.testing.expect(!finalized.is_error);
+    try std.testing.expectEqualStrings("final output", finalized.result.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+
+    const event = capture.events.items[0];
+    try std.testing.expectEqual(types.AgentEventType.tool_execution_end, event.event_type);
+    try std.testing.expectEqualStrings("tool-final", event.tool_call_id.?);
+    try std.testing.expectEqualStrings("finalize", event.tool_name.?);
+    try std.testing.expectEqualStrings("done", try testStringArg(event.args.?, "value"));
+    try std.testing.expectEqual(false, event.is_error.?);
+    try std.testing.expectEqual(false, event.result.?.is_error);
+    try std.testing.expectEqualStrings("final output", event.result.?.content[0].text.text);
 }
