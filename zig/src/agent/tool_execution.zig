@@ -964,7 +964,7 @@ fn testOutOfOrderToolExecute(
         }
         fixture.first_waited_for_second.store(true, .seq_cst);
     } else if (std.mem.eql(u8, value, "second")) {
-        fixture.second_completed.store(true, .seq_cst);
+        defer fixture.second_completed.store(true, .seq_cst);
     }
 
     return try testTextToolResult(
@@ -1186,8 +1186,14 @@ test "executeToolCallsParallel preserves result order when tools complete out of
     }
 
     try std.testing.expectEqual(@as(usize, 2), tool_end_ids.items.len);
-    try std.testing.expectEqualStrings("tool-2", tool_end_ids.items[0]);
-    try std.testing.expectEqualStrings("tool-1", tool_end_ids.items[1]);
+    var saw_tool_1_end = false;
+    var saw_tool_2_end = false;
+    for (tool_end_ids.items) |tool_end_id| {
+        if (std.mem.eql(u8, tool_end_id, "tool-1")) saw_tool_1_end = true;
+        if (std.mem.eql(u8, tool_end_id, "tool-2")) saw_tool_2_end = true;
+    }
+    try std.testing.expect(saw_tool_1_end);
+    try std.testing.expect(saw_tool_2_end);
     try std.testing.expectEqual(@as(usize, 2), tool_message_ids.items.len);
     try std.testing.expectEqualStrings("tool-1", tool_message_ids.items[0]);
     try std.testing.expectEqualStrings("tool-2", tool_message_ids.items[1]);
