@@ -223,6 +223,30 @@ pub fn handleInputKeyWithModifiers(
         }
 
         if (std.meta.activeTag(overlay_value.*) == .extension_dialog) {
+            if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
+                if (action == .tools_expand) {
+                    try handleAppAction(
+                        allocator,
+                        io,
+                        env_map,
+                        action,
+                        session,
+                        current_provider,
+                        session_dir,
+                        options,
+                        live_resources.runtime_config,
+                        app_state,
+                        overlay,
+                        editor,
+                        prompt_worker_active,
+                        tool_items,
+                        subscriber,
+                        should_exit,
+                        app_context,
+                    );
+                    return;
+                }
+            }
             try extension_dialog.handleDialogKey(
                 allocator,
                 &overlay_value.extension_dialog,
@@ -2571,6 +2595,112 @@ const BashSubmitHarness = struct {
         );
     }
 };
+
+fn makeExtensionChoiceDialog(allocator: std.mem.Allocator, kind: extension_dialog.DialogKind) !extension_dialog.ExtensionDialog {
+    const first_value = if (kind == .confirm) "yes" else "alpha";
+    const second_value = if (kind == .confirm) "no" else "beta";
+    const first_label = if (kind == .confirm) "Yes" else "Alpha";
+    const second_label = if (kind == .confirm) "No" else "Beta";
+
+    var choices = try allocator.alloc([]u8, 2);
+    var choices_initialized: usize = 0;
+    errdefer {
+        for (choices[0..choices_initialized]) |choice| allocator.free(choice);
+        allocator.free(choices);
+    }
+    choices[0] = try allocator.dupe(u8, first_value);
+    choices_initialized = 1;
+    choices[1] = try allocator.dupe(u8, second_value);
+    choices_initialized = 2;
+
+    var items = try allocator.alloc(tui.SelectItem, 2);
+    var items_initialized: usize = 0;
+    errdefer {
+        for (items[0..items_initialized]) |item| {
+            allocator.free(@constCast(item.value));
+            allocator.free(@constCast(item.label));
+            if (item.description) |description| allocator.free(@constCast(description));
+        }
+        allocator.free(items);
+    }
+    items[0] = try makeExtensionDialogTestItem(allocator, first_value, first_label);
+    items_initialized = 1;
+    items[1] = try makeExtensionDialogTestItem(allocator, second_value, second_label);
+    items_initialized = 2;
+
+    return .{
+        .id = try allocator.dupe(u8, "dialog-1"),
+        .kind = kind,
+        .title = try allocator.dupe(u8, if (kind == .confirm) "Confirm" else "Pick"),
+        .hint = try allocator.dupe(u8, "Up/Down move • Enter select • Esc cancel"),
+        .choices = choices,
+        .items = items,
+        .list = .{ .items = items, .max_visible = 2 },
+        .editor = tui.Editor.init(allocator),
+    };
+}
+
+fn makeExtensionDialogTestItem(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    label: []const u8,
+) !tui.SelectItem {
+    const owned_value = try allocator.dupe(u8, value);
+    errdefer allocator.free(owned_value);
+    const owned_label = try allocator.dupe(u8, label);
+    errdefer allocator.free(owned_label);
+    return .{
+        .value = owned_value,
+        .label = owned_label,
+    };
+}
+
+test "extension dialog keeps tools expand key available through app keybindings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try makeInputDispatchTestPath(allocator, tmp, "repo");
+    defer allocator.free(cwd);
+    const session_dir = try makeInputDispatchTestPath(allocator, tmp, "sessions");
+    defer allocator.free(session_dir);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, cwd);
+    try std.Io.Dir.createDirPath(.cwd(), std.testing.io, session_dir);
+
+    var harness = try BashSubmitHarness.init(allocator, cwd, session_dir);
+    defer harness.deinit();
+
+    var custom_keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer custom_keybindings.deinit();
+    try custom_keybindings.setBinding(.tools_expand, &.{.{ .ctrl = '9' }});
+    harness.live_resources.keybindings = &custom_keybindings;
+
+    try harness.state.appendItemLocked(.tool_result, "tool result output");
+    harness.state.setToolOutputExpanded(false);
+    harness.overlay = .{ .extension_dialog = try makeExtensionChoiceDialog(allocator, .select) };
+
+    try harness.press(.{ .ctrl = '9' }, .{});
+    try std.testing.expect(harness.state.all_expanded);
+    try std.testing.expect(harness.state.tool_output_expanded);
+    try std.testing.expect(harness.overlay != null);
+    try std.testing.expectEqual(.extension_dialog, std.meta.activeTag(harness.overlay.?));
+    try std.testing.expect(harness.overlay.?.extension_dialog.resolved_payload_json == null);
+    try std.testing.expectEqual(@as(usize, 0), harness.overlay.?.extension_dialog.list.selectedIndex());
+
+    try harness.press(.down, .{});
+    try std.testing.expectEqual(@as(usize, 1), harness.overlay.?.extension_dialog.list.selectedIndex());
+    try harness.press(.enter, .{});
+    try std.testing.expectEqualStrings("{\"value\":\"beta\"}", harness.overlay.?.extension_dialog.resolved_payload_json.?);
+
+    if (harness.overlay) |*value| {
+        value.deinit(allocator);
+        harness.overlay = null;
+    }
+
+    harness.overlay = .{ .extension_dialog = try makeExtensionChoiceDialog(allocator, .confirm) };
+    try harness.press(.escape, .{});
+    try std.testing.expectEqualStrings("{\"cancelled\":true}", harness.overlay.?.extension_dialog.resolved_payload_json.?);
+}
 
 test "configured editor keybindings drive movement and submit while old defaults stop" {
     const allocator = std.testing.allocator;
