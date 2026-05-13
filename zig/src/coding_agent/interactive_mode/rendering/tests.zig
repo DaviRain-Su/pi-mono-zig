@@ -1036,6 +1036,66 @@ test "collapse m2 items at or under threshold render without indicator" {
     try std.testing.expect(!renderedLinesContain(lines, "to expand"));
 }
 
+test "collapse m2 tool result without hidden expansion renders full content" {
+    const allocator = std.testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var keybindings = try keybindings_mod.Keybindings.initDefaults(allocator);
+    defer keybindings.deinit();
+
+    var screen = try tui.vaxis.Screen.init(allocator, .{
+        .rows = 8,
+        .cols = 80,
+        .x_pixel = 0,
+        .y_pixel = 0,
+    });
+    defer screen.deinit(allocator);
+
+    const window = tui.draw.rootWindow(&screen);
+    window.clear();
+    const rendered = try drawChatItem(window, arena.allocator(), &keybindings, null, .{
+        .kind = .tool_result,
+        .text = @constCast("Tool result web_search:\nline one\nline two\nline three\nline four"),
+    }, 0, 0, false);
+
+    try std.testing.expect(rendered >= 5);
+    const lines = try tui.cell_rows.screenRowsToLinesAlloc(allocator, &screen, 80, rendered);
+    defer freeLinesSlice(allocator, lines);
+    try std.testing.expect(renderedLinesContain(lines, "line four"));
+    try std.testing.expect(!renderedLinesContain(lines, "to expand"));
+}
+
+test "execution panel preserves recent tool activity after completion" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "web_search",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "search result" } }},
+        },
+        .is_error = false,
+    });
+    try state.handleAgentEvent(.{ .event_type = .agent_end });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 12,
+    };
+
+    const lines = try renderScreenToLines(allocator, &screen_component, 100);
+    defer freeLinesSlice(allocator, lines);
+    try std.testing.expect(renderedLinesContain(lines, "Activity"));
+    try std.testing.expect(renderedLinesContain(lines, "Tool completed web_search"));
+}
+
 test "tool expansion rerenders existing bash details immediately" {
     const allocator = std.testing.allocator;
 

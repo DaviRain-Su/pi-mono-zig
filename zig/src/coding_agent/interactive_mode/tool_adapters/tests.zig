@@ -1178,8 +1178,8 @@ test "extension startup diagnoses optional required and denied policy outcomes" 
     var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_capture.deinit();
     try writeStartupDiagnostics(&stderr_capture.writer, required_tools.startup_diagnostics);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "Error: extension lifecycle") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "extensionId=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "Error: extension failed:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "startup timed out") != null);
 }
 
 test "extension reload swaps tool registry and shuts down removed hosts" {

@@ -259,7 +259,8 @@ pub fn runExtensionRegistryDump(
     // observe them. Bun ignores trailing argv after the entry script.
     const cwd = if (cwd_override) |override| try allocator.dupe(u8, override) else blk: {
         const real_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
-        break :blk real_cwd;
+        defer allocator.free(real_cwd);
+        break :blk try allocator.dupe(u8, real_cwd);
     };
     defer allocator.free(cwd);
 

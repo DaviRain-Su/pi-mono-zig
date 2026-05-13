@@ -361,14 +361,132 @@ fn hasToolName(items: []const agent.AgentTool, name: []const u8) bool {
 }
 
 pub fn writeStartupDiagnostics(stderr: *std.Io.Writer, diagnostics: []const ExtensionStartupDiagnostic) !void {
+    const unapproved_count = countUnapprovedPolicyDiagnostics(diagnostics);
+    if (unapproved_count > 0) {
+        try stderr.print("Warning: {d} extensions skipped: unapproved", .{unapproved_count});
+        try writeUnapprovedPolicyNames(stderr, diagnostics);
+        try stderr.writeAll("\n");
+    }
+
     for (diagnostics) |diagnostic| {
+        if (isUnapprovedPolicyDiagnostic(diagnostic)) continue;
         const prefix = switch (diagnostic.severity) {
             .info => "Info",
             .warning => "Warning",
             .@"error" => "Error",
         };
-        try stderr.print("{s}: {s}\n", .{ prefix, diagnostic.message });
+        try stderr.print("{s}: {s}: {s} ({s})\n", .{
+            prefix,
+            startupDiagnosticAction(diagnostic),
+            startupDiagnosticName(diagnostic),
+            startupDiagnosticReason(diagnostic),
+        });
     }
+}
+
+fn countUnapprovedPolicyDiagnostics(diagnostics: []const ExtensionStartupDiagnostic) usize {
+    var count: usize = 0;
+    for (diagnostics) |diagnostic| {
+        if (isUnapprovedPolicyDiagnostic(diagnostic)) count += 1;
+    }
+    return count;
+}
+
+fn writeUnapprovedPolicyNames(stderr: *std.Io.Writer, diagnostics: []const ExtensionStartupDiagnostic) !void {
+    const max_names = 6;
+    var unique_count: usize = 0;
+    for (diagnostics, 0..) |diagnostic, index| {
+        if (!isUnapprovedPolicyDiagnostic(diagnostic)) continue;
+        const name = startupDiagnosticName(diagnostic);
+        if (hasPriorUnapprovedName(diagnostics[0..index], name)) continue;
+        unique_count += 1;
+    }
+
+    if (unique_count == 0) return;
+    try stderr.writeAll(" (");
+    var printed: usize = 0;
+    for (diagnostics, 0..) |diagnostic, index| {
+        if (!isUnapprovedPolicyDiagnostic(diagnostic)) continue;
+        const name = startupDiagnosticName(diagnostic);
+        if (hasPriorUnapprovedName(diagnostics[0..index], name)) continue;
+        if (printed == max_names) break;
+        if (printed > 0) try stderr.writeAll(", ");
+        try stderr.writeAll(name);
+        printed += 1;
+    }
+    if (unique_count > printed) {
+        try stderr.print(", +{d} more", .{unique_count - printed});
+    }
+    try stderr.writeAll(")");
+}
+
+fn hasPriorUnapprovedName(previous: []const ExtensionStartupDiagnostic, name: []const u8) bool {
+    for (previous) |diagnostic| {
+        if (!isUnapprovedPolicyDiagnostic(diagnostic)) continue;
+        if (std.mem.eql(u8, startupDiagnosticName(diagnostic), name)) return true;
+    }
+    return false;
+}
+
+fn isUnapprovedPolicyDiagnostic(diagnostic: ExtensionStartupDiagnostic) bool {
+    return std.mem.eql(u8, diagnostic.phase, "policy") and
+        std.mem.indexOf(u8, diagnostic.message, "extension is unapproved; no matching extensionPolicies entry") != null;
+}
+
+fn startupDiagnosticAction(diagnostic: ExtensionStartupDiagnostic) []const u8 {
+    if (diagnostic.severity == .@"error") return "extension failed";
+    if (std.mem.eql(u8, diagnostic.phase, "policy")) return "extension skipped";
+    return "extension warning";
+}
+
+fn startupDiagnosticName(diagnostic: ExtensionStartupDiagnostic) []const u8 {
+    if (diagnostic.policy_key) |policy_key| {
+        if (packageNameFromPolicyKey(policy_key)) |name| return name;
+    }
+    if (diagnostic.source_path.len > 0) return compactExtensionPath(diagnostic.source_path);
+    if (diagnostic.extension_path.len > 0) return compactExtensionPath(diagnostic.extension_path);
+    return diagnostic.extension_id;
+}
+
+fn packageNameFromPolicyKey(policy_key: []const u8) ?[]const u8 {
+    const prefix = "typescript:package:";
+    if (!std.mem.startsWith(u8, policy_key, prefix)) return null;
+    var rest = policy_key[prefix.len..];
+    const scope_end = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    rest = rest[scope_end + 1 ..];
+    if (std.mem.startsWith(u8, rest, "npm:")) {
+        rest = rest["npm:".len..];
+    }
+    const end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+fn compactExtensionPath(path: []const u8) []const u8 {
+    const marker = "/node_modules/";
+    if (std.mem.indexOf(u8, path, marker)) |index| {
+        return path[index + marker.len ..];
+    }
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |index| {
+        return path[index + 1 ..];
+    }
+    return path;
+}
+
+fn startupDiagnosticReason(diagnostic: ExtensionStartupDiagnostic) []const u8 {
+    if (std.mem.indexOf(u8, diagnostic.message, "approvedGrants does not include tool.use") != null) {
+        return "missing tool.use grant";
+    }
+    if (std.mem.indexOf(u8, diagnostic.message, "startup timed out") != null) {
+        return "startup timed out";
+    }
+    if (std.mem.indexOf(u8, diagnostic.message, "duplicate extension tool name skipped: ")) |index| {
+        return diagnostic.message[index + "duplicate extension tool name skipped: ".len ..];
+    }
+    if (std.mem.lastIndexOf(u8, diagnostic.message, ": ")) |index| {
+        return diagnostic.message[index + 2 ..];
+    }
+    return diagnostic.message;
 }
 
 pub const ExtensionBootstrapContributions = struct {

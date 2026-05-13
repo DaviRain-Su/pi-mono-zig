@@ -245,7 +245,7 @@ pub fn drawItem(
         .height = @intCast(remaining_height),
     });
     if (!all_expanded) {
-        if (previewThreshold(item.kind)) |threshold| {
+        if (previewThresholdForItem(item)) |threshold| {
             const full_height_hint = @max(@as(usize, 1), estimateItemRowsFull(item, @max(@as(usize, window.width), 1), true));
             var scratch = try tui.vaxis.Screen.init(allocator, .{
                 .rows = @intCast(@min(full_height_hint, @as(usize, std.math.maxInt(u16)))),
@@ -363,6 +363,13 @@ pub fn previewThreshold(kind: ChatKind) ?usize {
         .tool_result => 3,
         .assistant, .markdown => null,
         .welcome, .info, .@"error", .user, .tool_call, .bash_execution => null,
+    };
+}
+
+fn previewThresholdForItem(item: ChatItem) ?usize {
+    return switch (item.kind) {
+        .tool_result => if (item.expanded_text != null) previewThreshold(item.kind) else null,
+        else => previewThreshold(item.kind),
     };
 }
 
@@ -966,7 +973,7 @@ pub fn estimateRows(items: []const ChatItem, width: usize, all_expanded: bool) u
 pub fn estimateItemRowsVisible(item: ChatItem, width: usize, all_expanded: bool) usize {
     const full_rows = estimateItemRowsFull(item, width, true);
     if (!all_expanded) {
-        if (previewThreshold(item.kind)) |threshold| {
+        if (previewThresholdForItem(item)) |threshold| {
             if (full_rows > threshold) return threshold + 1;
         }
     }

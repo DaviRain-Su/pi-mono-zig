@@ -2691,7 +2691,7 @@ test "runCli extension boolean/string flags accepts registered local Bun fixture
     );
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings("ext-flags ok\n", stdout_capture.writer.buffered());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "extension is unapproved; no matching extensionPolicies entry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "extensions skipped: unapproved") != null);
 }
 
 test "runCli M11 extension registry dump emits live registry snapshot for explicit --extension" {

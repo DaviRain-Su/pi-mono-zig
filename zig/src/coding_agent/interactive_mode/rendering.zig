@@ -109,6 +109,7 @@ pub const RenderStateSnapshot = struct {
     working_message: ?[]u8 = null,
     working_visible: bool = true,
     active_operation: ?ActiveOperationSnapshot = null,
+    recent_activity: ?[]u8 = null,
 
     pub fn deinit(self: *RenderStateSnapshot, allocator: std.mem.Allocator) void {
         for (self.items) |*item| chat_items.deinit(allocator, item);
@@ -130,6 +131,7 @@ pub const RenderStateSnapshot = struct {
         deinitOwnedStringList(allocator, self.extension_footer_statuses);
         if (self.working_message) |message| allocator.free(message);
         if (self.active_operation) |operation| allocator.free(operation.label);
+        if (self.recent_activity) |activity| allocator.free(activity);
         self.* = undefined;
     }
 };
@@ -214,6 +216,7 @@ pub const AppState = struct {
     working_message: []u8 = &.{},
     working_visible: bool = true,
     active_operation: ?ActiveOperationState = null,
+    recent_activity: []u8 = &.{},
     terminal_progress_active: bool = false,
     terminal_progress_dirty: bool = false,
     clipboard_paste: clipboard_paste_task.ClipboardPasteTask,
@@ -241,6 +244,7 @@ pub const AppState = struct {
         state.git_branch = try allocator.dupe(u8, "");
         state.hidden_thinking_label = try allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
         state.working_message = try allocator.dupe(u8, "Working...");
+        state.recent_activity = try allocator.dupe(u8, "");
         try state.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
         return state;
     }
@@ -274,6 +278,7 @@ pub const AppState = struct {
         self.allocator.free(self.git_branch);
         self.allocator.free(self.hidden_thinking_label);
         self.allocator.free(self.working_message);
+        self.allocator.free(self.recent_activity);
         self.* = undefined;
     }
 
@@ -481,6 +486,7 @@ pub const AppState = struct {
         snapshot.extension_footer_statuses = try extension_ui.cloneFooterStatusesSorted(allocator, &self.extension_footer_statuses);
         snapshot.working_message = if (self.working_message.len > 0) try allocator.dupe(u8, self.working_message) else null;
         snapshot.working_visible = self.working_visible;
+        snapshot.recent_activity = if (self.recent_activity.len > 0) try allocator.dupe(u8, self.recent_activity) else null;
         if (self.active_operation) |operation| {
             snapshot.active_operation = .{
                 .kind = operation.kind,
@@ -897,6 +903,17 @@ pub const AppState = struct {
         };
     }
 
+    fn setRecentActivityLocked(self: *AppState, text: []const u8) !void {
+        const owned_text = try self.allocator.dupe(u8, text);
+        self.allocator.free(self.recent_activity);
+        self.recent_activity = owned_text;
+    }
+
+    fn clearRecentActivityLocked(self: *AppState) !void {
+        self.allocator.free(self.recent_activity);
+        self.recent_activity = try self.allocator.dupe(u8, "");
+    }
+
     fn clearActiveOperationLocked(self: *AppState) void {
         if (self.active_operation) |operation| {
             self.allocator.free(operation.label);
@@ -1167,6 +1184,11 @@ pub const AppState = struct {
         } else {
             try self.appendItemWithExpandedTextLocked(.bash_execution, text, expanded_text, null, null);
         }
+        const activity = try std.fmt.allocPrint(self.allocator, "{s} bash", .{
+            if (cancelled or exit_code == null or exit_code.? != 0) "Tool failed" else "Tool completed",
+        });
+        defer self.allocator.free(activity);
+        try self.setRecentActivityLocked(activity);
         self.clearActiveOperationLocked();
         try self.replaceLabelLocked(&self.status, "idle");
     }
@@ -1280,6 +1302,7 @@ pub const AppState = struct {
 
     fn handleAgentStartLocked(self: *AppState) !void {
         self.markTerminalProgressLocked(true);
+        try self.clearRecentActivityLocked();
         try self.replaceLabelLocked(&self.status, "thinking");
         try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
     }
@@ -1511,6 +1534,12 @@ pub const AppState = struct {
                 result.details,
             );
         }
+        const activity = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{
+            if (event.is_error orelse false) "Tool failed" else "Tool completed",
+            tool_name,
+        });
+        defer self.allocator.free(activity);
+        try self.setRecentActivityLocked(activity);
         try self.replaceLabelLocked(&self.status, "thinking");
         try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
     }
@@ -2674,7 +2703,7 @@ fn drawFooterWithTerminal(
 }
 
 fn showExecutionPanel(snapshot: *const RenderStateSnapshot) bool {
-    return snapshot.active_operation != null;
+    return snapshot.active_operation != null or snapshot.recent_activity != null;
 }
 
 fn measureExecutionPanelHeight(
@@ -2697,11 +2726,16 @@ fn formatExecutionPanelText(
     width: usize,
     now_ms: i64,
 ) !?[]u8 {
-    const active_status = try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse return null;
+    const active_status = if (snapshot.active_operation != null)
+        try active_operation_rendering.formatStatus(allocator, keybindings, snapshot.active_operation, now_ms) orelse return null
+    else
+        try allocator.dupe(u8, snapshot.recent_activity orelse return null);
     defer allocator.free(active_status);
 
-    const badge_width = tui.ansi.visibleWidth(executionPanelBadgeText(snapshot.active_operation.?.kind));
-    const label_width = tui.ansi.visibleWidth(if (layoutMode(width) == .compact) "Run" else "Execution");
+    const badge_text = if (snapshot.active_operation) |operation| executionPanelBadgeText(operation.kind) else "DONE";
+    const label_text = if (layoutMode(width) == .compact) "Run" else if (snapshot.active_operation != null) "Execution" else "Activity";
+    const badge_width = tui.ansi.visibleWidth(badge_text);
+    const label_width = tui.ansi.visibleWidth(label_text);
     const available_width = if (layoutMode(width) == .compact)
         width -| label_width -| 1
     else
@@ -2718,12 +2752,13 @@ fn drawExecutionPanel(
     now_ms: i64,
 ) !usize {
     if (window.height == 0 or window.width == 0) return 0;
-    const operation = snapshot.active_operation orelse return 0;
     const text = (try formatExecutionPanelText(allocator, keybindings, snapshot, window.width, now_ms)) orelse return 0;
-    const fill_style = executionPanelFillStyle(theme, operation.kind);
-    const label_style = executionPanelLabelStyle(theme, operation.kind);
-    const badge_style = executionPanelBadgeStyle(theme, operation.kind);
-    const label_text = if (layoutMode(window.width) == .compact) "Run" else "Execution";
+    const active_kind = if (snapshot.active_operation) |operation| operation.kind else null;
+    const fill_style = if (active_kind) |kind| executionPanelFillStyle(theme, kind) else styleForToken(theme, .role_tool_result);
+    const label_style = if (active_kind) |kind| executionPanelLabelStyle(theme, kind) else recentActivityLabelStyle(theme);
+    const badge_style = if (active_kind) |kind| executionPanelBadgeStyle(theme, kind) else recentActivityBadgeStyle(theme);
+    const label_text = if (layoutMode(window.width) == .compact) "Run" else if (active_kind != null) "Execution" else "Activity";
+    const badge_text = if (active_kind) |kind| executionPanelBadgeText(kind) else "DONE";
 
     const bar = tui.StatusBar{
         .left = &.{
@@ -2731,7 +2766,7 @@ fn drawExecutionPanel(
             .{ .text = text, .style = fill_style },
         },
         .right = if (layoutMode(window.width) == .compact) &.{} else &.{
-            .{ .text = executionPanelBadgeText(operation.kind), .style = badge_style },
+            .{ .text = badge_text, .style = badge_style },
         },
         .fill_style = fill_style,
         .separator = " ",
@@ -2769,6 +2804,20 @@ fn executionPanelBadgeStyle(
     kind: ActiveOperationKind,
 ) tui.vaxis.Cell.Style {
     var style = executionPanelFillStyle(theme, kind);
+    style.bold = true;
+    return style;
+}
+
+fn recentActivityLabelStyle(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    var style = styleForToken(theme, .role_tool_result);
+    const accent = styleForToken(theme, .task_header_accent);
+    if (accent.fg != .default) style.fg = accent.fg;
+    style.bold = true;
+    return style;
+}
+
+fn recentActivityBadgeStyle(theme: ?*const resources_mod.Theme) tui.vaxis.Cell.Style {
+    var style = styleForToken(theme, .role_tool_result);
     style.bold = true;
     return style;
 }

@@ -510,6 +510,13 @@ const Transport = struct {
 const tcp_buffer_bytes: usize = 16 * 1024;
 const tls_read_extra_bytes: usize = 16 * 1024;
 
+fn socketBufferBytes(is_tls: bool) usize {
+    return if (is_tls)
+        @max(tcp_buffer_bytes, std.crypto.tls.Client.min_buffer_len)
+    else
+        tcp_buffer_bytes;
+}
+
 fn resolveHostAddress(
     io: std.Io,
     host: []const u8,
@@ -560,9 +567,10 @@ fn openTransport(
     };
     errdefer stream.close(io);
 
-    const sock_read = try allocator.alloc(u8, tcp_buffer_bytes);
+    const socket_buffer_bytes = socketBufferBytes(parsed.is_tls);
+    const sock_read = try allocator.alloc(u8, socket_buffer_bytes);
     errdefer allocator.free(sock_read);
-    const sock_write = try allocator.alloc(u8, tcp_buffer_bytes);
+    const sock_write = try allocator.alloc(u8, socket_buffer_bytes);
     errdefer allocator.free(sock_write);
 
     var transport: Transport = .{
@@ -1041,6 +1049,11 @@ test "parseWsUrl ws and wss scheme handling" {
     {
         try std.testing.expectError(Error.UnsupportedScheme, parseWsUrl(allocator, "ftp://x/"));
     }
+}
+
+test "TLS socket buffer satisfies std crypto tls client minimum" {
+    try std.testing.expect(socketBufferBytes(false) == tcp_buffer_bytes);
+    try std.testing.expect(socketBufferBytes(true) >= std.crypto.tls.Client.min_buffer_len);
 }
 
 test "sendCloseFrame writes well-formed close payload" {
