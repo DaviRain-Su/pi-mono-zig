@@ -1,10 +1,16 @@
-import type { ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Model, SimpleStreamOptions, TextContent, Transport } from "@earendil-works/pi-ai";
+import type { QueueMode } from "../agent.js";
 import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "../index.js";
 import type { Session } from "./session/session.js";
 
-/** Model-visible skill loaded from a `SKILL.md` file or provided by an application. */
+/**
+ * Skill loaded from a `SKILL.md` file or provided by an application.
+ *
+ * `name`, `description`, and `filePath` are inserted into the system prompt in an XML-formatted block as suggested by agentskills.io.
+ * Use {@link formatSkillsForSystemPrompt} to generate the spec-compatible system prompt block.
+ */
 export interface Skill {
-	/** Skill command name. */
+	/** Stable skill name used for lookup and model-visible listings. */
 	name: string;
 	/** Short model-visible description of when to use the skill. */
 	description: string;
@@ -16,22 +22,52 @@ export interface Skill {
 	disableModelInvocation?: boolean;
 }
 
-/** Prompt template that can expand slash-command text before a prompt is sent. */
+/** Prompt template that can be formatted into a prompt for explicit invocation. */
 export interface PromptTemplate {
-	/** Slash-command name without the leading `/`. */
+	/** Stable template name used for lookup or application command routing. */
 	name: string;
 	/** Optional description for command lists or autocomplete. */
 	description?: string;
-	/** Template content. Argument placeholders are expanded by `expandPromptTemplate`. */
+	/** Template content. Argument placeholders are formatted by `formatPromptTemplateInvocation`. */
 	content: string;
 }
 
-/** Resources made available to harness prompt expansion and system-prompt callbacks. */
-export interface AgentHarnessResources {
-	/** Prompt templates used to expand `/template args` input. */
-	promptTemplates?: PromptTemplate[];
+/** Resources made available to explicit invocation methods and system-prompt callbacks. */
+export interface AgentHarnessResources<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+> {
+	/** Prompt templates available for explicit invocation. */
+	promptTemplates?: TPromptTemplate[];
 	/** Skills available to the model and explicit skill invocation. */
-	skills?: Skill[];
+	skills?: TSkill[];
+}
+
+/** Curated provider request options owned by the harness and snapshotted per turn. */
+export interface AgentHarnessStreamOptions {
+	/** Preferred transport forwarded to the stream function. */
+	transport?: Transport;
+	/** Provider request timeout in milliseconds. */
+	timeoutMs?: number;
+	/** Maximum provider retry attempts. */
+	maxRetries?: number;
+	/** Optional cap for provider-requested retry delays. */
+	maxRetryDelayMs?: number;
+	/** Additional request headers merged with auth and lifecycle headers. */
+	headers?: Record<string, string>;
+	/** Provider metadata forwarded with requests. */
+	metadata?: SimpleStreamOptions["metadata"];
+	/** Provider cache retention hint. */
+	cacheRetention?: SimpleStreamOptions["cacheRetention"];
+}
+
+/** Per-request stream option patch returned by provider hooks. */
+export interface AgentHarnessStreamOptionsPatch
+	extends Omit<Partial<AgentHarnessStreamOptions>, "headers" | "metadata"> {
+	/** Header patch. `undefined` values delete keys; explicit `headers: undefined` clears all headers. */
+	headers?: Record<string, string | undefined>;
+	/** Metadata patch. `undefined` values delete keys; explicit `metadata: undefined` clears all metadata. */
+	metadata?: Record<string, unknown | undefined>;
 }
 
 /** Kind of filesystem object as addressed by an {@link ExecutionEnv}. Symlinks are not followed automatically. */
@@ -281,44 +317,13 @@ export interface JsonlSessionListOptions {
 export interface JsonlSessionRepoApi
 	extends SessionRepo<JsonlSessionMetadata, JsonlSessionCreateOptions, JsonlSessionListOptions> {}
 
-export interface AgentHarnessPendingMutations {
-	appendMessages: AgentMessage[];
-	model?: Model<any>;
-	thinkingLevel?: ThinkingLevel;
-	activeToolNames?: string[];
-}
+export type AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry";
 
-export interface AgentHarnessConversationState {
-	session: Session;
-	model: Model<any>;
-	thinkingLevel: ThinkingLevel;
-	activeToolNames: string[];
-	nextTurnQueue: AgentMessage[];
-}
-
-export interface AgentHarnessOperationState {
-	idle: boolean;
-	liveOperationId?: string;
-	abortRequested: boolean;
-	steerQueue: AgentMessage[];
-	followUpQueue: AgentMessage[];
-	pendingMutations: AgentHarnessPendingMutations;
-}
-
-export interface SavePointSnapshot {
-	messages: AgentMessage[];
-	model: Model<any> | undefined;
-	thinkingLevel: ThinkingLevel;
-	activeToolNames: string[];
-	systemPrompt: string;
-}
-
-export interface AgentHarnessContext {
-	env: ExecutionEnv;
-	conversation: AgentHarnessConversationState;
-	operation: AgentHarnessOperationState;
-	abortSignal?: AbortSignal;
-}
+export type PendingSessionWrite = SessionTreeEntry extends infer TEntry
+	? TEntry extends SessionTreeEntry
+		? Omit<TEntry, "id" | "parentId" | "timestamp">
+		: never
+	: never;
 
 export interface QueueUpdateEvent {
 	type: "queue_update";
@@ -329,7 +334,6 @@ export interface QueueUpdateEvent {
 
 export interface SavePointEvent {
 	type: "save_point";
-	liveOperationId: string;
 	hadPendingMutations: boolean;
 }
 
@@ -344,12 +348,15 @@ export interface SettledEvent {
 	nextTurnCount: number;
 }
 
-export interface BeforeAgentStartEvent {
+export interface BeforeAgentStartEvent<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+> {
 	type: "before_agent_start";
 	prompt: string;
 	images?: ImageContent[];
 	systemPrompt: string;
-	resources: AgentHarnessResources;
+	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 }
 
 export interface ContextEvent {
@@ -359,6 +366,14 @@ export interface ContextEvent {
 
 export interface BeforeProviderRequestEvent {
 	type: "before_provider_request";
+	model: Model<any>;
+	sessionId: string;
+	streamOptions: AgentHarnessStreamOptions;
+}
+
+export interface BeforeProviderPayloadEvent {
+	type: "before_provider_payload";
+	model: Model<any>;
 	payload: unknown;
 }
 
@@ -426,14 +441,27 @@ export interface ThinkingLevelSelectEvent {
 	previousLevel: ThinkingLevel;
 }
 
-export type AgentHarnessOwnEvent =
+export interface ResourcesUpdateEvent<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+> {
+	type: "resources_update";
+	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	previousResources: AgentHarnessResources<TSkill, TPromptTemplate>;
+}
+
+export type AgentHarnessOwnEvent<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+> =
 	| QueueUpdateEvent
 	| SavePointEvent
 	| AbortEvent
 	| SettledEvent
-	| BeforeAgentStartEvent
+	| BeforeAgentStartEvent<TSkill, TPromptTemplate>
 	| ContextEvent
 	| BeforeProviderRequestEvent
+	| BeforeProviderPayloadEvent
 	| AfterProviderResponseEvent
 	| ToolCallEvent
 	| ToolResultEvent
@@ -442,9 +470,12 @@ export type AgentHarnessOwnEvent =
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent
 	| ModelSelectEvent
-	| ThinkingLevelSelectEvent;
+	| ThinkingLevelSelectEvent
+	| ResourcesUpdateEvent<TSkill, TPromptTemplate>;
 
-export type AgentHarnessEvent = AgentEvent | AgentHarnessOwnEvent;
+export type AgentHarnessEvent<TSkill extends Skill = Skill, TPromptTemplate extends PromptTemplate = PromptTemplate> =
+	| AgentEvent
+	| AgentHarnessOwnEvent<TSkill, TPromptTemplate>;
 
 export interface BeforeAgentStartResult {
 	messages?: AgentMessage[];
@@ -456,6 +487,10 @@ export interface ContextResult {
 }
 
 export interface BeforeProviderRequestResult {
+	streamOptions?: AgentHarnessStreamOptionsPatch;
+}
+
+export interface BeforeProviderPayloadResult {
 	payload: unknown;
 }
 
@@ -488,6 +523,7 @@ export type AgentHarnessEventResultMap = {
 	before_agent_start: BeforeAgentStartResult | undefined;
 	context: ContextResult | undefined;
 	before_provider_request: BeforeProviderRequestResult | undefined;
+	before_provider_payload: BeforeProviderPayloadResult | undefined;
 	after_provider_response: undefined;
 	tool_call: ToolCallResult | undefined;
 	tool_result: ToolResultPatch | undefined;
@@ -497,6 +533,7 @@ export type AgentHarnessEventResultMap = {
 	session_tree: undefined;
 	model_select: undefined;
 	thinking_level_select: undefined;
+	resources_update: undefined;
 	queue_update: undefined;
 	save_point: undefined;
 	abort: undefined;
@@ -577,13 +614,19 @@ export interface BranchSummaryResult {
 	error?: string;
 }
 
-export interface AgentHarnessOptions {
+export interface AgentHarnessOptions<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentTool = AgentTool,
+> {
 	env: ExecutionEnv;
 	session: Session;
-	tools?: AgentTool[];
-	resources?:
-		| AgentHarnessResources
-		| ((context: AgentHarnessContext) => AgentHarnessResources | Promise<AgentHarnessResources>);
+	tools?: TTool[];
+	/**
+	 * Concrete resources available to explicit invocation methods and system-prompt callbacks.
+	 * Applications own loading/reloading resources and should call `setResources()` with new values.
+	 */
+	resources?: AgentHarnessResources<TSkill, TPromptTemplate>;
 	systemPrompt?:
 		| string
 		| ((context: {
@@ -591,13 +634,19 @@ export interface AgentHarnessOptions {
 				session: Session;
 				model: Model<any>;
 				thinkingLevel: ThinkingLevel;
-				activeTools: AgentTool[];
-				resources: AgentHarnessResources;
+				activeTools: TTool[];
+				resources: AgentHarnessResources<TSkill, TPromptTemplate>;
 		  }) => string | Promise<string>);
-	requestAuth?: (model: Model<any>) => Promise<{ apiKey: string; headers?: Record<string, string> } | undefined>;
+	getApiKeyAndHeaders?: (
+		model: Model<any>,
+	) => Promise<{ apiKey: string; headers?: Record<string, string> } | undefined>;
+	/** Curated stream/provider request options. Snapshotted at turn start. */
+	streamOptions?: AgentHarnessStreamOptions;
 	model: Model<any>;
 	thinkingLevel?: ThinkingLevel;
 	activeToolNames?: string[];
+	steeringMode?: QueueMode;
+	followUpMode?: QueueMode;
 }
 
 export type { AgentHarness } from "./agent-harness.js";

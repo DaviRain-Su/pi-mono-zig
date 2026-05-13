@@ -25,8 +25,8 @@ interface SkillFrontmatter {
 	[key: string]: unknown;
 }
 
-/** Expand a skill into a prompt, optionally appending additional user instructions. */
-export function expandSkillCommand(skill: Skill, additionalInstructions?: string): string {
+/** Format a skill invocation prompt, optionally appending additional user instructions. */
+export function formatSkillInvocation(skill: Skill, additionalInstructions?: string): string {
 	const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${dirnameEnvPath(skill.filePath)}.\n\n${skill.content}\n</skill>`;
 	return additionalInstructions ? `${skillBlock}\n\n${additionalInstructions}` : skillBlock;
 }
@@ -59,18 +59,21 @@ export async function loadSkills(
  * Source values are preserved exactly and attached to every loaded skill and diagnostic. The agent package does not
  * interpret source values; applications define their own provenance shape.
  */
-export async function loadSourcedSkills<TSource>(
+export async function loadSourcedSkills<TSource, TSkill extends Skill = Skill>(
 	env: ExecutionEnv,
 	inputs: Array<{ path: string; source: TSource }>,
+	mapSkill?: (skill: Skill, source: TSource) => TSkill,
 ): Promise<{
-	skills: Array<{ skill: Skill; source: TSource }>;
+	skills: Array<{ skill: TSkill; source: TSource }>;
 	diagnostics: Array<SkillDiagnostic & { source: TSource }>;
 }> {
-	const skills: Array<{ skill: Skill; source: TSource }> = [];
+	const skills: Array<{ skill: TSkill; source: TSource }> = [];
 	const diagnostics: Array<SkillDiagnostic & { source: TSource }> = [];
 	for (const input of inputs) {
 		const result = await loadSkills(env, input.path);
-		for (const skill of result.skills) skills.push({ skill, source: input.source });
+		for (const skill of result.skills) {
+			skills.push({ skill: mapSkill ? mapSkill(skill, input.source) : (skill as TSkill), source: input.source });
+		}
 		for (const diagnostic of result.diagnostics) diagnostics.push({ ...diagnostic, source: input.source });
 	}
 	return { skills, diagnostics };

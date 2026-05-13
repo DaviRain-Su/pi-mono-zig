@@ -3,30 +3,39 @@ import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai";
 import { InMemorySessionStorage } from "../../src/harness/session/storage/memory.js";
 import {
-	createAgentHarness,
+	AgentHarness,
 	formatSkillsForSystemPrompt,
 	loadSourcedPromptTemplates,
 	loadSourcedSkills,
 	NodeExecutionEnv,
+	type PromptTemplate,
 	Session,
+	type Skill,
 } from "../../src/index.js";
 
 type Source = { type: "project" | "user" | "path"; dir: string };
+type SourcedSkill = Skill & { source: Source };
+type SourcedPromptTemplate = PromptTemplate & { source: Source };
 
 const env = new NodeExecutionEnv({ cwd: process.cwd() });
 const source = (type: Source["type"], dir: string) => ({ path: dir, source: { type, dir } });
-const { skills: sourcedSkills } = await loadSourcedSkills<Source>(env, [
-	source("project", join(env.cwd, ".pi/skills")),
-	source("user", join(homedir(), ".pi/agent/skills")),
-	source("path", join(env.cwd, "../../../pi-skills")),
-]);
-const { promptTemplates: sourcedPromptTemplates } = await loadSourcedPromptTemplates<Source>(env, [
-	source("project", join(env.cwd, ".pi/prompts")),
-	source("user", join(homedir(), ".pi/agent/prompts")),
-]);
+const { skills: sourcedSkills } = await loadSourcedSkills<Source, SourcedSkill>(
+	env,
+	[
+		source("project", join(env.cwd, ".pi/skills")),
+		source("user", join(homedir(), ".pi/agent/skills")),
+		source("path", join(env.cwd, "../../../pi-skills")),
+	],
+	(skill, source) => ({ ...skill, source }),
+);
+const { promptTemplates: sourcedPromptTemplates } = await loadSourcedPromptTemplates<Source, SourcedPromptTemplate>(
+	env,
+	[source("project", join(env.cwd, ".pi/prompts")), source("user", join(homedir(), ".pi/agent/prompts"))],
+	(promptTemplate, source) => ({ ...promptTemplate, source }),
+);
 
 const session = new Session(new InMemorySessionStorage());
-const agent = createAgentHarness({
+const agent = new AgentHarness({
 	env,
 	session,
 	model: getModel("openai", "gpt-5.5"),

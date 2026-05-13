@@ -1,193 +1,272 @@
-import { randomUUID } from "node:crypto";
-import type { AssistantMessage, ImageContent, Model } from "@earendil-works/pi-ai";
-import { Agent } from "../agent.js";
+import {
+	type AssistantMessage,
+	type ImageContent,
+	type Model,
+	streamSimple,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
+import { Agent, type QueueMode } from "../agent.js";
 import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "../types.js";
 import { collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/branch-summarization.js";
 import { compact, DEFAULT_COMPACTION_SETTINGS, prepareCompaction } from "./compaction/compaction.js";
-import { expandPromptTemplate } from "./prompt-templates.js";
-import { expandSkillCommand } from "./skills.js";
+import { formatPromptTemplateInvocation } from "./prompt-templates.js";
+import { formatSkillInvocation } from "./skills.js";
 import type {
 	AbortResult,
-	AgentHarnessContext,
-	AgentHarnessConversationState,
 	AgentHarnessEvent,
 	AgentHarnessEventResultMap,
-	AgentHarnessOperationState,
 	AgentHarnessOptions,
 	AgentHarnessOwnEvent,
+	AgentHarnessPhase,
 	AgentHarnessResources,
+	AgentHarnessStreamOptions,
+	AgentHarnessStreamOptionsPatch,
 	ExecutionEnv,
 	NavigateTreeResult,
+	PendingSessionWrite,
+	PromptTemplate,
 	Session,
+	Skill,
 } from "./types.js";
 
-function createUserMessage(text: string, images?: ImageContent[]): AgentMessage {
+function createUserMessage(text: string, images?: ImageContent[]): UserMessage {
 	const content: Array<{ type: "text"; text: string } | ImageContent> = [{ type: "text", text }];
 	if (images) content.push(...images);
 	return { role: "user", content, timestamp: Date.now() };
 }
 
-export class AgentHarness {
+function cloneStreamOptions(streamOptions?: AgentHarnessStreamOptions): AgentHarnessStreamOptions {
+	return {
+		...streamOptions,
+		headers: streamOptions?.headers ? { ...streamOptions.headers } : undefined,
+		metadata: streamOptions?.metadata ? { ...streamOptions.metadata } : undefined,
+	};
+}
+
+function mergeHeaders(...headers: Array<Record<string, string> | undefined>): Record<string, string> | undefined {
+	const merged: Record<string, string> = {};
+	let hasHeaders = false;
+	for (const entry of headers) {
+		if (!entry) continue;
+		Object.assign(merged, entry);
+		hasHeaders = true;
+	}
+	return hasHeaders ? merged : undefined;
+}
+
+function hasOwn(object: object, key: PropertyKey): boolean {
+	return Object.hasOwn(object, key);
+}
+
+function applyStreamOptionsPatch(
+	base: AgentHarnessStreamOptions,
+	patch?: AgentHarnessStreamOptionsPatch,
+): AgentHarnessStreamOptions {
+	const result = cloneStreamOptions(base);
+	if (!patch) return result;
+
+	if (hasOwn(patch, "transport")) result.transport = patch.transport;
+	if (hasOwn(patch, "timeoutMs")) result.timeoutMs = patch.timeoutMs;
+	if (hasOwn(patch, "maxRetries")) result.maxRetries = patch.maxRetries;
+	if (hasOwn(patch, "maxRetryDelayMs")) result.maxRetryDelayMs = patch.maxRetryDelayMs;
+	if (hasOwn(patch, "cacheRetention")) result.cacheRetention = patch.cacheRetention;
+
+	if (hasOwn(patch, "headers")) {
+		if (patch.headers === undefined) {
+			result.headers = undefined;
+		} else {
+			const headers = { ...(result.headers ?? {}) };
+			for (const [key, value] of Object.entries(patch.headers)) {
+				if (value === undefined) delete headers[key];
+				else headers[key] = value;
+			}
+			result.headers = Object.keys(headers).length > 0 ? headers : undefined;
+		}
+	}
+
+	if (hasOwn(patch, "metadata")) {
+		if (patch.metadata === undefined) {
+			result.metadata = undefined;
+		} else {
+			const metadata = { ...(result.metadata ?? {}) };
+			for (const [key, value] of Object.entries(patch.metadata)) {
+				if (value === undefined) delete metadata[key];
+				else metadata[key] = value;
+			}
+			result.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+		}
+	}
+
+	return result;
+}
+
+interface AgentHarnessTurnState<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentTool = AgentTool,
+> {
+	messages: AgentMessage[];
+	resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	streamOptions: AgentHarnessStreamOptions;
+	sessionId: string;
+	systemPrompt: string;
+	model: Model<any>;
+	thinkingLevel: ThinkingLevel;
+	tools: TTool[];
+	activeTools: TTool[];
+}
+
+export class AgentHarness<
+	TSkill extends Skill = Skill,
+	TPromptTemplate extends PromptTemplate = PromptTemplate,
+	TTool extends AgentTool = AgentTool,
+> {
 	readonly agent: Agent;
 	readonly env: ExecutionEnv;
-	readonly conversation: AgentHarnessConversationState;
-	readonly operation: AgentHarnessOperationState;
-
 	private session: Session;
-	private resourcesInput?: AgentHarnessOptions["resources"];
-	private systemPrompt: AgentHarnessOptions["systemPrompt"];
-	private requestAuth?: AgentHarnessOptions["requestAuth"];
-	private toolRegistry = new Map<string, AgentTool>();
-	private listeners = new Set<(event: AgentHarnessEvent, signal?: AbortSignal) => Promise<void> | void>();
-	private hooks = new Map<
-		keyof AgentHarnessEventResultMap,
-		Set<(event: any, ctx: AgentHarnessContext) => Promise<any> | any>
+	private model: Model<any>;
+	private thinkingLevel: ThinkingLevel;
+	private activeToolNames: string[];
+	private nextTurnQueue: AgentMessage[] = [];
+	private phase: AgentHarnessPhase = "idle";
+	private steerQueue: UserMessage[] = [];
+	private followUpQueue: UserMessage[] = [];
+	private pendingSessionWrites: PendingSessionWrite[] = [];
+	private resources: AgentHarnessResources<TSkill, TPromptTemplate>;
+	private streamOptions: AgentHarnessStreamOptions;
+	private appliedStreamOptions: AgentHarnessStreamOptions = {};
+	private appliedSessionId?: string;
+	private systemPrompt: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>["systemPrompt"];
+	private getApiKeyAndHeaders?: AgentHarnessOptions["getApiKeyAndHeaders"];
+	private tools = new Map<string, TTool>();
+	private listeners = new Set<
+		(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void
 	>();
+	private hooks = new Map<keyof AgentHarnessEventResultMap, Set<(event: any) => Promise<any> | any>>();
 
-	constructor(options: AgentHarnessOptions) {
+	constructor(options: AgentHarnessOptions<TSkill, TPromptTemplate, TTool>) {
 		this.agent = new Agent({
 			initialState: {
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
 				tools: options.tools ?? [],
 			},
+			streamFn: async (model, context, streamOptions) => {
+				const auth = await this.getApiKeyAndHeaders?.(model);
+				const snapshotOptions: AgentHarnessStreamOptions = {
+					...this.appliedStreamOptions,
+					headers: mergeHeaders(this.appliedStreamOptions.headers, auth?.headers),
+				};
+				const requestOptions = await this.emitBeforeProviderRequest(
+					model,
+					this.appliedSessionId ?? "",
+					snapshotOptions,
+				);
+				return streamSimple(model, context, {
+					cacheRetention: requestOptions.cacheRetention,
+					headers: requestOptions.headers,
+					maxRetries: requestOptions.maxRetries,
+					maxRetryDelayMs: requestOptions.maxRetryDelayMs,
+					metadata: requestOptions.metadata,
+					onPayload: async (payload) => await this.emitBeforeProviderPayload(model, payload),
+					onResponse: async (response) => {
+						const headers = { ...(response.headers as Record<string, string>) };
+						await this.emitOwn(
+							{ type: "after_provider_response", status: response.status, headers },
+							this.agent.signal,
+						);
+					},
+					reasoning: streamOptions?.reasoning,
+					signal: streamOptions?.signal,
+					sessionId: this.appliedSessionId,
+					timeoutMs: requestOptions.timeoutMs,
+					transport: requestOptions.transport,
+					apiKey: auth?.apiKey,
+				});
+			},
+			steeringMode: options.steeringMode,
+			followUpMode: options.followUpMode,
 		});
 		this.env = options.env;
 		this.session = options.session;
-		this.resourcesInput = options.resources;
+		this.resources = options.resources ?? {};
+		this.streamOptions = cloneStreamOptions(options.streamOptions);
 		this.systemPrompt = options.systemPrompt;
-		this.requestAuth = options.requestAuth;
-		for (const tool of this.agent.state.tools) {
-			this.toolRegistry.set(tool.name, tool);
+		this.getApiKeyAndHeaders = options.getApiKeyAndHeaders;
+		for (const tool of options.tools ?? []) {
+			this.tools.set(tool.name, tool);
 		}
-		this.conversation = {
-			session: options.session,
-			model: options.model,
-			thinkingLevel: options.thinkingLevel ?? this.agent.state.thinkingLevel,
-			activeToolNames: options.activeToolNames ?? this.agent.state.tools.map((tool) => tool.name),
-			nextTurnQueue: [],
-		};
-		this.agent.state.model = this.conversation.model;
-		this.agent.state.thinkingLevel = this.conversation.thinkingLevel;
-		this.agent.getApiKey = async (provider) => {
-			const model = this.conversation.model;
-			if (!this.requestAuth || model.provider !== provider) return undefined;
-			return (await this.requestAuth(model))?.apiKey;
-		};
-		this.operation = {
-			idle: true,
-			abortRequested: false,
-			steerQueue: [],
-			followUpQueue: [],
-			pendingMutations: {
-				appendMessages: [],
-			},
-		};
-		this.agent.transformContext = async (messages, signal) => {
-			const result = await this.emitHook("context", { type: "context", messages: [...messages] }, signal);
+		this.model = options.model;
+		this.thinkingLevel = options.thinkingLevel ?? this.agent.state.thinkingLevel;
+		this.activeToolNames = options.activeToolNames ?? (options.tools ?? []).map((tool) => tool.name);
+		this.agent.state.model = this.model;
+		this.agent.state.thinkingLevel = this.thinkingLevel;
+		this.agent.transformContext = async (messages) => {
+			const result = await this.emitHook({ type: "context", messages: [...messages] });
 			return result?.messages ?? messages;
 		};
-		this.agent.beforeToolCall = async ({ toolCall, args }, signal) => {
-			const result = await this.emitHook(
-				"tool_call",
-				{
-					type: "tool_call",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
-				},
-				signal,
-			);
+		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			const result = await this.emitHook({
+				type: "tool_call",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args as Record<string, unknown>,
+			});
 			return result ? { block: result.block, reason: result.reason } : undefined;
 		};
-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }, signal) => {
-			const patch = await this.emitHook(
-				"tool_result",
-				{
-					type: "tool_result",
-					toolCallId: toolCall.id,
-					toolName: toolCall.name,
-					input: args as Record<string, unknown>,
-					content: result.content,
-					details: result.details,
-					isError,
-				},
-				signal,
-			);
+		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
+			const patch = await this.emitHook({
+				type: "tool_result",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				input: args as Record<string, unknown>,
+				content: result.content,
+				details: result.details,
+				isError,
+			});
 			return patch
 				? { content: patch.content, details: patch.details, isError: patch.isError, terminate: patch.terminate }
 				: undefined;
 		};
-		this.agent.onPayload = async (payload) => {
-			const result = await this.emitHook("before_provider_request", { type: "before_provider_request", payload });
-			return result?.payload ?? payload;
-		};
-		this.agent.onResponse = async (response) => {
-			const headers = { ...(response.headers as Record<string, string>) };
-			await this.emitOwn({ type: "after_provider_response", status: response.status, headers }, this.agent.signal);
+		this.agent.prepareNextTurn = async () => {
+			await this.flushPendingSessionWrites();
+			const turnState = await this.createTurnState();
+			this.applyTurnState(turnState);
+			return {
+				context: {
+					systemPrompt: turnState.systemPrompt,
+					messages: turnState.messages.slice(),
+					tools: turnState.activeTools.slice(),
+				},
+				model: turnState.model,
+				thinkingLevel: turnState.thinkingLevel,
+			};
 		};
 		this.agent.subscribe(async (event, signal) => {
 			await this.handleAgentEvent(event, signal);
 		});
-		void this.syncFromTree();
 	}
 
-	private createContext(signal?: AbortSignal): AgentHarnessContext {
-		return {
-			env: this.env,
-			conversation: this.conversation,
-			operation: this.operation,
-			abortSignal: signal,
-		};
-	}
-
-	private async resolveResources(signal?: AbortSignal): Promise<AgentHarnessResources> {
-		return typeof this.resourcesInput === "function"
-			? await this.resourcesInput(this.createContext(signal))
-			: (this.resourcesInput ?? {});
-	}
-
-	private getActiveTools(): AgentTool[] {
-		return this.conversation.activeToolNames
-			.map((name) => this.toolRegistry.get(name))
-			.filter((tool): tool is AgentTool => tool !== undefined);
-	}
-
-	private async resolveSystemPrompt(resources: AgentHarnessResources): Promise<string> {
-		if (!this.systemPrompt) return "You are a helpful assistant.";
-		if (typeof this.systemPrompt === "string") return this.systemPrompt;
-		return await this.systemPrompt({
-			env: this.env,
-			session: this.session,
-			model: this.conversation.model,
-			thinkingLevel: this.conversation.thinkingLevel,
-			activeTools: this.getActiveTools(),
-			resources,
-		});
-	}
-
-	private async emitOwn(event: AgentHarnessOwnEvent, signal?: AbortSignal): Promise<void> {
+	private async emitOwn(event: AgentHarnessOwnEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
 		for (const listener of this.listeners) {
 			await listener(event, signal);
 		}
 	}
 
-	private async emitAny(event: AgentHarnessEvent, signal?: AbortSignal): Promise<void> {
+	private async emitAny(event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal): Promise<void> {
 		for (const listener of this.listeners) {
 			await listener(event, signal);
 		}
 	}
 
 	private async emitHook<TType extends keyof AgentHarnessEventResultMap>(
-		type: TType,
 		event: Extract<AgentHarnessOwnEvent, { type: TType }>,
-		signal?: AbortSignal,
 	): Promise<AgentHarnessEventResultMap[TType] | undefined> {
-		const handlers = this.hooks.get(type);
+		const handlers = this.hooks.get(event.type as TType);
 		if (!handlers || handlers.size === 0) return undefined;
 		let lastResult: AgentHarnessEventResultMap[TType] | undefined;
 		for (const handler of handlers) {
-			const result = await handler(event, this.createContext(signal));
+			const result = await handler(event);
 			if (result !== undefined) {
 				lastResult = result;
 			}
@@ -195,72 +274,132 @@ export class AgentHarness {
 		return lastResult;
 	}
 
+	private async emitBeforeProviderRequest(
+		model: Model<any>,
+		sessionId: string,
+		streamOptions: AgentHarnessStreamOptions,
+	): Promise<AgentHarnessStreamOptions> {
+		const handlers = this.hooks.get("before_provider_request");
+		let current = cloneStreamOptions(streamOptions);
+		if (!handlers || handlers.size === 0) return current;
+		for (const handler of handlers) {
+			const result = await handler({
+				type: "before_provider_request",
+				model,
+				sessionId,
+				streamOptions: cloneStreamOptions(current),
+			});
+			if (result?.streamOptions) {
+				current = applyStreamOptionsPatch(current, result.streamOptions);
+			}
+		}
+		return current;
+	}
+
+	private async emitBeforeProviderPayload(model: Model<any>, payload: unknown): Promise<unknown> {
+		const handlers = this.hooks.get("before_provider_payload");
+		let current = payload;
+		if (!handlers || handlers.size === 0) return current;
+		for (const handler of handlers) {
+			const result = await handler({ type: "before_provider_payload", model, payload: current });
+			if (result !== undefined) {
+				current = result.payload;
+			}
+		}
+		return current;
+	}
+
 	private async emitQueueUpdate(): Promise<void> {
 		await this.emitOwn({
 			type: "queue_update",
-			steer: [...this.operation.steerQueue],
-			followUp: [...this.operation.followUpQueue],
-			nextTurn: [...this.conversation.nextTurnQueue],
+			steer: [...this.steerQueue],
+			followUp: [...this.followUpQueue],
+			nextTurn: [...this.nextTurnQueue],
 		});
 	}
 
-	private async syncFromTree(): Promise<void> {
+	private async createTurnState(): Promise<AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>> {
 		const context = await this.session.buildContext();
-		this.agent.state.messages = context.messages;
-		if (context.model && this.conversation.model) {
-			// leave active model untouched; harness-level model is source of truth
+		const resources = this.getResources();
+		const sessionMetadata = await this.session.getMetadata();
+		const tools = [...this.tools.values()];
+		const activeTools = this.activeToolNames
+			.map((name) => this.tools.get(name))
+			.filter((tool): tool is TTool => tool !== undefined);
+		let systemPrompt = "You are a helpful assistant.";
+		if (typeof this.systemPrompt === "string") {
+			systemPrompt = this.systemPrompt;
+		} else if (this.systemPrompt) {
+			systemPrompt = await this.systemPrompt({
+				env: this.env,
+				session: this.session,
+				model: this.model,
+				thinkingLevel: this.thinkingLevel,
+				activeTools,
+				resources,
+			});
 		}
-		this.agent.state.systemPrompt = await this.resolveSystemPrompt(await this.resolveResources());
+		return {
+			messages: context.messages,
+			resources,
+			streamOptions: cloneStreamOptions(this.streamOptions),
+			sessionId: sessionMetadata.id,
+			systemPrompt,
+			model: this.model,
+			thinkingLevel: this.thinkingLevel,
+			tools,
+			activeTools,
+		};
 	}
 
-	private async applyPendingMutations(): Promise<void> {
-		for (const message of this.operation.pendingMutations.appendMessages) {
-			await this.session.appendMessage(message);
-		}
-		this.operation.pendingMutations.appendMessages = [];
+	private applyTurnState(turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>): void {
+		this.agent.state.messages = turnState.messages;
+		this.appliedStreamOptions = cloneStreamOptions(turnState.streamOptions);
+		this.appliedSessionId = turnState.sessionId;
+		this.agent.state.systemPrompt = turnState.systemPrompt;
+		this.agent.state.model = turnState.model;
+		this.agent.state.thinkingLevel = turnState.thinkingLevel;
+		this.agent.state.tools = turnState.activeTools;
+	}
 
-		if (this.operation.pendingMutations.model) {
-			const model = this.operation.pendingMutations.model;
-			const previousModel = this.conversation.model;
-			this.conversation.model = model;
-			this.agent.state.model = model;
-			await this.session.appendModelChange(model.provider, model.id);
-			await this.emitOwn({ type: "model_select", model, previousModel, source: "set" });
-			this.operation.pendingMutations.model = undefined;
-		}
+	private validateToolNames(toolNames: string[]): void {
+		const missing = toolNames.filter((name) => !this.tools.has(name));
+		if (missing.length > 0) throw new Error(`Unknown tool(s): ${missing.join(", ")}`);
+	}
 
-		if (this.operation.pendingMutations.thinkingLevel !== undefined) {
-			const level = this.operation.pendingMutations.thinkingLevel;
-			const previousLevel = this.conversation.thinkingLevel;
-			this.conversation.thinkingLevel = level;
-			this.agent.state.thinkingLevel = level;
-			await this.session.appendThinkingLevelChange(level);
-			await this.emitOwn({ type: "thinking_level_select", level, previousLevel });
-			this.operation.pendingMutations.thinkingLevel = undefined;
+	private async flushPendingSessionWrites(): Promise<void> {
+		const writes = this.pendingSessionWrites;
+		this.pendingSessionWrites = [];
+		for (const write of writes) {
+			if (write.type === "message") {
+				await this.session.appendMessage(write.message);
+			} else if (write.type === "model_change") {
+				await this.session.appendModelChange(write.provider, write.modelId);
+			} else if (write.type === "thinking_level_change") {
+				await this.session.appendThinkingLevelChange(write.thinkingLevel);
+			} else if (write.type === "custom") {
+				await this.session.appendCustomEntry(write.customType, write.data);
+			} else if (write.type === "custom_message") {
+				await this.session.appendCustomMessageEntry(write.customType, write.content, write.display, write.details);
+			} else if (write.type === "label") {
+				await this.session.appendLabel(write.targetId, write.label);
+			} else if (write.type === "session_info") {
+				await this.session.appendSessionName(write.name ?? "");
+			}
 		}
-
-		if (this.operation.pendingMutations.activeToolNames) {
-			this.conversation.activeToolNames = [...this.operation.pendingMutations.activeToolNames];
-			this.agent.state.tools = this.conversation.activeToolNames
-				.map((name) => this.toolRegistry.get(name))
-				.filter((tool): tool is (typeof this.agent.state.tools)[number] => tool !== undefined);
-			this.operation.pendingMutations.activeToolNames = undefined;
-		}
-
-		await this.syncFromTree();
 	}
 
 	private async handleAgentEvent(event: AgentEvent, signal?: AbortSignal): Promise<void> {
 		await this.emitAny(event, signal);
-		if (event.type === "message_start") {
-			const steerIndex = this.operation.steerQueue.indexOf(event.message);
+		if (event.type === "message_start" && event.message.role === "user") {
+			const steerIndex = this.steerQueue.indexOf(event.message);
 			if (steerIndex !== -1) {
-				this.operation.steerQueue.splice(steerIndex, 1);
+				this.steerQueue.splice(steerIndex, 1);
 				await this.emitQueueUpdate();
 			} else {
-				const followUpIndex = this.operation.followUpQueue.indexOf(event.message);
+				const followUpIndex = this.followUpQueue.indexOf(event.message);
 				if (followUpIndex !== -1) {
-					this.operation.followUpQueue.splice(followUpIndex, 1);
+					this.followUpQueue.splice(followUpIndex, 1);
 					await this.emitQueueUpdate();
 				}
 			}
@@ -269,55 +408,47 @@ export class AgentHarness {
 			await this.session.appendMessage(event.message);
 		}
 		if (event.type === "turn_end") {
-			const hadPendingMutations =
-				this.operation.pendingMutations.appendMessages.length > 0 ||
-				this.operation.pendingMutations.model !== undefined ||
-				this.operation.pendingMutations.thinkingLevel !== undefined ||
-				this.operation.pendingMutations.activeToolNames !== undefined;
-			await this.emitOwn(
-				{ type: "save_point", liveOperationId: this.operation.liveOperationId ?? "unknown", hadPendingMutations },
-				signal,
-			);
-			if (hadPendingMutations) {
-				await this.applyPendingMutations();
-			}
+			const hadPendingMutations = this.pendingSessionWrites.length > 0;
+			await this.flushPendingSessionWrites();
+			await this.emitOwn({
+				type: "save_point",
+				hadPendingMutations,
+			});
 		}
 		if (event.type === "agent_end") {
-			this.operation.idle = true;
-			this.operation.liveOperationId = undefined;
-			this.operation.abortRequested = false;
-			await this.syncFromTree();
-			await this.emitOwn({ type: "settled", nextTurnCount: this.conversation.nextTurnQueue.length }, signal);
+			await this.flushPendingSessionWrites();
+			this.phase = "idle";
+			await this.emitOwn({ type: "settled", nextTurnCount: this.nextTurnQueue.length }, signal);
 		}
 	}
 
-	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
-		if (!this.operation.idle) throw new Error("AgentHarness is busy");
+	private async executeTurn(
+		turnState: AgentHarnessTurnState<TSkill, TPromptTemplate, TTool>,
+		text: string,
+		options?: { images?: ImageContent[] },
+	): Promise<AssistantMessage> {
+		this.applyTurnState(turnState);
 		const beforeLength = this.agent.state.messages.length;
-		this.operation.idle = false;
-		this.operation.liveOperationId = randomUUID();
-		const resources = await this.resolveResources(this.agent.signal);
 		let messages: AgentMessage[] = [createUserMessage(text, options?.images)];
-		if (this.conversation.nextTurnQueue.length > 0) {
-			messages = [messages[0]!, ...this.conversation.nextTurnQueue];
-			this.conversation.nextTurnQueue = [];
+		if (this.nextTurnQueue.length > 0) {
+			messages = [...this.nextTurnQueue, messages[0]!];
+			this.nextTurnQueue = [];
 			await this.emitQueueUpdate();
 		}
-		this.agent.state.systemPrompt = await this.resolveSystemPrompt(resources);
-		const beforeResult = await this.emitHook(
-			"before_agent_start",
-			{
-				type: "before_agent_start",
-				prompt: text,
-				images: options?.images,
-				systemPrompt: this.agent.state.systemPrompt,
-				resources,
-			},
-			this.agent.signal,
-		);
+		const beforeResult = await this.emitHook({
+			type: "before_agent_start",
+			prompt: text,
+			images: options?.images,
+			systemPrompt: turnState.systemPrompt,
+			resources: turnState.resources,
+		});
 		if (beforeResult?.messages) messages = [...beforeResult.messages, ...messages];
 		if (beforeResult?.systemPrompt) this.agent.state.systemPrompt = beforeResult.systemPrompt;
-		await this.agent.prompt(messages);
+		try {
+			await this.agent.prompt(messages);
+		} finally {
+			await this.flushPendingSessionWrites();
+		}
 		let response: AssistantMessage | undefined;
 		const newMessages = this.agent.state.messages.slice(beforeLength);
 		for (let i = newMessages.length - 1; i >= 0; i--) {
@@ -331,81 +462,98 @@ export class AgentHarness {
 		return response;
 	}
 
+	async prompt(text: string, options?: { images?: ImageContent[] }): Promise<AssistantMessage> {
+		if (this.phase !== "idle") throw new Error("AgentHarness is busy");
+		this.phase = "turn";
+		try {
+			const turnState = await this.createTurnState();
+			return await this.executeTurn(turnState, text, options);
+		} catch (error) {
+			this.phase = "idle";
+			throw error;
+		}
+	}
+
 	async skill(name: string, additionalInstructions?: string): Promise<AssistantMessage> {
-		const resources = await this.resolveResources();
-		const skill = (resources.skills ?? []).find((candidate) => candidate.name === name);
-		if (!skill) throw new Error(`Unknown skill: ${name}`);
-		return await this.prompt(expandSkillCommand(skill, additionalInstructions));
+		if (this.phase !== "idle") throw new Error("AgentHarness is busy");
+		this.phase = "turn";
+		try {
+			const turnState = await this.createTurnState();
+			const skill = (turnState.resources.skills ?? []).find((candidate) => candidate.name === name);
+			if (!skill) throw new Error(`Unknown skill: ${name}`);
+			return await this.executeTurn(turnState, formatSkillInvocation(skill, additionalInstructions));
+		} catch (error) {
+			this.phase = "idle";
+			throw error;
+		}
 	}
 
 	async promptFromTemplate(name: string, args: string[] = []): Promise<AssistantMessage> {
-		const resources = await this.resolveResources();
-		const template = (resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
-		if (!template) throw new Error(`Unknown prompt template: ${name}`);
-		return await this.prompt(expandPromptTemplate(template, args));
+		if (this.phase !== "idle") throw new Error("AgentHarness is busy");
+		this.phase = "turn";
+		try {
+			const turnState = await this.createTurnState();
+			const template = (turnState.resources.promptTemplates ?? []).find((candidate) => candidate.name === name);
+			if (!template) throw new Error(`Unknown prompt template: ${name}`);
+			return await this.executeTurn(turnState, formatPromptTemplateInvocation(template, args));
+		} catch (error) {
+			this.phase = "idle";
+			throw error;
+		}
 	}
 
-	steer(message: AgentMessage): void {
-		if (this.operation.idle) throw new Error("Cannot steer while idle");
-		this.operation.steerQueue.push(message);
+	steer(text: string, options?: { images?: ImageContent[] }): void {
+		if (this.phase === "idle") throw new Error("Cannot steer while idle");
+		const message = createUserMessage(text, options?.images);
+		this.steerQueue.push(message);
 		this.agent.steer(message);
 		void this.emitQueueUpdate();
 	}
 
-	followUp(message: AgentMessage): void {
-		if (this.operation.idle) throw new Error("Cannot follow up while idle");
-		this.operation.followUpQueue.push(message);
+	followUp(text: string, options?: { images?: ImageContent[] }): void {
+		if (this.phase === "idle") throw new Error("Cannot follow up while idle");
+		const message = createUserMessage(text, options?.images);
+		this.followUpQueue.push(message);
 		this.agent.followUp(message);
 		void this.emitQueueUpdate();
 	}
 
-	nextTurn(message: AgentMessage): void {
-		this.conversation.nextTurnQueue.push(message);
+	nextTurn(text: string, options?: { images?: ImageContent[] }): void {
+		this.nextTurnQueue.push(createUserMessage(text, options?.images));
 		void this.emitQueueUpdate();
 	}
 
 	async appendMessage(message: AgentMessage): Promise<void> {
-		if (this.operation.idle) {
+		if (this.phase === "idle") {
 			await this.session.appendMessage(message);
-			await this.syncFromTree();
 		} else {
-			this.operation.pendingMutations.appendMessages.push(message);
+			this.pendingSessionWrites.push({ type: "message", message });
 		}
-	}
-
-	async shell(
-		command: string,
-		options?: {
-			cwd?: string;
-			env?: Record<string, string>;
-			timeout?: number;
-			signal?: AbortSignal;
-			onStdout?: (chunk: string) => void;
-			onStderr?: (chunk: string) => void;
-		},
-	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-		return await this.env.exec(command, options);
 	}
 
 	async compact(
 		customInstructions?: string,
 	): Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number; details?: unknown }> {
-		if (!this.operation.idle) throw new Error("compact() requires idle harness");
-		const model = this.conversation.model;
+		if (this.phase !== "idle") throw new Error("compact() requires idle harness");
+		this.phase = "compaction";
+		const model = this.model;
 		if (!model) throw new Error("No model set for compaction");
-		const auth = await this.requestAuth?.(model);
+		const auth = await this.getApiKeyAndHeaders?.(model);
 		if (!auth) throw new Error("No auth available for compaction");
 		const branchEntries = await this.session.getBranch();
 		const preparation = prepareCompaction(branchEntries, DEFAULT_COMPACTION_SETTINGS);
 		if (!preparation) throw new Error("Nothing to compact");
-		const hookResult = await this.emitHook("session_before_compact", {
+		const hookResult = await this.emitHook({
 			type: "session_before_compact",
 			preparation,
 			branchEntries,
 			customInstructions,
 			signal: new AbortController().signal,
 		});
-		if (hookResult?.cancel) throw new Error("Compaction cancelled");
+		if (hookResult?.cancel) {
+			this.phase = "idle";
+			throw new Error("Compaction cancelled");
+		}
 		const provided = hookResult?.compaction;
 		const result =
 			provided ??
@@ -416,7 +564,7 @@ export class AgentHarness {
 				auth.headers,
 				customInstructions,
 				undefined,
-				this.conversation.thinkingLevel,
+				this.thinkingLevel,
 			));
 		const entryId = await this.session.appendCompaction(
 			result.summary,
@@ -426,10 +574,10 @@ export class AgentHarness {
 			provided !== undefined,
 		);
 		const entry = await this.session.getEntry(entryId);
-		await this.syncFromTree();
 		if (entry?.type === "compaction") {
 			await this.emitOwn({ type: "session_compact", compactionEntry: entry, fromHook: provided !== undefined });
 		}
+		this.phase = "idle";
 		return result;
 	}
 
@@ -437,9 +585,13 @@ export class AgentHarness {
 		targetId: string,
 		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
 	): Promise<NavigateTreeResult> {
-		if (!this.operation.idle) throw new Error("navigateTree() requires idle harness");
+		if (this.phase !== "idle") throw new Error("navigateTree() requires idle harness");
+		this.phase = "branch_summary";
 		const oldLeafId = await this.session.getLeafId();
-		if (oldLeafId === targetId) return { cancelled: false };
+		if (oldLeafId === targetId) {
+			this.phase = "idle";
+			return { cancelled: false };
+		}
 		const targetEntry = await this.session.getEntry(targetId);
 		if (!targetEntry) throw new Error(`Entry ${targetId} not found`);
 		const { entries, commonAncestorId } = await collectEntriesForBranchSummary(this.session, oldLeafId, targetId);
@@ -454,19 +606,22 @@ export class AgentHarness {
 			label: options?.label,
 		};
 		const signal = new AbortController().signal;
-		const hookResult = await this.emitHook("session_before_tree", {
+		const hookResult = await this.emitHook({
 			type: "session_before_tree",
 			preparation,
 			signal,
 		});
-		if (hookResult?.cancel) return { cancelled: true };
+		if (hookResult?.cancel) {
+			this.phase = "idle";
+			return { cancelled: true };
+		}
 		let summaryEntry: any | undefined;
 		let summaryText: string | undefined = hookResult?.summary?.summary;
 		let summaryDetails: unknown = hookResult?.summary?.details;
 		if (!summaryText && options?.summarize && entries.length > 0) {
-			const model = this.conversation.model;
+			const model = this.model;
 			if (!model) throw new Error("No model set for branch summary");
-			const auth = await this.requestAuth?.(model);
+			const auth = await this.getApiKeyAndHeaders?.(model);
 			if (!auth) throw new Error("No auth available for branch summary");
 			const branchSummary = await generateBranchSummary(entries, {
 				model,
@@ -476,7 +631,10 @@ export class AgentHarness {
 				customInstructions: hookResult?.customInstructions ?? options?.customInstructions,
 				replaceInstructions: hookResult?.replaceInstructions ?? options?.replaceInstructions,
 			});
-			if (branchSummary.aborted) return { cancelled: true };
+			if (branchSummary.aborted) {
+				this.phase = "idle";
+				return { cancelled: true };
+			}
 			if (branchSummary.error) throw new Error(branchSummary.error);
 			summaryText = branchSummary.summary;
 			summaryDetails = {
@@ -521,7 +679,6 @@ export class AgentHarness {
 		if (summaryId) {
 			summaryEntry = await this.session.getEntry(summaryId);
 		}
-		await this.syncFromTree();
 		await this.emitOwn({
 			type: "session_tree",
 			newLeafId: await this.session.getLeafId(),
@@ -529,48 +686,100 @@ export class AgentHarness {
 			summaryEntry,
 			fromHook: hookResult?.summary !== undefined,
 		});
+		this.phase = "idle";
 		return { cancelled: false, editorText, summaryEntry };
 	}
 
 	async setModel(model: Model<any>): Promise<void> {
-		if (this.operation.idle) {
-			const previousModel = this.conversation.model;
-			this.conversation.model = model;
+		const previousModel = this.model;
+		this.model = model;
+		if (this.phase === "idle") {
 			this.agent.state.model = model;
 			await this.session.appendModelChange(model.provider, model.id);
-			await this.emitOwn({ type: "model_select", model, previousModel, source: "set" });
 		} else {
-			this.operation.pendingMutations.model = model;
+			this.pendingSessionWrites.push({ type: "model_change", provider: model.provider, modelId: model.id });
 		}
+		await this.emitOwn({ type: "model_select", model, previousModel, source: "set" });
 	}
 
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
-		if (this.operation.idle) {
-			const previousLevel = this.conversation.thinkingLevel;
-			this.conversation.thinkingLevel = level;
+		const previousLevel = this.thinkingLevel;
+		this.thinkingLevel = level;
+		if (this.phase === "idle") {
 			this.agent.state.thinkingLevel = level;
 			await this.session.appendThinkingLevelChange(level);
-			await this.emitOwn({ type: "thinking_level_select", level, previousLevel });
 		} else {
-			this.operation.pendingMutations.thinkingLevel = level;
+			this.pendingSessionWrites.push({ type: "thinking_level_change", thinkingLevel: level });
 		}
+		await this.emitOwn({ type: "thinking_level_select", level, previousLevel });
 	}
 
 	async setActiveTools(toolNames: string[]): Promise<void> {
-		if (this.operation.idle) {
-			this.conversation.activeToolNames = [...toolNames];
-			this.agent.state.tools = this.getActiveTools();
+		this.validateToolNames(toolNames);
+		this.activeToolNames = [...toolNames];
+		if (this.phase === "idle") {
+			this.agent.state.tools = this.activeToolNames.map((name) => this.tools.get(name)!);
+		}
+	}
+
+	get steeringMode(): QueueMode {
+		return this.agent.steeringMode;
+	}
+
+	set steeringMode(mode: QueueMode) {
+		this.agent.steeringMode = mode;
+	}
+
+	get followUpMode(): QueueMode {
+		return this.agent.followUpMode;
+	}
+
+	set followUpMode(mode: QueueMode) {
+		this.agent.followUpMode = mode;
+	}
+
+	getResources(): AgentHarnessResources<TSkill, TPromptTemplate> {
+		return {
+			skills: this.resources.skills?.slice(),
+			promptTemplates: this.resources.promptTemplates?.slice(),
+		};
+	}
+
+	async setResources(resources: AgentHarnessResources<TSkill, TPromptTemplate>): Promise<void> {
+		const previousResources = this.getResources();
+		this.resources = {
+			skills: resources.skills?.slice(),
+			promptTemplates: resources.promptTemplates?.slice(),
+		};
+		await this.emitOwn({ type: "resources_update", resources: this.getResources(), previousResources });
+	}
+
+	getStreamOptions(): AgentHarnessStreamOptions {
+		return cloneStreamOptions(this.streamOptions);
+	}
+
+	setStreamOptions(streamOptions: AgentHarnessStreamOptions): void {
+		this.streamOptions = cloneStreamOptions(streamOptions);
+	}
+
+	async setTools(tools: TTool[], activeToolNames?: string[]): Promise<void> {
+		this.tools = new Map(tools.map((tool) => [tool.name, tool]));
+		if (activeToolNames) {
+			this.validateToolNames(activeToolNames);
+			this.activeToolNames = [...activeToolNames];
 		} else {
-			this.operation.pendingMutations.activeToolNames = [...toolNames];
+			this.validateToolNames(this.activeToolNames);
+		}
+		if (this.phase === "idle") {
+			this.agent.state.tools = this.activeToolNames.map((name) => this.tools.get(name)!);
 		}
 	}
 
 	async abort(): Promise<AbortResult> {
-		this.operation.abortRequested = true;
-		const clearedSteer = [...this.operation.steerQueue];
-		const clearedFollowUp = [...this.operation.followUpQueue];
-		this.operation.steerQueue = [];
-		this.operation.followUpQueue = [];
+		const clearedSteer = [...this.steerQueue];
+		const clearedFollowUp = [...this.followUpQueue];
+		this.steerQueue = [];
+		this.followUpQueue = [];
 		this.agent.clearAllQueues();
 		await this.emitQueueUpdate();
 		this.agent.abort();
@@ -583,7 +792,9 @@ export class AgentHarness {
 		await this.agent.waitForIdle();
 	}
 
-	subscribe(listener: (event: AgentHarnessEvent, signal?: AbortSignal) => Promise<void> | void): () => void {
+	subscribe(
+		listener: (event: AgentHarnessEvent<TSkill, TPromptTemplate>, signal?: AbortSignal) => Promise<void> | void,
+	): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	}
@@ -591,8 +802,7 @@ export class AgentHarness {
 	on<TType extends keyof AgentHarnessEventResultMap>(
 		type: TType,
 		handler: (
-			event: Extract<import("./types.js").AgentHarnessOwnEvent, { type: TType }>,
-			ctx: AgentHarnessContext,
+			event: Extract<AgentHarnessOwnEvent, { type: TType }>,
 		) => Promise<AgentHarnessEventResultMap[TType]> | AgentHarnessEventResultMap[TType],
 	): () => void {
 		let handlers = this.hooks.get(type);
