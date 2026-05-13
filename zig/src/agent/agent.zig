@@ -132,6 +132,8 @@ pub const AgentOptions = struct {
     extension_hook_context: ?*anyopaque = null,
     before_tool_call: ?types.BeforeToolCallFn = null,
     after_tool_call: ?types.AfterToolCallFn = null,
+    prepare_next_turn: ?types.PrepareNextTurnFn = null,
+    prepare_next_turn_context: ?*anyopaque = null,
 };
 
 pub const DEFAULT_MODEL = ai.Model{
@@ -177,6 +179,8 @@ pub const Agent = struct {
     extension_hook_context: ?*anyopaque,
     before_tool_call: ?types.BeforeToolCallFn,
     after_tool_call: ?types.AfterToolCallFn,
+    prepare_next_turn: ?types.PrepareNextTurnFn,
+    prepare_next_turn_context: ?*anyopaque,
     listeners: std.ArrayList(types.AgentSubscriber),
     active_abort_signal: ?*std.atomic.Value(bool),
     run_state_mutex: std.Io.Mutex = .init,
@@ -210,6 +214,8 @@ pub const Agent = struct {
             .extension_hook_context = options.extension_hook_context,
             .before_tool_call = options.before_tool_call,
             .after_tool_call = options.after_tool_call,
+            .prepare_next_turn = options.prepare_next_turn,
+            .prepare_next_turn_context = options.prepare_next_turn_context,
             .listeners = .empty,
             .active_abort_signal = null,
         };
@@ -571,6 +577,8 @@ pub const Agent = struct {
             .get_steering_messages = drainSteeringMessages,
             .get_follow_up_messages_context = @constCast(self),
             .get_follow_up_messages = drainFollowUpMessages,
+            .prepare_next_turn_context = self.prepare_next_turn_context,
+            .prepare_next_turn = self.prepare_next_turn,
         };
     }
 
@@ -774,7 +782,6 @@ pub fn deinitMessageSlice(allocator: std.mem.Allocator, messages: []types.AgentM
     for (messages) |*message| deinitMessage(allocator, message);
 }
 
-
 fn cloneToolCalls(allocator: std.mem.Allocator, tool_calls: []const ai.ToolCall) ![]const ai.ToolCall {
     const cloned = try allocator.alloc(ai.ToolCall, tool_calls.len);
     errdefer allocator.free(cloned);
@@ -802,7 +809,6 @@ fn deinitToolCallsPartial(allocator: std.mem.Allocator, tool_calls: []const ai.T
         content_clone.deinitToolCall(allocator, tool_call);
     }
 }
-
 
 fn defaultConvertToLlm(
     allocator: std.mem.Allocator,

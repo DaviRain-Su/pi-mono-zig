@@ -132,6 +132,14 @@ pub const ShouldStopAfterTurnContext = struct {
     new_messages: []const AgentMessage,
 };
 
+pub const AgentLoopTurnUpdate = struct {
+    context: ?AgentContext = null,
+    model: ?ai.Model = null,
+    thinking_level: ?ThinkingLevel = null,
+};
+
+pub const PrepareNextTurnContext = ShouldStopAfterTurnContext;
+
 pub const BeforeToolCallFn = *const fn (
     allocator: std.mem.Allocator,
     context: BeforeToolCallContext,
@@ -150,6 +158,13 @@ pub const ShouldStopAfterTurnFn = *const fn (
     callback_context: ?*anyopaque,
     signal: ?*const std.atomic.Value(bool),
 ) anyerror!bool;
+
+pub const PrepareNextTurnFn = *const fn (
+    allocator: std.mem.Allocator,
+    context: PrepareNextTurnContext,
+    callback_context: ?*anyopaque,
+    signal: ?*const std.atomic.Value(bool),
+) anyerror!?AgentLoopTurnUpdate;
 
 pub const AgentTool = struct {
     name: []const u8,
@@ -241,6 +256,8 @@ pub const AgentLoopConfig = struct {
     get_steering_messages: ?PendingMessagesFn = null,
     get_follow_up_messages_context: ?*anyopaque = null,
     get_follow_up_messages: ?PendingMessagesFn = null,
+    prepare_next_turn_context: ?*anyopaque = null,
+    prepare_next_turn: ?PrepareNextTurnFn = null,
     should_stop_after_turn_context: ?*anyopaque = null,
     should_stop_after_turn: ?ShouldStopAfterTurnFn = null,
 };

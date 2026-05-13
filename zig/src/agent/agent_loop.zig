@@ -97,11 +97,15 @@ fn runLoop(
     signal: ?*const std.atomic.Value(bool),
     stream_fn: ?types.StreamFn,
 ) !void {
+    var loop_config = config;
+    var current_system_prompt = system_prompt;
+    var current_tools = tools;
+    var current_extension_hook_context = config.extension_hook_context;
     var first_turn = true;
     var pending_messages = try getPendingMessages(
         allocator,
-        config.get_steering_messages,
-        config.get_steering_messages_context,
+        loop_config.get_steering_messages,
+        loop_config.get_steering_messages_context,
     );
     defer allocator.free(pending_messages);
 
@@ -134,17 +138,17 @@ fn runLoop(
             }
 
             const current_context = types.AgentContext{
-                .system_prompt = system_prompt,
+                .system_prompt = current_system_prompt,
                 .messages = current_messages.items,
-                .tools = tools,
-                .extension_hook_context = config.extension_hook_context,
+                .tools = current_tools,
+                .extension_hook_context = current_extension_hook_context,
             };
 
             const assistant = try streaming.streamAssistantResponse(
                 allocator,
                 io,
                 current_context,
-                config,
+                loop_config,
                 emit_context,
                 emit,
                 signal,
@@ -181,7 +185,7 @@ fn runLoop(
                     current_context,
                     assistant,
                     tool_calls,
-                    config,
+                    loop_config,
                     emit_context,
                     emit,
                     signal,
@@ -201,12 +205,52 @@ fn runLoop(
                 .tool_results = tool_results.items,
             });
 
-            if (config.should_stop_after_turn) |should_stop_after_turn| {
+            if (loop_config.prepare_next_turn) |prepare_next_turn| {
                 const after_turn_context = types.AgentContext{
-                    .system_prompt = system_prompt,
+                    .system_prompt = current_system_prompt,
                     .messages = current_messages.items,
-                    .tools = tools,
-                    .extension_hook_context = config.extension_hook_context,
+                    .tools = current_tools,
+                    .extension_hook_context = current_extension_hook_context,
+                };
+                if (try prepare_next_turn(
+                    allocator,
+                    .{
+                        .assistant_message = assistant,
+                        .tool_results = tool_results.items,
+                        .context = after_turn_context,
+                        .new_messages = new_messages.items,
+                    },
+                    loop_config.prepare_next_turn_context,
+                    signal,
+                )) |turn_update| {
+                    if (turn_update.context) |next_context| {
+                        current_system_prompt = next_context.system_prompt;
+                        current_tools = next_context.tools;
+                        current_extension_hook_context = next_context.extension_hook_context;
+                        if (next_context.messages.ptr != current_messages.items.ptr or
+                            next_context.messages.len != current_messages.items.len)
+                        {
+                            const copied_messages = try allocator.dupe(types.AgentMessage, next_context.messages);
+                            defer allocator.free(copied_messages);
+                            current_messages.clearRetainingCapacity();
+                            try current_messages.appendSlice(allocator, copied_messages);
+                        }
+                    }
+                    if (turn_update.model) |next_model| {
+                        loop_config.model = next_model;
+                    }
+                    if (turn_update.thinking_level) |thinking_level| {
+                        loop_config.reasoning = if (thinking_level == .off) null else thinking_level;
+                    }
+                }
+            }
+
+            if (loop_config.should_stop_after_turn) |should_stop_after_turn| {
+                const after_turn_context = types.AgentContext{
+                    .system_prompt = current_system_prompt,
+                    .messages = current_messages.items,
+                    .tools = current_tools,
+                    .extension_hook_context = current_extension_hook_context,
                 };
                 if (try should_stop_after_turn(
                     allocator,
@@ -216,7 +260,7 @@ fn runLoop(
                         .context = after_turn_context,
                         .new_messages = new_messages.items,
                     },
-                    config.should_stop_after_turn_context,
+                    loop_config.should_stop_after_turn_context,
                     signal,
                 )) {
                     try emit(emit_context, .{
@@ -238,16 +282,16 @@ fn runLoop(
             allocator.free(pending_messages);
             pending_messages = try getPendingMessages(
                 allocator,
-                config.get_steering_messages,
-                config.get_steering_messages_context,
+                loop_config.get_steering_messages,
+                loop_config.get_steering_messages_context,
             );
         }
 
         allocator.free(pending_messages);
         pending_messages = try getPendingMessages(
             allocator,
-            config.get_follow_up_messages,
-            config.get_follow_up_messages_context,
+            loop_config.get_follow_up_messages,
+            loop_config.get_follow_up_messages_context,
         );
         if (pending_messages.len > 0) {
             continue;
@@ -1028,6 +1072,7 @@ const ShouldStopAfterTurnTestState = struct {
     callback_count: usize = 0,
     stop_after_call: ?usize = null,
     context_message_len: usize = 0,
+    context_system_prompt: []const u8 = "",
     new_message_len: usize = 0,
     tool_result_len: usize = 0,
     assistant_stop_reason: ai.StopReason = .stop,
@@ -1042,6 +1087,7 @@ fn shouldStopAfterTurnForTest(
     const state: *ShouldStopAfterTurnTestState = @ptrCast(@alignCast(callback_context.?));
     state.callback_count += 1;
     state.context_message_len = context.context.messages.len;
+    state.context_system_prompt = context.context.system_prompt;
     state.new_message_len = context.new_messages.len;
     state.tool_result_len = context.tool_results.len;
     state.assistant_stop_reason = context.assistant_message.stop_reason;
@@ -1049,6 +1095,44 @@ fn shouldStopAfterTurnForTest(
         return state.callback_count >= stop_after_call;
     }
     return false;
+}
+
+const PrepareNextTurnTestState = struct {
+    callback_count: usize = 0,
+    context_message_len: usize = 0,
+    new_message_len: usize = 0,
+    tool_result_len: usize = 0,
+    system_prompt: ?[]const u8 = null,
+    tools: []const types.AgentTool = &.{},
+    model: ?ai.Model = null,
+    thinking_level: ?types.ThinkingLevel = null,
+};
+
+fn prepareNextTurnForTest(
+    _: std.mem.Allocator,
+    context: types.PrepareNextTurnContext,
+    callback_context: ?*anyopaque,
+    _: ?*const std.atomic.Value(bool),
+) !?types.AgentLoopTurnUpdate {
+    const state: *PrepareNextTurnTestState = @ptrCast(@alignCast(callback_context.?));
+    state.callback_count += 1;
+    state.context_message_len = context.context.messages.len;
+    state.new_message_len = context.new_messages.len;
+    state.tool_result_len = context.tool_results.len;
+    if (state.callback_count > 1) return null;
+
+    var update = types.AgentLoopTurnUpdate{};
+    if (state.system_prompt != null or state.tools.len > 0) {
+        update.context = .{
+            .system_prompt = state.system_prompt orelse context.context.system_prompt,
+            .messages = context.context.messages,
+            .tools = if (state.tools.len > 0) state.tools else context.context.tools,
+            .extension_hook_context = context.context.extension_hook_context,
+        };
+    }
+    update.model = state.model;
+    update.thinking_level = state.thinking_level;
+    return update;
 }
 
 fn drainSteeringForTest(
@@ -1146,6 +1230,125 @@ fn followUpQueueFactory(
     }
 }
 
+fn prepareContextUpdateFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+
+    switch (call_count.*) {
+        1 => {
+            try std.testing.expectEqualStrings("first prompt", context.system_prompt.?);
+            const llm_tools = context.tools orelse return error.MissingTools;
+            try std.testing.expectEqual(@as(usize, 1), llm_tools.len);
+            try std.testing.expectEqualStrings("echo", llm_tools[0].name);
+            return try buildToolCallAssistantMessage(allocator, "tool-1", "echo", "hello");
+        },
+        2 => {
+            try std.testing.expectEqualStrings("second prompt", context.system_prompt.?);
+            try std.testing.expectEqual(@as(usize, 3), context.messages.len);
+            const llm_tools = context.tools orelse return error.MissingTools;
+            try std.testing.expectEqual(@as(usize, 1), llm_tools.len);
+            try std.testing.expectEqualStrings("replacement", llm_tools[0].name);
+            const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+            blocks[0] = faux.fauxText("done after prepared context");
+            return faux.fauxAssistantMessage(blocks, .{});
+        },
+        else => return error.UnexpectedFactoryCallCount,
+    }
+}
+
+const PrepareModelReasoningStreamState = struct {
+    call_count: usize = 0,
+};
+
+fn prepareModelReasoningStreamFn(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model: ai.Model,
+    _: ai.Context,
+    options: ?ai.types.SimpleStreamOptions,
+    stream_context: ?*anyopaque,
+) !ai.event_stream.AssistantMessageEventStream {
+    const state: *PrepareModelReasoningStreamState = @ptrCast(@alignCast(stream_context orelse return error.MissingPrepareModelReasoningState));
+    state.call_count += 1;
+    var stream = ai.event_stream.createAssistantMessageEventStream(allocator, io);
+
+    const assistant = switch (state.call_count) {
+        1 => blk: {
+            try std.testing.expectEqualStrings("model-one", model.id);
+            const args = try jsonStringObject(allocator, "value", "hello");
+            const tool_calls = try allocator.alloc(ai.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "tool-1"),
+                .name = try allocator.dupe(u8, "echo"),
+                .arguments = args,
+            };
+            const content_args = try jsonStringObject(allocator, "value", "hello");
+            const content = try allocator.alloc(ai.ContentBlock, 1);
+            content[0] = .{ .tool_call = .{
+                .id = try allocator.dupe(u8, "tool-1"),
+                .name = try allocator.dupe(u8, "echo"),
+                .arguments = content_args,
+            } };
+            break :blk ai.AssistantMessage{
+                .content = content,
+                .tool_calls = tool_calls,
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = ai.Usage.init(),
+                .stop_reason = .tool_use,
+                .timestamp = 1,
+            };
+        },
+        2 => blk: {
+            try std.testing.expectEqualStrings("model-two", model.id);
+            const stream_options = options orelse return error.MissingStreamOptions;
+            try std.testing.expectEqual(ai.types.ThinkingLevel.high, stream_options.reasoning.?);
+            const content = try allocator.alloc(ai.ContentBlock, 1);
+            content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "done with next model") } };
+            break :blk ai.AssistantMessage{
+                .content = content,
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = ai.Usage.init(),
+                .stop_reason = .stop,
+                .timestamp = 1,
+            };
+        },
+        else => return error.UnexpectedFactoryCallCount,
+    };
+    stream.push(.{
+        .event_type = if (assistant.stop_reason == .tool_use) .start else .done,
+        .message = assistant,
+    });
+    if (assistant.stop_reason == .tool_use) {
+        stream.push(.{ .event_type = .done, .message = assistant });
+    }
+    stream.end(assistant);
+    return stream;
+}
+
+fn prepareStopFactory(
+    allocator: std.mem.Allocator,
+    context: ai.Context,
+    _: ?ai.types.StreamOptions,
+    call_count: *usize,
+    _: ai.Model,
+) !ai.providers.faux.FauxAssistantMessage {
+    const faux = ai.providers.faux;
+    try std.testing.expectEqual(@as(usize, 1), call_count.*);
+    try std.testing.expectEqualStrings("first prompt", context.system_prompt.?);
+    const blocks = try allocator.alloc(faux.FauxContentBlock, 1);
+    blocks[0] = faux.fauxText("stop before follow up");
+    return faux.fauxAssistantMessage(blocks, .{});
+}
+
 test "runAgentLoop injects steering messages before the next LLM call" {
     const faux = ai.providers.faux;
     const registration = try faux.registerFauxProvider(std.testing.allocator, .{
@@ -1236,6 +1439,191 @@ test "runAgentLoop processes follow-up messages only after the agent would other
     try std.testing.expectEqualStrings("first reply", result[1].assistant.content[0].text.text);
     try expectUserText(result[2], "follow up");
     try std.testing.expectEqualStrings("after follow up", result[3].assistant.content[0].text.text);
+}
+
+test "runAgentLoop uses prepare_next_turn context snapshot before continuing" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = prepareContextUpdateFactory },
+        .{ .factory = prepareContextUpdateFactory },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const echo_tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute = echoToolExecute,
+    };
+    const replacement_tool = types.AgentTool{
+        .name = "replacement",
+        .description = "Replacement tool",
+        .label = "Replacement",
+        .parameters = .null,
+    };
+    const replacement_tools = [_]types.AgentTool{replacement_tool};
+    var prepare_state = PrepareNextTurnTestState{
+        .system_prompt = "second prompt",
+        .tools = replacement_tools[0..],
+    };
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "first prompt",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{echo_tool},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .prepare_next_turn_context = &prepare_state,
+            .prepare_next_turn = prepareNextTurnForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("done after prepared context", result[3].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 2), prepare_state.callback_count);
+    try std.testing.expectEqual(@as(usize, 4), prepare_state.context_message_len);
+    try std.testing.expectEqual(@as(usize, 4), prepare_state.new_message_len);
+}
+
+test "runAgentLoop applies prepare_next_turn model and thinking level to the next request" {
+    const initial_model = ai.Model{
+        .id = "model-one",
+        .name = "Model One",
+        .api = "recording:test:prepare-model",
+        .provider = "recording",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const next_model = ai.Model{
+        .id = "model-two",
+        .name = "Model Two",
+        .api = "recording:test:prepare-model",
+        .provider = "recording",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stream_state = PrepareModelReasoningStreamState{};
+
+    const echo_tool = types.AgentTool{
+        .name = "echo",
+        .description = "Echo input",
+        .label = "Echo",
+        .parameters = .null,
+        .execute = echoToolExecute,
+    };
+    var prepare_state = PrepareNextTurnTestState{
+        .model = next_model,
+        .thinking_level = .high,
+    };
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "",
+            .messages = &.{},
+            .tools = &[_]types.AgentTool{echo_tool},
+        },
+        .{
+            .model = initial_model,
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .prepare_next_turn_context = &prepare_state,
+            .prepare_next_turn = prepareNextTurnForTest,
+            .stream_context = &stream_state,
+        },
+        null,
+        ignoreEvent,
+        null,
+        prepareModelReasoningStreamFn,
+    );
+
+    try std.testing.expectEqual(@as(usize, 4), result.len);
+    try std.testing.expectEqualStrings("model-two", result[3].assistant.model);
+    try std.testing.expectEqualStrings("done with next model", result[3].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 2), prepare_state.callback_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_state.call_count);
+}
+
+test "runAgentLoop runs prepare_next_turn before should_stop_after_turn and does not continue when stopped" {
+    const faux = ai.providers.faux;
+    const registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .token_size = .{ .min = 64, .max = 64 },
+    });
+    defer registration.unregister();
+
+    try registration.setResponses(&[_]faux.FauxResponseStep{
+        .{ .factory = prepareStopFactory },
+    });
+
+    var queue_state = PendingQueueTestState{};
+    var prepare_state = PrepareNextTurnTestState{ .system_prompt = "prepared prompt" };
+    var stop_state = ShouldStopAfterTurnTestState{ .stop_after_call = 1 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const prompts = [_]types.AgentMessage{createUserMessage("hello", 1)};
+    const result = try runAgentLoop(
+        arena.allocator(),
+        std.Io.failing,
+        prompts[0..],
+        .{
+            .system_prompt = "first prompt",
+            .messages = &.{},
+            .tools = &.{},
+        },
+        .{
+            .model = registration.getModel(),
+            .convert_to_llm = defaultConvertToLlmForTest,
+            .get_steering_messages_context = &queue_state,
+            .get_steering_messages = drainSteeringForTest,
+            .get_follow_up_messages_context = &queue_state,
+            .get_follow_up_messages = drainFollowUpsForTest,
+            .prepare_next_turn_context = &prepare_state,
+            .prepare_next_turn = prepareNextTurnForTest,
+            .should_stop_after_turn_context = &stop_state,
+            .should_stop_after_turn = shouldStopAfterTurnForTest,
+        },
+        null,
+        ignoreEvent,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("stop before follow up", result[1].assistant.content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), prepare_state.callback_count);
+    try std.testing.expectEqual(@as(usize, 1), stop_state.callback_count);
+    try std.testing.expectEqualStrings("prepared prompt", stop_state.context_system_prompt);
+    try std.testing.expectEqual(@as(usize, 1), queue_state.steering_poll_count);
+    try std.testing.expectEqual(@as(usize, 0), queue_state.follow_up_poll_count);
 }
 
 test "runAgentLoop continues normally when should_stop_after_turn returns false" {
