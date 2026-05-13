@@ -8,68 +8,44 @@ const native_runtime = @import("../extensions/native_runtime.zig");
 const sdk = @import("../extensions/sdk.zig");
 const wasm_manifest = @import("../extensions/wasm/wasm_manifest.zig");
 const session_manager = @import("session_manager.zig");
+const session_compaction = @import("session_compaction.zig");
+const session_retry = @import("session_retry.zig");
+const session_json_helpers = @import("session_json_helpers.zig");
 const tools_common = @import("../tools/common.zig");
 
-pub const CompactionSettings = struct {
-    enabled: bool = false,
-    reserve_tokens: u32 = 4096,
-    keep_recent_tokens: u32 = 20000,
-};
+pub const CompactionSettings = session_compaction.CompactionSettings;
+pub const CompactionReason = session_compaction.CompactionReason;
+pub const CompactionLifecycleEvent = session_compaction.CompactionLifecycleEvent;
+pub const CompactionLifecycleCallback = session_compaction.CompactionLifecycleCallback;
+pub const CompactionResult = session_compaction.CompactionResult;
+pub const RetrySettings = session_retry.RetrySettings;
+pub const RetryLifecycleEvent = session_retry.RetryLifecycleEvent;
+pub const RetryLifecycleCallback = session_retry.RetryLifecycleCallback;
 
-pub const RetrySettings = struct {
-    enabled: bool = false,
-    max_retries: u32 = 2,
-    base_delay_ms: u64 = 1000,
-};
+const makeObject = session_json_helpers.makeObject;
+const putString = session_json_helpers.putString;
+const putBool = session_json_helpers.putBool;
+const putInt = session_json_helpers.putInt;
+const putValue = session_json_helpers.putValue;
+const jsonObjectWithString = session_json_helpers.jsonObjectWithString;
+const jsonObjectWithTruncateInput = session_json_helpers.jsonObjectWithTruncateInput;
+const putMessageSummary = session_json_helpers.putMessageSummary;
+const putMessagesSummary = session_json_helpers.putMessagesSummary;
+const toolResultMessageEntry = session_json_helpers.toolResultMessageEntry;
+const makeToolResultPayload = session_json_helpers.makeToolResultPayload;
+const contentBlocksToJsonArray = session_json_helpers.contentBlocksToJsonArray;
 
-pub const RetryLifecycleEvent = union(enum) {
-    start: struct {
-        attempt: u32,
-        max_attempts: u32,
-        delay_ms: u64,
-        error_message: []const u8,
-    },
-    end: struct {
-        success: bool,
-        attempt: u32,
-        final_error: ?[]const u8 = null,
-    },
-};
+const findLastAssistantMessage = session_compaction.findLastAssistantMessage;
+const isContextOverflow = session_compaction.isContextOverflow;
+const shouldAutoCompact = session_compaction.shouldAutoCompact;
+const estimateContextTokens = session_compaction.estimateContextTokens;
+const prepareCompaction = session_compaction.prepareCompaction;
+const prepareManualCompaction = session_compaction.prepareManualCompaction;
+const buildCompactionSummary = session_compaction.buildCompactionSummary;
 
-pub const RetryLifecycleCallback = struct {
-    context: ?*anyopaque = null,
-    callback: *const fn (context: ?*anyopaque, event: RetryLifecycleEvent) anyerror!void,
-};
-
-pub const CompactionReason = enum {
-    manual,
-    threshold,
-    overflow,
-};
-
-pub const CompactionLifecycleEvent = union(enum) {
-    start: struct {
-        reason: CompactionReason,
-    },
-    end: struct {
-        reason: CompactionReason,
-        result: ?CompactionResult = null,
-        aborted: bool = false,
-        will_retry: bool = false,
-        error_message: ?[]const u8 = null,
-    },
-};
-
-pub const CompactionLifecycleCallback = struct {
-    context: ?*anyopaque = null,
-    callback: *const fn (context: ?*anyopaque, event: CompactionLifecycleEvent) anyerror!void,
-};
-
-pub const CompactionResult = struct {
-    summary: []const u8,
-    first_kept_entry_id: []const u8,
-    tokens_before: u32,
-};
+const isRetryableError = session_retry.isRetryableError;
+const exponentialBackoffMs = session_retry.exponentialBackoffMs;
+const sleepMilliseconds = session_retry.sleepMilliseconds;
 
 pub const QueuedInput = struct {
     text: []u8,
@@ -1190,47 +1166,6 @@ fn afterToolCallHook(
     return patch;
 }
 
-fn makeObject(allocator: std.mem.Allocator) !std.json.Value {
-    return .{ .object = try std.json.ObjectMap.init(allocator, &.{}, &.{}) };
-}
-
-fn putString(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
-    try tools_common.putString(allocator, &object, key, value);
-}
-
-fn putBool(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !void {
-    try tools_common.putBool(allocator, &object, key, value);
-}
-
-fn putInt(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: i64) !void {
-    try tools_common.putInt(allocator, &object, key, value);
-}
-
-fn putValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
-    try tools_common.putValue(allocator, &object, key, value);
-}
-
-fn jsonObjectWithString(allocator: std.mem.Allocator, key: []const u8, value: []const u8) !std.json.Value {
-    var object = try makeObject(allocator);
-    errdefer tools_common.deinitJsonValue(allocator, object);
-    try putString(allocator, &object.object, key, value);
-    return object;
-}
-
-fn jsonObjectWithTruncateInput(
-    allocator: std.mem.Allocator,
-    content: []const u8,
-    max_lines: i64,
-    max_bytes: i64,
-) !std.json.Value {
-    var object = try makeObject(allocator);
-    errdefer tools_common.deinitJsonValue(allocator, object);
-    try putString(allocator, &object.object, "content", content);
-    try putInt(allocator, &object.object, "maxLines", max_lines);
-    try putInt(allocator, &object.object, "maxBytes", max_bytes);
-    return object;
-}
-
 fn absoluteSessionTmpPath(allocator: std.mem.Allocator, sub_path: []const u8, name: []const u8) ![]u8 {
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(cwd);
@@ -1285,49 +1220,6 @@ const cross_native_descriptor: extension_runtime.NativeDescriptor = .{
     .tools = &.{cross_native_tool},
 };
 
-/// Builds `{ "role": ..., "content": "first text" }` for a single AgentMessage.
-/// Shared by putMessageSummary (single message) and putMessagesSummary (array)
-/// so the per-variant role/content extraction stays in one place.
-fn messageSummaryEntry(allocator: std.mem.Allocator, message: agent.AgentMessage) !std.json.ObjectMap {
-    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer tools_common.deinitJsonValue(allocator, .{ .object = entry });
-    const role: []const u8, const content: []const u8 = switch (message) {
-        .user => |user| .{ "user", firstText(user.content) orelse "" },
-        .assistant => |assistant| .{ "assistant", firstText(assistant.content) orelse "" },
-        .tool_result => |tool| .{ "tool", firstText(tool.content) orelse "" },
-    };
-    try putString(allocator, &entry, "role", role);
-    try putString(allocator, &entry, "content", content);
-    return entry;
-}
-
-fn putMessageSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, message: agent.AgentMessage) !void {
-    const entry = try messageSummaryEntry(allocator, message);
-    try putValue(allocator, object, "message", .{ .object = entry });
-}
-
-fn putMessagesSummary(allocator: std.mem.Allocator, object: *std.json.ObjectMap, messages: []const agent.AgentMessage) !void {
-    var array = std.json.Array.init(allocator);
-    for (messages) |message| {
-        const entry = try messageSummaryEntry(allocator, message);
-        try array.append(.{ .object = entry });
-    }
-    try putValue(allocator, object, "messages", .{ .array = array });
-}
-
-/// Builds `{ toolCallId, toolName, content, isError }` for an
-/// agent.types.ToolResultMessage; used inside lifecycle events that carry a
-/// `toolResults` array.
-fn toolResultMessageEntry(allocator: std.mem.Allocator, tool_result: agent.types.ToolResultMessage) !std.json.ObjectMap {
-    var entry = try std.json.ObjectMap.init(allocator, &.{}, &.{});
-    errdefer tools_common.deinitJsonValue(allocator, .{ .object = entry });
-    try putString(allocator, &entry, "toolCallId", tool_result.tool_call_id);
-    try putString(allocator, &entry, "toolName", tool_result.tool_name);
-    try putString(allocator, &entry, "content", firstText(tool_result.content) orelse "");
-    try putBool(allocator, &entry, "isError", tool_result.is_error);
-    return entry;
-}
-
 fn makeLifecycleEventObject(
     allocator: std.mem.Allocator,
     event_name: []const u8,
@@ -1358,15 +1250,6 @@ fn makeLifecycleEventObject(
         try putValue(allocator, &payload.object, "result", try makeToolResultPayload(allocator, result));
     }
     if (event.is_error) |is_error| try putBool(allocator, &payload.object, "isError", is_error);
-    return payload;
-}
-
-fn makeToolResultPayload(allocator: std.mem.Allocator, result: agent.types.AgentToolResult) !std.json.Value {
-    var payload = try makeObject(allocator);
-    errdefer tools_common.deinitJsonValue(allocator, payload);
-    try putValue(allocator, &payload.object, "content", try contentBlocksToJsonArray(allocator, result.content));
-    if (result.details) |details| try putValue(allocator, &payload.object, "details", try tools_common.cloneJsonValue(allocator, details));
-    try putBool(allocator, &payload.object, "isError", result.is_error);
     return payload;
 }
 
@@ -1593,41 +1476,6 @@ fn toolCallEvent(allocator: std.mem.Allocator, event_name: []const u8, tool_call
 fn putToolResultEventFields(allocator: std.mem.Allocator, object: *std.json.ObjectMap, result: agent.types.AgentToolResult) !void {
     try putValue(allocator, object, "content", try contentBlocksToJsonArray(allocator, result.content));
     if (result.details) |details| try putValue(allocator, object, "details", try tools_common.cloneJsonValue(allocator, details));
-}
-
-fn contentBlocksToJsonArray(allocator: std.mem.Allocator, blocks: []const ai.ContentBlock) !std.json.Value {
-    var array = std.json.Array.init(allocator);
-    errdefer {
-        for (array.items) |item| tools_common.deinitJsonValue(allocator, item);
-        array.deinit();
-    }
-    for (blocks) |block| switch (block) {
-        .text => |text| {
-            var entry = try makeObject(allocator);
-            errdefer tools_common.deinitJsonValue(allocator, entry);
-            try putString(allocator, &entry.object, "type", "text");
-            try putString(allocator, &entry.object, "text", text.text);
-            try array.append(entry);
-        },
-        .image => |image| {
-            var entry = try makeObject(allocator);
-            errdefer tools_common.deinitJsonValue(allocator, entry);
-            try putString(allocator, &entry.object, "type", "image");
-            try putString(allocator, &entry.object, "data", image.data);
-            try putString(allocator, &entry.object, "mimeType", image.mime_type);
-            try array.append(entry);
-        },
-        else => {},
-    };
-    return .{ .array = array };
-}
-
-fn firstText(content: []const ai.ContentBlock) ?[]const u8 {
-    for (content) |block| switch (block) {
-        .text => |text| return text.text,
-        else => {},
-    };
-    return null;
 }
 
 fn objectField(value: std.json.Value, key: []const u8) ?std.json.Value {
@@ -1958,24 +1806,6 @@ fn handleSessionManagerEvent(context: ?*anyopaque, event: agent.AgentEvent) !voi
     }
 }
 
-const CompactionPreparation = struct {
-    summary_start_index: usize,
-    first_kept_entry_index: usize,
-    tokens_before: u32,
-};
-
-fn findLastAssistantMessage(messages: []const agent.AgentMessage) ?ai.AssistantMessage {
-    var index = messages.len;
-    while (index > 0) {
-        index -= 1;
-        switch (messages[index]) {
-            .assistant => |assistant_message| return assistant_message,
-            else => {},
-        }
-    }
-    return null;
-}
-
 fn removeLastAssistantError(self: *AgentSession) bool {
     const messages = self.agent.getMessages();
     if (messages.len == 0) return false;
@@ -1987,322 +1817,6 @@ fn removeLastAssistantError(self: *AgentSession) bool {
         },
         else => return false,
     }
-}
-
-fn isContextOverflow(message: ai.AssistantMessage, context_window: u32) bool {
-    _ = context_window;
-    if (message.stop_reason != .error_reason) return false;
-    const error_message = message.error_message orelse return false;
-    inline for ([_][]const u8{
-        "overflow",
-        "context length",
-        "context window",
-        "context limit",
-        "maximum context",
-        "max context",
-        "too long",
-        "exceeded model",
-        "exceeds model",
-    }) |needle| {
-        if (string_utils.containsIgnoreCase(error_message, needle)) return true;
-    }
-    return false;
-}
-
-fn isRetryableError(message: ai.AssistantMessage, context_window: u32) bool {
-    if (message.stop_reason != .error_reason) return false;
-    const error_message = message.error_message orelse return false;
-    if (isContextOverflow(message, context_window)) return false;
-
-    return string_utils.containsIgnoreCase(error_message, "overloaded") or
-        string_utils.containsIgnoreCase(error_message, "rate limit") or
-        string_utils.containsIgnoreCase(error_message, "too many requests") or
-        string_utils.containsIgnoreCase(error_message, "service unavailable") or
-        string_utils.containsIgnoreCase(error_message, "server error") or
-        string_utils.containsIgnoreCase(error_message, "internal error") or
-        string_utils.containsIgnoreCase(error_message, "network error") or
-        string_utils.containsIgnoreCase(error_message, "connection error") or
-        string_utils.containsIgnoreCase(error_message, "connection refused") or
-        string_utils.containsIgnoreCase(error_message, "connection lost") or
-        string_utils.containsIgnoreCase(error_message, "socket hang up") or
-        string_utils.containsIgnoreCase(error_message, "fetch failed") or
-        string_utils.containsIgnoreCase(error_message, "timeout") or
-        string_utils.containsIgnoreCase(error_message, "timed out") or
-        string_utils.containsIgnoreCase(error_message, "429") or
-        string_utils.containsIgnoreCase(error_message, "500") or
-        string_utils.containsIgnoreCase(error_message, "502") or
-        string_utils.containsIgnoreCase(error_message, "503") or
-        string_utils.containsIgnoreCase(error_message, "504");
-}
-
-fn shouldAutoCompact(context_tokens: u32, context_window: u32, settings: CompactionSettings) bool {
-    if (!settings.enabled or context_window == 0) return false;
-    const threshold = if (context_window > settings.reserve_tokens) context_window - settings.reserve_tokens else 0;
-    return context_tokens > threshold;
-}
-
-fn estimateContextTokens(messages: []const agent.AgentMessage) u32 {
-    var total: u32 = 0;
-    for (messages) |message| {
-        total += estimateMessageTokens(message);
-    }
-    return total;
-}
-
-fn estimateMessageTokens(message: agent.AgentMessage) u32 {
-    var chars: usize = 0;
-    switch (message) {
-        .user => |user_message| {
-            for (user_message.content) |block| {
-                switch (block) {
-                    .text => |text| chars += text.text.len,
-                    .image => chars += 4800,
-                    .thinking => |thinking| chars += thinking.thinking.len,
-                    .tool_call => |tool_call| {
-                        chars += tool_call.name.len;
-                        chars += jsonValueCharCount(tool_call.arguments);
-                    },
-                }
-            }
-        },
-        .assistant => |assistant_message| {
-            if (assistant_message.stop_reason == .error_reason) return 0;
-            for (assistant_message.content) |block| {
-                switch (block) {
-                    .text => |text| chars += text.text.len,
-                    .image => chars += 4800,
-                    .thinking => |thinking| chars += thinking.thinking.len,
-                    .tool_call => |tool_call| {
-                        chars += tool_call.name.len;
-                        chars += jsonValueCharCount(tool_call.arguments);
-                    },
-                }
-            }
-            if (!ai.hasInlineToolCalls(assistant_message)) {
-                if (assistant_message.tool_calls) |tool_calls| {
-                    for (tool_calls) |tool_call| {
-                        chars += tool_call.name.len;
-                        chars += jsonValueCharCount(tool_call.arguments);
-                    }
-                }
-            }
-        },
-        .tool_result => |tool_result| {
-            for (tool_result.content) |block| {
-                switch (block) {
-                    .text => |text| chars += text.text.len,
-                    .image => chars += 4800,
-                    .thinking => |thinking| chars += thinking.thinking.len,
-                    .tool_call => |tool_call| {
-                        chars += tool_call.name.len;
-                        chars += jsonValueCharCount(tool_call.arguments);
-                    },
-                }
-            }
-        },
-    }
-    return @intCast((chars + 3) / 4);
-}
-
-fn jsonValueCharCount(value: std.json.Value) usize {
-    return switch (value) {
-        .null => 4,
-        .bool => |bool_value| if (bool_value) 4 else 5,
-        .integer => |integer| std.fmt.count("{}", .{integer}),
-        .float => |float_value| std.fmt.count("{d}", .{float_value}),
-        .number_string => |number_string| number_string.len,
-        .string => |string| string.len,
-        .array => |array| blk: {
-            var total: usize = 2;
-            for (array.items, 0..) |item, index| {
-                if (index > 0) total += 1;
-                total += jsonValueCharCount(item);
-            }
-            break :blk total;
-        },
-        .object => |object| blk: {
-            var total: usize = 2;
-            var iterator = object.iterator();
-            var first = true;
-            while (iterator.next()) |entry| {
-                if (!first) total += 1;
-                first = false;
-                total += entry.key_ptr.*.len + jsonValueCharCount(entry.value_ptr.*) + 1;
-            }
-            break :blk total;
-        },
-    };
-}
-
-fn prepareCompaction(
-    branch_entries: []const *const session_manager.SessionEntry,
-    keep_recent_tokens: u32,
-) ?CompactionPreparation {
-    if (branch_entries.len == 0) return null;
-
-    var latest_compaction_index: ?usize = null;
-    for (branch_entries, 0..) |entry, index| {
-        if (entry.* == .compaction) latest_compaction_index = index;
-    }
-
-    const summary_start_index = if (latest_compaction_index) |index| index + 1 else 0;
-    if (summary_start_index >= branch_entries.len) return null;
-
-    var tokens_before: u32 = 0;
-    var first_visible_index: ?usize = null;
-    for (branch_entries[summary_start_index..], summary_start_index..) |entry, index| {
-        const entry_tokens = visibleEntryTokens(entry.*);
-        if (entry_tokens == 0) continue;
-        if (first_visible_index == null) first_visible_index = index;
-        tokens_before += entry_tokens;
-    }
-
-    const first_visible = first_visible_index orelse return null;
-    if (tokens_before <= keep_recent_tokens) return null;
-
-    var kept_tokens: u32 = 0;
-    var first_kept_entry_index = first_visible;
-    var index = branch_entries.len;
-    while (index > summary_start_index) {
-        index -= 1;
-        const entry_tokens = visibleEntryTokens(branch_entries[index].*);
-        if (entry_tokens == 0) continue;
-        kept_tokens += entry_tokens;
-        first_kept_entry_index = index;
-        if (kept_tokens >= keep_recent_tokens) break;
-    }
-
-    if (first_kept_entry_index <= first_visible) return null;
-
-    return .{
-        .summary_start_index = summary_start_index,
-        .first_kept_entry_index = first_kept_entry_index,
-        .tokens_before = tokens_before,
-    };
-}
-
-fn prepareManualCompaction(branch_entries: []const *const session_manager.SessionEntry) ?CompactionPreparation {
-    if (branch_entries.len == 0) return null;
-
-    var latest_compaction_index: ?usize = null;
-    for (branch_entries, 0..) |entry, index| {
-        if (entry.* == .compaction) latest_compaction_index = index;
-    }
-
-    const summary_start_index = if (latest_compaction_index) |index| index + 1 else 0;
-    if (summary_start_index >= branch_entries.len) return null;
-
-    var visible_count: usize = 0;
-    var last_visible_index: ?usize = null;
-    var tokens_before: u32 = 0;
-    for (branch_entries[summary_start_index..], summary_start_index..) |entry, index| {
-        const entry_tokens = visibleEntryTokens(entry.*);
-        if (entry_tokens == 0) continue;
-        visible_count += 1;
-        last_visible_index = index;
-        tokens_before += entry_tokens;
-    }
-
-    if (visible_count < 2 or last_visible_index == null) return null;
-
-    return .{
-        .summary_start_index = summary_start_index,
-        .first_kept_entry_index = last_visible_index.?,
-        .tokens_before = tokens_before,
-    };
-}
-
-fn visibleEntryTokens(entry: session_manager.SessionEntry) u32 {
-    return switch (entry) {
-        .message => |message_entry| estimateMessageTokens(message_entry.message),
-        else => 0,
-    };
-}
-
-fn buildCompactionSummary(
-    allocator: std.mem.Allocator,
-    branch_entries: []const *const session_manager.SessionEntry,
-    start_index: usize,
-    end_index: usize,
-    custom_instructions: ?[]const u8,
-) ![]u8 {
-    var writer: std.Io.Writer.Allocating = .init(allocator);
-    defer writer.deinit();
-
-    try writer.writer.writeAll("Earlier conversation summary:");
-    if (custom_instructions) |instructions| {
-        try writer.writer.print("\nFocus: {s}", .{instructions});
-    }
-
-    var wrote_line = false;
-    for (branch_entries[start_index..end_index]) |entry| {
-        if (entry.* != .message) continue;
-        switch (entry.message.message) {
-            .user => |user_message| {
-                const text = summarizeBlocks(user_message.content);
-                if (text.len == 0) continue;
-                try writer.writer.print("\n- user: {s}", .{text});
-                wrote_line = true;
-            },
-            .assistant => |assistant_message| {
-                if (assistant_message.stop_reason == .error_reason or assistant_message.stop_reason == .aborted) continue;
-                const text = summarizeAssistant(assistant_message);
-                if (text.len == 0) continue;
-                try writer.writer.print("\n- assistant: {s}", .{text});
-                wrote_line = true;
-            },
-            .tool_result => |tool_result| {
-                const text = summarizeBlocks(tool_result.content);
-                if (text.len == 0) continue;
-                try writer.writer.print("\n- tool {s}: {s}", .{ tool_result.tool_name, text });
-                wrote_line = true;
-            },
-        }
-    }
-
-    if (!wrote_line) {
-        try writer.writer.writeAll("\n- Session history was compacted to keep recent context available.");
-    }
-
-    return try allocator.dupe(u8, writer.written());
-}
-
-fn summarizeAssistant(message: ai.AssistantMessage) []const u8 {
-    const text = summarizeBlocks(message.content);
-    if (text.len > 0) return text;
-    if (message.tool_calls) |tool_calls| {
-        if (tool_calls.len > 0) return tool_calls[0].name;
-    }
-    return "";
-}
-
-fn summarizeBlocks(blocks: []const ai.ContentBlock) []const u8 {
-    for (blocks) |block| {
-        switch (block) {
-            .text => |text| if (text.text.len > 0) return trimSummary(text.text),
-            .thinking => |thinking| if (thinking.thinking.len > 0) return trimSummary(thinking.thinking),
-            else => {},
-        }
-    }
-    return "";
-}
-
-fn trimSummary(text: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, text, " \n\r\t");
-    return if (trimmed.len > 120) trimmed[0..120] else trimmed;
-}
-
-fn exponentialBackoffMs(base_delay_ms: u64, attempt: u32) u64 {
-    const exponent = if (attempt == 0) 0 else attempt - 1;
-    if (exponent >= 63) return std.math.maxInt(u64);
-    const multiplier = @as(u64, 1) << @intCast(exponent);
-    const product, const overflowed = @mulWithOverflow(base_delay_ms, multiplier);
-    return if (overflowed != 0) std.math.maxInt(u64) else product;
-}
-
-fn sleepMilliseconds(io: std.Io, delay_ms: u64) !void {
-    const clamped = @min(delay_ms, @as(u64, std.math.maxInt(i64)));
-    try std.Io.sleep(io, .fromMilliseconds(@intCast(clamped)), .awake);
 }
 
 test "agent session creation keeps model system prompt and working directory" {
@@ -3941,4 +3455,10 @@ test "extension lifecycle hooks run deterministically by host order" {
     try std.testing.expectEqualStrings("second", order_log.items[1]);
     try std.testing.expectEqual(@as(usize, 1), first.turn_start_calls);
     try std.testing.expectEqual(@as(usize, 1), second.turn_start_calls);
+}
+
+test {
+    _ = session_compaction;
+    _ = session_retry;
+    _ = session_json_helpers;
 }
