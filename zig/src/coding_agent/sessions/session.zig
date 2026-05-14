@@ -1287,11 +1287,26 @@ fn emitModelSelectHook(
     previous_model: ai.Model,
     source: []const u8,
 ) !void {
-    return emitNotificationHook(allocator, ctx, "model_select", &.{
-        .{ .json_owned = .{ .key = "model", .value = try modelToJsonValue(allocator, model) } },
-        .{ .json_owned = .{ .key = "previousModel", .value = try modelToJsonValue(allocator, previous_model) } },
-        .{ .string = .{ .key = "source", .value = source } },
-    });
+    if (!ctx.hasHook("model_select")) return;
+    var event = try makeObject(allocator);
+    defer tools_common.deinitJsonValue(allocator, event);
+    try putString(allocator, &event.object, "type", "model_select");
+    try putOwnedJsonField(allocator, &event.object, "model", try modelToJsonValue(allocator, model));
+    try putOwnedJsonField(allocator, &event.object, "previousModel", try modelToJsonValue(allocator, previous_model));
+    try putString(allocator, &event.object, "source", source);
+    const result = try ctx.invoke(allocator, "model_select", event);
+    if (result) |value| tools_common.deinitJsonValue(allocator, value);
+}
+
+fn putOwnedJsonField(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    const owned = value;
+    errdefer tools_common.deinitJsonValue(allocator, owned);
+    try putValue(allocator, object, key, owned);
 }
 
 fn emitThinkingLevelSelectHook(

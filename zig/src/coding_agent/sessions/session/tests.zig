@@ -712,6 +712,10 @@ const TestHookHost = struct {
     session_before_tree_calls: usize = 0,
     before_provider_request_calls: usize = 0,
     after_provider_response_calls: usize = 0,
+    expected_model_select_model_id: ?[]const u8 = null,
+    expected_model_select_previous_id: ?[]const u8 = null,
+    expected_model_select_source: ?[]const u8 = null,
+    model_select_payload_matched: bool = false,
     input_handled: bool = false,
     before_agent_start_handled: bool = false,
     context_invalid: bool = false,
@@ -830,7 +834,6 @@ fn testHookInvoke(
     event: std.json.Value,
     timeout_ms: u64,
 ) !?std.json.Value {
-    _ = event;
     _ = timeout_ms;
     const host = testHookHost(ptr);
     if (host.order_log) |log| {
@@ -887,6 +890,39 @@ fn testHookInvoke(
         try putBool(allocator, &result.object, "isError", false);
         return result;
     }
+    if (std.mem.eql(u8, event_name, "model_select")) {
+        host.model_select_calls += 1;
+        if (host.expected_model_select_model_id) |expected_model_id| {
+            const expected_previous_id = host.expected_model_select_previous_id orelse "";
+            const expected_source = host.expected_model_select_source orelse "";
+            if (event == .object) {
+                const model_value = event.object.get("model");
+                const previous_value = event.object.get("previousModel");
+                const source_value = event.object.get("source");
+                if (model_value != null and
+                    previous_value != null and
+                    source_value != null and
+                    model_value.? == .object and
+                    previous_value.? == .object and
+                    source_value.? == .string)
+                {
+                    const model_id = model_value.?.object.get("id");
+                    const previous_id = previous_value.?.object.get("id");
+                    if (model_id != null and
+                        previous_id != null and
+                        model_id.? == .string and
+                        previous_id.? == .string)
+                    {
+                        host.model_select_payload_matched =
+                            std.mem.eql(u8, model_id.?.string, expected_model_id) and
+                            std.mem.eql(u8, previous_id.?.string, expected_previous_id) and
+                            std.mem.eql(u8, source_value.?.string, expected_source);
+                    }
+                }
+            }
+        }
+        return result;
+    }
     if (std.mem.eql(u8, event_name, "session_before_compact")) {
         host.session_before_compact_calls += 1;
         if (host.cancel_session_before) try putBool(allocator, &result.object, "cancel", true);
@@ -912,7 +948,6 @@ fn testHookInvoke(
         "tool_execution_start",
         "tool_execution_update",
         "tool_execution_end",
-        "model_select",
         "thinking_level_select",
         "session_start",
         "session_shutdown",
@@ -1576,6 +1611,9 @@ test "Stage C: model_select / thinking_level_select fire from session setters" {
     var fixture = TestHookHost{
         .model_select = true,
         .thinking_level_select = true,
+        .expected_model_select_model_id = "faux-2",
+        .expected_model_select_previous_id = registration.getModel().id,
+        .expected_model_select_source = "set",
     };
     const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
     var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
@@ -1588,15 +1626,52 @@ test "Stage C: model_select / thinking_level_select fire from session setters" {
 
     // Switch the model to a fresh registration to trigger model_select.
     const second_registration = try faux.registerFauxProvider(std.testing.allocator, .{
+        .models = &.{.{ .id = "faux-2", .name = "Faux 2" }},
         .token_size = .{ .min = 64, .max = 64 },
     });
     defer second_registration.unregister();
     try session.setModel(second_registration.getModel());
     try std.testing.expectEqual(@as(usize, 1), fixture.model_select_calls);
+    try std.testing.expect(fixture.model_select_payload_matched);
 
     // Change the thinking level to trigger thinking_level_select.
     try session.setThinkingLevel(.medium);
     try std.testing.expectEqual(@as(usize, 1), fixture.thinking_level_select_calls);
+}
+
+test "Session.setModel does not leak model select JSON when hook is absent" {
+    const first_model = ai.Model{
+        .id = "first-model",
+        .name = "First Model",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const second_model = ai.Model{
+        .id = "second-model",
+        .name = "Second Model",
+        .api = "faux",
+        .provider = "faux",
+        .base_url = "",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    var fixture = TestHookHost{};
+    const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
+    var session = try AgentSession.create(std.testing.allocator, std.testing.io, .{
+        .cwd = "/tmp/model-select-no-hook",
+        .system_prompt = "system",
+        .model = first_model,
+        .extension_hosts = adapters[0..],
+    });
+    defer session.deinit();
+
+    try session.setModel(second_model);
+    try std.testing.expectEqual(@as(usize, 0), fixture.model_select_calls);
 }
 
 test "Stage B: tool_execution_start / update / end events forward to extension hooks" {
