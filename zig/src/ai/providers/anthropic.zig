@@ -323,6 +323,18 @@ pub fn mapStopReason(reason: []const u8) types.StopReason {
     return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.anthropic_mappings, reason, .error_reason);
 }
 
+fn applyProviderStopReason(allocator: std.mem.Allocator, output: *types.AssistantMessage, reason: []const u8) !void {
+    const mapped = mapStopReason(reason);
+    output.stop_reason = mapped;
+    if (mapped == .error_reason) {
+        if (output.error_message) |existing| allocator.free(existing);
+        output.error_message = try std.fmt.allocPrint(allocator, "Provider stop_reason: {s}", .{reason});
+    } else if (output.error_message) |existing| {
+        allocator.free(existing);
+        output.error_message = null;
+    }
+}
+
 fn anthropicEffortString(effort: types.AnthropicEffort) []const u8 {
     return switch (effort) {
         .low => "low",
@@ -623,6 +635,66 @@ test "parse anthropic stream handles compact data fields and provider errors" {
     try std.testing.expectEqual(types.EventType.error_event, error_event.event_type);
     try std.testing.expectEqualStrings("invalid_request_error: bad request", error_event.error_message.?);
     try std.testing.expectEqual(types.StopReason.error_reason, error_event.message.?.stop_reason);
+}
+
+test "parse anthropic-compatible stream preserves error stop reason message" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body =
+        "event: message_start\n" ++
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_kimi_search_refusal\",\"usage\":{\"input_tokens\":9,\"output_tokens\":0}}}\n" ++
+        "\n" ++
+        "event: content_block_start\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" ++
+        "\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Sources:\\n- Result one\\n\"}}\n" ++
+        "\n" ++
+        "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" ++
+        "event: message_delta\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"sensitive\"},\"usage\":{\"output_tokens\":4}}\n" ++
+        "\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n" ++
+        "\n";
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = try allocator.dupe(u8, body),
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-for-coding",
+        .name = "Kimi For Coding",
+        .api = "anthropic-messages",
+        .provider = "kimi-coding",
+        .base_url = "https://api.kimi.com/coding",
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, .{ .messages = &[_]types.Message{} }, null);
+
+    var done_message: ?types.AssistantMessage = null;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .done) done_message = event.message.?;
+    }
+
+    try std.testing.expect(done_message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, done_message.?.stop_reason);
+    try std.testing.expect(done_message.?.error_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, done_message.?.error_message.?, "sensitive") != null);
+    try std.testing.expectEqualStrings("Sources:\n- Result one\n", done_message.?.content[0].text.text);
 }
 
 test "parse anthropic stream preserves frame-aware multiline data under shared SSE loop" {
@@ -2455,7 +2527,7 @@ fn processAnthropicSseEvent(
         if (value.object.get("delta")) |delta_value| {
             if (delta_value == .object) {
                 if (delta_value.object.get("stop_reason")) |stop_reason| {
-                    if (stop_reason == .string) output.stop_reason = mapStopReason(stop_reason.string);
+                    if (stop_reason == .string) try applyProviderStopReason(allocator, output, stop_reason.string);
                 }
             }
         }

@@ -600,10 +600,14 @@ fn processKimiSseData(
 
     if (choice.object.get("finish_reason")) |finish_reason| {
         if (finish_reason == .string) {
-            const mapped = mapStopReason(finish_reason.string);
+            const mapped = try mapStopReason(allocator, finish_reason.string);
             output.stop_reason = mapped.stop_reason;
             if (mapped.error_message) |error_message| {
+                if (output.error_message) |existing| allocator.free(existing);
                 output.error_message = error_message;
+            } else if (output.error_message) |existing| {
+                allocator.free(existing);
+                output.error_message = null;
             }
         }
     }
@@ -947,8 +951,15 @@ fn extractU32Field(value: std.json.Value, key: []const u8) u32 {
     return 0;
 }
 
-fn mapStopReason(reason: []const u8) stop_reason_mod.StopReasonResult {
-    return stop_reason_mod.mapStopReasonFromTableWithMessage(&stop_reason_mod.kimi_mappings, reason);
+fn mapStopReason(allocator: std.mem.Allocator, reason: []const u8) !stop_reason_mod.StopReasonResult {
+    const mapped = stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.kimi_mappings, reason, .error_reason);
+    return .{
+        .stop_reason = mapped,
+        .error_message = if (mapped == .error_reason)
+            try std.fmt.allocPrint(allocator, "Provider finish_reason: {s}", .{reason})
+        else
+            null,
+    };
 }
 
 fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !std.json.Value {
@@ -1179,6 +1190,55 @@ test "parseSseStream keeps Kimi compact data-line tolerance under shared SSE loo
     try std.testing.expectEqualStrings("cmpl_compact", done.message.?.response_id.?);
     try std.testing.expectEqual(types.StopReason.stop, done.message.?.stop_reason);
     freeAssistantMessageOwned(allocator, done.message.?);
+}
+
+test "parseSseStream preserves kimi error finish reason message" {
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"cmpl_kimi_content_filter\",\"choices\":[{\"delta\":{\"content\":\"Search results\\n- item\"},\"finish_reason\":null}]}\n" ++
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\",\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var stream_instance = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream_instance.deinit();
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    const model = types.Model{
+        .id = "kimi-k2.6",
+        .name = "Kimi K2.6",
+        .api = "kimi-completions",
+        .provider = "kimi",
+        .base_url = "https://api.moonshot.ai/v1",
+        .reasoning = true,
+        .input_types = &[_][]const u8{"text"},
+        .context_window = 262144,
+        .max_tokens = 32768,
+    };
+
+    try parseSseStreamLines(allocator, &stream_instance, &streaming, model, null);
+
+    var done_message: ?types.AssistantMessage = null;
+    while (stream_instance.next()) |event| {
+        if (event.event_type == .done) done_message = event.message.?;
+    }
+
+    try std.testing.expect(done_message != null);
+    try std.testing.expectEqual(types.StopReason.error_reason, done_message.?.stop_reason);
+    try std.testing.expect(done_message.?.error_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, done_message.?.error_message.?, "content_filter") != null);
+    try std.testing.expectEqualStrings("Search results\n- item", done_message.?.content[0].text.text);
+    freeAssistantMessageOwned(allocator, done_message.?);
 }
 
 test "parseChunk rejects malformed provider control envelopes without JSON repair" {

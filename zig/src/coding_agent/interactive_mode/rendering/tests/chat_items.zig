@@ -549,6 +549,50 @@ test "execution panel preserves recent tool activity after completion" {
     try std.testing.expect(renderedLinesContain(lines, "Tool completed web_search"));
 }
 
+test "assistant provider error after tool result renders concrete message" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    try state.handleAgentEvent(.{
+        .event_type = .tool_execution_end,
+        .tool_name = "web_search",
+        .result = .{
+            .content = &[_]ai.ContentBlock{.{ .text = .{ .text = "Sources:\n- result" } }},
+        },
+        .is_error = false,
+    });
+
+    const assistant_blocks = [_]ai.ContentBlock{.{ .text = .{ .text = "Sources:\n- result" } }};
+    try state.handleAgentEvent(.{
+        .event_type = .message_end,
+        .message = .{ .assistant = .{
+            .content = &assistant_blocks,
+            .api = "anthropic-messages",
+            .provider = "kimi-coding",
+            .model = "kimi-for-coding",
+            .usage = ai.Usage.init(),
+            .stop_reason = .error_reason,
+            .error_message = "Provider stop_reason: sensitive",
+            .timestamp = 0,
+        } },
+    });
+
+    var editor = tui.Editor.init(allocator);
+    defer editor.deinit();
+    var screen_component = ScreenComponent{
+        .state = &state,
+        .editor = &editor,
+        .height = 12,
+    };
+
+    const lines = try renderScreenToLines(allocator, &screen_component, 100);
+    defer freeLinesSlice(allocator, lines);
+    try std.testing.expect(renderedLinesContain(lines, "Error: Provider stop_reason: sensitive"));
+    try std.testing.expect(!renderedLinesContain(lines, "Unknown error"));
+}
+
 test "tool expansion rerenders existing bash details immediately" {
     const allocator = std.testing.allocator;
 
