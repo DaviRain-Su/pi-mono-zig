@@ -218,6 +218,20 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		this.shellEnv = options.shellEnv;
 	}
 
+	async absolutePath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>> {
+		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult<string>(abortSignal, resolved);
+		if (aborted) return aborted;
+		return ok(resolved);
+	}
+
+	async joinPath(parts: string[], abortSignal?: AbortSignal): Promise<Result<string, FileError>> {
+		const joined = join(...parts);
+		const aborted = abortResult<string>(abortSignal, joined);
+		if (aborted) return aborted;
+		return ok(joined);
+	}
+
 	async exec(
 		command: string,
 		options?: {
@@ -438,7 +452,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		}
 	}
 
-	async realPath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>> {
+	async canonicalPath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>> {
 		const resolved = resolvePath(this.cwd, path);
 		const aborted = abortResult<string>(abortSignal, resolved);
 		if (aborted) return aborted;

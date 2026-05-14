@@ -93,10 +93,10 @@ export interface AgentHarnessStreamOptionsPatch
 	metadata?: Record<string, unknown | undefined>;
 }
 
-/** Kind of filesystem object as addressed by an {@link ExecutionEnv}. Symlinks are not followed automatically. */
+/** Kind of filesystem object as addressed by a {@link FileSystem}. Symlinks are not followed automatically. */
 export type FileKind = "file" | "directory" | "symlink";
 
-/** Stable, backend-independent file error codes returned by {@link ExecutionEnv} file operations. */
+/** Stable, backend-independent file error codes returned by {@link FileSystem} file operations. */
 export type FileErrorCode =
 	| "aborted"
 	| "not_found"
@@ -107,7 +107,7 @@ export type FileErrorCode =
 	| "not_supported"
 	| "unknown";
 
-/** Error returned by {@link ExecutionEnv} file operations. */
+/** Error returned by {@link FileSystem} file operations. */
 export class FileError extends Error {
 	constructor(
 		/** Backend-independent error code. */
@@ -154,13 +154,13 @@ export class CompactionError extends Error {
 	}
 }
 
-/** Metadata for one filesystem object in an {@link ExecutionEnv}. */
+/** Metadata for one filesystem object in a {@link FileSystem}. */
 export interface FileInfo {
 	/** Basename of {@link path}. */
 	name: string;
 	/** Absolute, syntactically normalized addressed path in the execution environment. Symlinks are not followed. */
 	path: string;
-	/** Object kind. Symlink targets are not followed; use {@link ExecutionEnv.resolvePath} explicitly. */
+	/** Object kind. Symlink targets are not followed; use {@link FileSystem.canonicalPath} explicitly. */
 	kind: FileKind;
 	/** Size in bytes for the addressed filesystem object. */
 	size: number;
@@ -168,7 +168,7 @@ export interface FileInfo {
 	mtimeMs: number;
 }
 
-/** Options for {@link ExecutionEnv.exec}. */
+/** Options for {@link Shell.exec}. */
 export interface ExecutionEnvExecOptions {
 	/** Working directory for the command. Relative paths are resolved against {@link ExecutionEnv.cwd}. Defaults to {@link ExecutionEnv.cwd}. */
 	cwd?: string;
@@ -185,24 +185,22 @@ export interface ExecutionEnvExecOptions {
 }
 
 /**
- * Filesystem and process execution environment used by the harness.
+ * Filesystem capability used by the harness.
  *
- * Paths passed to methods may be absolute or relative to {@link cwd}. Paths returned by this interface are absolute
- * addressed paths in the environment, but are not canonicalized through symlinks unless returned by {@link resolvePath}.
+ * Paths passed to methods may be absolute or relative to {@link cwd}. Paths returned by file operations are addressed paths
+ * in the filesystem namespace, but are not canonicalized through symlinks unless returned by {@link canonicalPath}.
  *
- * Operation methods must never throw or reject. All filesystem/process failures, including unexpected backend failures,
- * must be encoded in the returned {@link Result}. Implementations must preserve this invariant.
+ * Operation methods must never throw or reject. All filesystem failures, including unexpected backend failures, must be
+ * encoded in the returned {@link Result}. Implementations must preserve this invariant.
  */
-export interface ExecutionEnv {
-	/** Current working directory for relative paths and command execution. */
+export interface FileSystem {
+	/** Current working directory for relative paths. */
 	cwd: string;
 
-	/** Execute a shell command in {@link cwd} unless `options.cwd` is provided. */
-	exec(
-		command: string,
-		options?: ExecutionEnvExecOptions,
-	): Promise<Result<{ stdout: string; stderr: string; exitCode: number }, ExecutionError>>;
-
+	/** Return an absolute addressed path without requiring it to exist and without resolving symlinks. */
+	absolutePath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
+	/** Join path segments in the filesystem namespace without requiring the result to exist. */
+	joinPath(parts: string[], abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
 	/** Read a UTF-8 text file. */
 	readTextFile(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
 	/** Read a binary file. */
@@ -215,8 +213,8 @@ export interface ExecutionEnv {
 	fileInfo(path: string, abortSignal?: AbortSignal): Promise<Result<FileInfo, FileError>>;
 	/** List direct children of a directory without following symlinks. */
 	listDir(path: string, abortSignal?: AbortSignal): Promise<Result<FileInfo[], FileError>>;
-	/** Return the canonical path for a path, following symlinks. */
-	realPath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
+	/** Return the canonical path for an existing path, resolving symlinks where supported. */
+	canonicalPath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
 	/** Return false for missing paths. Other errors, such as permission failures, return a {@link FileError}. */
 	exists(path: string, abortSignal?: AbortSignal): Promise<Result<boolean, FileError>>;
 	/** Create a directory. Defaults: `recursive: true`, no abort signal. */
@@ -238,9 +236,23 @@ export interface ExecutionEnv {
 		abortSignal?: AbortSignal;
 	}): Promise<Result<string, FileError>>;
 
-	/** Release resources owned by the environment. Must be best-effort and must not throw or reject. */
+	/** Release filesystem resources. Must be best-effort and must not throw or reject. */
 	cleanup(): Promise<void>;
 }
+
+/** Shell execution capability used by the harness. */
+export interface Shell {
+	/** Execute a shell command in {@link FileSystem.cwd} unless `options.cwd` is provided. */
+	exec(
+		command: string,
+		options?: ExecutionEnvExecOptions,
+	): Promise<Result<{ stdout: string; stderr: string; exitCode: number }, ExecutionError>>;
+	/** Release shell resources. Must be best-effort and must not throw or reject. */
+	cleanup(): Promise<void>;
+}
+
+/** Filesystem and process execution environment used by the harness. */
+export interface ExecutionEnv extends FileSystem, Shell {}
 
 export interface SessionTreeEntryBase {
 	type: string;

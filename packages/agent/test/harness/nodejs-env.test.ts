@@ -2,7 +2,7 @@ import { access, chmod, realpath, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.js";
-import { FileError, getOrThrow } from "../../src/harness/execution-env.js";
+import { FileError, getOrThrow } from "../../src/harness/types.js";
 import { executeShellWithCapture } from "../../src/harness/utils/shell-output.js";
 import { createTempDir } from "./session-test-utils.js";
 
@@ -21,6 +21,8 @@ describe("NodeExecutionEnv", () => {
 	it("reads, writes, lists, and removes files and directories", async () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });
+		expect(getOrThrow(await env.absolutePath("nested/child"))).toBe(join(root, "nested/child"));
+		expect(getOrThrow(await env.joinPath([root, "nested", "child"]))).toBe(join(root, "nested", "child"));
 		getOrThrow(await env.createDir("nested/child"));
 		getOrThrow(await env.writeFile("nested/child/file.txt", "hel"));
 		getOrThrow(await env.appendFile("nested/child/file.txt", "lo"));
@@ -71,7 +73,7 @@ describe("NodeExecutionEnv", () => {
 			path: join(root, "dir-link"),
 			kind: "symlink",
 		});
-		expect(getOrThrow(await env.realPath("file-link"))).toBe(await realpath(join(root, "dir/file.txt")));
+		expect(getOrThrow(await env.canonicalPath("file-link"))).toBe(await realpath(join(root, "dir/file.txt")));
 	});
 
 	it("lists symlinks as symlinks", async () => {
@@ -168,7 +170,7 @@ describe("NodeExecutionEnv", () => {
 			env.appendFile("other.txt", "hello", signal),
 			env.fileInfo("file.txt", signal),
 			env.listDir(".", signal),
-			env.realPath("file.txt", signal),
+			env.canonicalPath("file.txt", signal),
 			env.exists("file.txt", signal),
 			env.createDir("dir", { abortSignal: signal }),
 			env.remove("file.txt", { abortSignal: signal }),

@@ -2,8 +2,8 @@ import { fauxAssistantMessage, fauxToolCall, getModel, registerFauxProvider } fr
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentHarness } from "../../src/harness/agent-harness.js";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.js";
+import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.js";
 import { Session } from "../../src/harness/session/session.js";
-import { InMemorySessionStorage } from "../../src/harness/session/storage/memory.js";
 import type { PromptTemplate, Skill } from "../../src/harness/types.js";
 import type { AgentMessage, AgentTool } from "../../src/types.js";
 import { calculateTool } from "../utils/calculate.js";

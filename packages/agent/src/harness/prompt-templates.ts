@@ -148,9 +148,9 @@ async function loadTemplateFromFile(
 
 async function resolveKind(env: ExecutionEnv, info: FileInfo): Promise<"file" | "directory" | undefined> {
 	if (info.kind === "file" || info.kind === "directory") return info.kind;
-	const realPath = await env.realPath(info.path);
-	if (!realPath.ok) return undefined;
-	const target = getOrUndefined(await env.fileInfo(realPath.value));
+	const canonicalPath = await env.canonicalPath(info.path);
+	if (!canonicalPath.ok) return undefined;
+	const target = getOrUndefined(await env.fileInfo(canonicalPath.value));
 	if (!target) return undefined;
 	return target.kind === "file" || target.kind === "directory" ? target.kind : undefined;
 }
