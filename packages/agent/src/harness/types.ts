@@ -1,6 +1,5 @@
 import type { ImageContent, Model, SimpleStreamOptions, TextContent, Transport } from "@earendil-works/pi-ai";
-import type { QueueMode } from "../agent.js";
-import type { AgentEvent, AgentMessage, AgentTool, ThinkingLevel } from "../index.js";
+import type { AgentEvent, AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../index.js";
 import type { Session } from "./session/session.js";
 
 /** Result of a fallible operation. Expected failures are returned as `ok: false` instead of thrown. */
