@@ -383,6 +383,143 @@ pub const PROVIDERS: []const ProviderInfo = &.{
     },
 };
 
+comptime {
+    @setEvalBranchQuota(10_000);
+    validateProviderInfoComptime();
+}
+
+fn validateProviderInfoComptime() void {
+    inline for (PROVIDERS, 0..) |provider, i| {
+        if (provider.id.len == 0) @compileError("provider_info row has empty provider id");
+        if (provider.display_name) |display_name| {
+            if (display_name.len == 0) @compileError("provider_info display_name is empty for provider '" ++ provider.id ++ "'");
+        }
+        if (provider.default_model) |default_model| {
+            if (default_model.len == 0) @compileError("provider_info default_model is empty for provider '" ++ provider.id ++ "'");
+        }
+        if (provider.missing_api_key_message) |message| {
+            if (message.len == 0) @compileError("provider_info missing_api_key_message is empty for provider '" ++ provider.id ++ "'");
+        }
+        if (provider.oauth_default_client_id) |client_id| {
+            if (client_id.len == 0) @compileError("provider_info oauth_default_client_id is empty for provider '" ++ provider.id ++ "'");
+        }
+
+        inline for (PROVIDERS[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, provider.id, other.id)) {
+                @compileError("provider_info duplicate provider id '" ++ provider.id ++ "'");
+            }
+        }
+
+        validateEnvMetadataComptime(provider);
+        validatePreferInitialComptime(provider);
+        validateRegistryMetadataComptime(provider);
+    }
+
+    inline for (model_registry.builtInProviderConfigs()) |cfg| {
+        if (std.mem.eql(u8, cfg.provider, "faux")) continue;
+        if (findProviderInfoComptime(cfg.provider) == null) {
+            @compileError("provider_info missing row for model_registry provider '" ++ cfg.provider ++ "'");
+        }
+    }
+}
+
+fn validateEnvMetadataComptime(provider: ProviderInfo) void {
+    if (provider.env_var != null and provider.env_vars != null) {
+        @compileError("provider_info row for '" ++ provider.id ++ "' sets both env_var and env_vars");
+    }
+
+    if (provider.env_var) |env_var| {
+        if (!isValidEnvVarNameComptime(env_var)) {
+            @compileError("provider_info row for '" ++ provider.id ++ "' has invalid env_var '" ++ env_var ++ "'");
+        }
+    }
+
+    if (provider.env_vars) |env_vars| {
+        if (env_vars.len == 0) {
+            @compileError("provider_info row for '" ++ provider.id ++ "' has empty env_vars");
+        }
+        inline for (env_vars, 0..) |env_var, i| {
+            if (!isValidEnvVarNameComptime(env_var)) {
+                @compileError("provider_info row for '" ++ provider.id ++ "' has invalid env_vars entry '" ++ env_var ++ "'");
+            }
+            inline for (env_vars[i + 1 ..]) |other| {
+                if (std.mem.eql(u8, env_var, other)) {
+                    @compileError("provider_info row for '" ++ provider.id ++ "' has duplicate env_vars entry '" ++ env_var ++ "'");
+                }
+            }
+        }
+    }
+}
+
+fn validatePreferInitialComptime(provider: ProviderInfo) void {
+    const prefer_initial = provider.prefer_initial orelse return;
+    if (prefer_initial.len == 0) {
+        @compileError("provider_info prefer_initial is empty for provider '" ++ provider.id ++ "'");
+    }
+    if (findProviderInfoComptime(prefer_initial) == null) {
+        @compileError("provider_info prefer_initial for '" ++ provider.id ++ "' references unknown provider '" ++ prefer_initial ++ "'");
+    }
+}
+
+fn validateRegistryMetadataComptime(provider: ProviderInfo) void {
+    const cfg = findBuiltInProviderConfigComptime(provider.id) orelse {
+        if (provider.default_api != null) {
+            @compileError("provider_info row for '" ++ provider.id ++ "' has default_api but no model_registry built-in provider config");
+        }
+        if (provider.default_model != null) {
+            @compileError("provider_info row for '" ++ provider.id ++ "' has default_model but no model_registry built-in provider config");
+        }
+        return;
+    };
+
+    const default_api = provider.default_api orelse {
+        @compileError("provider_info row for '" ++ provider.id ++ "' has null default_api but model_registry has a built-in provider config");
+    };
+    if (!std.mem.eql(u8, default_api, cfg.api)) {
+        @compileError("provider_info default_api mismatch for provider '" ++ provider.id ++ "'");
+    }
+
+    if (provider.default_model) |default_model| {
+        const registry_default_model = cfg.default_model_id orelse {
+            @compileError("provider_info row for '" ++ provider.id ++ "' has default_model but model_registry default_model_id is null");
+        };
+        if (!std.mem.eql(u8, default_model, registry_default_model)) {
+            @compileError("provider_info default_model mismatch for provider '" ++ provider.id ++ "'");
+        }
+    }
+}
+
+fn findProviderInfoComptime(id: []const u8) ?ProviderInfo {
+    inline for (PROVIDERS) |provider| {
+        if (std.mem.eql(u8, provider.id, id)) return provider;
+    }
+    return null;
+}
+
+fn findBuiltInProviderConfigComptime(provider_id: []const u8) ?model_registry.ProviderConfig {
+    inline for (model_registry.builtInProviderConfigs()) |cfg| {
+        if (std.mem.eql(u8, cfg.provider, provider_id)) return cfg;
+    }
+    return null;
+}
+
+fn isValidEnvVarNameComptime(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!isEnvVarFirstCharComptime(name[0])) return false;
+    inline for (name[1..]) |char| {
+        if (!isEnvVarCharComptime(char)) return false;
+    }
+    return true;
+}
+
+fn isEnvVarFirstCharComptime(char: u8) bool {
+    return char == '_' or (char >= 'A' and char <= 'Z');
+}
+
+fn isEnvVarCharComptime(char: u8) bool {
+    return isEnvVarFirstCharComptime(char) or (char >= '0' and char <= '9');
+}
+
 const PROVIDER_INFO_MAP = std.StaticStringMap(*const ProviderInfo).initComptime(blk: {
     var kv: [PROVIDERS.len]struct { []const u8, *const ProviderInfo } = undefined;
     for (PROVIDERS, 0..) |*provider, i| {

@@ -39,53 +39,12 @@ pub const Capability = enum {
     agent_delegate,
 
     pub fn jsonName(self: Capability) []const u8 {
-        return switch (self) {
-            .file_read => "file.read",
-            .file_write => "file.write",
-            .network_request => "network.request",
-            .shell_run => "shell.run",
-            .env_read => "env.read",
-            .model_call => "model.call",
-            .session_read => "session.read",
-            .session_write => "session.write",
-            .ui_notify => "ui.notify",
-            .tool_use => "tool.use",
-            .agent_spawn => "agent.spawn",
-            .agent_delegate => "agent.delegate",
-        };
+        return capabilitySpec(self).json_name;
     }
 
     pub fn enforcementBranch(self: Capability) CapabilityEnforcementBranch {
-        return switch (self) {
-            .file_read => .filesystem_read,
-            .file_write => .filesystem_write,
-            .network_request => .network_request,
-            .shell_run => .shell_process,
-            .env_read => .environment_variable,
-            .model_call => .model_call,
-            .session_read => .session_read,
-            .session_write => .session_write,
-            .ui_notify => .ui_notification,
-            .tool_use => .tool_execution,
-            .agent_spawn => .agent_spawn,
-            .agent_delegate => .agent_delegate,
-        };
+        return capabilitySpec(self).branch;
     }
-};
-
-pub const CANONICAL_CAPABILITIES = [_]Capability{
-    .file_read,
-    .file_write,
-    .network_request,
-    .shell_run,
-    .env_read,
-    .model_call,
-    .session_read,
-    .session_write,
-    .ui_notify,
-    .tool_use,
-    .agent_spawn,
-    .agent_delegate,
 };
 
 pub const CapabilityEnforcementBranch = enum {
@@ -119,6 +78,83 @@ pub const CapabilityEnforcementBranch = enum {
         };
     }
 };
+
+const CapabilitySpec = struct {
+    capability: Capability,
+    json_name: []const u8,
+    branch: CapabilityEnforcementBranch,
+};
+
+const CAPABILITY_SPECS = [_]CapabilitySpec{
+    .{ .capability = .file_read, .json_name = "file.read", .branch = .filesystem_read },
+    .{ .capability = .file_write, .json_name = "file.write", .branch = .filesystem_write },
+    .{ .capability = .network_request, .json_name = "network.request", .branch = .network_request },
+    .{ .capability = .shell_run, .json_name = "shell.run", .branch = .shell_process },
+    .{ .capability = .env_read, .json_name = "env.read", .branch = .environment_variable },
+    .{ .capability = .model_call, .json_name = "model.call", .branch = .model_call },
+    .{ .capability = .session_read, .json_name = "session.read", .branch = .session_read },
+    .{ .capability = .session_write, .json_name = "session.write", .branch = .session_write },
+    .{ .capability = .ui_notify, .json_name = "ui.notify", .branch = .ui_notification },
+    .{ .capability = .tool_use, .json_name = "tool.use", .branch = .tool_execution },
+    .{ .capability = .agent_spawn, .json_name = "agent.spawn", .branch = .agent_spawn },
+    .{ .capability = .agent_delegate, .json_name = "agent.delegate", .branch = .agent_delegate },
+};
+
+comptime {
+    validateCapabilitySpecs();
+}
+
+pub const CANONICAL_CAPABILITIES = blk: {
+    var capabilities: [CAPABILITY_SPECS.len]Capability = undefined;
+    for (CAPABILITY_SPECS, 0..) |spec, index| {
+        capabilities[index] = spec.capability;
+    }
+    break :blk capabilities;
+};
+
+const CAPABILITY_BY_JSON_NAME = blk: {
+    var entries: [CAPABILITY_SPECS.len]struct { []const u8, Capability } = undefined;
+    for (CAPABILITY_SPECS, 0..) |spec, index| {
+        entries[index] = .{ spec.json_name, spec.capability };
+    }
+    break :blk std.StaticStringMap(Capability).initComptime(entries);
+};
+
+fn validateCapabilitySpecs() void {
+    const fields = @typeInfo(Capability).@"enum".fields;
+    if (CAPABILITY_SPECS.len != fields.len) {
+        @compileError("CAPABILITY_SPECS must cover every Capability enum field exactly once");
+    }
+
+    inline for (fields) |field| {
+        const capability: Capability = @enumFromInt(field.value);
+        comptime var count = 0;
+        inline for (CAPABILITY_SPECS) |spec| {
+            if (spec.capability == capability) count += 1;
+        }
+        if (count == 0) {
+            @compileError("missing capability spec for " ++ field.name);
+        }
+        if (count > 1) {
+            @compileError("duplicate capability spec for " ++ field.name);
+        }
+    }
+
+    inline for (CAPABILITY_SPECS, 0..) |left, left_index| {
+        inline for (CAPABILITY_SPECS[left_index + 1 ..]) |right| {
+            if (std.mem.eql(u8, left.json_name, right.json_name)) {
+                @compileError("duplicate capability json name: " ++ left.json_name);
+            }
+        }
+    }
+}
+
+fn capabilitySpec(capability: Capability) CapabilitySpec {
+    inline for (CAPABILITY_SPECS) |spec| {
+        if (spec.capability == capability) return spec;
+    }
+    unreachable;
+}
 
 pub const CapabilityDenialDiagnostic = struct {
     category: []const u8 = "denied_capability",
@@ -196,19 +232,7 @@ fn hasCapability(capabilities: []const Capability, needle: Capability) bool {
 }
 
 pub fn parseCapability(value: []const u8) ?Capability {
-    if (std.mem.eql(u8, value, "file.read")) return .file_read;
-    if (std.mem.eql(u8, value, "file.write")) return .file_write;
-    if (std.mem.eql(u8, value, "network.request")) return .network_request;
-    if (std.mem.eql(u8, value, "shell.run")) return .shell_run;
-    if (std.mem.eql(u8, value, "env.read")) return .env_read;
-    if (std.mem.eql(u8, value, "model.call")) return .model_call;
-    if (std.mem.eql(u8, value, "session.read")) return .session_read;
-    if (std.mem.eql(u8, value, "session.write")) return .session_write;
-    if (std.mem.eql(u8, value, "ui.notify")) return .ui_notify;
-    if (std.mem.eql(u8, value, "tool.use")) return .tool_use;
-    if (std.mem.eql(u8, value, "agent.spawn")) return .agent_spawn;
-    if (std.mem.eql(u8, value, "agent.delegate")) return .agent_delegate;
-    return null;
+    return CAPABILITY_BY_JSON_NAME.get(value);
 }
 
 pub const ResourceLimits = struct {
@@ -343,4 +367,3 @@ test "capability runtime import mappings share canonical denial vocabulary" {
     }
     try std.testing.expectEqual(@as(?CapabilityDenialDiagnostic, null), denyRuntimeImport("pi:unknown", "call", .load, "runtime/import"));
 }
-

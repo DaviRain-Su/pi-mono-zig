@@ -81,6 +81,9 @@ pub const EditorAction = enum(u8) {
     select_cancel,
 };
 
+const ACTION_COUNT = @typeInfo(Action).@"enum".fields.len;
+const EDITOR_ACTION_COUNT = @typeInfo(EditorAction).@"enum".fields.len;
+
 pub const KeySpec = union(enum) {
     ctrl: u8,
     ctrl_alt: u8,
@@ -279,8 +282,7 @@ const DEFINITIONS = [_]BindingDefinition{
 };
 
 comptime {
-    std.debug.assert(DEFINITIONS.len == 42);
-    std.debug.assert(DEFINITIONS.len == @typeInfo(Action).@"enum".fields.len);
+    assertDefinitionsCoverActions(Action, DEFINITIONS);
 }
 
 const EDITOR_DEFINITIONS = [_]struct {
@@ -322,7 +324,42 @@ const EDITOR_DEFINITIONS = [_]struct {
 };
 
 comptime {
-    std.debug.assert(EDITOR_DEFINITIONS.len == @typeInfo(EditorAction).@"enum".fields.len);
+    assertDefinitionsCoverActions(EditorAction, EDITOR_DEFINITIONS);
+}
+
+const AllowedDefaultCollision = struct {
+    key: []const u8,
+    first_id: []const u8,
+    second_id: []const u8,
+};
+
+const APP_ALLOWED_DEFAULT_COLLISIONS = [_]AllowedDefaultCollision{
+    .{ .key = "ctrl+p", .first_id = "app.model.cycleForward", .second_id = "app.session.togglePath" },
+    .{ .key = "ctrl+p", .first_id = "app.model.cycleForward", .second_id = "app.models.toggleProvider" },
+    .{ .key = "ctrl+p", .first_id = "app.session.togglePath", .second_id = "app.models.toggleProvider" },
+    .{ .key = "ctrl+d", .first_id = "app.exit", .second_id = "app.session.delete" },
+    .{ .key = "ctrl+d", .first_id = "app.exit", .second_id = "app.tree.filter.default" },
+    .{ .key = "ctrl+d", .first_id = "app.session.delete", .second_id = "app.tree.filter.default" },
+    .{ .key = "ctrl+s", .first_id = "app.session.toggleSort", .second_id = "app.models.save" },
+    .{ .key = "alt+up", .first_id = "app.message.dequeue", .second_id = "app.models.reorderUp" },
+    .{ .key = "ctrl+t", .first_id = "app.thinking.toggle", .second_id = "app.tree.filter.noTools" },
+    .{ .key = "ctrl+l", .first_id = "app.model.select", .second_id = "app.tree.filter.labeledOnly" },
+    .{ .key = "ctrl+a", .first_id = "app.models.enableAll", .second_id = "app.tree.filter.all" },
+    .{ .key = "ctrl+o", .first_id = "app.tools.expand", .second_id = "app.tree.filter.cycleForward" },
+};
+
+const EDITOR_ALLOWED_DEFAULT_COLLISIONS = [_]AllowedDefaultCollision{
+    .{ .key = "up", .first_id = "tui.editor.cursorUp", .second_id = "tui.select.up" },
+    .{ .key = "down", .first_id = "tui.editor.cursorDown", .second_id = "tui.select.down" },
+    .{ .key = "pageUp", .first_id = "tui.editor.pageUp", .second_id = "tui.select.pageUp" },
+    .{ .key = "pageDown", .first_id = "tui.editor.pageDown", .second_id = "tui.select.pageDown" },
+    .{ .key = "enter", .first_id = "tui.input.submit", .second_id = "tui.select.confirm" },
+    .{ .key = "ctrl+c", .first_id = "tui.input.copy", .second_id = "tui.select.cancel" },
+};
+
+comptime {
+    assertNoUnexpectedDefaultCollisions(DEFINITIONS, APP_ALLOWED_DEFAULT_COLLISIONS);
+    assertNoUnexpectedDefaultCollisions(EDITOR_DEFINITIONS, EDITOR_ALLOWED_DEFAULT_COLLISIONS);
 }
 
 /// Legacy keybinding name → modern dotted ID migration table.
@@ -389,10 +426,22 @@ const LEGACY_MIGRATIONS = [_]struct { legacy: []const u8, modern: []const u8 }{
     .{ .legacy = "deleteSessionNoninvasive", .modern = "app.session.deleteNoninvasive" },
 };
 
+const LEGACY_MIGRATION_MAP = std.StaticStringMap([]const u8).initComptime(blk: {
+    var entries: [LEGACY_MIGRATIONS.len]struct { []const u8, []const u8 } = undefined;
+    for (LEGACY_MIGRATIONS, 0..) |migration, index| {
+        entries[index] = .{ migration.legacy, migration.modern };
+    }
+    break :blk entries;
+});
+
+comptime {
+    assertLegacyMigrationTable();
+}
+
 pub const Keybindings = struct {
     allocator: std.mem.Allocator,
-    bindings: [DEFINITIONS.len][]KeySpec,
-    editor_bindings: [EDITOR_DEFINITIONS.len][]KeySpec,
+    bindings: [ACTION_COUNT][]KeySpec,
+    editor_bindings: [EDITOR_ACTION_COUNT][]KeySpec,
 
     pub fn initDefaults(allocator: std.mem.Allocator) !Keybindings {
         var result = Keybindings{
@@ -579,10 +628,99 @@ pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
 }
 
 fn legacyToModern(key: []const u8) ?[]const u8 {
-    for (LEGACY_MIGRATIONS) |migration| {
-        if (std.mem.eql(u8, migration.legacy, key)) return migration.modern;
+    return LEGACY_MIGRATION_MAP.get(key);
+}
+
+fn assertDefinitionsCoverActions(comptime Enum: type, comptime definitions: anytype) void {
+    @setEvalBranchQuota(100_000);
+    const enum_fields = @typeInfo(Enum).@"enum".fields;
+    if (definitions.len != enum_fields.len) {
+        @compileError("keybinding definitions length must match action enum length");
     }
-    return null;
+
+    inline for (definitions, 0..) |definition, index| {
+        if (@as(usize, @intFromEnum(definition.action)) != index) {
+            @compileError("keybinding definition action order must match enum order");
+        }
+
+        inline for (definition.defaults) |raw| {
+            _ = parseKeySpec(raw) orelse @compileError("keybinding default must parse");
+        }
+
+        inline for (definitions, 0..) |other, other_index| {
+            if (other_index <= index) continue;
+            if (definition.action == other.action) {
+                @compileError("duplicate keybinding action definition");
+            }
+            if (std.mem.eql(u8, definition.id, other.id)) {
+                @compileError("duplicate keybinding definition id");
+            }
+        }
+    }
+}
+
+fn assertNoUnexpectedDefaultCollisions(comptime definitions: anytype, comptime allowed_collisions: anytype) void {
+    @setEvalBranchQuota(100_000);
+    inline for (definitions, 0..) |definition, definition_index| {
+        inline for (definition.defaults, 0..) |raw, default_index| {
+            inline for (definitions, 0..) |other, other_definition_index| {
+                inline for (other.defaults, 0..) |other_raw, other_default_index| {
+                    if (other_definition_index < definition_index or
+                        (other_definition_index == definition_index and other_default_index <= default_index))
+                    {
+                        continue;
+                    }
+
+                    if (std.ascii.eqlIgnoreCase(raw, other_raw) and
+                        !defaultCollisionAllowed(allowed_collisions, raw, definition.id, other.id))
+                    {
+                        @compileError("unexpected duplicate keybinding default");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn defaultCollisionAllowed(
+    comptime allowed_collisions: anytype,
+    comptime key: []const u8,
+    comptime first_id: []const u8,
+    comptime second_id: []const u8,
+) bool {
+    inline for (allowed_collisions) |allowed| {
+        _ = parseKeySpec(allowed.key) orelse @compileError("allowed keybinding collision key must parse");
+        const ids_match =
+            (std.mem.eql(u8, first_id, allowed.first_id) and std.mem.eql(u8, second_id, allowed.second_id)) or
+            (std.mem.eql(u8, first_id, allowed.second_id) and std.mem.eql(u8, second_id, allowed.first_id));
+        if (ids_match and std.ascii.eqlIgnoreCase(key, allowed.key)) return true;
+    }
+    return false;
+}
+
+fn assertLegacyMigrationTable() void {
+    @setEvalBranchQuota(100_000);
+    inline for (LEGACY_MIGRATIONS, 0..) |migration, index| {
+        if (!bindingIdExists(migration.modern)) {
+            @compileError("legacy keybinding migration target must be a known binding id");
+        }
+        inline for (LEGACY_MIGRATIONS, 0..) |other, other_index| {
+            if (other_index <= index) continue;
+            if (std.mem.eql(u8, migration.legacy, other.legacy)) {
+                @compileError("duplicate legacy keybinding migration");
+            }
+        }
+    }
+}
+
+fn bindingIdExists(comptime id: []const u8) bool {
+    inline for (DEFINITIONS) |definition| {
+        if (std.mem.eql(u8, id, definition.id)) return true;
+    }
+    inline for (EDITOR_DEFINITIONS) |definition| {
+        if (std.mem.eql(u8, id, definition.id)) return true;
+    }
+    return false;
 }
 
 fn parseBindingValue(allocator: std.mem.Allocator, value: std.json.Value) ![]KeySpec {
@@ -694,8 +832,8 @@ pub fn parseKeySpec(raw: []const u8) ?KeySpec {
 }
 
 test "keybinding definitions count matches action enum" {
-    try std.testing.expectEqual(42, DEFINITIONS.len);
-    try std.testing.expectEqual(42, @typeInfo(Action).@"enum".fields.len);
+    try std.testing.expectEqual(ACTION_COUNT, DEFINITIONS.len);
+    try std.testing.expectEqual(ACTION_COUNT, @typeInfo(Action).@"enum".fields.len);
 }
 
 test "keybinding definition IDs are unique" {
@@ -822,11 +960,11 @@ test "keybinding new defaults match TS" {
     try std.testing.expectEqual(Action.tree_filter_cycleBackward, defaults.actionForKeyWithModifiers(.{ .ctrl = 'o' }, .{ .shift = true }).?);
 }
 
-test "keybinding initDefaults produces 42 bindings" {
+test "keybinding initDefaults produces one binding list per action" {
     const allocator = std.testing.allocator;
     var defaults = try Keybindings.initDefaults(allocator);
     defer defaults.deinit();
-    try std.testing.expectEqual(@as(usize, 42), defaults.bindings.len);
+    try std.testing.expectEqual(ACTION_COUNT, defaults.bindings.len);
 }
 
 test "keybinding parseKeySpec handles all new formats" {

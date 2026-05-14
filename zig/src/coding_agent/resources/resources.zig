@@ -1971,48 +1971,84 @@ fn trimExtension(name: []const u8, extension: []const u8) []const u8 {
     return name;
 }
 
+const THEME_TOKEN_ALIASES = [_]struct { []const u8, ThemeToken }{
+    .{ "welcome", .welcome },
+    .{ "user", .user },
+    .{ "assistant", .assistant },
+    .{ "toolCall", .tool_call },
+    .{ "toolResult", .tool_result },
+    .{ "error", .@"error" },
+    .{ "status", .status },
+    .{ "footer", .footer },
+    .{ "prompt", .prompt },
+    .{ "boxBorder", .box_border },
+    .{ "text", .text },
+    .{ "editor", .editor },
+    .{ "editorCursor", .editor_cursor },
+    .{ "selectSelected", .select_selected },
+    .{ "selectDescription", .select_description },
+    .{ "selectScroll", .select_scroll },
+    .{ "selectEmpty", .select_empty },
+    .{ "markdownText", .markdown_text },
+    .{ "markdownHeading", .markdown_heading },
+    .{ "markdownLink", .markdown_link },
+    .{ "markdownCode", .markdown_code },
+    .{ "markdownCodeBorder", .markdown_code_border },
+    .{ "markdownQuote", .markdown_quote },
+    .{ "markdownQuoteBorder", .markdown_quote_border },
+    .{ "markdownListBullet", .markdown_list_bullet },
+    .{ "markdownRule", .markdown_rule },
+    .{ "overlayTitle", .overlay_title },
+    .{ "overlayHint", .overlay_hint },
+    .{ "promptGlyph", .prompt_glyph },
+    .{ "promptBorder", .prompt_border },
+    .{ "taskHeader", .task_header },
+    .{ "taskHeaderAccent", .task_header_accent },
+    .{ "taskHeaderSeparator", .task_header_separator },
+    .{ "role_user", .role_user },
+    .{ "roleUser", .role_user },
+    .{ "role_assistant", .role_assistant },
+    .{ "roleAssistant", .role_assistant },
+    .{ "role_thinking", .role_thinking },
+    .{ "roleThinking", .role_thinking },
+    .{ "role_tool_call", .role_tool_call },
+    .{ "roleToolCall", .role_tool_call },
+    .{ "role_tool_result", .role_tool_result },
+    .{ "roleToolResult", .role_tool_result },
+    .{ "role_thinking_glyph", .role_thinking_glyph },
+    .{ "roleThinkingGlyph", .role_thinking_glyph },
+    .{ "terminalBadge", .terminal_badge },
+};
+
+const THEME_TOKEN_MAP = initThemeTokenMap();
+
+fn initThemeTokenMap() std.StaticStringMap(ThemeToken) {
+    @setEvalBranchQuota(10_000);
+    validateThemeTokenAliases();
+    return std.StaticStringMap(ThemeToken).initComptime(THEME_TOKEN_ALIASES);
+}
+
+fn validateThemeTokenAliases() void {
+    for (THEME_TOKEN_ALIASES, 0..) |left, left_index| {
+        for (THEME_TOKEN_ALIASES[left_index + 1 ..]) |right| {
+            if (std.mem.eql(u8, left[0], right[0])) {
+                @compileError("duplicate theme token alias: " ++ left[0]);
+            }
+        }
+    }
+
+    for (@typeInfo(ThemeToken).@"enum".fields) |field| {
+        const token: ThemeToken = @enumFromInt(field.value);
+        for (THEME_TOKEN_ALIASES) |entry| {
+            if (entry[1] == token) break;
+        } else {
+            @compileError("missing theme token alias for: " ++ field.name);
+        }
+    }
+}
+
 fn parseThemeToken(name: []const u8) ?ThemeToken {
-    if (std.mem.eql(u8, name, "welcome")) return .welcome;
-    if (std.mem.eql(u8, name, "user")) return .user;
-    if (std.mem.eql(u8, name, "assistant")) return .assistant;
-    if (std.mem.eql(u8, name, "toolCall")) return .tool_call;
-    if (std.mem.eql(u8, name, "toolResult")) return .tool_result;
-    if (std.mem.eql(u8, name, "error")) return .@"error";
-    if (std.mem.eql(u8, name, "status")) return .status;
-    if (std.mem.eql(u8, name, "footer")) return .footer;
-    if (std.mem.eql(u8, name, "prompt")) return .prompt;
-    if (std.mem.eql(u8, name, "boxBorder")) return .box_border;
-    if (std.mem.eql(u8, name, "text")) return .text;
-    if (std.mem.eql(u8, name, "editor")) return .editor;
-    if (std.mem.eql(u8, name, "editorCursor")) return .editor_cursor;
-    if (std.mem.eql(u8, name, "selectSelected")) return .select_selected;
-    if (std.mem.eql(u8, name, "selectDescription")) return .select_description;
-    if (std.mem.eql(u8, name, "selectScroll")) return .select_scroll;
-    if (std.mem.eql(u8, name, "selectEmpty")) return .select_empty;
-    if (std.mem.eql(u8, name, "markdownText")) return .markdown_text;
-    if (std.mem.eql(u8, name, "markdownHeading")) return .markdown_heading;
-    if (std.mem.eql(u8, name, "markdownLink")) return .markdown_link;
-    if (std.mem.eql(u8, name, "markdownCode")) return .markdown_code;
-    if (std.mem.eql(u8, name, "markdownCodeBorder")) return .markdown_code_border;
-    if (std.mem.eql(u8, name, "markdownQuote")) return .markdown_quote;
-    if (std.mem.eql(u8, name, "markdownQuoteBorder")) return .markdown_quote_border;
-    if (std.mem.eql(u8, name, "markdownListBullet")) return .markdown_list_bullet;
-    if (std.mem.eql(u8, name, "markdownRule")) return .markdown_rule;
-    if (std.mem.eql(u8, name, "overlayTitle")) return .overlay_title;
-    if (std.mem.eql(u8, name, "overlayHint")) return .overlay_hint;
-    if (std.mem.eql(u8, name, "promptGlyph")) return .prompt_glyph;
-    if (std.mem.eql(u8, name, "promptBorder")) return .prompt_border;
-    if (std.mem.eql(u8, name, "taskHeader")) return .task_header;
-    if (std.mem.eql(u8, name, "taskHeaderAccent")) return .task_header_accent;
-    if (std.mem.eql(u8, name, "taskHeaderSeparator")) return .task_header_separator;
-    if (std.mem.eql(u8, name, "role_user") or std.mem.eql(u8, name, "roleUser")) return .role_user;
-    if (std.mem.eql(u8, name, "role_assistant") or std.mem.eql(u8, name, "roleAssistant")) return .role_assistant;
-    if (std.mem.eql(u8, name, "role_thinking") or std.mem.eql(u8, name, "roleThinking")) return .role_thinking;
-    if (std.mem.eql(u8, name, "role_tool_call") or std.mem.eql(u8, name, "roleToolCall")) return .role_tool_call;
-    if (std.mem.eql(u8, name, "role_tool_result") or std.mem.eql(u8, name, "roleToolResult")) return .role_tool_result;
-    if (std.mem.eql(u8, name, "role_thinking_glyph") or std.mem.eql(u8, name, "roleThinkingGlyph")) return .role_thinking_glyph;
-    if (std.mem.eql(u8, name, "terminalBadge")) return .terminal_badge;
-    return null;
+    return THEME_TOKEN_MAP.get(name);
 }
 
 fn parseThemeColor(name: []const u8) ?ThemeColor {
