@@ -60,9 +60,6 @@ const long_function_allowlist = [_]AllowlistedLongFunction{
     .{ .path = "src/ai/providers/google.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/kimi.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/mistral.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
-    .{ .path = "src/ai/providers/openai.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
-    .{ .path = "src/ai/providers/openai.zig", .function_name = "buildRequestPayloadWithCacheRetentionEnv", .reason = "pre-existing OpenAI payload construction debt tracked by exact function allowlist so new long functions still fail tidy" },
-    .{ .path = "src/ai/providers/openai.zig", .function_name = "buildAssistantMessage", .reason = "pre-existing OpenAI response conversion debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/openai_codex_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/ai/providers/openai_responses.zig", .function_name = "parseSseStreamLines", .reason = "pre-existing provider SSE parser debt tracked by exact function allowlist so new long functions still fail tidy" },
     .{ .path = "src/cli/args.zig", .function_name = "parseArgs", .reason = "pre-existing CLI argument parser debt tracked by exact function allowlist so new long functions still fail tidy" },
@@ -729,7 +726,7 @@ test "scanLongFunctions suppresses exact allowlisted legacy functions" {
         .reachable_files = std.StringHashMap(void).init(std.testing.allocator),
     };
     defer tidy.deinit();
-    const warnings = try scanLongFunctionsInFile("src/ai/providers/openai.zig", source, 3, &tidy);
+    const warnings = try scanLongFunctionsInFile("src/ai/providers/google.zig", source, 3, &tidy);
     try std.testing.expectEqual(@as(usize, 0), warnings);
     try std.testing.expectEqual(@as(usize, 0), tidy.warnings);
     try std.testing.expectEqual(@as(usize, 0), tidy.long_function_warnings.items.len);
