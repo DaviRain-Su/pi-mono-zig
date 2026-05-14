@@ -230,6 +230,7 @@ const writeTerminalProgress = interactive_mode.testing.callWriteTerminalProgress
 const updateInteractiveTerminalTitle = interactive_mode.testing.callUpdateInteractiveTerminalTitle;
 const appendConfigErrorsStartupWarning = interactive_mode.testing.callAppendConfigErrorsStartupWarning;
 const appendVerboseStartupState = interactive_mode.testing.callAppendVerboseStartupState;
+const appendExtensionStartupDiagnosticsToAppState = interactive_mode.testing.callAppendExtensionStartupDiagnosticsToAppState;
 
 test "screen renders welcome prompt footer and tool lines" {
     const allocator = std.testing.allocator;
@@ -448,6 +449,52 @@ test "appendConfigErrorsStartupWarning adds nonfatal startup row" {
         }
     }
     try std.testing.expect(saw_warning);
+}
+
+test "appendExtensionStartupDiagnosticsToAppState filters optional warnings but keeps required and errors" {
+    const allocator = std.testing.allocator;
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    const diagnostics = [_]tool_adapters.ExtensionStartupDiagnostic{
+        .{
+            .severity = .warning,
+            .phase = @constCast("policy"),
+            .extension_id = @constCast("optional-warning"),
+            .extension_path = @constCast("/tmp/optional-warning.js"),
+            .source_path = @constCast("/tmp/optional-warning.js"),
+            .required = false,
+            .message = @constCast("extension lifecycle optional-warning should be hidden"),
+        },
+        .{
+            .severity = .@"error",
+            .phase = @constCast("runtime"),
+            .extension_id = @constCast("optional-error"),
+            .extension_path = @constCast("/tmp/optional-error.js"),
+            .source_path = @constCast("/tmp/optional-error.js"),
+            .required = false,
+            .message = @constCast("extension lifecycle optional-error should stay visible"),
+        },
+        .{
+            .severity = .warning,
+            .phase = @constCast("startup"),
+            .extension_id = @constCast("required-warning"),
+            .extension_path = @constCast("/tmp/required-warning.js"),
+            .source_path = @constCast("/tmp/required-warning.js"),
+            .required = true,
+            .message = @constCast("extension lifecycle required-warning should stay visible"),
+        },
+    };
+
+    try appendExtensionStartupDiagnosticsToAppState(allocator, &diagnostics, &state, false);
+
+    var snapshot = try state.snapshotForRender(allocator);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expect(!appStateSnapshotContains(snapshot.items, "optional-warning should be hidden"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "Startup extension lifecycle optional-error should stay visible"));
+    try std.testing.expect(appStateSnapshotContains(snapshot.items, "Startup extension lifecycle required-warning should stay visible"));
 }
 
 test "tool output details stay collapsed until verbose expansion is enabled" {
@@ -3695,6 +3742,7 @@ test "reload slash command renders structured extension diagnostics" {
         "while IFS= read -r line; do case \"$line\" in *'\"shutdown\"'*) printf '{\"type\":\"shutdown_complete\"}\\n'; exit 0;; esac; done\n";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "runtime.js", .data = runtime_script });
     try writeInteractiveRegisteringExtensionScript(&tmp, "denied.js", "denied-tool", "Denied Tool");
+    try writeInteractiveRegisteringExtensionScript(&tmp, "optional-unapproved.js", "optional-tool", "Optional Tool");
 
     const cwd = try makeInteractiveTestPath(allocator, tmp, "project");
     defer allocator.free(cwd);
@@ -3706,6 +3754,8 @@ test "reload slash command renders structured extension diagnostics" {
     defer allocator.free(runtime_path);
     const denied_path = try makeInteractiveTestPath(allocator, tmp, "denied.js");
     defer allocator.free(denied_path);
+    const optional_unapproved_path = try makeInteractiveTestPath(allocator, tmp, "optional-unapproved.js");
+    defer allocator.free(optional_unapproved_path);
 
     const parse_key = try temporaryTypeScriptPolicyKey(allocator, parse_path);
     defer allocator.free(parse_key);
@@ -3776,7 +3826,7 @@ test "reload slash command renders structured extension diagnostics" {
         .session_dir = agent_dir,
         .provider = "faux",
         .runtime_config = &runtime_config,
-        .startup_cli_extensions = &.{ parse_path, denied_path, runtime_path },
+        .startup_cli_extensions = &.{ parse_path, denied_path, runtime_path, optional_unapproved_path },
         .include_default_extensions = false,
     });
     defer live_resources.deinit(allocator);
@@ -3809,6 +3859,19 @@ test "reload slash command renders structured extension diagnostics" {
     try std.testing.expect(appStateSnapshotContains(snapshot.items, "required=true"));
     try std.testing.expect(appStateSnapshotContains(snapshot.items, "phase=runtime"));
     try std.testing.expect(appStateSnapshotContains(snapshot.items, "category=host_error"));
+    try std.testing.expect(!appStateSnapshotContains(snapshot.items, "optional-unapproved.js"));
+    try std.testing.expect(!appStateSnapshotContains(snapshot.items, "extension is unapproved; no matching extensionPolicies entry"));
+
+    var saw_stored_optional_warning = false;
+    for (bootstrap.built_tools.startup_diagnostics) |diagnostic| {
+        if (diagnostic.severity == .warning and
+            !diagnostic.required and
+            std.mem.indexOf(u8, diagnostic.message, "optional-unapproved.js") != null)
+        {
+            saw_stored_optional_warning = true;
+        }
+    }
+    try std.testing.expect(saw_stored_optional_warning);
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);

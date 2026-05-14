@@ -223,6 +223,7 @@ fn reloadExtensionToolsForInteractiveMode(
     }
 
     for (reload_context.bootstrap.built_tools.startup_diagnostics) |diagnostic| {
+        if (!shouldShowExtensionLifecycleDiagnosticInAppState(diagnostic, reload_context.options.verbose)) continue;
         const message = try std.fmt.allocPrint(allocator, "Reload {s}", .{diagnostic.message});
         defer allocator.free(message);
         switch (diagnostic.severity) {
@@ -236,8 +237,10 @@ fn appendExtensionStartupDiagnosticsToAppState(
     allocator: std.mem.Allocator,
     diagnostics: []const tool_adapters.ExtensionStartupDiagnostic,
     app_state: *AppState,
+    show_optional: bool,
 ) !void {
     for (diagnostics) |diagnostic| {
+        if (!shouldShowExtensionLifecycleDiagnosticInAppState(diagnostic, show_optional)) continue;
         const message = try std.fmt.allocPrint(allocator, "Startup {s}", .{diagnostic.message});
         defer allocator.free(message);
         switch (diagnostic.severity) {
@@ -245,6 +248,13 @@ fn appendExtensionStartupDiagnosticsToAppState(
             .warning, .@"error" => try app_state.appendError(message),
         }
     }
+}
+
+fn shouldShowExtensionLifecycleDiagnosticInAppState(
+    diagnostic: tool_adapters.ExtensionStartupDiagnostic,
+    show_optional: bool,
+) bool {
+    return show_optional or diagnostic.required or diagnostic.severity == .@"error";
 }
 
 pub const handleLoginSlashCommand = auth_flow_mod.handleLoginSlashCommand;
@@ -354,7 +364,7 @@ pub fn runInteractiveMode(
     defer clearSessionUiCallbacks(&bootstrap.session);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
-    try appendExtensionStartupDiagnosticsToAppState(allocator, bootstrap.built_tools.startup_diagnostics, &app_state);
+    try appendExtensionStartupDiagnosticsToAppState(allocator, bootstrap.built_tools.startup_diagnostics, &app_state, options.verbose);
     if (live_resources.runtime_config) |runtime_config| {
         try app_state.setThinkingBlockVisibility(runtime_config.hideThinkingBlock());
     }
@@ -1031,6 +1041,15 @@ pub const testing = struct {
         app_state: *AppState,
     ) !void {
         return appendConfigErrorsStartupWarning(allocator, errors, app_state);
+    }
+
+    pub fn callAppendExtensionStartupDiagnosticsToAppState(
+        allocator: std.mem.Allocator,
+        diagnostics: []const tool_adapters.ExtensionStartupDiagnostic,
+        app_state: *AppState,
+        show_optional: bool,
+    ) !void {
+        return appendExtensionStartupDiagnosticsToAppState(allocator, diagnostics, app_state, show_optional);
     }
 
     pub fn callAppendVerboseStartupState(
