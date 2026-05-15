@@ -54,3 +54,6 @@ zig/vendor/zwasm/*
 !zig/vendor/zwasm/LICENSE
 !zig/vendor/zwasm/src/
 !zig/vendor/zwasm/src/**
+.pi/*
+!.pi/agents/
+!.pi/agents/**
