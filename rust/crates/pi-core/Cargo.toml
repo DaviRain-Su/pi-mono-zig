@@ -1,0 +1,10 @@
+[package]
+name = "pi-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pi-ai = { path = "../pi-ai" }
+
+[lib]
+path = "src/lib.rs"

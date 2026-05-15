@@ -1,0 +1,3 @@
+/target
+/zig-kernel/zig-out
+/zig-kernel/.zig-cache

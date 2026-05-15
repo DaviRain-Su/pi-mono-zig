@@ -1,0 +1,13 @@
+[package]
+name = "pi-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pi-rs"
+path = "src/main.rs"
+
+[dependencies]
+pi-ai = { path = "../pi-ai" }
+pi-core = { path = "../pi-core" }
+pi-zig = { path = "../pi-zig" }
