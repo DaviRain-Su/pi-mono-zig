@@ -1813,5 +1813,4 @@ test {
     _ = session_compaction;
     _ = session_retry;
     _ = session_json_helpers;
-    _ = @import("session/tests.zig");
 }

@@ -201,9 +201,6 @@ fn dispatchWebViewMode(
         },
     });
     defer built_tools.deinit();
-    if (built_tools.locked_wasm_runtimes) |*runtime_set| {
-        try output.writeResourceDiagnostics(stderr, runtime_set.diagnostics);
-    }
     try coding_agent.interactive_mode.writeStartupDiagnostics(stderr, built_tools.startup_diagnostics);
     if (built_tools.required_startup_failed) {
         try stderr.flush();
@@ -348,9 +345,6 @@ fn dispatchNonInteractiveMode(
         },
     });
     defer built_tools.deinit();
-    if (built_tools.locked_wasm_runtimes) |*runtime_set| {
-        try output.writeResourceDiagnostics(stderr, runtime_set.diagnostics);
-    }
     try coding_agent.interactive_mode.writeStartupDiagnostics(stderr, built_tools.startup_diagnostics);
     if (built_tools.required_startup_failed) {
         try stderr.flush();
@@ -524,8 +518,8 @@ fn includeBuiltinTools(options: *const cli.Args) bool {
 }
 
 fn includeInstalledWasmTools(options: *const cli.Args) bool {
-    if (options.no_tools) return options.tools != null;
-    return true;
+    _ = options;
+    return false;
 }
 
 fn constructionToolSelection(options: *const cli.Args, selected_tools: tool_selection.ToolSelection) tool_selection.ToolSelection {

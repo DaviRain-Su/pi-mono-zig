@@ -1,45 +1,104 @@
-/// Thin backward-compatibility wrapper.
-///
-/// Capability types and manifest validation have moved to
-/// `extensions/capability.zig` and `extensions/manifest.zig`.
-/// This module re-exports the public API so existing imports
-/// continue to compile. New code should import the upstream
-/// modules directly.
+const std = @import("std");
 const capability = @import("../capability.zig");
-const manifest = @import("../manifest.zig");
 
-// Capability system
-pub const LifecyclePhase = capability.LifecyclePhase;
+pub const MANIFEST_FILE_NAME = "pi-extension.json";
+pub const SCHEMA_VERSION = "pi-extension.v1";
 pub const Capability = capability.Capability;
 pub const CANONICAL_CAPABILITIES = capability.CANONICAL_CAPABILITIES;
 pub const CapabilityEnforcementBranch = capability.CapabilityEnforcementBranch;
 pub const CapabilityDenialDiagnostic = capability.CapabilityDenialDiagnostic;
 pub const ResourceLimits = capability.ResourceLimits;
-
-pub const denyFirstUnapprovedCapability = capability.denyFirstUnapprovedCapability;
-pub const denyRuntimeCapability = capability.denyRuntimeCapability;
-pub const denyRuntimeImport = capability.denyRuntimeImport;
-pub const runtimeImportCapability = capability.runtimeImportCapability;
+pub const LifecyclePhase = capability.LifecyclePhase;
 pub const parseCapability = capability.parseCapability;
+pub const denyFirstUnapprovedCapability = capability.denyFirstUnapprovedCapability;
 
-// Manifest system
-pub const MANIFEST_FILE_NAME = manifest.MANIFEST_FILE_NAME;
-pub const SCHEMA_VERSION = manifest.SCHEMA_VERSION;
-pub const ARTIFACT_DIGEST_MISMATCH_CATEGORY = manifest.ARTIFACT_DIGEST_MISMATCH_CATEGORY;
-pub const ARTIFACT_INVALID_CATEGORY = manifest.ARTIFACT_INVALID_CATEGORY;
-pub const ArtifactKind = manifest.ArtifactKind;
-pub const Diagnostic = manifest.Diagnostic;
-pub const DiagnosticPrincipal = manifest.DiagnosticPrincipal;
-pub const DiagnosticSource = manifest.DiagnosticSource;
-pub const Manifest = manifest.Manifest;
-pub const ValidationResult = manifest.ValidationResult;
-pub const ValidationOptions = manifest.ValidationOptions;
+pub const Diagnostic = struct {
+    path: []const u8 = "$",
+    message: []const u8 = "wasm extensions are not supported by the Zig runtime",
+    principal: ?struct {
+        policy_lookup_key: []const u8,
+        extension_id: []const u8,
+        tool_id: []const u8,
+        runtime_kind: []const u8,
+    } = null,
+    capability: ?Capability = null,
+    source: ?struct {
+        manifest_path: []const u8,
+        package_root: []const u8,
+        artifact_path: []const u8,
+    } = null,
+};
 
-pub const validateManifestText = manifest.validateManifestText;
-pub const validateManifestTextWithOptions = manifest.validateManifestTextWithOptions;
-pub const validateManifestFile = manifest.validateManifestFile;
-pub const validateManifestFileWithOptions = manifest.validateManifestFileWithOptions;
-pub const packageTrustPrincipalInputs = manifest.packageTrustPrincipalInputs;
-pub const verifyArtifactSha256 = manifest.verifyArtifactSha256;
-pub const computeArtifactSha256 = manifest.computeArtifactSha256;
-pub const computePackageRootSha256 = manifest.computePackageRootSha256;
+pub const ArtifactKind = enum {
+    wasm_component,
+
+    pub fn jsonName(self: ArtifactKind) []const u8 {
+        return switch (self) {
+            .wasm_component => "wasm-component",
+        };
+    }
+};
+
+pub const Manifest = struct {
+    package_root: []const u8 = "",
+    manifest_path: []const u8 = "",
+    schema_version: []const u8 = SCHEMA_VERSION,
+    id: []const u8 = "",
+    name: []const u8 = "",
+    version: []const u8 = "",
+    description: []const u8 = "",
+    artifact_kind: ArtifactKind = .wasm_component,
+    artifact_path: []const u8 = "",
+    artifact_absolute_path: []const u8 = "",
+    artifact_sha256: []const u8 = "",
+    package_root_sha256: []const u8 = "",
+    tool_id: []const u8 = "",
+    tool_description: []const u8 = "",
+    input_schema_json: []const u8 = "{}",
+    output_schema_json: []const u8 = "{}",
+    requested_capabilities: []const Capability = &.{},
+    resource_limits: ResourceLimits = .{},
+
+    pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.* = .{};
+    }
+};
+
+pub const ValidationResult = union(enum) {
+    valid: Manifest,
+    invalid: []const Diagnostic,
+
+    pub fn deinit(self: *ValidationResult, allocator: std.mem.Allocator) void {
+        _ = allocator;
+        self.* = .{ .invalid = &.{} };
+    }
+};
+
+pub const ValidateOptions = struct {
+    approved_capabilities: []const Capability = CANONICAL_CAPABILITIES[0..],
+};
+
+pub fn validateManifestFile(allocator: std.mem.Allocator, io: std.Io, package_root: []const u8) !ValidationResult {
+    return validateManifestFileWithOptions(allocator, io, package_root, .{});
+}
+
+pub fn validateManifestFileWithOptions(allocator: std.mem.Allocator, io: std.Io, package_root: []const u8, options: ValidateOptions) !ValidationResult {
+    _ = allocator;
+    _ = io;
+    _ = package_root;
+    _ = options;
+    return .{ .invalid = &.{.{}} };
+}
+
+pub fn validateManifestText(allocator: std.mem.Allocator, package_root: []const u8, manifest_text: []const u8) !ValidationResult {
+    _ = allocator;
+    _ = package_root;
+    _ = manifest_text;
+    return .{ .invalid = &.{.{}} };
+}
+
+pub fn computePackageRootSha256(allocator: std.mem.Allocator, package_root: []const u8) ![]u8 {
+    _ = package_root;
+    return allocator.dupe(u8, "unsupported");
+}

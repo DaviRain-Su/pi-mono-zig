@@ -146,7 +146,7 @@ pub fn createWasmLockEntry(
     allocator: std.mem.Allocator,
     scope: Scope,
     source_identity: []const u8,
-    manifest: *const wasm_manifest.Manifest,
+    manifest: anytype,
 ) !LockEntry {
     const key = try std.fmt.allocPrint(allocator, "local:{s}", .{source_identity});
     errdefer allocator.free(key);

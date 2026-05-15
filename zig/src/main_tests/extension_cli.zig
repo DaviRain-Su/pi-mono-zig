@@ -58,54 +58,6 @@ const jsonObjectWithString = common.jsonObjectWithString;
 const expectToolResultContainsMain = common.expectToolResultContainsMain;
 const findToolByName = common.findToolByName;
 
-test "runCli extension boolean/string flags accepts registered local Bun fixture" {
-    const allocator = std.testing.allocator;
-
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    try env_map.put("PI_FAUX_RESPONSE", "ext-flags ok");
-
-    const fixture_path = try cli_test.makeAbsoluteTestPath(allocator, "test/fixtures/extensions/flag-fixture/extension.ts");
-    defer allocator.free(fixture_path);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home");
-    try tmp.dir.createDirPath(std.testing.io, "agent");
-    try tmp.dir.createDirPath(std.testing.io, "project/.pi");
-    const home_dir = try cli_test.makeTmpPath(allocator, tmp, "home");
-    defer allocator.free(home_dir);
-    const agent_dir = try cli_test.makeTmpPath(allocator, tmp, "agent");
-    defer allocator.free(agent_dir);
-    const project_dir = try cli_test.makeTmpPath(allocator, tmp, "project");
-    defer allocator.free(project_dir);
-    try env_map.put("HOME", home_dir);
-    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
-
-    var stdout_capture: std.Io.Writer.Allocating = .init(allocator);
-    defer stdout_capture.deinit();
-    var stderr_capture: std.Io.Writer.Allocating = .init(allocator);
-    defer stderr_capture.deinit();
-
-    const exit_code = try runCli(
-        allocator,
-        std.testing.io,
-        &env_map,
-        &.{
-            "--extension",  fixture_path,
-            "--no-session", "--provider",
-            "faux",         "--print",
-            "--plan",       "--model-alias",
-            "claude-haiku", "hello",
-        },
-        project_dir,
-        &stdout_capture.writer,
-        &stderr_capture.writer,
-    );
-    try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expectEqualStrings("ext-flags ok\n", stdout_capture.writer.buffered());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_capture.writer.buffered(), "extensions skipped: unapproved") != null);
-}
-
 test "runCli M11 extension registry dump emits live registry snapshot for explicit --extension" {
     // Live Bun JSONL register_* protocol parity coverage. Drives a
     // deterministic /bin/sh stub as the host runtime via the

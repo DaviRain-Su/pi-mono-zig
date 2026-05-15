@@ -1360,18 +1360,6 @@ const TsRpcServer = struct {
         const invocation = parseSlashCommandInvocation(message) orelse return false;
         if (!host.hasRegisteredCommand(invocation.name)) return false;
 
-        if (try self.tryExecuteRegisteredWorkflowCommand(host, invocation.name, invocation.argument)) |workflow_response| {
-            defer workflow_response.deinit(self.allocator);
-            if (workflow_response.success) {
-                try self.writeSuccessResponseRawData(id, response_command, workflow_response.data_json);
-            } else {
-                const failure_message = try std.fmt.allocPrint(self.allocator, "Workflow command failed: {s}", .{workflow_response.state});
-                defer self.allocator.free(failure_message);
-                try self.writeFailureResponseRawData(id, response_command, failure_message, workflow_response.data_json);
-            }
-            return true;
-        }
-
         const event = try extensionCommandEventValue(self.allocator, invocation.name, invocation.argument);
         defer common.deinitJsonValue(self.allocator, event);
         const result = host.invokeExtensionEvent(self.allocator, "command", event, EXTENSION_COMMAND_ACK_TIMEOUT_MS) catch |err| {
@@ -1391,29 +1379,6 @@ const TsRpcServer = struct {
         }
         try self.drainExtensionHostUiRequests(50);
         return true;
-    }
-
-    fn tryExecuteRegisteredWorkflowCommand(
-        self: *TsRpcServer,
-        host: extension_runtime.RuntimeAdapter,
-        command_name: []const u8,
-        argument: []const u8,
-    ) !?WorkflowCommandResponse {
-        var input = try workflowCommandInput(self.allocator, argument);
-        defer input.deinit();
-        var context = WorkflowCommandDispatchContext{
-            .allocator = self.allocator,
-            .command_name = command_name,
-            .input = input.value,
-            .dispatch_context = .{ .adapter = host },
-        };
-        try host.withRegistry(&context, executeWorkflowCommandCallback);
-        if (!context.handled) return null;
-        return .{
-            .success = context.success,
-            .state = context.state orelse "unknown",
-            .data_json = context.result_json orelse try self.allocator.dupe(u8, "{\"kind\":\"workflow\",\"state\":\"unknown\",\"diagnostics\":[]}"),
-        };
     }
 
     fn parseErrorMessage(self: *TsRpcServer, line: []const u8) ![]u8 {
@@ -2382,27 +2347,6 @@ const ExtensionCommandsJsonContext = struct {
     wrote_command: bool = false,
 };
 
-const WorkflowCommandDispatchContext = struct {
-    allocator: std.mem.Allocator,
-    command_name: []const u8,
-    input: std.json.Value,
-    dispatch_context: extension_runtime.SingleRuntimeWorkflowCapabilityDispatchContext,
-    handled: bool = false,
-    success: bool = false,
-    state: ?[]const u8 = null,
-    result_json: ?[]u8 = null,
-};
-
-const WorkflowCommandResponse = struct {
-    success: bool,
-    state: []const u8,
-    data_json: []u8,
-
-    fn deinit(self: WorkflowCommandResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.data_json);
-    }
-};
-
 fn writeExtensionCommandsJsonCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
     const json_context: *ExtensionCommandsJsonContext = @ptrCast(@alignCast(context.?));
     const commands = try registry.resolveCommands(json_context.allocator);
@@ -2445,39 +2389,6 @@ fn parseSlashCommandInvocation(message: []const u8) ?SlashCommandInvocation {
         .name = trimmed[0..name_end],
         .argument = std.mem.trim(u8, trimmed[name_end..], " \t\r\n"),
     };
-}
-
-fn executeWorkflowCommandCallback(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
-    const workflow_context: *WorkflowCommandDispatchContext = @ptrCast(@alignCast(context.?));
-    var result = (try extension_runtime.executeRegisteredWorkflowSurface(
-        workflow_context.allocator,
-        registry,
-        .command,
-        workflow_context.command_name,
-        workflow_context.input,
-        .{
-            .capability_dispatch = extension_runtime.dispatchWorkflowCapabilityFromAdapter,
-            .capability_dispatch_context = &workflow_context.dispatch_context,
-        },
-    )) orelse return;
-    defer result.deinit(workflow_context.allocator);
-    workflow_context.handled = true;
-    workflow_context.success = result.state == .completed;
-    workflow_context.state = result.state.jsonName();
-    workflow_context.result_json = try extension_runtime.workflowExecutionResultDataJson(workflow_context.allocator, result);
-}
-
-fn workflowCommandInput(allocator: std.mem.Allocator, argument: []const u8) !std.json.Parsed(std.json.Value) {
-    if (argument.len == 0) return try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
-    if (std.mem.startsWith(u8, std.mem.trim(u8, argument, " \t\r\n"), "{")) {
-        if (std.json.parseFromSlice(std.json.Value, allocator, argument, .{})) |parsed| return parsed else |_| {}
-    }
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"argument\":");
-    try writeJsonString(allocator, &out.writer, argument);
-    try out.writer.writeAll("}");
-    return try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
 }
 
 fn extensionCommandEventValue(allocator: std.mem.Allocator, name: []const u8, argument: []const u8) !std.json.Value {

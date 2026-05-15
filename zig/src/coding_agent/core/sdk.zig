@@ -1,1 +1,1 @@
-pub const module = @import("../extensions/sdk.zig");
+pub const module = struct {};

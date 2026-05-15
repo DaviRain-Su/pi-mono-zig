@@ -1,13 +1,8 @@
-const std = @import("std");
-
 pub const default_extension_handler_timeout_ms: u64 = 5000;
 
 pub const LifecycleSupportRuntime = enum {
     typescript,
     process_jsonl,
-    wasm,
-    native,
-    zig,
 };
 
 pub const LifecycleSupportEntry = struct {
@@ -29,7 +24,6 @@ pub const LifecycleSupportEntry = struct {
 const lifecycle_reason_names = [_][]const u8{ "startup", "reload", "new", "resume", "fork" };
 const lifecycle_result_types = [_][]const u8{ "none", "cancellable", "resources" };
 const lifecycle_payload_fields = [_][]const u8{ "type", "reason", "previousSessionFile", "targetSessionFile", "cwd", "signal" };
-const lifecycle_core_event_names = [_][]const u8{ "session_start", "session_shutdown", "resources_discover" };
 const lifecycle_all_event_names = [_][]const u8{
     "resources_discover",
     "session_start",
@@ -89,51 +83,6 @@ pub fn lifecycleSupportMatrix() []const LifecycleSupportEntry {
             .timeout_source = "lifecycle-handler-timeout-ms",
             .timeout_default_ms = default_extension_handler_timeout_ms,
             .timeout_override = "runtime host options",
-            .abort_supported = false,
-            .late_results = "ignored",
-            .shutdown_supported = true,
-            .shutdown_exactly_once = true,
-            .unsupported_diagnostics = true,
-        },
-        .{
-            .runtime = .wasm,
-            .event_names = &lifecycle_core_event_names,
-            .payload_fields = &lifecycle_payload_fields,
-            .reasons = &lifecycle_reason_names,
-            .result_types = &lifecycle_result_types,
-            .timeout_source = "lifecycle-handler-timeout-ms",
-            .timeout_default_ms = default_extension_handler_timeout_ms,
-            .timeout_override = "runtime host options",
-            .abort_supported = false,
-            .late_results = "ignored",
-            .shutdown_supported = true,
-            .shutdown_exactly_once = true,
-            .unsupported_diagnostics = false,
-        },
-        .{
-            .runtime = .native,
-            .event_names = &lifecycle_core_event_names,
-            .payload_fields = &lifecycle_payload_fields,
-            .reasons = &lifecycle_reason_names,
-            .result_types = &lifecycle_result_types,
-            .timeout_source = "lifecycle-handler-timeout-ms",
-            .timeout_default_ms = default_extension_handler_timeout_ms,
-            .timeout_override = "runtime host options",
-            .abort_supported = false,
-            .late_results = "ignored",
-            .shutdown_supported = true,
-            .shutdown_exactly_once = true,
-            .unsupported_diagnostics = false,
-        },
-        .{
-            .runtime = .zig,
-            .event_names = &lifecycle_all_event_names,
-            .payload_fields = &lifecycle_payload_fields,
-            .reasons = &lifecycle_reason_names,
-            .result_types = &lifecycle_result_types,
-            .timeout_source = "lifecycle-handler-timeout-ms",
-            .timeout_default_ms = default_extension_handler_timeout_ms,
-            .timeout_override = "compile-time/default host options",
             .abort_supported = false,
             .late_results = "ignored",
             .shutdown_supported = true,
