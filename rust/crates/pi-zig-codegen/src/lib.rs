@@ -2,9 +2,7 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/zig_tools.rs"));
 }
 
-pub use generated::{
-    GeneratedTool, ZIG_GENERATED_TOOLS, ZIG_GENERATED_TOOL_COUNT, ZIG_GENERATED_TOOL_NAMES,
-};
+pub use generated::*;
 
 #[macro_export]
 macro_rules! zig_generated_tool_count {
@@ -47,5 +45,14 @@ mod tests {
             .parameters_json
             .contains("\"edits\":{\"type\":\"array\""));
         assert!(edit.parameters_json.contains("\"old_text\""));
+
+        let args = parse_generated_tool_args(
+            "edit",
+            r#"{"path":"a.txt","edits":[{"old_text":"old","new_text":"new"}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(args.tool_name().as_str(), "edit");
+        assert!(matches!(args, GeneratedToolArgs::Edit(_)));
     }
 }

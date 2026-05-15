@@ -145,6 +145,23 @@ Zig reflects `Params` with `@typeInfo(T).@"struct".fields`, unwraps optionals, d
 Rust generated shape:
 
 ```rust
+pub struct EditBlock {
+    pub old_text: String,
+    pub new_text: String,
+}
+
+pub struct EditParams {
+    pub path: String,
+    pub edits: Vec<EditBlock>,
+}
+
+pub enum GeneratedToolArgs {
+    Read(ReadParams),
+    Bash(BashParams),
+    Edit(EditParams),
+    Write(WriteParams),
+}
+
 pub const ZIG_GENERATED_TOOL_COUNT: usize = 4;
 pub const ZIG_GENERATED_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
 pub const ZIG_GENERATED_TOOLS: &[GeneratedTool] = &[/* includes reflected parameters_json */];
@@ -237,3 +254,4 @@ At Cargo build time:
 16. Unsupported reflected tools return `UnsupportedTool` rather than silently executing.
 17. `write` creates parent directories before writing content.
 18. `edit` rejects missing or non-unique `old_text` replacements.
+19. Rust tool execution parses arguments through Zig-generated Rust types, not hand-written duplicate structs.

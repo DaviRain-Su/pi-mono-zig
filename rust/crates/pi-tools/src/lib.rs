@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use pi_zig_codegen::GeneratedToolArgs;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -65,34 +65,6 @@ impl From<serde_json::Error> for ToolError {
     }
 }
 
-#[derive(Deserialize)]
-struct ReadArgs {
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct BashArgs {
-    command: String,
-}
-
-#[derive(Deserialize)]
-struct WriteArgs {
-    path: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct EditArgs {
-    path: String,
-    edits: Vec<EditBlock>,
-}
-
-#[derive(Deserialize)]
-struct EditBlock {
-    old_text: String,
-    new_text: String,
-}
-
 pub fn read_file(path: impl AsRef<Path>) -> io::Result<String> {
     fs::read_to_string(path)
 }
@@ -157,29 +129,23 @@ pub fn execute_builtin_tool(name: &str, arguments_json: &str) -> Result<ToolOutp
         return Err(ToolError::UnknownTool(name.to_string()));
     }
 
-    match name {
-        "read" => {
-            let args: ReadArgs = serde_json::from_str(arguments_json)?;
-            Ok(ToolOutput {
-                content: read_file(args.path)?,
-            })
-        }
-        "bash" => {
-            let args: BashArgs = serde_json::from_str(arguments_json)?;
+    match pi_zig_codegen::parse_generated_tool_args(name, arguments_json)? {
+        Some(GeneratedToolArgs::Read(args)) => Ok(ToolOutput {
+            content: read_file(args.path)?,
+        }),
+        Some(GeneratedToolArgs::Bash(args)) => {
             let output = run_bash(&args.command)?;
             Ok(ToolOutput {
                 content: format_bash_output(&output),
             })
         }
-        "write" => {
-            let args: WriteArgs = serde_json::from_str(arguments_json)?;
+        Some(GeneratedToolArgs::Write(args)) => {
             write_file(&args.path, &args.content)?;
             Ok(ToolOutput {
                 content: format!("wrote {} bytes to {}", args.content.len(), args.path),
             })
         }
-        "edit" => {
-            let args: EditArgs = serde_json::from_str(arguments_json)?;
+        Some(GeneratedToolArgs::Edit(args)) => {
             let edits = args
                 .edits
                 .into_iter()
@@ -190,7 +156,7 @@ pub fn execute_builtin_tool(name: &str, arguments_json: &str) -> Result<ToolOutp
                 content: format!("edited {}; new size {} bytes", args.path, content.len()),
             })
         }
-        _ => Err(ToolError::UnsupportedTool(name.to_string())),
+        None => Err(ToolError::UnsupportedTool(name.to_string())),
     }
 }
 

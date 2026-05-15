@@ -54,6 +54,7 @@
 - `execute_builtin_tool("bash", json)` returns formatted status/stdout/stderr.
 - `execute_builtin_tool("write", json)` creates parent directories and writes content.
 - `execute_builtin_tool("edit", json)` performs exact unique replacements.
+- Tool execution uses `pi_zig_codegen::GeneratedToolArgs` rather than hand-written duplicate argument structs.
 
 ### Boundary
 
@@ -71,7 +72,7 @@
 ### Happy Path
 
 - Zig codegen emits a Rust table containing `read`, `bash`, `edit`, and `write`.
-- Zig comptime reflection emits nested parameter schemas from typed parameter structs.
+- Zig comptime reflection emits Rust argument structs, nested parameter schemas, and the generated argument enum from typed parameter structs.
 - Rust macro wrappers expose the generated count and names.
 
 ### Boundary
