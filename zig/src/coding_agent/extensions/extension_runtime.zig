@@ -30,9 +30,6 @@ pub const LifecycleSupportRuntime = lifecycle_support.LifecycleSupportRuntime;
 pub const LifecycleSupportEntry = lifecycle_support.LifecycleSupportEntry;
 pub const lifecycleSupportMatrix = lifecycle_support.lifecycleSupportMatrix;
 
-pub const approvedCapabilitiesFromExtensionPolicy = policy_resource_helpers.approvedCapabilitiesFromExtensionPolicy;
-pub const enforcementResourceLimitsFromExtensionPolicy = policy_resource_helpers.enforcementResourceLimitsFromExtensionPolicy;
-
 const runtime_adapter_dispatch = runtime_adapter.RuntimeAdapterDispatch{
     .process_jsonl = process_runtime_adapter.startProcessJsonl,
 };

@@ -1,8 +1,5 @@
 const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
-const provenance_lockfile = @import("../packages/provenance_lockfile.zig");
-const ext_manifest = @import("../extensions/manifest.zig");
-const native_manifest = @import("../extensions/native/native_manifest.zig");
 const tui = @import("tui");
 const theme_mod = tui.theme;
 
@@ -144,58 +141,6 @@ pub const ResolvedPaths = struct {
         deinitResolvedSlice(allocator, self.skills);
         deinitResolvedSlice(allocator, self.prompts);
         deinitResolvedSlice(allocator, self.themes);
-        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
-        allocator.free(self.diagnostics);
-        self.* = undefined;
-    }
-};
-
-pub const LockedWasmPackage = struct {
-    source_info: SourceInfo,
-    manifest: ext_manifest.Manifest,
-    lock_entry: provenance_lockfile.LockEntry,
-
-    pub fn deinit(self: *LockedWasmPackage, allocator: std.mem.Allocator) void {
-        self.source_info.deinit(allocator);
-        self.manifest.deinit(allocator);
-        self.lock_entry.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const LockedWasmPackageResolution = struct {
-    packages: []LockedWasmPackage,
-    diagnostics: []Diagnostic,
-
-    pub fn deinit(self: *LockedWasmPackageResolution, allocator: std.mem.Allocator) void {
-        for (self.packages) |*package| package.deinit(allocator);
-        allocator.free(self.packages);
-        for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
-        allocator.free(self.diagnostics);
-        self.* = undefined;
-    }
-};
-
-pub const LockedNativePackage = struct {
-    source_info: SourceInfo,
-    manifest: native_manifest.Manifest,
-    lock_entry: provenance_lockfile.LockEntry,
-
-    pub fn deinit(self: *LockedNativePackage, allocator: std.mem.Allocator) void {
-        self.source_info.deinit(allocator);
-        self.manifest.deinit(allocator);
-        self.lock_entry.deinit(allocator);
-        self.* = undefined;
-    }
-};
-
-pub const LockedNativePackageResolution = struct {
-    packages: []LockedNativePackage,
-    diagnostics: []Diagnostic,
-
-    pub fn deinit(self: *LockedNativePackageResolution, allocator: std.mem.Allocator) void {
-        for (self.packages) |*package| package.deinit(allocator);
-        allocator.free(self.packages);
         for (self.diagnostics) |*diagnostic| diagnostic.deinit(allocator);
         allocator.free(self.diagnostics);
         self.* = undefined;

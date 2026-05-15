@@ -33,58 +33,6 @@ pub fn typeScriptPolicyLookupKey(allocator: std.mem.Allocator, options: TypeScri
     return std.fmt.allocPrint(allocator, "typescript:local:{s}:{s}", .{ scope, resolved_path });
 }
 
-pub const WasmManifestPolicyLookupOptions = struct {
-    schema_version: []const u8,
-    id: []const u8,
-    version: []const u8,
-    package_root: []const u8,
-    manifest_path: []const u8,
-    artifact_path: []const u8,
-};
-
-pub fn wasmManifestPolicyLookupKey(allocator: std.mem.Allocator, options: WasmManifestPolicyLookupOptions) ![]u8 {
-    const package_root = try toPolicyPathAlloc(allocator, options.package_root);
-    defer allocator.free(package_root);
-    const manifest_path = try toPolicyPathAlloc(allocator, options.manifest_path);
-    defer allocator.free(manifest_path);
-    const artifact_path = try toPolicyPathAlloc(allocator, options.artifact_path);
-    defer allocator.free(artifact_path);
-    return std.fmt.allocPrint(
-        allocator,
-        "wasm:manifest:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{ options.schema_version, options.id, options.version, package_root, manifest_path, artifact_path },
-    );
-}
-
-pub fn wasmPolicyLookupKey(allocator: std.mem.Allocator, manifest: anytype) ![]u8 {
-    const manifest_path = try toPolicyPathAlloc(allocator, manifest.manifest_path orelse "");
-    defer allocator.free(manifest_path);
-    const artifact_absolute_path = try toPolicyPathAlloc(allocator, manifest.artifact_absolute_path);
-    defer allocator.free(artifact_absolute_path);
-    return std.fmt.allocPrint(
-        allocator,
-        "wasm:locked:{s}:{s}:{s}:{s}:{s}:{s}:{s}:{s}",
-        .{
-            manifest.policy_scope,
-            manifest.schema_version,
-            manifest.id,
-            manifest.version,
-            manifest.package_root_sha256 orelse "",
-            manifest.artifact_sha256 orelse "",
-            manifest_path,
-            artifact_absolute_path,
-        },
-    );
-}
-
-pub fn nativePolicyLookupKey(allocator: std.mem.Allocator, descriptor: anytype) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "native:{s}:{s}:{s}",
-        .{ descriptor.id, descriptor.version, descriptor.name },
-    );
-}
-
 pub fn processJsonlPolicyLookupKey(allocator: std.mem.Allocator, options: anytype) ![]u8 {
     const argv: []const []const u8 = options.argv;
     const extension_path: ?[]const u8 = options.extension_path;
