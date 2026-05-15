@@ -28,7 +28,7 @@ Defines provider traits and a faux provider. Real providers are deferred.
 
 ### `pi-tools`
 
-Provides Rust-native built-in tools. It consumes Zig-reflected tool metadata from `pi-zig-codegen`, exposes tool definitions with schemas, and executes implemented built-ins. Current executable tools are `read` and `bash`; `edit` and `write` are reflected but intentionally return unsupported until implemented.
+Provides Rust-native built-in tools. It consumes Zig-reflected tool metadata from `pi-zig-codegen`, exposes tool definitions with schemas, and executes implemented built-ins. Current executable tools are `read`, `bash`, `write`, and exact-replacement `edit`.
 
 ### `pi-zig-sys`
 

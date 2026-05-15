@@ -30,6 +30,8 @@ pub struct ToolOutput {
 pub enum ToolError {
     UnknownTool(String),
     UnsupportedTool(String),
+    ReplaceNotFound(String),
+    ReplaceNotUnique(String),
     InvalidArguments(serde_json::Error),
     Io(io::Error),
 }
@@ -39,6 +41,10 @@ impl Display for ToolError {
         match self {
             ToolError::UnknownTool(name) => write!(f, "unknown tool: {name}"),
             ToolError::UnsupportedTool(name) => write!(f, "unsupported tool execution: {name}"),
+            ToolError::ReplaceNotFound(text) => write!(f, "replacement text not found: {text}"),
+            ToolError::ReplaceNotUnique(text) => {
+                write!(f, "replacement text is not unique: {text}")
+            }
             ToolError::InvalidArguments(error) => write!(f, "invalid tool arguments: {error}"),
             ToolError::Io(error) => write!(f, "tool IO error: {error}"),
         }
@@ -69,8 +75,49 @@ struct BashArgs {
     command: String,
 }
 
+#[derive(Deserialize)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct EditArgs {
+    path: String,
+    edits: Vec<EditBlock>,
+}
+
+#[derive(Deserialize)]
+struct EditBlock {
+    old_text: String,
+    new_text: String,
+}
+
 pub fn read_file(path: impl AsRef<Path>) -> io::Result<String> {
     fs::read_to_string(path)
+}
+
+pub fn write_file(path: impl AsRef<Path>, content: &str) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)
+}
+
+pub fn edit_file(path: impl AsRef<Path>, edits: &[(String, String)]) -> Result<String, ToolError> {
+    let path = path.as_ref();
+    let mut content = fs::read_to_string(path)?;
+    for (old_text, new_text) in edits {
+        let matches: Vec<_> = content.match_indices(old_text).collect();
+        match matches.len() {
+            0 => return Err(ToolError::ReplaceNotFound(old_text.clone())),
+            1 => content = content.replacen(old_text, new_text, 1),
+            _ => return Err(ToolError::ReplaceNotUnique(old_text.clone())),
+        }
+    }
+    fs::write(path, &content)?;
+    Ok(content)
 }
 
 pub fn run_bash(command: &str) -> io::Result<BashOutput> {
@@ -122,6 +169,25 @@ pub fn execute_builtin_tool(name: &str, arguments_json: &str) -> Result<ToolOutp
             let output = run_bash(&args.command)?;
             Ok(ToolOutput {
                 content: format_bash_output(&output),
+            })
+        }
+        "write" => {
+            let args: WriteArgs = serde_json::from_str(arguments_json)?;
+            write_file(&args.path, &args.content)?;
+            Ok(ToolOutput {
+                content: format!("wrote {} bytes to {}", args.content.len(), args.path),
+            })
+        }
+        "edit" => {
+            let args: EditArgs = serde_json::from_str(arguments_json)?;
+            let edits = args
+                .edits
+                .into_iter()
+                .map(|edit| (edit.old_text, edit.new_text))
+                .collect::<Vec<_>>();
+            let content = edit_file(&args.path, &edits)?;
+            Ok(ToolOutput {
+                content: format!("edited {}; new size {} bytes", args.path, content.len()),
             })
         }
         _ => Err(ToolError::UnsupportedTool(name.to_string())),
@@ -196,19 +262,90 @@ mod tests {
     }
 
     #[test]
+    fn write_file_creates_parent_directories() {
+        let mut path = temp_path("write-dir");
+        path.push("nested/file.txt");
+
+        write_file(&path, "created").unwrap();
+        let contents = read_file(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+
+        assert_eq!(contents, "created");
+    }
+
+    #[test]
+    fn edit_file_replaces_unique_text() {
+        let path = write_temp_file("edit", "alpha beta gamma");
+        let edits = vec![("beta".to_string(), "delta".to_string())];
+
+        let updated = edit_file(&path, &edits).unwrap();
+        let contents = read_file(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(updated, "alpha delta gamma");
+        assert_eq!(contents, "alpha delta gamma");
+    }
+
+    #[test]
+    fn edit_file_rejects_non_unique_text() {
+        let path = write_temp_file("edit-non-unique", "same same");
+        let edits = vec![("same".to_string(), "other".to_string())];
+
+        let error = edit_file(&path, &edits).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(error, ToolError::ReplaceNotUnique(_)));
+    }
+
+    #[test]
+    fn execute_write_tool_uses_json_arguments() {
+        let path = temp_path("execute-write");
+        let args = serde_json::json!({"path": path, "content": "written"}).to_string();
+
+        let output = execute_builtin_tool("write", &args).unwrap();
+        let contents = read_file(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(output.content.contains("wrote 7 bytes"));
+        assert_eq!(contents, "written");
+    }
+
+    #[test]
+    fn execute_edit_tool_uses_json_arguments() {
+        let path = write_temp_file("execute-edit", "hello old");
+        let args = serde_json::json!({
+            "path": path,
+            "edits": [{"old_text": "old", "new_text": "new"}]
+        })
+        .to_string();
+
+        let output = execute_builtin_tool("edit", &args).unwrap();
+        let contents = read_file(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(output.content.contains("edited"));
+        assert_eq!(contents, "hello new");
+    }
+
+    #[test]
     fn execute_unknown_tool_returns_error() {
         let error = execute_builtin_tool("missing", "{}").unwrap_err();
         assert!(matches!(error, ToolError::UnknownTool(_)));
     }
 
     fn write_temp_file(label: &str, contents: &str) -> std::path::PathBuf {
+        let path = temp_path(label);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        path.push(format!("pi-tools-{label}-{unique}.txt"));
-        fs::write(&path, contents).unwrap();
+        path.push(format!("pi-tools-{label}-{unique}"));
         path
     }
 }

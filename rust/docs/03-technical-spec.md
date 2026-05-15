@@ -235,3 +235,5 @@ At Cargo build time:
 14. Codegen runs on the host and is not linked into the final binary.
 15. Tool registry definitions expose Zig-reflected schemas.
 16. Unsupported reflected tools return `UnsupportedTool` rather than silently executing.
+17. `write` creates parent directories before writing content.
+18. `edit` rejects missing or non-unique `old_text` replacements.

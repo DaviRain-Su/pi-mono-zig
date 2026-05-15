@@ -52,6 +52,8 @@
 - Built-in tool definitions include Zig-reflected schemas.
 - `execute_builtin_tool("read", json)` returns file contents.
 - `execute_builtin_tool("bash", json)` returns formatted status/stdout/stderr.
+- `execute_builtin_tool("write", json)` creates parent directories and writes content.
+- `execute_builtin_tool("edit", json)` performs exact unique replacements.
 
 ### Boundary
 
@@ -62,6 +64,7 @@
 - Missing file returns IO error.
 - Unknown tool returns `UnknownTool`.
 - Reflected but unimplemented tool returns `UnsupportedTool`.
+- Edit with missing or duplicated `old_text` returns a typed replacement error.
 
 ## `pi-zig-codegen`
 
