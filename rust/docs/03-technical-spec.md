@@ -272,3 +272,4 @@ At Cargo build time:
 22. `pi-rs -p ... --provider tool-demo --session <path>` persists the full user -> assistant tool-call -> tool result -> final assistant transcript.
 23. `pi-rs --mode rpc` reads LF-delimited JSON commands from stdin and writes one JSON response per line.
 24. RPC commands support `prompt`, `set_provider`, `get_state`, `get_messages`, and direct `tool` execution.
+25. RPC `prompt` writes the command response first, followed by lifecycle event lines: `message_start`, `message_end`, `tool_execution_start`, and `tool_execution_end`.

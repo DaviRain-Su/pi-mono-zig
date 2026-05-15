@@ -258,13 +258,15 @@ impl RpcRuntime {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        if command == "prompt" {
+            return self.handle_prompt(id, command, &parsed);
+        }
         vec![self.handle_command(id, command, &parsed)]
     }
 
     fn handle_command(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
         match command {
             "set_provider" => self.handle_set_provider(id, command, value),
-            "prompt" => self.handle_prompt(id, command, value),
             "get_state" => rpc_response(
                 id,
                 command,
@@ -318,25 +320,26 @@ impl RpcRuntime {
         }
     }
 
-    fn handle_prompt(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+    fn handle_prompt(&mut self, id: Option<Value>, command: &str, value: &Value) -> Vec<String> {
         let Some(message) = value.get("message").and_then(Value::as_str) else {
-            return rpc_response(
+            return vec![rpc_response(
                 id,
                 command,
                 false,
                 None,
                 Some("message is required".to_string()),
-            );
+            )];
         };
 
         let provider = match value.get("provider").and_then(Value::as_str) {
             Some(provider) => match parse_provider(provider) {
                 Ok(provider) => provider,
-                Err(error) => return rpc_response(id, command, false, None, Some(error)),
+                Err(error) => return vec![rpc_response(id, command, false, None, Some(error))],
             },
             None => self.provider,
         };
 
+        let old_len = self.messages.len();
         let result = match provider {
             ProviderKind::Faux => {
                 self.prompt_with_provider(FauxProvider, message.to_string(), false)
@@ -347,14 +350,19 @@ impl RpcRuntime {
         };
 
         match result {
-            Ok(assistant) => rpc_response(
-                id,
-                command,
-                true,
-                Some(json!({ "assistant": assistant, "messages": self.messages })),
-                None,
-            ),
-            Err(error) => rpc_response(id, command, false, None, Some(error)),
+            Ok(assistant) => {
+                let new_messages = self.messages[old_len..].to_vec();
+                let mut lines = vec![rpc_response(
+                    id,
+                    command,
+                    true,
+                    Some(json!({ "assistant": assistant, "messages": self.messages })),
+                    None,
+                )];
+                lines.extend(rpc_events_for_messages(&new_messages));
+                lines
+            }
+            Err(error) => vec![rpc_response(id, command, false, None, Some(error))],
         }
     }
 
@@ -407,6 +415,49 @@ impl RpcRuntime {
             Err(error) => rpc_response(id, command, false, None, Some(error.to_string())),
         }
     }
+}
+
+fn rpc_events_for_messages(messages: &[Message]) -> Vec<String> {
+    let mut events = Vec::new();
+    for message in messages {
+        match message.role {
+            pi_ai::Role::User => {}
+            pi_ai::Role::Assistant => {
+                events.push(rpc_event("message_start", json!({ "message": message })));
+                events.push(rpc_event("message_end", json!({ "message": message })));
+                for tool_call in &message.tool_calls {
+                    events.push(rpc_event(
+                        "tool_execution_start",
+                        json!({
+                            "toolCallId": tool_call.id,
+                            "toolName": tool_call.name,
+                            "arguments": tool_call.arguments_json,
+                        }),
+                    ));
+                }
+            }
+            pi_ai::Role::Tool => {
+                events.push(rpc_event(
+                    "tool_execution_end",
+                    json!({
+                        "toolCallId": message.tool_call_id,
+                        "toolName": message.tool_name,
+                        "output": message.content,
+                    }),
+                ));
+            }
+        }
+    }
+    events
+}
+
+fn rpc_event(event_type: &str, data: Value) -> String {
+    json!({
+        "type": "event",
+        "event": event_type,
+        "data": data,
+    })
+    .to_string()
 }
 
 fn rpc_response(
@@ -574,6 +625,12 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["data"]["assistant"]["content"], "faux: hello");
         assert_eq!(runtime.messages.len(), 2);
+        assert_eq!(responses.len(), 3);
+        let start_event: Value = serde_json::from_str(&responses[1]).unwrap();
+        let end_event: Value = serde_json::from_str(&responses[2]).unwrap();
+        assert_eq!(start_event["type"], "event");
+        assert_eq!(start_event["event"], "message_start");
+        assert_eq!(end_event["event"], "message_end");
     }
 
     #[test]
@@ -590,6 +647,16 @@ mod tests {
             .unwrap()
             .contains("rpc-loop"));
         assert_eq!(runtime.messages.len(), 4);
+        assert_eq!(responses.len(), 7);
+        let tool_start: Value = serde_json::from_str(&responses[3]).unwrap();
+        let tool_end: Value = serde_json::from_str(&responses[4]).unwrap();
+        assert_eq!(tool_start["event"], "tool_execution_start");
+        assert_eq!(tool_start["data"]["toolName"], "bash");
+        assert_eq!(tool_end["event"], "tool_execution_end");
+        assert!(tool_end["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("rpc-loop"));
     }
 
     #[test]

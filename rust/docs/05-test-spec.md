@@ -112,6 +112,7 @@
 - `pi-rs --tool-demo 'bash: printf hello'` exercises the agent tool loop.
 - `pi-rs -p 'bash: printf hello' --provider tool-demo --session <path>` persists all tool-loop messages.
 - `pi-rs --mode rpc` accepts JSONL `prompt`, `get_state`, `get_messages`, `set_provider`, and `tool` commands.
+- RPC `prompt` emits message lifecycle events and tool execution lifecycle events after the command response.
 
 ### Boundary
 
