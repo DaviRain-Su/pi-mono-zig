@@ -7,5 +7,6 @@ members = [
     "crates/pi-session",
     "crates/pi-tools",
     "crates/pi-zig",
+    "crates/pi-zig-codegen",
     "crates/pi-zig-sys",
 ]

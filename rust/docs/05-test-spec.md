@@ -58,6 +58,21 @@
 
 - Missing file returns IO error.
 
+## `pi-zig-codegen`
+
+### Happy Path
+
+- Zig codegen emits a Rust table containing `read`, `bash`, `edit`, and `write`.
+- Rust macro wrappers expose the generated count and names.
+
+### Boundary
+
+- Host codegen runs during `cargo test` without requiring final target execution.
+
+### Error
+
+- Zig codegen failure fails the Rust crate build.
+
 ## `pi-zig`
 
 ### Happy Path
@@ -79,6 +94,7 @@
 
 - `pi-rs -p hello` prints faux assistant output.
 - `pi-rs -p hello --session <path>` appends user and assistant entries.
+- `pi-rs --list-zig-generated-tools` prints the Zig comptime generated registry.
 
 ### Boundary
 

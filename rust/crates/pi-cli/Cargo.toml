@@ -12,3 +12,4 @@ pi-ai = { path = "../pi-ai" }
 pi-core = { path = "../pi-core" }
 pi-session = { path = "../pi-session" }
 pi-zig = { path = "../pi-zig" }
+pi-zig-codegen = { path = "../pi-zig-codegen" }

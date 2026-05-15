@@ -97,6 +97,33 @@ Ordering:
 - Higher `score` first.
 - Stable enough for MVP deterministic tests.
 
+### `pi_zig_codegen` generated table
+
+Zig source of truth:
+
+```zig
+const generated_tools = [_]GeneratedTool{
+    .{ .name = "read", .label = "Read File", .mutates = false },
+    .{ .name = "bash", .label = "Run Bash", .mutates = true },
+    .{ .name = "edit", .label = "Edit File", .mutates = true },
+    .{ .name = "write", .label = "Write File", .mutates = true },
+};
+```
+
+Rust generated shape:
+
+```rust
+pub const ZIG_GENERATED_TOOL_COUNT: usize = 4;
+pub const ZIG_GENERATED_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
+```
+
+Rust macro shell:
+
+```rust
+pi_zig_codegen::zig_generated_tool_names!()
+pi_zig_codegen::zig_generated_tool_count!()
+```
+
 ## Zig FFI Interface
 
 ```zig
@@ -146,6 +173,16 @@ For every item:
 5. Exclude non-matching items.
 6. Sort by descending score.
 
+### Zig comptime Rust codegen
+
+At Cargo build time:
+
+1. `pi-zig-codegen/build.rs` invokes `zig run rust/zig-codegen/tool_registry.zig`.
+2. Zig validates and iterates `generated_tools` with `inline for`.
+3. Zig prints Rust source to stdout.
+4. `build.rs` writes stdout to `OUT_DIR/zig_tools.rs`.
+5. `pi-zig-codegen` includes that file and exposes macro-style Rust APIs.
+
 ## Boundary Cases
 
 1. Empty query returns all items with score `0`.
@@ -160,3 +197,5 @@ For every item:
 10. CLI without `-p` returns usage error for MVP.
 11. Missing session file loads as an empty transcript.
 12. Existing session file appends only newly generated messages.
+13. Zig comptime generated tool names are available through Rust macro wrappers.
+14. Codegen runs on the host and is not linked into the final binary.

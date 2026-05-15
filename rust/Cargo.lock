@@ -29,6 +29,7 @@ dependencies = [
  "pi-core",
  "pi-session",
  "pi-zig",
+ "pi-zig-codegen",
 ]
 
 [[package]]
@@ -59,6 +60,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "pi-zig-codegen"
+version = "0.1.0"
 
 [[package]]
 name = "pi-zig-sys"

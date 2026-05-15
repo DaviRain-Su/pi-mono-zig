@@ -38,9 +38,17 @@ Unsafe FFI bindings and build integration. Its `build.rs` calls `zig build` in `
 
 Safe wrapper over `pi-zig-sys`. Owns every Zig allocation via RAII and exposes typed Rust functions.
 
+### `pi-zig-codegen`
+
+Macro-style code generation bridge. Its `build.rs` runs the host Zig program in `zig-codegen/`; Zig uses `comptime` tool descriptors to emit Rust source into Cargo `OUT_DIR`. Rust exposes a small `macro_rules!` shell over the generated table.
+
 ### `zig-kernel`
 
 Small Zig static library. Exports only C ABI functions. MVP exports batched fuzzy filtering plus buffer cleanup.
+
+### `zig-codegen`
+
+Host-only Zig code generation programs. These do not link into the final binary; they run at Rust compile time to generate Rust source from Zig `comptime` data.
 
 ## FFI Rules
 
@@ -57,7 +65,10 @@ cargo build / cargo zigbuild
   -> pi-zig-sys/build.rs
       -> zig build -Dtarget=<mapped target>
       -> libpi_zig_kernel.a
-  -> rustc links static pi_zig_kernel
+  -> pi-zig-codegen/build.rs
+      -> zig run zig-codegen/tool_registry.zig
+      -> OUT_DIR/zig_tools.rs
+  -> rustc links static pi_zig_kernel and includes generated Rust source
 ```
 
 ## Future Expansion
