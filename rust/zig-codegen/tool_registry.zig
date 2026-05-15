@@ -4,13 +4,66 @@ const GeneratedTool = struct {
     name: []const u8,
     label: []const u8,
     mutates: bool,
+    Params: type,
+};
+
+const ReadParams = struct {
+    path: []const u8,
+    offset: ?u32 = null,
+    limit: ?u32 = null,
+
+    pub const json_field_docs = .{
+        .path = "File path to read.",
+        .offset = "Optional 1-based line offset.",
+        .limit = "Optional maximum number of lines.",
+    };
+};
+
+const BashParams = struct {
+    command: []const u8,
+    timeout_seconds: ?u32 = null,
+
+    pub const json_field_docs = .{
+        .command = "Shell command to execute.",
+        .timeout_seconds = "Optional timeout in seconds.",
+    };
+};
+
+const EditBlock = struct {
+    old_text: []const u8,
+    new_text: []const u8,
+
+    pub const json_field_docs = .{
+        .old_text = "Exact text to replace.",
+        .new_text = "Replacement text.",
+    };
+};
+
+const EditParams = struct {
+    path: []const u8,
+    edits: []const EditBlock,
+
+    pub const json_field_docs = .{
+        .path = "File path to edit.",
+        .edits = "Batch of exact text replacements.",
+    };
+};
+
+const WriteParams = struct {
+    path: []const u8,
+    content: []const u8,
+
+    pub const json_field_docs = .{
+        .path = "File path to write.",
+        .content = "Complete file contents.",
+    };
 };
 
 const generated_tools = [_]GeneratedTool{
-    .{ .name = "read", .label = "Read File", .mutates = false },
-    .{ .name = "bash", .label = "Run Bash", .mutates = true },
-    .{ .name = "edit", .label = "Edit File", .mutates = true },
-    .{ .name = "write", .label = "Write File", .mutates = true },
+    .{ .name = "read", .label = "Read File", .mutates = false, .Params = ReadParams },
+    .{ .name = "bash", .label = "Run Bash", .mutates = true, .Params = BashParams },
+    .{ .name = "edit", .label = "Edit File", .mutates = true, .Params = EditParams },
+    .{ .name = "write", .label = "Write File", .mutates = true, .Params = WriteParams },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -29,6 +82,7 @@ fn emitRust(writer: *std.Io.Writer) !void {
     try writer.writeAll("    pub name: &'static str,\n");
     try writer.writeAll("    pub label: &'static str,\n");
     try writer.writeAll("    pub mutates: bool,\n");
+    try writer.writeAll("    pub parameters_json: &'static str,\n");
     try writer.writeAll("}\n\n");
 
     try writer.print("pub const ZIG_GENERATED_TOOL_COUNT: usize = {};\n\n", .{generated_tools.len});
@@ -42,16 +96,126 @@ fn emitRust(writer: *std.Io.Writer) !void {
     try writer.writeAll("pub const ZIG_GENERATED_TOOLS: &[GeneratedTool] = &[\n");
     inline for (generated_tools) |tool| {
         try writer.print(
-            "    GeneratedTool {{ name: \"{s}\", label: \"{s}\", mutates: {} }},\n",
+            "    GeneratedTool {{ name: \"{s}\", label: \"{s}\", mutates: {}, parameters_json: r###\"",
             .{ tool.name, tool.label, tool.mutates },
         );
+        try emitSchemaForType(writer, tool.Params);
+        try writer.writeAll("\"### },\n");
     }
     try writer.writeAll("];\n");
+}
+
+fn emitSchemaForType(writer: *std.Io.Writer, comptime T: type) !void {
+    comptime validateParamType(T);
+
+    try writer.writeAll("{\"type\":\"object\",\"properties\":{");
+    const fields = @typeInfo(T).@"struct".fields;
+    inline for (fields, 0..) |field, index| {
+        if (index > 0) try writer.writeAll(",");
+        try emitJsonString(writer, field.name);
+        try writer.writeAll(":");
+        try emitFieldSchema(writer, field.type, @field(T.json_field_docs, field.name));
+    }
+    try writer.writeAll("}");
+
+    var required_count: usize = 0;
+    inline for (fields) |field| {
+        if (comptime fieldRequired(field)) required_count += 1;
+    }
+    if (required_count > 0) {
+        try writer.writeAll(",\"required\":[");
+        var emitted: usize = 0;
+        inline for (fields) |field| {
+            if (comptime fieldRequired(field)) {
+                if (emitted > 0) try writer.writeAll(",");
+                try emitJsonString(writer, field.name);
+                emitted += 1;
+            }
+        }
+        try writer.writeAll("]");
+    }
+    try writer.writeAll("}");
+}
+
+fn emitFieldSchema(writer: *std.Io.Writer, comptime FieldT: type, description: []const u8) !void {
+    switch (@typeInfo(FieldT)) {
+        .optional => |optional| try emitFieldSchema(writer, optional.child, description),
+        .pointer => |pointer| {
+            if (pointer.size != .slice) @compileError("unsupported pointer field type: " ++ @typeName(FieldT));
+            if (pointer.child == u8) {
+                try writer.writeAll("{\"type\":\"string\",\"description\":");
+                try emitJsonString(writer, description);
+                try writer.writeAll("}");
+            } else if (@typeInfo(pointer.child) == .@"struct") {
+                try writer.writeAll("{\"type\":\"array\",\"description\":");
+                try emitJsonString(writer, description);
+                try writer.writeAll(",\"items\":");
+                try emitSchemaForType(writer, pointer.child);
+                try writer.writeAll("}");
+            } else {
+                @compileError("unsupported slice child type: " ++ @typeName(pointer.child));
+            }
+        },
+        .bool => {
+            try writer.writeAll("{\"type\":\"boolean\",\"description\":");
+            try emitJsonString(writer, description);
+            try writer.writeAll("}");
+        },
+        .int => {
+            try writer.writeAll("{\"type\":\"integer\",\"description\":");
+            try emitJsonString(writer, description);
+            try writer.writeAll("}");
+        },
+        else => @compileError("unsupported field type: " ++ @typeName(FieldT)),
+    }
+}
+
+fn emitJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    try writer.writeAll("\"");
+    for (value) |byte| {
+        switch (byte) {
+            '\\' => try writer.writeAll("\\\\"),
+            '"' => try writer.writeAll("\\\""),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeAll("\"");
+}
+
+fn validateParamType(comptime T: type) void {
+    if (@typeInfo(T) != .@"struct") @compileError("tool params must be a struct: " ++ @typeName(T));
+    if (!@hasDecl(T, "json_field_docs")) @compileError(@typeName(T) ++ " must declare json_field_docs");
+    const docs_type = @TypeOf(T.json_field_docs);
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (!@hasField(docs_type, field.name)) {
+            @compileError(@typeName(T) ++ " missing json_field_docs." ++ field.name);
+        }
+    }
+}
+
+fn fieldRequired(comptime field: std.builtin.Type.StructField) bool {
+    if (@typeInfo(field.type) == .optional) return false;
+    if (field.defaultValue() != null) return false;
+    return true;
 }
 
 test "tool registry descriptors are comptime-visible" {
     try std.testing.expectEqual(@as(usize, 4), generated_tools.len);
     comptime {
-        if (generated_tools[0].name.len == 0) @compileError("tool names must be non-empty");
+        if (generated_tools[0].Params != ReadParams) @compileError("tool params must remain typed");
     }
+}
+
+test "reflection emits nested parameter schema" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try emitSchemaForType(&out.writer, EditParams);
+    const written = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"edits\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"old_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"required\":[\"path\",\"edits\"]") != null);
 }

@@ -63,6 +63,7 @@
 ### Happy Path
 
 - Zig codegen emits a Rust table containing `read`, `bash`, `edit`, and `write`.
+- Zig comptime reflection emits nested parameter schemas from typed parameter structs.
 - Rust macro wrappers expose the generated count and names.
 
 ### Boundary
@@ -95,6 +96,7 @@
 - `pi-rs -p hello` prints faux assistant output.
 - `pi-rs -p hello --session <path>` appends user and assistant entries.
 - `pi-rs --list-zig-generated-tools` prints the Zig comptime generated registry.
+- `pi-rs --list-zig-generated-tool-schemas` prints reflected JSON schemas.
 
 ### Boundary
 

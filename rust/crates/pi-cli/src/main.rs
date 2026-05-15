@@ -30,6 +30,12 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     {
         return Ok(Some(pi_zig_codegen::zig_generated_tool_names!().join("\n")));
     }
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--list-zig-generated-tool-schemas")
+    {
+        return Ok(Some(format_zig_generated_tool_schemas()));
+    }
 
     let args = parse_args(&args)?;
     ensure_zig_kernel_linked()?;
@@ -62,6 +68,14 @@ fn ensure_zig_kernel_linked() -> Result<(), String> {
     pi_zig::fuzzy_filter("", &[])
         .map(|_| ())
         .map_err(|error| format!("Zig kernel smoke failed: {error}"))
+}
+
+fn format_zig_generated_tool_schemas() -> String {
+    pi_zig_codegen::generated_tools()
+        .iter()
+        .map(|tool| format!("{} {}", tool.name, tool.parameters_json))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_args(args: &[String]) -> Result<CliArgs, String> {
@@ -101,7 +115,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 }
 
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools".to_string()
+    "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools | --list-zig-generated-tool-schemas".to_string()
 }
 
 #[cfg(test)]
@@ -127,7 +141,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools"
+            "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools | --list-zig-generated-tool-schemas"
         );
     }
 
@@ -135,6 +149,15 @@ mod tests {
     fn lists_zig_comptime_generated_tools() {
         let output = run(vec!["--list-zig-generated-tools".into()]).unwrap();
         assert_eq!(output, Some("read\nbash\nedit\nwrite".into()));
+    }
+
+    #[test]
+    fn lists_zig_comptime_reflected_schemas() {
+        let output = run(vec!["--list-zig-generated-tool-schemas".into()])
+            .unwrap()
+            .unwrap();
+        assert!(output.contains("edit {\"type\":\"object\""));
+        assert!(output.contains("\"old_text\""));
     }
 
     #[test]

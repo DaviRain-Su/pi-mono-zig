@@ -102,19 +102,39 @@ Ordering:
 Zig source of truth:
 
 ```zig
+const EditBlock = struct {
+    old_text: []const u8,
+    new_text: []const u8,
+
+    pub const json_field_docs = .{
+        .old_text = "Exact text to replace.",
+        .new_text = "Replacement text.",
+    };
+};
+
+const EditParams = struct {
+    path: []const u8,
+    edits: []const EditBlock,
+
+    pub const json_field_docs = .{
+        .path = "File path to edit.",
+        .edits = "Batch of exact text replacements.",
+    };
+};
+
 const generated_tools = [_]GeneratedTool{
-    .{ .name = "read", .label = "Read File", .mutates = false },
-    .{ .name = "bash", .label = "Run Bash", .mutates = true },
-    .{ .name = "edit", .label = "Edit File", .mutates = true },
-    .{ .name = "write", .label = "Write File", .mutates = true },
+    .{ .name = "edit", .label = "Edit File", .mutates = true, .Params = EditParams },
 };
 ```
+
+Zig reflects `Params` with `@typeInfo(T).@"struct".fields`, unwraps optionals, detects slice-of-struct nested arrays, and emits both Rust metadata and JSON schema. Missing `json_field_docs` is a compile error.
 
 Rust generated shape:
 
 ```rust
 pub const ZIG_GENERATED_TOOL_COUNT: usize = 4;
 pub const ZIG_GENERATED_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
+pub const ZIG_GENERATED_TOOLS: &[GeneratedTool] = &[/* includes reflected parameters_json */];
 ```
 
 Rust macro shell:
@@ -179,9 +199,10 @@ At Cargo build time:
 
 1. `pi-zig-codegen/build.rs` invokes `zig run rust/zig-codegen/tool_registry.zig`.
 2. Zig validates and iterates `generated_tools` with `inline for`.
-3. Zig prints Rust source to stdout.
-4. `build.rs` writes stdout to `OUT_DIR/zig_tools.rs`.
-5. `pi-zig-codegen` includes that file and exposes macro-style Rust APIs.
+3. For each tool's `Params` type, Zig uses `@typeInfo` reflection to walk fields, required/default state, optionals, and nested structs.
+4. Zig prints Rust source and reflected JSON schemas to stdout.
+5. `build.rs` writes stdout to `OUT_DIR/zig_tools.rs`.
+6. `pi-zig-codegen` includes that file and exposes macro-style Rust APIs.
 
 ## Boundary Cases
 

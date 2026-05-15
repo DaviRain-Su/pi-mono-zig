@@ -40,7 +40,7 @@ Safe wrapper over `pi-zig-sys`. Owns every Zig allocation via RAII and exposes t
 
 ### `pi-zig-codegen`
 
-Macro-style code generation bridge. Its `build.rs` runs the host Zig program in `zig-codegen/`; Zig uses `comptime` tool descriptors to emit Rust source into Cargo `OUT_DIR`. Rust exposes a small `macro_rules!` shell over the generated table.
+Macro-style code generation bridge. Its `build.rs` runs the host Zig program in `zig-codegen/`; Zig uses `comptime` reflection (`@typeInfo`, `inline for`, `@field`, `@compileError`) over typed tool parameter structs to emit Rust source into Cargo `OUT_DIR`. Rust exposes a small `macro_rules!` shell over the generated table and reflected JSON schemas.
 
 ### `zig-kernel`
 

@@ -39,5 +39,13 @@ mod tests {
         assert!(generated_tools()
             .iter()
             .any(|tool| tool.name == "bash" && tool.mutates));
+        let edit = generated_tools()
+            .iter()
+            .find(|tool| tool.name == "edit")
+            .expect("edit tool exists");
+        assert!(edit
+            .parameters_json
+            .contains("\"edits\":{\"type\":\"array\""));
+        assert!(edit.parameters_json.contains("\"old_text\""));
     }
 }
