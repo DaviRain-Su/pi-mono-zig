@@ -28,7 +28,14 @@ Constraints:
 pub trait Provider {
     fn complete(&self, messages: &[Message]) -> Result<Message, ProviderError>;
 }
+
+pub enum BuiltinProvider {
+    Faux,
+    ToolDemo,
+}
 ```
+
+`BuiltinProvider` parses stable provider IDs (`faux`, `tool-demo`), exposes `supports_tools()`, and implements `Provider` by dispatching to the concrete provider.
 
 Preconditions:
 
@@ -275,3 +282,4 @@ At Cargo build time:
 25. RPC `prompt` writes the command response first, followed by lifecycle event lines: `message_start`, `message_end`, `tool_execution_start`, and `tool_execution_end`.
 26. Print mode supports `--continue --session <path>` to continue from an existing JSONL transcript.
 27. RPC supports `switch_session`, `new_session`, and `continue`; prompts and continues persist new messages when a session path is active.
+28. CLI and RPC provider selection use `pi_ai::BuiltinProvider`; provider parsing is no longer duplicated in the CLI.

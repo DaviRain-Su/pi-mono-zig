@@ -1,4 +1,4 @@
-use pi_ai::{FauxProvider, Message, ToolDemoProvider};
+use pi_ai::{BuiltinProvider, Message};
 use pi_core::AgentSession;
 use pi_session::SessionFile;
 use serde_json::{json, Value};
@@ -33,13 +33,7 @@ struct CliArgs {
     prompt: Option<String>,
     continue_session: bool,
     session_path: Option<PathBuf>,
-    provider: ProviderKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderKind {
-    Faux,
-    ToolDemo,
+    provider: BuiltinProvider,
 }
 
 fn run(args: Vec<String>) -> Result<Option<String>, String> {
@@ -68,17 +62,10 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     let args = parse_args(&args)?;
     ensure_zig_kernel_linked()?;
 
-    match args.provider {
-        ProviderKind::Faux => run_print_with_provider(FauxProvider, args, false),
-        ProviderKind::ToolDemo => run_print_with_provider(ToolDemoProvider, args, true),
-    }
+    run_print_with_provider(args)
 }
 
-fn run_print_with_provider<P: pi_ai::Provider>(
-    provider: P,
-    args: CliArgs,
-    use_tools: bool,
-) -> Result<Option<String>, String> {
+fn run_print_with_provider(args: CliArgs) -> Result<Option<String>, String> {
     let existing_messages = if let Some(path) = &args.session_path {
         SessionFile::open(path)
             .and_then(|session| session.load_messages())
@@ -92,9 +79,9 @@ fn run_print_with_provider<P: pi_ai::Provider>(
         return Err("--continue requires --session <path>".to_string());
     }
 
-    let mut agent = AgentSession::with_messages(provider, existing_messages);
+    let mut agent = AgentSession::with_messages(args.provider, existing_messages);
     let assistant = if args.continue_session {
-        if use_tools {
+        if args.provider.supports_tools() {
             agent
                 .continue_with_tools()
                 .map_err(|error| error.to_string())?
@@ -103,7 +90,7 @@ fn run_print_with_provider<P: pi_ai::Provider>(
         }
     } else {
         let prompt = args.prompt.unwrap_or_default();
-        if use_tools {
+        if args.provider.supports_tools() {
             agent
                 .prompt_with_tools(prompt)
                 .map_err(|error| error.to_string())?
@@ -163,7 +150,7 @@ fn run_tool_command(args: &[String]) -> Result<Option<String>, String> {
 
 fn run_tool_demo_command(args: &[String]) -> Result<Option<String>, String> {
     let prompt = args[1..].join(" ");
-    let mut session = AgentSession::new(ToolDemoProvider);
+    let mut session = AgentSession::new(BuiltinProvider::ToolDemo);
     session
         .prompt_with_tools(prompt)
         .map(|message| Some(message.content))
@@ -175,7 +162,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut prompt_parts = Vec::new();
     let mut print_mode = false;
     let mut continue_session = false;
-    let mut provider = ProviderKind::Faux;
+    let mut provider = BuiltinProvider::Faux;
     let mut index = 0;
 
     while index < args.len() {
@@ -225,12 +212,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     })
 }
 
-fn parse_provider(value: &str) -> Result<ProviderKind, String> {
-    match value {
-        "faux" => Ok(ProviderKind::Faux),
-        "tool-demo" => Ok(ProviderKind::ToolDemo),
-        _ => Err(format!("unknown provider: {value}")),
-    }
+fn parse_provider(value: &str) -> Result<BuiltinProvider, String> {
+    value
+        .parse::<BuiltinProvider>()
+        .map_err(|error| error.to_string())
 }
 
 fn run_rpc_stdio() -> Result<(), String> {
@@ -251,7 +236,7 @@ fn run_rpc_stdio() -> Result<(), String> {
 
 #[derive(Clone, Debug)]
 struct RpcRuntime {
-    provider: ProviderKind,
+    provider: BuiltinProvider,
     messages: Vec<Message>,
     session_path: Option<PathBuf>,
 }
@@ -259,7 +244,7 @@ struct RpcRuntime {
 impl RpcRuntime {
     fn new() -> Self {
         Self {
-            provider: ProviderKind::Faux,
+            provider: BuiltinProvider::Faux,
             messages: Vec::new(),
             session_path: None,
         }
@@ -397,10 +382,7 @@ impl RpcRuntime {
 
     fn handle_continue(&mut self, id: Option<Value>, command: &str) -> Vec<String> {
         let old_len = self.messages.len();
-        let result = match self.provider {
-            ProviderKind::Faux => self.continue_with_provider(FauxProvider, false),
-            ProviderKind::ToolDemo => self.continue_with_provider(ToolDemoProvider, true),
-        };
+        let result = self.continue_with_provider(self.provider);
         self.response_and_events(id, command, old_len, result)
     }
 
@@ -424,14 +406,7 @@ impl RpcRuntime {
         };
 
         let old_len = self.messages.len();
-        let result = match provider {
-            ProviderKind::Faux => {
-                self.prompt_with_provider(FauxProvider, message.to_string(), false)
-            }
-            ProviderKind::ToolDemo => {
-                self.prompt_with_provider(ToolDemoProvider, message.to_string(), true)
-            }
-        };
+        let result = self.prompt_with_provider(provider, message.to_string());
 
         self.response_and_events(id, command, old_len, result)
     }
@@ -473,14 +448,13 @@ impl RpcRuntime {
         Ok(())
     }
 
-    fn prompt_with_provider<P: pi_ai::Provider>(
+    fn prompt_with_provider(
         &mut self,
-        provider: P,
+        provider: BuiltinProvider,
         message: String,
-        use_tools: bool,
     ) -> Result<Message, String> {
         let mut session = AgentSession::with_messages(provider, self.messages.clone());
-        let assistant = if use_tools {
+        let assistant = if provider.supports_tools() {
             session
                 .prompt_with_tools(message)
                 .map_err(|error| error.to_string())?
@@ -491,13 +465,9 @@ impl RpcRuntime {
         Ok(assistant)
     }
 
-    fn continue_with_provider<P: pi_ai::Provider>(
-        &mut self,
-        provider: P,
-        use_tools: bool,
-    ) -> Result<Message, String> {
+    fn continue_with_provider(&mut self, provider: BuiltinProvider) -> Result<Message, String> {
         let mut session = AgentSession::with_messages(provider, self.messages.clone());
-        let assistant = if use_tools {
+        let assistant = if provider.supports_tools() {
             session
                 .continue_with_tools()
                 .map_err(|error| error.to_string())?
@@ -608,15 +578,6 @@ fn rpc_response(
     response.to_string()
 }
 
-impl ProviderKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            ProviderKind::Faux => "faux",
-            ProviderKind::ToolDemo => "tool-demo",
-        }
-    }
-}
-
 fn usage() -> String {
     "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | pi-rs --continue --session <path> [--provider faux|tool-demo] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
 }
@@ -626,7 +587,10 @@ mod tests {
     use super::*;
     use pi_session::load_entries;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn print_mode_returns_faux_response() {
@@ -938,8 +902,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("pi-cli-{unique}.jsonl"));
+        path.push(format!("pi-cli-{unique}-{counter}.jsonl"));
         path
     }
 }

@@ -5,6 +5,7 @@
 ### Happy Path
 
 - Faux provider returns assistant message containing the latest user prompt.
+- Built-in provider registry parses `tool-demo`, advertises tool support, and dispatches to the provider implementation.
 
 ### Boundary
 
@@ -13,6 +14,7 @@
 ### Error
 
 - Last message not user returns provider error.
+- Unknown provider ID returns a typed unknown-provider error.
 
 ## `pi-core`
 

@@ -24,7 +24,7 @@ Owns the minimal agent session abstraction. For MVP, a session accepts one user 
 
 ### `pi-ai`
 
-Defines provider traits and a faux provider. Real providers are deferred.
+Defines provider traits, built-in provider registry metadata, and demo providers. `BuiltinProvider` parses stable provider IDs, advertises tool capability, and dispatches to `faux` or `tool-demo` implementations.
 
 ### `pi-tools`
 

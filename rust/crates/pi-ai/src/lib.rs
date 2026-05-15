@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -95,6 +96,72 @@ pub trait Provider {
     fn complete(&self, messages: &[Message]) -> Result<Message, ProviderError>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuiltinProvider {
+    Faux,
+    ToolDemo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownProvider {
+    pub name: String,
+}
+
+impl Display for UnknownProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown provider: {}", self.name)
+    }
+}
+
+impl Error for UnknownProvider {}
+
+impl BuiltinProvider {
+    pub const ALL: &'static [BuiltinProvider] = &[BuiltinProvider::Faux, BuiltinProvider::ToolDemo];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BuiltinProvider::Faux => "faux",
+            BuiltinProvider::ToolDemo => "tool-demo",
+        }
+    }
+
+    pub const fn supports_tools(self) -> bool {
+        match self {
+            BuiltinProvider::Faux => false,
+            BuiltinProvider::ToolDemo => true,
+        }
+    }
+}
+
+impl Display for BuiltinProvider {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BuiltinProvider {
+    type Err = UnknownProvider;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "faux" => Ok(BuiltinProvider::Faux),
+            "tool-demo" => Ok(BuiltinProvider::ToolDemo),
+            _ => Err(UnknownProvider {
+                name: value.to_string(),
+            }),
+        }
+    }
+}
+
+impl Provider for BuiltinProvider {
+    fn complete(&self, messages: &[Message]) -> Result<Message, ProviderError> {
+        match self {
+            BuiltinProvider::Faux => FauxProvider.complete(messages),
+            BuiltinProvider::ToolDemo => ToolDemoProvider.complete(messages),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct FauxProvider;
 
@@ -164,6 +231,21 @@ mod tests {
             provider.complete(&messages).unwrap_err(),
             ProviderError::LastMessageNotUser
         );
+    }
+
+    #[test]
+    fn builtin_provider_parses_and_dispatches() {
+        let provider: BuiltinProvider = "tool-demo".parse().unwrap();
+        assert_eq!(provider.as_str(), "tool-demo");
+        assert!(provider.supports_tools());
+        let response = provider.complete(&[Message::user("plain")]).unwrap();
+        assert_eq!(response, Message::assistant("tool-demo: plain"));
+    }
+
+    #[test]
+    fn unknown_builtin_provider_returns_name() {
+        let error = "missing".parse::<BuiltinProvider>().unwrap_err();
+        assert_eq!(error.name, "missing");
     }
 
     #[test]
