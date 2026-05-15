@@ -72,6 +72,10 @@ impl<P: Provider> AgentSession<P> {
 
     pub fn prompt(&mut self, text: impl Into<String>) -> Result<Message, ProviderError> {
         self.messages.push(Message::user(text));
+        self.continue_once()
+    }
+
+    pub fn continue_once(&mut self) -> Result<Message, ProviderError> {
         let assistant = self.provider.complete(&self.messages)?;
         self.messages.push(assistant.clone());
         Ok(assistant)
@@ -79,6 +83,10 @@ impl<P: Provider> AgentSession<P> {
 
     pub fn prompt_with_tools(&mut self, text: impl Into<String>) -> Result<Message, AgentError> {
         self.messages.push(Message::user(text));
+        self.continue_with_tools()
+    }
+
+    pub fn continue_with_tools(&mut self) -> Result<Message, AgentError> {
         self.complete_with_tools()
     }
 
@@ -138,6 +146,16 @@ mod tests {
 
         assert_eq!(assistant.content, "faux: new");
         assert_eq!(session.messages().len(), 4);
+    }
+
+    #[test]
+    fn continue_once_uses_existing_transcript() {
+        let mut session =
+            AgentSession::with_messages(FauxProvider, vec![Message::user("continue")]);
+        let assistant = session.continue_once().unwrap();
+
+        assert_eq!(assistant.content, "faux: continue");
+        assert_eq!(session.messages().len(), 2);
     }
 
     #[test]

@@ -22,12 +22,17 @@ cargo test
 cd rust
 cargo run -p pi-cli -- -p "hello"
 cargo run -p pi-cli -- -p "bash: printf hello" --provider tool-demo --session /tmp/pi-rs-session.jsonl
+cargo run -p pi-cli -- --continue --session /tmp/pi-rs-session.jsonl --provider tool-demo
 cargo run -p pi-cli -- --list-zig-generated-tools
 cargo run -p pi-cli -- --list-zig-generated-tool-schemas
 cargo run -p pi-cli -- --list-tools
 cargo run -p pi-cli -- --tool bash '{"command":"printf hello"}'
 cargo run -p pi-cli -- --tool-demo 'bash: printf hello-from-loop'
-printf '%s\n' '{"id":"1","type":"prompt","provider":"tool-demo","message":"bash: printf rpc"}' | cargo run -p pi-cli -- --mode rpc
+printf '%s\n' \
+  '{"type":"new_session","path":"/tmp/pi-rs-rpc.jsonl"}' \
+  '{"id":"1","type":"prompt","provider":"tool-demo","message":"bash: printf rpc"}' \
+  '{"id":"2","type":"get_state"}' \
+  | cargo run -p pi-cli -- --mode rpc
 # RPC prompt writes the response first, followed by message/tool lifecycle event lines.
 ```
 

@@ -30,7 +30,8 @@ fn main() {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CliArgs {
-    prompt: String,
+    prompt: Option<String>,
+    continue_session: bool,
     session_path: Option<PathBuf>,
     provider: ProviderKind,
 }
@@ -87,15 +88,28 @@ fn run_print_with_provider<P: pi_ai::Provider>(
     };
     let existing_len = existing_messages.len();
 
+    if args.continue_session && args.session_path.is_none() {
+        return Err("--continue requires --session <path>".to_string());
+    }
+
     let mut agent = AgentSession::with_messages(provider, existing_messages);
-    let assistant = if use_tools {
-        agent
-            .prompt_with_tools(args.prompt)
-            .map_err(|error| error.to_string())?
+    let assistant = if args.continue_session {
+        if use_tools {
+            agent
+                .continue_with_tools()
+                .map_err(|error| error.to_string())?
+        } else {
+            agent.continue_once().map_err(|error| error.to_string())?
+        }
     } else {
-        agent
-            .prompt(args.prompt)
-            .map_err(|error| error.to_string())?
+        let prompt = args.prompt.unwrap_or_default();
+        if use_tools {
+            agent
+                .prompt_with_tools(prompt)
+                .map_err(|error| error.to_string())?
+        } else {
+            agent.prompt(prompt).map_err(|error| error.to_string())?
+        }
     };
 
     if let Some(path) = &args.session_path {
@@ -160,6 +174,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut session_path = None;
     let mut prompt_parts = Vec::new();
     let mut print_mode = false;
+    let mut continue_session = false;
     let mut provider = ProviderKind::Faux;
     let mut index = 0;
 
@@ -167,6 +182,10 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         match args[index].as_str() {
             "-p" | "--print" => {
                 print_mode = true;
+                index += 1;
+            }
+            "-c" | "--continue" => {
+                continue_session = true;
                 index += 1;
             }
             "--session" => {
@@ -190,12 +209,17 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
         }
     }
 
-    if !print_mode {
+    if !print_mode && !continue_session {
         return Err(usage());
     }
 
     Ok(CliArgs {
-        prompt: prompt_parts.join(" "),
+        prompt: if print_mode {
+            Some(prompt_parts.join(" "))
+        } else {
+            None
+        },
+        continue_session,
         session_path,
         provider,
     })
@@ -229,6 +253,7 @@ fn run_rpc_stdio() -> Result<(), String> {
 struct RpcRuntime {
     provider: ProviderKind,
     messages: Vec<Message>,
+    session_path: Option<PathBuf>,
 }
 
 impl RpcRuntime {
@@ -236,6 +261,7 @@ impl RpcRuntime {
         Self {
             provider: ProviderKind::Faux,
             messages: Vec::new(),
+            session_path: None,
         }
     }
 
@@ -261,12 +287,17 @@ impl RpcRuntime {
         if command == "prompt" {
             return self.handle_prompt(id, command, &parsed);
         }
+        if command == "continue" {
+            return self.handle_continue(id, command);
+        }
         vec![self.handle_command(id, command, &parsed)]
     }
 
     fn handle_command(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
         match command {
             "set_provider" => self.handle_set_provider(id, command, value),
+            "switch_session" => self.handle_switch_session(id, command, value),
+            "new_session" => self.handle_new_session(id, command, value),
             "get_state" => rpc_response(
                 id,
                 command,
@@ -274,6 +305,7 @@ impl RpcRuntime {
                 Some(json!({
                     "provider": self.provider.as_str(),
                     "messageCount": self.messages.len(),
+                    "sessionPath": self.session_path,
                 })),
                 None,
             ),
@@ -320,6 +352,58 @@ impl RpcRuntime {
         }
     }
 
+    fn handle_switch_session(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        let Some(path) = value.get("path").and_then(Value::as_str) else {
+            return rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some("path is required".to_string()),
+            );
+        };
+        match SessionFile::open(path).and_then(|session| session.load_messages()) {
+            Ok(messages) => {
+                self.messages = messages;
+                self.session_path = Some(PathBuf::from(path));
+                rpc_response(
+                    id,
+                    command,
+                    true,
+                    Some(json!({ "sessionPath": path, "messageCount": self.messages.len() })),
+                    None,
+                )
+            }
+            Err(error) => rpc_response(id, command, false, None, Some(error.to_string())),
+        }
+    }
+
+    fn handle_new_session(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        self.messages.clear();
+        self.session_path = value.get("path").and_then(Value::as_str).map(PathBuf::from);
+        if let Some(path) = &self.session_path {
+            if let Err(error) = SessionFile::open(path) {
+                return rpc_response(id, command, false, None, Some(error.to_string()));
+            }
+        }
+        rpc_response(
+            id,
+            command,
+            true,
+            Some(json!({ "sessionPath": self.session_path, "messageCount": 0 })),
+            None,
+        )
+    }
+
+    fn handle_continue(&mut self, id: Option<Value>, command: &str) -> Vec<String> {
+        let old_len = self.messages.len();
+        let result = match self.provider {
+            ProviderKind::Faux => self.continue_with_provider(FauxProvider, false),
+            ProviderKind::ToolDemo => self.continue_with_provider(ToolDemoProvider, true),
+        };
+        self.response_and_events(id, command, old_len, result)
+    }
+
     fn handle_prompt(&mut self, id: Option<Value>, command: &str, value: &Value) -> Vec<String> {
         let Some(message) = value.get("message").and_then(Value::as_str) else {
             return vec![rpc_response(
@@ -349,9 +433,22 @@ impl RpcRuntime {
             }
         };
 
+        self.response_and_events(id, command, old_len, result)
+    }
+
+    fn response_and_events(
+        &mut self,
+        id: Option<Value>,
+        command: &str,
+        old_len: usize,
+        result: Result<Message, String>,
+    ) -> Vec<String> {
         match result {
             Ok(assistant) => {
                 let new_messages = self.messages[old_len..].to_vec();
+                if let Err(error) = self.persist_new_messages(&new_messages) {
+                    return vec![rpc_response(id, command, false, None, Some(error))];
+                }
                 let mut lines = vec![rpc_response(
                     id,
                     command,
@@ -364,6 +461,16 @@ impl RpcRuntime {
             }
             Err(error) => vec![rpc_response(id, command, false, None, Some(error))],
         }
+    }
+
+    fn persist_new_messages(&self, messages: &[Message]) -> Result<(), String> {
+        if let Some(path) = &self.session_path {
+            let mut session = SessionFile::open(path).map_err(|error| error.to_string())?;
+            session
+                .append_messages(messages)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     fn prompt_with_provider<P: pi_ai::Provider>(
@@ -379,6 +486,23 @@ impl RpcRuntime {
                 .map_err(|error| error.to_string())?
         } else {
             session.prompt(message).map_err(|error| error.to_string())?
+        };
+        self.messages = session.messages().to_vec();
+        Ok(assistant)
+    }
+
+    fn continue_with_provider<P: pi_ai::Provider>(
+        &mut self,
+        provider: P,
+        use_tools: bool,
+    ) -> Result<Message, String> {
+        let mut session = AgentSession::with_messages(provider, self.messages.clone());
+        let assistant = if use_tools {
+            session
+                .continue_with_tools()
+                .map_err(|error| error.to_string())?
+        } else {
+            session.continue_once().map_err(|error| error.to_string())?
         };
         self.messages = session.messages().to_vec();
         Ok(assistant)
@@ -494,7 +618,7 @@ impl ProviderKind {
 }
 
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
+    "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | pi-rs --continue --session <path> [--provider faux|tool-demo] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
 }
 
 #[cfg(test)]
@@ -520,7 +644,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
+            "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | pi-rs --continue --session <path> [--provider faux|tool-demo] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
         );
     }
 
@@ -684,6 +808,109 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["data"]["provider"], "tool-demo");
         assert_eq!(response["data"]["messageCount"], 0);
+    }
+
+    #[test]
+    fn rpc_switch_session_loads_messages() {
+        let path = temp_session_path();
+        let mut session = SessionFile::open(&path).unwrap();
+        session.append_message(Message::user("loaded")).unwrap();
+
+        let mut runtime = RpcRuntime::new();
+        let command = json!({"type":"switch_session", "path": path}).to_string();
+        let responses = runtime.handle_line(&command);
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["messageCount"], 1);
+        assert_eq!(runtime.messages[0].content, "loaded");
+    }
+
+    #[test]
+    fn rpc_prompt_persists_to_switched_session() {
+        let path = temp_session_path();
+        let mut runtime = RpcRuntime::new();
+        runtime.handle_line(&json!({"type":"new_session", "path": path}).to_string());
+        runtime.handle_line(r#"{"type":"prompt","message":"persist rpc"}"#);
+
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message.content, "persist rpc");
+        assert_eq!(entries[1].message.content, "faux: persist rpc");
+    }
+
+    #[test]
+    fn rpc_continue_uses_loaded_session() {
+        let path = temp_session_path();
+        let mut session = SessionFile::open(&path).unwrap();
+        session.append_message(Message::user("rpc resume")).unwrap();
+
+        let mut runtime = RpcRuntime::new();
+        runtime.handle_line(&json!({"type":"switch_session", "path": path}).to_string());
+        let responses = runtime.handle_line(r#"{"id":"c","type":"continue"}"#);
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["assistant"]["content"], "faux: rpc resume");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn continue_session_uses_existing_user_message() {
+        let path = temp_session_path();
+        let mut session = SessionFile::open(&path).unwrap();
+        session.append_message(Message::user("resume me")).unwrap();
+
+        let output = run(vec![
+            "--continue".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(output, Some("faux: resume me".into()));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].message.content, "faux: resume me");
+    }
+
+    #[test]
+    fn continue_session_runs_tool_loop_for_tool_demo() {
+        let path = temp_session_path();
+        let mut session = SessionFile::open(&path).unwrap();
+        session
+            .append_message(Message::user("bash: printf resumed-loop"))
+            .unwrap();
+
+        let output = run(vec![
+            "--continue".into(),
+            "--provider".into(),
+            "tool-demo".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert!(output.contains("resumed-loop"));
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[2].message.role, pi_ai::Role::Tool);
+    }
+
+    #[test]
+    fn continue_requires_session_path() {
+        assert_eq!(
+            run(vec!["--continue".into()]).unwrap_err(),
+            "--continue requires --session <path>"
+        );
     }
 
     #[test]

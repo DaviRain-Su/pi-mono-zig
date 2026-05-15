@@ -273,3 +273,5 @@ At Cargo build time:
 23. `pi-rs --mode rpc` reads LF-delimited JSON commands from stdin and writes one JSON response per line.
 24. RPC commands support `prompt`, `set_provider`, `get_state`, `get_messages`, and direct `tool` execution.
 25. RPC `prompt` writes the command response first, followed by lifecycle event lines: `message_start`, `message_end`, `tool_execution_start`, and `tool_execution_end`.
+26. Print mode supports `--continue --session <path>` to continue from an existing JSONL transcript.
+27. RPC supports `switch_session`, `new_session`, and `continue`; prompts and continues persist new messages when a session path is active.
