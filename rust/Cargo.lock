@@ -19,6 +19,7 @@ name = "pi-ai"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -38,6 +39,7 @@ name = "pi-core"
 version = "0.1.0"
 dependencies = [
  "pi-ai",
+ "pi-tools",
 ]
 
 [[package]]

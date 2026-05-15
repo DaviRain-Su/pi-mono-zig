@@ -1,4 +1,4 @@
-use pi_ai::FauxProvider;
+use pi_ai::{FauxProvider, ToolDemoProvider};
 use pi_core::AgentSession;
 use pi_session::SessionFile;
 use std::path::PathBuf;
@@ -41,6 +41,9 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     }
     if args.first().is_some_and(|arg| arg == "--tool") {
         return run_tool_command(&args);
+    }
+    if args.first().is_some_and(|arg| arg == "--tool-demo") {
+        return run_tool_demo_command(&args);
     }
 
     let args = parse_args(&args)?;
@@ -109,6 +112,15 @@ fn run_tool_command(args: &[String]) -> Result<Option<String>, String> {
         .map_err(|error| error.to_string())
 }
 
+fn run_tool_demo_command(args: &[String]) -> Result<Option<String>, String> {
+    let prompt = args[1..].join(" ");
+    let mut session = AgentSession::new(ToolDemoProvider);
+    session
+        .prompt_with_tools(prompt)
+        .map(|message| Some(message.content))
+        .map_err(|error| error.to_string())
+}
+
 fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut session_path = None;
     let mut prompt_parts = Vec::new();
@@ -146,7 +158,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 }
 
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json>".to_string()
+    "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
 }
 
 #[cfg(test)]
@@ -172,7 +184,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json>"
+            "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
         );
     }
 
@@ -209,6 +221,20 @@ mod tests {
         .unwrap();
         assert!(output.contains("status: 0"));
         assert!(output.contains("cli-tool"));
+    }
+
+    #[test]
+    fn tool_demo_runs_agent_tool_loop() {
+        let output = run(vec![
+            "--tool-demo".into(),
+            "bash:".into(),
+            "printf".into(),
+            "loop".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(output.contains("tool result:"));
+        assert!(output.contains("loop"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 pi-ai = { path = "../pi-ai" }
+pi-tools = { path = "../pi-tools" }
 
 [lib]
 path = "src/lib.rs"

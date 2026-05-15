@@ -10,9 +10,22 @@ pub enum Role {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl Message {
@@ -20,6 +33,9 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -27,6 +43,29 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    pub fn assistant_with_tool_call(content: impl Into<String>, tool_call: ToolCall) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: vec![tool_call],
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    pub fn tool_result(tool_call: &ToolCall, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call.id.clone()),
+            tool_name: Some(tool_call.name.clone()),
         }
     }
 }
@@ -35,6 +74,7 @@ impl Message {
 pub enum ProviderError {
     EmptyMessages,
     LastMessageNotUser,
+    LastMessageNotUserOrTool,
 }
 
 impl Display for ProviderError {
@@ -42,6 +82,9 @@ impl Display for ProviderError {
         match self {
             ProviderError::EmptyMessages => write!(f, "provider requires at least one message"),
             ProviderError::LastMessageNotUser => write!(f, "latest message must be a user message"),
+            ProviderError::LastMessageNotUserOrTool => {
+                write!(f, "latest message must be a user or tool message")
+            }
         }
     }
 }
@@ -62,6 +105,34 @@ impl Provider for FauxProvider {
             return Err(ProviderError::LastMessageNotUser);
         }
         Ok(Message::assistant(format!("faux: {}", last.content)))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ToolDemoProvider;
+
+impl Provider for ToolDemoProvider {
+    fn complete(&self, messages: &[Message]) -> Result<Message, ProviderError> {
+        let last = messages.last().ok_or(ProviderError::EmptyMessages)?;
+        match last.role {
+            Role::User => {
+                if let Some(command) = last.content.strip_prefix("bash: ") {
+                    let arguments_json = serde_json::json!({ "command": command }).to_string();
+                    Ok(Message::assistant_with_tool_call(
+                        "requesting bash tool",
+                        ToolCall {
+                            id: "call-1".to_string(),
+                            name: "bash".to_string(),
+                            arguments_json,
+                        },
+                    ))
+                } else {
+                    Ok(Message::assistant(format!("tool-demo: {}", last.content)))
+                }
+            }
+            Role::Tool => Ok(Message::assistant(format!("tool result: {}", last.content))),
+            Role::Assistant => Err(ProviderError::LastMessageNotUserOrTool),
+        }
     }
 }
 
@@ -93,5 +164,29 @@ mod tests {
             provider.complete(&messages).unwrap_err(),
             ProviderError::LastMessageNotUser
         );
+    }
+
+    #[test]
+    fn tool_demo_provider_requests_bash_tool() {
+        let provider = ToolDemoProvider;
+        let response = provider
+            .complete(&[Message::user("bash: printf hi")])
+            .unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "bash");
+        assert!(response.tool_calls[0].arguments_json.contains("printf hi"));
+    }
+
+    #[test]
+    fn tool_result_message_records_call_identity() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments_json: "{}".into(),
+        };
+        let result = Message::tool_result(&call, "ok");
+        assert_eq!(result.role, Role::Tool);
+        assert_eq!(result.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(result.tool_name.as_deref(), Some("bash"));
     }
 }

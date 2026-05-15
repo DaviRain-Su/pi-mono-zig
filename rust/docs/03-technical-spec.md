@@ -97,6 +97,18 @@ Ordering:
 - Higher `score` first.
 - Stable enough for MVP deterministic tests.
 
+### `pi_ai::ToolCall`
+
+```rust
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+```
+
+Assistant messages may include zero or more `tool_calls`. Tool result messages use `role = Tool` and preserve `tool_call_id`/`tool_name`.
+
 ### `pi_tools::ToolDefinition`
 
 ```rust
@@ -255,3 +267,5 @@ At Cargo build time:
 17. `write` creates parent directories before writing content.
 18. `edit` rejects missing or non-unique `old_text` replacements.
 19. Rust tool execution parses arguments through Zig-generated Rust types, not hand-written duplicate structs.
+20. `prompt_with_tools` appends assistant tool-call messages, executes tool calls, appends tool results, then continues until the provider returns an assistant message without tool calls.
+21. Tool loop execution stops with `ToolTurnLimitExceeded` after the configured max tool turns.

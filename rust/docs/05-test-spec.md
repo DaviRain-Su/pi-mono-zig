@@ -19,6 +19,7 @@
 ### Happy Path
 
 - `prompt("hello")` appends user and assistant messages.
+- `prompt_with_tools("bash: ...")` appends user, assistant tool-call, tool result, and final assistant messages.
 
 ### Boundary
 
@@ -108,6 +109,7 @@
 - `pi-rs --list-zig-generated-tool-schemas` prints reflected JSON schemas.
 - `pi-rs --list-tools` prints registry definitions and schemas.
 - `pi-rs --tool bash '{"command":"printf hello"}'` executes through the registry.
+- `pi-rs --tool-demo 'bash: printf hello'` exercises the agent tool loop.
 
 ### Boundary
 

@@ -26,6 +26,7 @@ cargo run -p pi-cli -- --list-zig-generated-tools
 cargo run -p pi-cli -- --list-zig-generated-tool-schemas
 cargo run -p pi-cli -- --list-tools
 cargo run -p pi-cli -- --tool bash '{"command":"printf hello"}'
+cargo run -p pi-cli -- --tool-demo 'bash: printf hello-from-loop'
 ```
 
 ## Cross compilation
