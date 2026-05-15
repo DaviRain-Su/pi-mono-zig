@@ -25,12 +25,13 @@
       "required": ["kind", "entrypoint"],
       "properties": {
         "kind": {
-          "enum": ["typescript", "javascript", "process_jsonl", "wasm", "native", "future"]
+          "enum": ["typescript", "javascript", "process_jsonl", "future"]
         },
         "entrypoint": {
           "oneOf": [
             {
-              "type": "string"
+              "type": "string",
+              "pattern": ".+\\.(ts|js)$"
             },
             {
               "type": "object",
@@ -44,31 +45,6 @@
                     "minLength": 1
                   }
                 }
-              },
-              "additionalProperties": true
-            },
-            {
-              "type": "object",
-              "required": ["artifactPath"],
-              "properties": {
-                "artifactPath": {
-                  "type": "string",
-                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*//).+\\.wasm$"
-                }
-              },
-              "additionalProperties": true
-            },
-            {
-              "type": "object",
-              "required": ["descriptor"],
-              "properties": {
-                "descriptor": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "library_path": false,
-                "dynamic_library_path": false,
-                "remote_url": false
               },
               "additionalProperties": true
             },

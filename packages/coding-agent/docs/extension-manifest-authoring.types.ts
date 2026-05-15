@@ -38,67 +38,12 @@ export interface PiExtensionResourceLimits {
 	readonly toolScopes?: readonly string[];
 }
 
-export interface PiExtensionV0Tool {
-	readonly id: string;
-	readonly description: string;
-	readonly inputSchema: PiExtensionJsonObject;
-	readonly outputSchema: PiExtensionJsonObject;
-}
-
-export interface PiExtensionV0WasmManifest {
-	readonly schemaVersion: "pi-extension.v0";
-	readonly id: string;
-	readonly name: string;
-	readonly version: string;
-	readonly description: string;
-	readonly artifact: {
-		readonly kind: "wasm-component";
-		readonly path: `${string}.wasm`;
-	};
-	readonly tool: PiExtensionV0Tool;
-	readonly capabilities?: readonly PiExtensionCanonicalCapability[];
-	readonly resourceLimits?: PiExtensionResourceLimits;
-	readonly tools?: never;
-	readonly workflow?: never;
-	readonly workflowPreset?: never;
-	readonly wiki?: never;
-	readonly qa?: never;
-	readonly review?: never;
-	readonly webSimulator?: never;
-	readonly marketplace?: never;
-	readonly signing?: never;
-	readonly publisher?: never;
-	readonly remoteUrl?: never;
-	readonly remoteWasmUrl?: never;
-	readonly slashCommand?: never;
-	readonly slashCommands?: never;
-}
-
-export type PiExtensionV1RuntimeKind = "typescript" | "javascript" | "process_jsonl" | "wasm" | "native" | "future";
+export type PiExtensionV1RuntimeKind = "typescript" | "javascript" | "process_jsonl" | "future";
 
 export interface PiExtensionV1RuntimeLimits extends PiExtensionResourceLimits {
 	readonly timeoutMs?: number;
 	readonly outputBytes?: number;
 	readonly toolScopes?: readonly string[];
-}
-
-export interface PiExtensionV1WasmRuntime {
-	readonly kind: "wasm";
-	readonly entrypoint: {
-		readonly artifactPath: `${string}.wasm`;
-	};
-	readonly limits?: PiExtensionV1RuntimeLimits;
-}
-
-export interface PiExtensionV1NativeRuntime {
-	readonly kind: "native";
-	readonly entrypoint: {
-		readonly descriptor: string;
-		readonly library_path?: never;
-		readonly dynamic_library_path?: never;
-		readonly remote_url?: never;
-	};
-	readonly limits?: PiExtensionV1RuntimeLimits;
 }
 
 export interface PiExtensionV1TypeScriptRuntime {
@@ -133,8 +78,6 @@ export type PiExtensionV1Runtime =
 	| PiExtensionV1TypeScriptRuntime
 	| PiExtensionV1JavaScriptRuntime
 	| PiExtensionV1ProcessJsonlRuntime
-	| PiExtensionV1WasmRuntime
-	| PiExtensionV1NativeRuntime
 	| PiExtensionV1FutureRuntime;
 
 export interface PiExtensionV1Tool {
@@ -164,7 +107,7 @@ export interface PiExtensionV1Capabilities {
 	readonly imports?: readonly PiExtensionV1CapabilityImport[];
 }
 
-export interface PiExtensionV1BaseManifest {
+export interface PiExtensionV1Manifest {
 	readonly schemaVersion: "pi-extension.v1";
 	readonly id: string;
 	readonly name: string;
@@ -184,29 +127,12 @@ export interface PiExtensionV1BaseManifest {
 	readonly workflows?: readonly PiExtensionJsonObject[];
 }
 
-export interface PiExtensionV1NativeManifest extends PiExtensionV1BaseManifest {
-	readonly runtime: PiExtensionV1NativeRuntime;
-}
-
-export interface PiExtensionV1WasmManifest extends PiExtensionV1BaseManifest {
-	readonly runtime: PiExtensionV1WasmRuntime;
-}
-
-export type PiExtensionV1Manifest = PiExtensionV1BaseManifest;
-
-export type PiExtensionManifest = PiExtensionV0WasmManifest | PiExtensionV1Manifest;
-
-export type PiNativeAbiVersion = "pi_native_extension_abi_v0";
+export type PiExtensionManifest = PiExtensionV1Manifest;
 
 export interface PiExtensionRuntimeMetadata {
 	readonly kind: PiExtensionV1RuntimeKind;
 	readonly adapter: string;
 	readonly executable: boolean;
-	readonly abi?: {
-		readonly name: PiNativeAbiVersion;
-		readonly minimum?: 0;
-		readonly maximum?: 0;
-	};
 }
 
 export interface PiExtensionOwnerMetadata {
@@ -220,19 +146,6 @@ export interface PiExtensionOwnerMetadata {
 export interface PiExtensionNormalizedDeclarationMetadata {
 	readonly owner: PiExtensionOwnerMetadata;
 	readonly runtime: PiExtensionRuntimeMetadata;
-}
-
-export interface PiExtensionDigestBoundPolicyPrincipal {
-	readonly scope: "user" | "project";
-	readonly sourceIdentity: string;
-	readonly packageId: string;
-	readonly packageVersion: string;
-	readonly runtimeKind: "wasm" | "native";
-	readonly packageRootSha256: string;
-	readonly selectedArtifactSha256: string;
-	readonly selectedArtifactPath?: string;
-	readonly selectedArtifactOs?: string;
-	readonly selectedArtifactArch?: string;
 }
 
 export interface PiExtensionDiagnosticEnvelope {

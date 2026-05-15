@@ -152,13 +152,13 @@ If both are set, video takes precedence.
 
 ### `pi-extension.json` authoring manifests
 
-Zig SDK-backed WASM and native authoring use `pi-extension.json` manifests.
-The TypeScript-facing docs, types, schemas, and examples are parity references
-for the Zig validators only; they do not add TypeScript production runtime
-execution behavior.
+TypeScript and process-backed extensions may use `pi-extension.json` manifests.
+The TypeScript-facing docs, types, and schema are parity references for the Zig
+validators; they do not add separate TypeScript production runtime behavior.
 
 See [Extension Manifest Authoring](extension-manifest-authoring.md) for the
-WASM `pi-extension.v0` and native `pi-extension.v1` authoring shapes.
+supported `pi-extension.v1` TypeScript, JavaScript, and `process_jsonl` authoring
+shapes.
 
 ### Convention Directories
 
