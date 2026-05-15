@@ -36,6 +36,12 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     {
         return Ok(Some(format_zig_generated_tool_schemas()));
     }
+    if args.first().is_some_and(|arg| arg == "--list-tools") {
+        return Ok(Some(format_tool_definitions()));
+    }
+    if args.first().is_some_and(|arg| arg == "--tool") {
+        return run_tool_command(&args);
+    }
 
     let args = parse_args(&args)?;
     ensure_zig_kernel_linked()?;
@@ -78,6 +84,31 @@ fn format_zig_generated_tool_schemas() -> String {
         .join("\n")
 }
 
+fn format_tool_definitions() -> String {
+    pi_tools::builtin_tool_definitions()
+        .iter()
+        .map(|tool| {
+            format!(
+                "{}\t{}\tmutates={}\t{}",
+                tool.name, tool.label, tool.mutates, tool.parameters_json
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn run_tool_command(args: &[String]) -> Result<Option<String>, String> {
+    let Some(name) = args.get(1) else {
+        return Err("--tool requires a tool name".to_string());
+    };
+    let Some(arguments_json) = args.get(2) else {
+        return Err("--tool requires JSON arguments".to_string());
+    };
+    pi_tools::execute_builtin_tool(name, arguments_json)
+        .map(|output| Some(output.content))
+        .map_err(|error| error.to_string())
+}
+
 fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut session_path = None;
     let mut prompt_parts = Vec::new();
@@ -115,7 +146,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
 }
 
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools | --list-zig-generated-tool-schemas".to_string()
+    "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json>".to_string()
 }
 
 #[cfg(test)]
@@ -141,7 +172,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--session <path>] | --list-zig-generated-tools | --list-zig-generated-tool-schemas"
+            "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json>"
         );
     }
 
@@ -158,6 +189,26 @@ mod tests {
             .unwrap();
         assert!(output.contains("edit {\"type\":\"object\""));
         assert!(output.contains("\"old_text\""));
+    }
+
+    #[test]
+    fn lists_tool_definitions_from_registry() {
+        let output = run(vec!["--list-tools".into()]).unwrap().unwrap();
+        assert!(output.contains("read\tRead File"));
+        assert!(output.contains("\"path\""));
+    }
+
+    #[test]
+    fn executes_bash_tool_from_registry() {
+        let output = run(vec![
+            "--tool".into(),
+            "bash".into(),
+            r#"{"command":"printf cli-tool"}"#.into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(output.contains("status: 0"));
+        assert!(output.contains("cli-tool"));
     }
 
     #[test]

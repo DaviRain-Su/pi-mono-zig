@@ -97,6 +97,19 @@ Ordering:
 - Higher `score` first.
 - Stable enough for MVP deterministic tests.
 
+### `pi_tools::ToolDefinition`
+
+```rust
+pub struct ToolDefinition {
+    pub name: &'static str,
+    pub label: &'static str,
+    pub mutates: bool,
+    pub parameters_json: &'static str,
+}
+```
+
+`parameters_json` comes from Zig comptime reflection and is not manually duplicated in Rust.
+
 ### `pi_zig_codegen` generated table
 
 Zig source of truth:
@@ -220,3 +233,5 @@ At Cargo build time:
 12. Existing session file appends only newly generated messages.
 13. Zig comptime generated tool names are available through Rust macro wrappers.
 14. Codegen runs on the host and is not linked into the final binary.
+15. Tool registry definitions expose Zig-reflected schemas.
+16. Unsupported reflected tools return `UnsupportedTool` rather than silently executing.

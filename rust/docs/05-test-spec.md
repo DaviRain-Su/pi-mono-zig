@@ -49,6 +49,9 @@
 
 - Reading an existing file returns its contents.
 - Running `printf hello` returns stdout and status `0`.
+- Built-in tool definitions include Zig-reflected schemas.
+- `execute_builtin_tool("read", json)` returns file contents.
+- `execute_builtin_tool("bash", json)` returns formatted status/stdout/stderr.
 
 ### Boundary
 
@@ -57,6 +60,8 @@
 ### Error
 
 - Missing file returns IO error.
+- Unknown tool returns `UnknownTool`.
+- Reflected but unimplemented tool returns `UnsupportedTool`.
 
 ## `pi-zig-codegen`
 
@@ -97,6 +102,8 @@
 - `pi-rs -p hello --session <path>` appends user and assistant entries.
 - `pi-rs --list-zig-generated-tools` prints the Zig comptime generated registry.
 - `pi-rs --list-zig-generated-tool-schemas` prints reflected JSON schemas.
+- `pi-rs --list-tools` prints registry definitions and schemas.
+- `pi-rs --tool bash '{"command":"printf hello"}'` executes through the registry.
 
 ### Boundary
 

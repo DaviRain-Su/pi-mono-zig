@@ -28,6 +28,7 @@ dependencies = [
  "pi-ai",
  "pi-core",
  "pi-session",
+ "pi-tools",
  "pi-zig",
  "pi-zig-codegen",
 ]
@@ -51,6 +52,11 @@ dependencies = [
 [[package]]
 name = "pi-tools"
 version = "0.1.0"
+dependencies = [
+ "pi-zig-codegen",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "pi-zig"

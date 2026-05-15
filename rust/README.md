@@ -24,6 +24,8 @@ cargo run -p pi-cli -- -p "hello"
 cargo run -p pi-cli -- -p "hello" --session /tmp/pi-rs-session.jsonl
 cargo run -p pi-cli -- --list-zig-generated-tools
 cargo run -p pi-cli -- --list-zig-generated-tool-schemas
+cargo run -p pi-cli -- --list-tools
+cargo run -p pi-cli -- --tool bash '{"command":"printf hello"}'
 ```
 
 ## Cross compilation
