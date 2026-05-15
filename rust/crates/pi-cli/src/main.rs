@@ -1,10 +1,21 @@
-use pi_ai::{FauxProvider, ToolDemoProvider};
+use pi_ai::{FauxProvider, Message, ToolDemoProvider};
 use pi_core::AgentSession;
 use pi_session::SessionFile;
+use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 fn main() {
-    match run(std::env::args().skip(1).collect()) {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--mode", "rpc"] {
+        if let Err(message) = run_rpc_stdio() {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match run(args) {
         Ok(output) => {
             if let Some(output) = output {
                 println!("{output}");
@@ -198,8 +209,241 @@ fn parse_provider(value: &str) -> Result<ProviderKind, String> {
     }
 }
 
+fn run_rpc_stdio() -> Result<(), String> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut runtime = RpcRuntime::new();
+
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        for response in runtime.handle_line(&line) {
+            writeln!(writer, "{response}").map_err(|error| error.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct RpcRuntime {
+    provider: ProviderKind,
+    messages: Vec<Message>,
+}
+
+impl RpcRuntime {
+    fn new() -> Self {
+        Self {
+            provider: ProviderKind::Faux,
+            messages: Vec::new(),
+        }
+    }
+
+    fn handle_line(&mut self, line: &str) -> Vec<String> {
+        let parsed = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error) => {
+                return vec![rpc_response(
+                    None,
+                    "parse",
+                    false,
+                    None,
+                    Some(error.to_string()),
+                )];
+            }
+        };
+
+        let id = parsed.get("id").cloned();
+        let command = parsed
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        vec![self.handle_command(id, command, &parsed)]
+    }
+
+    fn handle_command(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        match command {
+            "set_provider" => self.handle_set_provider(id, command, value),
+            "prompt" => self.handle_prompt(id, command, value),
+            "get_state" => rpc_response(
+                id,
+                command,
+                true,
+                Some(json!({
+                    "provider": self.provider.as_str(),
+                    "messageCount": self.messages.len(),
+                })),
+                None,
+            ),
+            "get_messages" => rpc_response(
+                id,
+                command,
+                true,
+                Some(json!({ "messages": self.messages })),
+                None,
+            ),
+            "tool" => self.handle_tool(id, command, value),
+            _ => rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some(format!("unknown command: {command}")),
+            ),
+        }
+    }
+
+    fn handle_set_provider(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        let Some(provider) = value.get("provider").and_then(Value::as_str) else {
+            return rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some("provider is required".to_string()),
+            );
+        };
+        match parse_provider(provider) {
+            Ok(provider) => {
+                self.provider = provider;
+                rpc_response(
+                    id,
+                    command,
+                    true,
+                    Some(json!({ "provider": self.provider.as_str() })),
+                    None,
+                )
+            }
+            Err(error) => rpc_response(id, command, false, None, Some(error)),
+        }
+    }
+
+    fn handle_prompt(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        let Some(message) = value.get("message").and_then(Value::as_str) else {
+            return rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some("message is required".to_string()),
+            );
+        };
+
+        let provider = match value.get("provider").and_then(Value::as_str) {
+            Some(provider) => match parse_provider(provider) {
+                Ok(provider) => provider,
+                Err(error) => return rpc_response(id, command, false, None, Some(error)),
+            },
+            None => self.provider,
+        };
+
+        let result = match provider {
+            ProviderKind::Faux => {
+                self.prompt_with_provider(FauxProvider, message.to_string(), false)
+            }
+            ProviderKind::ToolDemo => {
+                self.prompt_with_provider(ToolDemoProvider, message.to_string(), true)
+            }
+        };
+
+        match result {
+            Ok(assistant) => rpc_response(
+                id,
+                command,
+                true,
+                Some(json!({ "assistant": assistant, "messages": self.messages })),
+                None,
+            ),
+            Err(error) => rpc_response(id, command, false, None, Some(error)),
+        }
+    }
+
+    fn prompt_with_provider<P: pi_ai::Provider>(
+        &mut self,
+        provider: P,
+        message: String,
+        use_tools: bool,
+    ) -> Result<Message, String> {
+        let mut session = AgentSession::with_messages(provider, self.messages.clone());
+        let assistant = if use_tools {
+            session
+                .prompt_with_tools(message)
+                .map_err(|error| error.to_string())?
+        } else {
+            session.prompt(message).map_err(|error| error.to_string())?
+        };
+        self.messages = session.messages().to_vec();
+        Ok(assistant)
+    }
+
+    fn handle_tool(&mut self, id: Option<Value>, command: &str, value: &Value) -> String {
+        let Some(name) = value.get("name").and_then(Value::as_str) else {
+            return rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some("name is required".to_string()),
+            );
+        };
+        let Some(arguments) = value.get("arguments") else {
+            return rpc_response(
+                id,
+                command,
+                false,
+                None,
+                Some("arguments is required".to_string()),
+            );
+        };
+        let arguments_json = arguments.to_string();
+        match pi_tools::execute_builtin_tool(name, &arguments_json) {
+            Ok(output) => rpc_response(
+                id,
+                command,
+                true,
+                Some(json!({ "output": output.content })),
+                None,
+            ),
+            Err(error) => rpc_response(id, command, false, None, Some(error.to_string())),
+        }
+    }
+}
+
+fn rpc_response(
+    id: Option<Value>,
+    command: &str,
+    success: bool,
+    data: Option<Value>,
+    error: Option<String>,
+) -> String {
+    let mut response = json!({
+        "type": "response",
+        "command": command,
+        "success": success,
+    });
+    if let Some(id) = id {
+        response["id"] = id;
+    }
+    if let Some(data) = data {
+        response["data"] = data;
+    }
+    if let Some(error) = error {
+        response["error"] = json!(error);
+    }
+    response.to_string()
+}
+
+impl ProviderKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Faux => "faux",
+            ProviderKind::ToolDemo => "tool-demo",
+        }
+    }
+}
+
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
+    "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
 }
 
 #[cfg(test)]
@@ -225,7 +469,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
+            "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --mode rpc | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
         );
     }
 
@@ -318,6 +562,61 @@ mod tests {
         assert_eq!(entries[0].message.content, "bash: printf persist-loop");
         assert!(!entries[1].message.tool_calls.is_empty());
         assert_eq!(entries[2].message.role, pi_ai::Role::Tool);
+    }
+
+    #[test]
+    fn rpc_prompt_returns_response_and_records_messages() {
+        let mut runtime = RpcRuntime::new();
+        let responses = runtime.handle_line(r#"{"id":"1","type":"prompt","message":"hello"}"#);
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+
+        assert_eq!(response["id"], "1");
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["assistant"]["content"], "faux: hello");
+        assert_eq!(runtime.messages.len(), 2);
+    }
+
+    #[test]
+    fn rpc_tool_demo_prompt_runs_tool_loop() {
+        let mut runtime = RpcRuntime::new();
+        let responses = runtime.handle_line(
+            r#"{"id":"2","type":"prompt","provider":"tool-demo","message":"bash: printf rpc-loop"}"#,
+        );
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+
+        assert_eq!(response["success"], true);
+        assert!(response["data"]["assistant"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("rpc-loop"));
+        assert_eq!(runtime.messages.len(), 4);
+    }
+
+    #[test]
+    fn rpc_tool_command_executes_registry_tool() {
+        let mut runtime = RpcRuntime::new();
+        let responses = runtime.handle_line(
+            r#"{"id":"3","type":"tool","name":"bash","arguments":{"command":"printf rpc-tool"}}"#,
+        );
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+
+        assert_eq!(response["success"], true);
+        assert!(response["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("rpc-tool"));
+    }
+
+    #[test]
+    fn rpc_get_state_reports_provider_and_message_count() {
+        let mut runtime = RpcRuntime::new();
+        runtime.handle_line(r#"{"type":"set_provider","provider":"tool-demo"}"#);
+        let responses = runtime.handle_line(r#"{"type":"get_state"}"#);
+        let response: Value = serde_json::from_str(&responses[0]).unwrap();
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"]["provider"], "tool-demo");
+        assert_eq!(response["data"]["messageCount"], 0);
     }
 
     #[test]

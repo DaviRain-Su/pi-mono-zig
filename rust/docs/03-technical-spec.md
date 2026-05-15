@@ -270,3 +270,5 @@ At Cargo build time:
 20. `prompt_with_tools` appends assistant tool-call messages, executes tool calls, appends tool results, then continues until the provider returns an assistant message without tool calls.
 21. Tool loop execution stops with `ToolTurnLimitExceeded` after the configured max tool turns.
 22. `pi-rs -p ... --provider tool-demo --session <path>` persists the full user -> assistant tool-call -> tool result -> final assistant transcript.
+23. `pi-rs --mode rpc` reads LF-delimited JSON commands from stdin and writes one JSON response per line.
+24. RPC commands support `prompt`, `set_provider`, `get_state`, `get_messages`, and direct `tool` execution.

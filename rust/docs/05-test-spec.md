@@ -111,6 +111,7 @@
 - `pi-rs --tool bash '{"command":"printf hello"}'` executes through the registry.
 - `pi-rs --tool-demo 'bash: printf hello'` exercises the agent tool loop.
 - `pi-rs -p 'bash: printf hello' --provider tool-demo --session <path>` persists all tool-loop messages.
+- `pi-rs --mode rpc` accepts JSONL `prompt`, `get_state`, `get_messages`, `set_provider`, and `tool` commands.
 
 ### Boundary
 

@@ -32,6 +32,7 @@ dependencies = [
  "pi-tools",
  "pi-zig",
  "pi-zig-codegen",
+ "serde_json",
 ]
 
 [[package]]
