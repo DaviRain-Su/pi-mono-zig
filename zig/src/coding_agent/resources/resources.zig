@@ -1,7 +1,6 @@
 const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
-const tui = @import("tui");
-const theme_mod = tui.theme;
+const theme_mod = @import("shared").theme;
 
 const resource_types = @import("types.zig");
 const resource_commands = @import("commands.zig");
@@ -1576,7 +1575,7 @@ test "roles m0 parseThemeToken accepts role token names" {
 }
 
 fn appendColorAnsi(allocator: std.mem.Allocator, builder: *std.ArrayList(u8), value: []const u8, foreground: bool) !void {
-    if (tui.style.parseNamedColor(value)) |named| {
+    if (theme_mod.parseNamedColor(value)) |named| {
         const prefix = if (foreground) "\x1b[3" else "\x1b[4";
         const color_text = try std.fmt.allocPrint(allocator, "{s}{d}m", .{ prefix, named });
         defer allocator.free(color_text);

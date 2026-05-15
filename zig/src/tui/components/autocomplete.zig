@@ -1,13 +1,10 @@
 const std = @import("std");
 const select_list = @import("vaxis-widgets").components.select_list;
-const fuzzy = @import("../fuzzy.zig");
+const fuzzy = @import("shared").fuzzy;
 
 pub const Item = select_list.SelectItem;
 
-pub const Match = struct {
-    matches: bool,
-    score: i32,
-};
+pub const Match = fuzzy.RankedFuzzyMatch;
 
 const RankedItem = struct {
     item: Item,
@@ -15,27 +12,7 @@ const RankedItem = struct {
     original_index: usize,
 };
 
-/// Cfg used by the Item-oriented autocomplete helpers. Matches the previous
-/// `fuzzyMatchNormalized` behaviour exactly: i32 scores, no query trim, no
-/// newline boundaries, no exact-match bonus.
-const AutocompleteFuzzyCfg = struct {
-    pub const Score = i32;
-    pub const boundary_bonus: Score = 100;
-    pub const consecutive_penalty_unit: Score = 50;
-    pub const gap_weight: Score = 20;
-    pub const position_weight: Score = 1;
-    pub const exact_match_bonus: Score = 0;
-    pub const swap_bonus: Score = 50;
-    pub const trim_query: bool = false;
-    pub const boundary_includes_newline: bool = false;
-};
-
-const Matcher = fuzzy.FuzzyMatcher(AutocompleteFuzzyCfg);
-
-pub fn fuzzyMatch(query: []const u8, text: []const u8) Match {
-    const result = Matcher.matchWithSwap(query, text);
-    return .{ .matches = result.matches, .score = result.score };
-}
+pub const fuzzyMatch = fuzzy.fuzzyMatchRanked;
 
 pub fn fuzzyFilterAlloc(
     allocator: std.mem.Allocator,

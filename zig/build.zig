@@ -53,11 +53,22 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zigimg_dep = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigimg_mod = zigimg_dep.module("zigimg");
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+    });
+
+    const shared_mod = b.createModule(.{
+        .root_source_file = b.path("src/shared/root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     const ai_mod = b.createModule(.{
@@ -88,6 +99,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    tui_mod.addImport("shared", shared_mod);
     tui_mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     tui_mod.addImport("vaxis-widgets", vaxis_widgets_mod);
 
@@ -99,8 +111,10 @@ pub fn build(b: *std.Build) void {
 
     mod.addImport("ai", ai_mod);
     mod.addImport("agent", agent_mod);
+    mod.addImport("shared", shared_mod);
     mod.addImport("tui", tui_mod);
     mod.addImport("web_ui", web_ui_mod);
+    mod.addImport("zigimg", zigimg_mod);
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -199,6 +213,15 @@ pub fn build(b: *std.Build) void {
         addProviderParitySuite(b, target, optimize, ai_mod, external_tool_check_step, provider_parity_suite);
     }
 
+    const shared_tests = b.addTest(.{
+        .root_module = shared_mod,
+    });
+    const run_shared_tests = b.addRunArtifact(shared_tests);
+    test_step.dependOn(&run_shared_tests.step);
+
+    const shared_test_step = b.step("test-shared", "Run shared utility unit tests only");
+    shared_test_step.dependOn(&run_shared_tests.step);
+
     const ai_tests = b.addTest(.{
         .root_module = ai_mod,
     });
@@ -235,7 +258,9 @@ pub fn build(b: *std.Build) void {
     });
     coding_agent_mod.addImport("ai", ai_mod);
     coding_agent_mod.addImport("agent", agent_mod);
+    coding_agent_mod.addImport("shared", shared_mod);
     coding_agent_mod.addImport("tui", tui_mod);
+    coding_agent_mod.addImport("zigimg", zigimg_mod);
 
     const coding_agent_tests = b.addTest(.{
         .root_module = coding_agent_mod,
@@ -258,7 +283,9 @@ pub fn build(b: *std.Build) void {
     });
     main_test_mod.addImport("ai", ai_mod);
     main_test_mod.addImport("agent", agent_mod);
+    main_test_mod.addImport("shared", shared_mod);
     main_test_mod.addImport("tui", tui_mod);
+    main_test_mod.addImport("zigimg", zigimg_mod);
 
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,
@@ -316,13 +343,20 @@ pub fn build(b: *std.Build) void {
     });
     coding_agent_rendering_mod.addImport("ai", ai_mod);
     coding_agent_rendering_mod.addImport("agent", agent_mod);
+    coding_agent_rendering_mod.addImport("shared", shared_mod);
     coding_agent_rendering_mod.addImport("tui", tui_mod);
     coding_agent_rendering_mod.addImport("coding_agent", coding_agent_mod);
+    coding_agent_rendering_mod.addImport("zigimg", zigimg_mod);
 
     const coding_agent_rendering_tests = b.addTest(.{
         .root_module = coding_agent_rendering_mod,
     });
     const run_coding_agent_rendering_tests = b.addRunArtifact(coding_agent_rendering_tests);
+    test_step.dependOn(&run_coding_agent_rendering_tests.step);
+    coding_agent_test_step.dependOn(&run_coding_agent_rendering_tests.step);
+
+    const coding_agent_rendering_test_step = b.step("test-coding-agent-rendering", "Run coding-agent rendering tests only");
+    coding_agent_rendering_test_step.dependOn(&run_coding_agent_rendering_tests.step);
 
     const tui_tests = b.addTest(.{
         .root_module = tui_mod,
@@ -333,7 +367,6 @@ pub fn build(b: *std.Build) void {
     const tui_test_step = b.step("test-tui", "Run TUI unit tests only");
     tui_test_step.dependOn(external_tool_check_step);
     tui_test_step.dependOn(&run_tui_tests.step);
-    tui_test_step.dependOn(&run_coding_agent_rendering_tests.step);
 }
 
 fn addMacosWebViewSupport(

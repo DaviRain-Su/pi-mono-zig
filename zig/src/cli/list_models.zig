@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai = @import("ai");
-const tui = @import("tui");
+const fuzzy = @import("shared").fuzzy;
 
 const ModelRow = struct {
     provider: []const u8,
@@ -56,7 +56,7 @@ pub fn listModels(
         if (search_pattern) |pattern| {
             const label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ summary.provider, summary.id });
             defer allocator.free(label);
-            if (!tui.components.autocomplete.fuzzyMatch(pattern, label).matches) continue;
+            if (!fuzzy.fuzzyMatchRanked(pattern, label).matches) continue;
         }
 
         try rows.append(allocator, .{

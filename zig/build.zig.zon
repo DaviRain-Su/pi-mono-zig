@@ -3,6 +3,10 @@
     .version = "0.16.0",
     .dependencies = .{
         .vaxis = .{ .path = "vendor/vaxis" },
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg#d695acd97c02e57bb151e8f659d1280f5cd6ca70",
+            .hash = "zigimg-0.1.0-8_eo2oyaFwBZwJpmqPkCfVXWBrHcqbYwmrp1I6bTD3lI",
+        },
     },
     .paths = .{""},
     .fingerprint = 0xc1ce1081f1ad3ac6,

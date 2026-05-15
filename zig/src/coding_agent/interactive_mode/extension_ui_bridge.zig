@@ -421,7 +421,7 @@ fn captureMatchingShortcut(context: ?*anyopaque, registry: *const extension_runt
     for (registry.shortcuts.items) |shortcut| {
         const command_text = shortcut.command orelse continue;
         const spec = keybindings_mod.parseKeySpec(shortcut.shortcut) orelse continue;
-        if (spec.matches(lookup.key, lookup.modifiers)) {
+        if (keybindings_mod.keySpecMatches(spec, lookup.key, lookup.modifiers)) {
             lookup.matched_command = try lookup.allocator.dupe(u8, command_text);
             return;
         }

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigimg = @import("tui").vaxis.zigimg;
+const zigimg = @import("zigimg");
 const exif_orientation = @import("exif_orientation.zig");
 
 pub const ConvertedImage = struct {

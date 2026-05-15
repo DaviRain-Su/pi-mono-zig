@@ -1,6 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const tui = @import("tui");
+const keybinding_schema = @import("shared").keybinding_schema;
+const keybinding_matcher = @import("keybinding_matcher.zig");
 
 pub const Action = enum(u8) {
     interrupt,
@@ -84,152 +85,11 @@ pub const EditorAction = enum(u8) {
 const ACTION_COUNT = @typeInfo(Action).@"enum".fields.len;
 const EDITOR_ACTION_COUNT = @typeInfo(EditorAction).@"enum".fields.len;
 
-pub const KeySpec = union(enum) {
-    ctrl: u8,
-    ctrl_alt: u8,
-    alt: u8,
-    escape,
-    enter,
-    shift_enter,
-    tab,
-    shift_tab,
-    alt_enter,
-    alt_up,
-    alt_down,
-    alt_left,
-    alt_right,
-    ctrl_left,
-    ctrl_right,
-    ctrl_end,
-    ctrl_backspace,
-    shift_char: u8,
-    shift_ctrl_char: u8,
-    up,
-    down,
-    left,
-    right,
-    home,
-    end,
-    page_up,
-    page_down,
-    backspace,
-    delete,
-    alt_backspace,
-    alt_delete,
+pub const KeySpec = keybinding_schema.KeySpec;
+pub const parseKeySpec = keybinding_schema.parseKeySpec;
+pub const altModifierDisplayName = keybinding_schema.altModifierDisplayName;
 
-    pub fn matches(self: KeySpec, key: tui.Key, modifiers: tui.keys.KeyModifiers) bool {
-        return switch (self) {
-            .ctrl => |value| switch (key) {
-                .ctrl => |pressed| pressed == value and !modifiers.hasAny(),
-                else => false,
-            },
-            .ctrl_alt => |value| switch (key) {
-                .printable => |pk| pk.slice().len == 1 and
-                    std.ascii.toLower(pk.slice()[0]) == value and
-                    modifiers.ctrl and modifiers.alt and !modifiers.shift and !modifiers.super,
-                .ctrl => |pressed| pressed == value and modifiers.alt and !modifiers.shift and !modifiers.super,
-                else => false,
-            },
-            .alt => |value| switch (key) {
-                .printable => |pk| pk.slice().len == 1 and
-                    std.ascii.toLower(pk.slice()[0]) == value and
-                    modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-                else => false,
-            },
-            .escape => key == .escape and !modifiers.hasAny(),
-            .enter => key == .enter and !modifiers.hasAny(),
-            .shift_enter => key == .enter and modifiers.shift and !modifiers.alt and !modifiers.ctrl and !modifiers.super,
-            .tab => key == .tab and !modifiers.hasAny(),
-            .shift_tab => key == .shift_tab and !modifiers.hasAny(),
-            .alt_enter => key == .enter and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .alt_up => key == .up and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .alt_down => key == .down and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .alt_left => key == .left and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .alt_right => key == .right and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .ctrl_left => key == .ctrl_left and !modifiers.hasAny(),
-            .ctrl_right => key == .ctrl_right and !modifiers.hasAny(),
-            .ctrl_end => key == .ctrl_end and !modifiers.hasAny(),
-            .ctrl_backspace => key == .backspace and modifiers.ctrl and !modifiers.shift and !modifiers.alt and !modifiers.super,
-            .shift_char => |letter| blk: {
-                break :blk switch (key) {
-                    .printable => |pk| pk.slice().len == 1 and
-                        (pk.slice()[0] == letter or pk.slice()[0] == std.ascii.toUpper(letter)) and
-                        modifiers.shift and !modifiers.ctrl and !modifiers.alt and !modifiers.super,
-                    else => false,
-                };
-            },
-            .shift_ctrl_char => |letter| blk: {
-                // Match both:
-                // - printable "P" with shift+ctrl (modern kitty terminals)
-                // - ctrl 'p' with shift modifier (some terminal emulators / unit tests)
-                break :blk switch (key) {
-                    .printable => |pk| pk.slice().len == 1 and
-                        (pk.slice()[0] == letter or pk.slice()[0] == std.ascii.toUpper(letter)) and
-                        modifiers.shift and modifiers.ctrl and !modifiers.alt and !modifiers.super,
-                    .ctrl => |c| c == letter and modifiers.shift and !modifiers.alt and !modifiers.super,
-                    else => false,
-                };
-            },
-            .up => key == .up and !modifiers.hasAny(),
-            .down => key == .down and !modifiers.hasAny(),
-            .left => key == .left and !modifiers.hasAny(),
-            .right => key == .right and !modifiers.hasAny(),
-            .home => key == .home and !modifiers.hasAny(),
-            .end => key == .end and !modifiers.hasAny(),
-            .page_up => key == .page_up and !modifiers.hasAny(),
-            .page_down => key == .page_down and !modifiers.hasAny(),
-            .backspace => key == .backspace and !modifiers.hasAny(),
-            .delete => key == .delete and !modifiers.hasAny(),
-            .alt_backspace => key == .backspace and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-            .alt_delete => key == .delete and modifiers.alt and !modifiers.shift and !modifiers.ctrl and !modifiers.super,
-        };
-    }
-
-    pub fn format(self: KeySpec, allocator: std.mem.Allocator) ![]u8 {
-        return self.formatForOs(allocator, builtin.target.os.tag);
-    }
-
-    pub fn formatForOs(self: KeySpec, allocator: std.mem.Allocator, os_tag: std.Target.Os.Tag) ![]u8 {
-        return switch (self) {
-            .ctrl => |value| std.fmt.allocPrint(allocator, "Ctrl+{c}", .{std.ascii.toUpper(value)}),
-            .ctrl_alt => |value| std.fmt.allocPrint(allocator, "Ctrl+{s}+{c}", .{ altModifierDisplayName(os_tag), std.ascii.toUpper(value) }),
-            .alt => |value| std.fmt.allocPrint(allocator, "{s}+{c}", .{ altModifierDisplayName(os_tag), std.ascii.toUpper(value) }),
-            .escape => allocator.dupe(u8, "Esc"),
-            .enter => allocator.dupe(u8, "Enter"),
-            .shift_enter => allocator.dupe(u8, "Shift+Enter"),
-            .tab => allocator.dupe(u8, "Tab"),
-            .shift_tab => allocator.dupe(u8, "Shift+Tab"),
-            .alt_enter => std.fmt.allocPrint(allocator, "{s}+Enter", .{altModifierDisplayName(os_tag)}),
-            .alt_up => std.fmt.allocPrint(allocator, "{s}+Up", .{altModifierDisplayName(os_tag)}),
-            .alt_down => std.fmt.allocPrint(allocator, "{s}+Down", .{altModifierDisplayName(os_tag)}),
-            .alt_left => std.fmt.allocPrint(allocator, "{s}+Left", .{altModifierDisplayName(os_tag)}),
-            .alt_right => std.fmt.allocPrint(allocator, "{s}+Right", .{altModifierDisplayName(os_tag)}),
-            .ctrl_left => allocator.dupe(u8, "Ctrl+Left"),
-            .ctrl_right => allocator.dupe(u8, "Ctrl+Right"),
-            .ctrl_end => allocator.dupe(u8, "Ctrl+End"),
-            .ctrl_backspace => allocator.dupe(u8, "Ctrl+Backspace"),
-            .shift_char => |letter| std.fmt.allocPrint(allocator, "Shift+{c}", .{std.ascii.toUpper(letter)}),
-            .shift_ctrl_char => |letter| std.fmt.allocPrint(allocator, "Shift+Ctrl+{c}", .{std.ascii.toUpper(letter)}),
-            .up => allocator.dupe(u8, "Up"),
-            .down => allocator.dupe(u8, "Down"),
-            .left => allocator.dupe(u8, "Left"),
-            .right => allocator.dupe(u8, "Right"),
-            .home => allocator.dupe(u8, "Home"),
-            .end => allocator.dupe(u8, "End"),
-            .page_up => allocator.dupe(u8, "PgUp"),
-            .page_down => allocator.dupe(u8, "PgDn"),
-            .backspace => allocator.dupe(u8, "Backspace"),
-            .delete => allocator.dupe(u8, "Delete"),
-            .alt_backspace => std.fmt.allocPrint(allocator, "{s}+Backspace", .{altModifierDisplayName(os_tag)}),
-            .alt_delete => std.fmt.allocPrint(allocator, "{s}+Delete", .{altModifierDisplayName(os_tag)}),
-        };
-    }
-};
-
-pub fn altModifierDisplayName(os_tag: std.Target.Os.Tag) []const u8 {
-    return if (os_tag == .macos) "Option" else "Alt";
-}
-
+pub const keySpecMatches = keybinding_matcher.keySpecMatches;
 const BindingDefinition = struct {
     action: Action,
     id: []const u8,
@@ -495,7 +355,7 @@ pub const Keybindings = struct {
     ) ?Action {
         for (DEFINITIONS, 0..) |definition, index| {
             for (self.bindings[index]) |spec| {
-                if (spec.matches(key, modifiers)) return definition.action;
+                if (keySpecMatches(spec, key, modifiers)) return definition.action;
             }
         }
         return null;
@@ -508,7 +368,7 @@ pub const Keybindings = struct {
     ) ?EditorAction {
         for (EDITOR_DEFINITIONS, 0..) |definition, index| {
             for (self.editor_bindings[index]) |spec| {
-                if (spec.matches(key, modifiers)) return definition.action;
+                if (keySpecMatches(spec, key, modifiers)) return definition.action;
             }
         }
         return null;
@@ -522,7 +382,7 @@ pub const Keybindings = struct {
     ) bool {
         const binding = self.bindings[@intFromEnum(action)];
         for (binding) |spec| {
-            if (spec.matches(key, modifiers)) return true;
+            if (keySpecMatches(spec, key, modifiers)) return true;
         }
         return false;
     }
@@ -535,7 +395,7 @@ pub const Keybindings = struct {
     ) bool {
         const binding = self.editor_bindings[@intFromEnum(action)];
         for (binding) |spec| {
-            if (spec.matches(key, modifiers)) return true;
+            if (keySpecMatches(spec, key, modifiers)) return true;
         }
         return false;
     }
@@ -570,7 +430,7 @@ pub fn defaultEditorActionForKeyWithModifiers(
     for (EDITOR_DEFINITIONS) |definition| {
         for (definition.defaults) |raw| {
             const spec = parseKeySpec(raw) orelse continue;
-            if (spec.matches(key, modifiers)) return definition.action;
+            if (keySpecMatches(spec, key, modifiers)) return definition.action;
         }
     }
     return null;
@@ -752,85 +612,6 @@ fn parseBindingList(allocator: std.mem.Allocator, entries: []const []const u8) !
     return specs.toOwnedSlice(allocator);
 }
 
-pub fn parseKeySpec(raw: []const u8) ?KeySpec {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return null;
-
-    var buffer: [64]u8 = undefined;
-    if (trimmed.len > buffer.len) return null;
-    for (trimmed, 0..) |byte, index| {
-        buffer[index] = std.ascii.toLower(byte);
-    }
-    const normalized = buffer[0..trimmed.len];
-
-    if (std.mem.eql(u8, normalized, "escape") or std.mem.eql(u8, normalized, "esc")) return .escape;
-    if (std.mem.eql(u8, normalized, "enter") or std.mem.eql(u8, normalized, "return")) return .enter;
-    if (std.mem.eql(u8, normalized, "shift+enter") or std.mem.eql(u8, normalized, "shift+return")) return .shift_enter;
-    if (std.mem.eql(u8, normalized, "tab")) return .tab;
-    if (std.mem.eql(u8, normalized, "shift+tab")) return .shift_tab;
-    if (std.mem.eql(u8, normalized, "alt+enter")) return .alt_enter;
-    if (std.mem.eql(u8, normalized, "alt+up")) return .alt_up;
-    if (std.mem.eql(u8, normalized, "alt+down")) return .alt_down;
-    if (std.mem.eql(u8, normalized, "alt+left")) return .alt_left;
-    if (std.mem.eql(u8, normalized, "alt+right")) return .alt_right;
-    if (std.mem.eql(u8, normalized, "ctrl+left")) return .ctrl_left;
-    if (std.mem.eql(u8, normalized, "ctrl+right")) return .ctrl_right;
-    if (std.mem.eql(u8, normalized, "ctrl+end")) return .ctrl_end;
-    if (std.mem.eql(u8, normalized, "ctrl+backspace")) return .ctrl_backspace;
-    if (std.mem.eql(u8, normalized, "up")) return .up;
-    if (std.mem.eql(u8, normalized, "down")) return .down;
-    if (std.mem.eql(u8, normalized, "left")) return .left;
-    if (std.mem.eql(u8, normalized, "right")) return .right;
-    if (std.mem.eql(u8, normalized, "home")) return .home;
-    if (std.mem.eql(u8, normalized, "end")) return .end;
-    if (std.mem.eql(u8, normalized, "pageup") or std.mem.eql(u8, normalized, "page_up")) return .page_up;
-    if (std.mem.eql(u8, normalized, "pagedown") or std.mem.eql(u8, normalized, "page_down")) return .page_down;
-    if (std.mem.eql(u8, normalized, "backspace")) return .backspace;
-    if (std.mem.eql(u8, normalized, "delete") or std.mem.eql(u8, normalized, "del")) return .delete;
-    if (std.mem.eql(u8, normalized, "alt+backspace")) return .alt_backspace;
-    if (std.mem.eql(u8, normalized, "alt+delete") or std.mem.eql(u8, normalized, "alt+del")) return .alt_delete;
-
-    // shift+ctrl+<letter>: e.g. "shift+ctrl+p"
-    if (std.mem.startsWith(u8, normalized, "shift+ctrl+") and normalized.len == 12) {
-        const value = normalized[11];
-        if (value >= 'a' and value <= 'z') {
-            return .{ .shift_ctrl_char = value };
-        }
-    }
-
-    if (std.mem.startsWith(u8, normalized, "ctrl+alt+") and normalized.len == 10) {
-        const value = normalized[9];
-        if ((value >= 'a' and value <= 'z') or value == ']') {
-            return .{ .ctrl_alt = value };
-        }
-    }
-
-    // ctrl+<letter, digit, or TS-supported punctuation>: e.g. "ctrl+c", "ctrl+0", "ctrl+-", "ctrl+]"
-    if (std.mem.startsWith(u8, normalized, "ctrl+") and normalized.len == 6) {
-        const value = normalized[5];
-        if ((value >= 'a' and value <= 'z') or (value >= '0' and value <= '9') or value == '-' or value == ']') {
-            return .{ .ctrl = value };
-        }
-    }
-
-    if (std.mem.startsWith(u8, normalized, "alt+") and normalized.len == 5) {
-        const value = normalized[4];
-        if (value >= 'a' and value <= 'z') {
-            return .{ .alt = value };
-        }
-    }
-
-    // shift+<letter>: e.g. "shift+l", "shift+t"
-    if (std.mem.startsWith(u8, normalized, "shift+") and normalized.len == 7) {
-        const value = normalized[6];
-        if (value >= 'a' and value <= 'z') {
-            return .{ .shift_char = value };
-        }
-    }
-
-    return null;
-}
-
 test "keybinding definitions count matches action enum" {
     try std.testing.expectEqual(ACTION_COUNT, DEFINITIONS.len);
     try std.testing.expectEqual(ACTION_COUNT, @typeInfo(Action).@"enum".fields.len);
@@ -1010,32 +791,36 @@ test "keybinding display labels use Option on macOS while matching Alt" {
     defer allocator.free(linux_label);
     try std.testing.expectEqualStrings("Alt+Enter", linux_label);
 
-    try std.testing.expect(alt_enter.matches(.enter, .{ .alt = true }));
+    try std.testing.expect(keySpecMatches(alt_enter, .enter, .{ .alt = true }));
 }
 
 test "keybinding shift_char matches uppercase printable key with shift modifier" {
     const spec = KeySpec{ .shift_char = 'l' };
 
     // Matches uppercase printable "L" with shift
-    try std.testing.expect(spec.matches(
+    try std.testing.expect(keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("L") },
         .{ .shift = true },
     ));
 
     // Also matches lowercase printable "l" with shift (fallback for some terminals)
-    try std.testing.expect(spec.matches(
+    try std.testing.expect(keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("l") },
         .{ .shift = true },
     ));
 
     // Does NOT match without shift modifier
-    try std.testing.expect(!spec.matches(
+    try std.testing.expect(!keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("L") },
         .{},
     ));
 
     // Does NOT match with ctrl modifier
-    try std.testing.expect(!spec.matches(
+    try std.testing.expect(!keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("L") },
         .{ .shift = true, .ctrl = true },
     ));
@@ -1045,22 +830,25 @@ test "keybinding shift_ctrl_char matches both ctrl key and printable key" {
     const spec = KeySpec{ .shift_ctrl_char = 'p' };
 
     // Matches ctrl 'p' with shift (unit test / some terminals)
-    try std.testing.expect(spec.matches(
+    try std.testing.expect(keySpecMatches(
+        spec,
         .{ .ctrl = 'p' },
         .{ .shift = true },
     ));
 
     // Matches printable "P" with shift+ctrl (kitty terminals)
-    try std.testing.expect(spec.matches(
+    try std.testing.expect(keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("P") },
         .{ .shift = true, .ctrl = true },
     ));
 
     // Does NOT match without shift
-    try std.testing.expect(!spec.matches(.{ .ctrl = 'p' }, .{}));
+    try std.testing.expect(!keySpecMatches(spec, .{ .ctrl = 'p' }, .{}));
 
     // Does NOT match without ctrl (would be shift_char then)
-    try std.testing.expect(!spec.matches(
+    try std.testing.expect(!keySpecMatches(
+        spec,
         .{ .printable = tui.keys.PrintableKey.fromSlice("P") },
         .{ .shift = true },
     ));

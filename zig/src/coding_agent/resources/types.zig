@@ -1,7 +1,6 @@
 const std = @import("std");
 const config_errors = @import("../config/config_errors.zig");
-const tui = @import("tui");
-const theme_mod = tui.theme;
+const theme_mod = @import("shared").theme;
 
 pub const SourceScope = enum {
     temporary,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("tui");
+const fuzzy = @import("shared").fuzzy;
 
 pub const SessionSearchInfo = struct {
     path: []const u8,
@@ -291,7 +291,7 @@ fn matchSessionSearchQuery(
                 total_score += @as(i32, @intCast(match_index * 10));
             },
             .fuzzy => {
-                const match = tui.components.autocomplete.fuzzyMatch(token.value, text);
+                const match = fuzzy.fuzzyMatchRanked(token.value, text);
                 if (!match.matches) {
                     return .{
                         .matches = false,
