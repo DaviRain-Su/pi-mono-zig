@@ -39,8 +39,6 @@ pub const RuntimeKind = enum {
     typescript,
     javascript,
     process_jsonl,
-    wasm,
-    native,
     future,
 
     pub fn jsonName(self: RuntimeKind) []const u8 {
@@ -48,8 +46,6 @@ pub const RuntimeKind = enum {
             .typescript => "typescript",
             .javascript => "javascript",
             .process_jsonl => "process_jsonl",
-            .wasm => "wasm",
-            .native => "native",
             .future => "future",
         };
     }
@@ -58,8 +54,6 @@ pub const RuntimeKind = enum {
         return switch (self) {
             .typescript, .javascript => "ts-js-extension-loader",
             .process_jsonl => "process-jsonl-host",
-            .wasm => "wasm-component-host",
-            .native => "zig-native-static-host",
             .future => "future-runtime-placeholder",
         };
     }
@@ -578,46 +572,6 @@ fn validateRuntimeEntrypoint(
                     defer allocator.free(json_path);
                     return try invalidOne(allocator, manifest_path, json_path, "manifest.expected_string", "expected non-empty string");
                 }
-            }
-            return null;
-        },
-        .wasm => {
-            if (entrypoint != .object) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.expected_object", "wasm entrypoint must be an object");
-            }
-            const artifact_path = entrypoint.object.get("artifactPath") orelse
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.artifactPath", "manifest.missing_required_field", "missing required field");
-            if (artifact_path != .string) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.artifactPath", "manifest.expected_string", "expected string");
-            }
-            if (!std.mem.endsWith(u8, artifact_path.string, ".wasm")) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.artifactPath", "manifest.invalid_entrypoint", "wasm artifactPath must point to a .wasm file");
-            }
-            return validatePackageRelativePath(allocator, manifest_path, "$.runtime.entrypoint.artifactPath", artifact_path.string, null);
-        },
-        .native => {
-            if (entrypoint != .object) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.expected_object", "native entrypoint must be an object");
-            }
-            const has_descriptor = entrypoint.object.get("descriptor") != null;
-            const has_dynamic_library = entrypoint.object.get("dynamic_library_path") != null;
-            if (!has_descriptor and !has_dynamic_library) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.missing_required_field", "native entrypoint must have either descriptor or dynamic_library_path");
-            }
-            if (has_descriptor) {
-                const descriptor = entrypoint.object.get("descriptor").?;
-                if (descriptor != .string or descriptor.string.len == 0) {
-                    return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.descriptor", "manifest.expected_string", "expected non-empty string");
-                }
-            }
-            if (has_dynamic_library) {
-                const dynamic_library_path = entrypoint.object.get("dynamic_library_path").?;
-                if (dynamic_library_path != .string or dynamic_library_path.string.len == 0) {
-                    return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint.dynamic_library_path", "manifest.expected_string", "expected non-empty string");
-                }
-            }
-            if (entrypoint.object.get("library_path") != null or entrypoint.object.get("remote_url") != null) {
-                return try invalidOne(allocator, manifest_path, "$.runtime.entrypoint", "manifest.forbidden_native_entrypoint_field", "native manifests must use an approved static descriptor or dynamic_library_path entrypoint");
             }
             return null;
         },
