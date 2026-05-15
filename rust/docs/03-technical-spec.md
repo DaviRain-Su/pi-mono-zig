@@ -269,3 +269,4 @@ At Cargo build time:
 19. Rust tool execution parses arguments through Zig-generated Rust types, not hand-written duplicate structs.
 20. `prompt_with_tools` appends assistant tool-call messages, executes tool calls, appends tool results, then continues until the provider returns an assistant message without tool calls.
 21. Tool loop execution stops with `ToolTurnLimitExceeded` after the configured max tool turns.
+22. `pi-rs -p ... --provider tool-demo --session <path>` persists the full user -> assistant tool-call -> tool result -> final assistant transcript.

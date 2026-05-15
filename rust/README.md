@@ -21,7 +21,7 @@ cargo test
 ```bash
 cd rust
 cargo run -p pi-cli -- -p "hello"
-cargo run -p pi-cli -- -p "hello" --session /tmp/pi-rs-session.jsonl
+cargo run -p pi-cli -- -p "bash: printf hello" --provider tool-demo --session /tmp/pi-rs-session.jsonl
 cargo run -p pi-cli -- --list-zig-generated-tools
 cargo run -p pi-cli -- --list-zig-generated-tool-schemas
 cargo run -p pi-cli -- --list-tools

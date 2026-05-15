@@ -21,6 +21,13 @@ fn main() {
 struct CliArgs {
     prompt: String,
     session_path: Option<PathBuf>,
+    provider: ProviderKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderKind {
+    Faux,
+    ToolDemo,
 }
 
 fn run(args: Vec<String>) -> Result<Option<String>, String> {
@@ -49,6 +56,17 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     let args = parse_args(&args)?;
     ensure_zig_kernel_linked()?;
 
+    match args.provider {
+        ProviderKind::Faux => run_print_with_provider(FauxProvider, args, false),
+        ProviderKind::ToolDemo => run_print_with_provider(ToolDemoProvider, args, true),
+    }
+}
+
+fn run_print_with_provider<P: pi_ai::Provider>(
+    provider: P,
+    args: CliArgs,
+    use_tools: bool,
+) -> Result<Option<String>, String> {
     let existing_messages = if let Some(path) = &args.session_path {
         SessionFile::open(path)
             .and_then(|session| session.load_messages())
@@ -58,10 +76,16 @@ fn run(args: Vec<String>) -> Result<Option<String>, String> {
     };
     let existing_len = existing_messages.len();
 
-    let mut agent = AgentSession::with_messages(FauxProvider, existing_messages);
-    let assistant = agent
-        .prompt(args.prompt)
-        .map_err(|error| error.to_string())?;
+    let mut agent = AgentSession::with_messages(provider, existing_messages);
+    let assistant = if use_tools {
+        agent
+            .prompt_with_tools(args.prompt)
+            .map_err(|error| error.to_string())?
+    } else {
+        agent
+            .prompt(args.prompt)
+            .map_err(|error| error.to_string())?
+    };
 
     if let Some(path) = &args.session_path {
         let mut session = SessionFile::open(path).map_err(|error| error.to_string())?;
@@ -125,6 +149,7 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     let mut session_path = None;
     let mut prompt_parts = Vec::new();
     let mut print_mode = false;
+    let mut provider = ProviderKind::Faux;
     let mut index = 0;
 
     while index < args.len() {
@@ -138,6 +163,13 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
                     return Err("--session requires a path".to_string());
                 };
                 session_path = Some(PathBuf::from(path));
+                index += 2;
+            }
+            "--provider" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err("--provider requires a provider name".to_string());
+                };
+                provider = parse_provider(value)?;
                 index += 2;
             }
             value => {
@@ -154,11 +186,20 @@ fn parse_args(args: &[String]) -> Result<CliArgs, String> {
     Ok(CliArgs {
         prompt: prompt_parts.join(" "),
         session_path,
+        provider,
     })
 }
 
+fn parse_provider(value: &str) -> Result<ProviderKind, String> {
+    match value {
+        "faux" => Ok(ProviderKind::Faux),
+        "tool-demo" => Ok(ProviderKind::ToolDemo),
+        _ => Err(format!("unknown provider: {value}")),
+    }
+}
+
 fn usage() -> String {
-    "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
+    "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>".to_string()
 }
 
 #[cfg(test)]
@@ -184,7 +225,7 @@ mod tests {
     fn missing_print_flag_returns_usage_error() {
         assert_eq!(
             run(vec![]).unwrap_err(),
-            "usage: pi-rs -p <prompt> [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
+            "usage: pi-rs -p <prompt> [--provider faux|tool-demo] [--session <path>] | --list-tools | --tool <name> <json> | --tool-demo <prompt>"
         );
     }
 
@@ -235,6 +276,48 @@ mod tests {
         .unwrap();
         assert!(output.contains("tool result:"));
         assert!(output.contains("loop"));
+    }
+
+    #[test]
+    fn provider_tool_demo_runs_tool_loop_in_print_mode() {
+        let output = run(vec![
+            "-p".into(),
+            "bash:".into(),
+            "printf".into(),
+            "provider-loop".into(),
+            "--provider".into(),
+            "tool-demo".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(output.contains("tool result:"));
+        assert!(output.contains("provider-loop"));
+    }
+
+    #[test]
+    fn provider_tool_demo_persists_tool_loop_messages() {
+        let path = temp_session_path();
+        let output = run(vec![
+            "--provider".into(),
+            "tool-demo".into(),
+            "-p".into(),
+            "bash:".into(),
+            "printf".into(),
+            "persist-loop".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(output.contains("persist-loop"));
+
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].message.content, "bash: printf persist-loop");
+        assert!(!entries[1].message.tool_calls.is_empty());
+        assert_eq!(entries[2].message.role, pi_ai::Role::Tool);
     }
 
     #[test]
