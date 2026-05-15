@@ -21,9 +21,13 @@ A final lifecycle hardening pass should prove these guarantees with a broad list
 
 ## Error handling
 
-The target error-handling model is `Result<TValue, TError>` for fallible harness operations instead of thrown exceptions. Implementations should catch backend/provider/filesystem exceptions at the boundary and normalize them into typed error results; callers should inspect returned results instead of relying on thrown exceptions.
+The current split is:
 
-This is currently implemented for `ExecutionEnv`, `NodeExecutionEnv`, shell-output capture, and skill/prompt-template resource loading. Older harness/session/compaction APIs still throw in several paths; finishing that migration is tracked in the cleanup todo.
+- low-level capabilities and helpers use `Result<TValue, TError>` where expected failures are contained and must not throw, such as `ExecutionEnv`, filesystem/shell operations, shell-output capture, resource loading, and compaction helpers
+- high-level mutation/orchestration APIs such as `Session` and `AgentHarness` reject/throw instead of returning bare results that can be ignored
+- public `AgentHarness` failures are normalized to `AgentHarnessError` where practical; subsystem errors are preserved as `cause`
+
+Harness events observe committed state. Public mutators validate required input and persistence before committing when practical, then await notifications. If a hook or subscriber fails after commit, the state change is not rolled back and the public method rejects with `AgentHarnessError` code `"hook"`.
 
 ## State model
 
@@ -73,6 +77,8 @@ Stream options are shallow-copied when a snapshot is created. `headers` and `met
 
 The session contains persisted entries only. Session reads return persisted state and do not include queued writes.
 
+Session storage implementations must persist leaf changes as `leaf` entries. `setLeafId()` is not an in-memory-only cursor update; it appends a durable entry whose `targetId` is the active tree leaf or `null` for root. Reopening storage must reconstruct the current leaf from the latest persisted leaf-affecting entry.
+
 ### Pending session writes
 
 Session writes requested while an operation is active are queued as pending session writes. Pending writes are based on session-entry shapes without generated fields (`id`, `parentId`, `timestamp`).
@@ -97,7 +103,7 @@ Structural operations require `phase === "idle"` and synchronously set the phase
 - `compact`
 - `navigateTree`
 
-Starting another structural operation while the harness is not idle currently throws. This should become a typed result failure as part of the error-handling cleanup.
+Starting another structural operation while the harness is not idle rejects with `AgentHarnessError` code `"busy"`.
 
 The following operations are allowed during a turn where appropriate:
 
@@ -148,7 +154,7 @@ The low-level loop converts harness `ThinkingLevel` to provider `reasoning` at t
 
 No state refresh is needed on `agent_end` except flushing leftover pending session writes and clearing the operation phase. The exact `settled` event timing is still under review.
 
-If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation currently throws and the harness returns to idle. This should become a typed result failure as part of the error-handling cleanup. If it throws from the save-point snapshot created by `prepareNextTurn`, the low-level agent run records an assistant error message.
+If the system-prompt callback throws while starting `prompt`, `skill`, or `promptFromTemplate`, the operation rejects with `AgentHarnessError` and the harness returns to idle. If it throws from the save-point snapshot created by `prepareNextTurn`, the low-level agent run records an assistant error message.
 
 ## Hooks and events
 
@@ -331,7 +337,7 @@ Implemented so far:
 
 - `setTools(tools, activeToolNames?)`
 - `setActiveTools(toolNames)`
-- invalid active tool names currently throw; convert to result errors
+- invalid active tool names reject with `AgentHarnessError`
 - generic common app tool shape via `AgentHarness<TSkill, TPromptTemplate, TTool>`
 - `QueueMode` exported from core types
 - `AgentHarnessOptions.steeringMode` / `followUpMode`
@@ -363,6 +369,17 @@ Implemented so far:
 - Removed `liveOperationId`.
 - Removed `shell()`; use `harness.env`.
 
+Implemented in the hardening pass:
+
+- Structural compaction/tree operations restore phase with `finally`.
+- Public harness failures normalize subsystem causes to `AgentHarnessError`.
+- Pending session writes flush one-by-one and are not dropped on failure.
+- Queue drains roll back if queue-update notification fails.
+- `message_end` persistence happens before subscriber notification.
+- `abort()` signals cancellation before notifications and still waits for idle through notification errors.
+- Idle model/thinking/tool updates validate and persist before committing in-memory state.
+- `setLeafId()` persists durable `leaf` entries so tree navigation survives storage reopen.
+
 Still needed:
 
 - Finalize phase/idle semantics.
@@ -371,7 +388,6 @@ Still needed:
 - Audit follow-up behavior around `agent_end`.
 - Implement auto-compaction decision point.
 - Implement retry handling.
-- Ensure structural operations use consistent `try/finally` phase cleanup.
 - Verify `before_agent_start` hook semantics against coding-agent:
   - current behavior appends returned messages after the user/next-turn prompt messages.
   - decide whether replacement, prepend, append, or transform semantics are correct.
@@ -379,9 +395,9 @@ Still needed:
 - Document or change timing for model/thinking/stream-option events that may fire before queued session entries persist while busy.
 - Audit `abort()` barrier semantics.
 
-### 7. Complete `Result`/non-throwing harness cleanup
+### 7. Complete low-level `Result` cleanup
 
-Started.
+Current hardening pass complete; future items remain as the API evolves.
 
 Implemented so far:
 
@@ -395,17 +411,22 @@ Implemented so far:
 - Replaced `Buffer` usage in generic truncation utilities with runtime-neutral UTF-8 handling.
 - Converted compaction summary helpers to typed result returns and added error-path coverage.
 - Expanded `NodeExecutionEnv` tests for file operations, exec errors, aborts, callbacks, timeouts, and shell-output full-output spill.
+- Added `readTextLines()` so JSONL metadata loading reads only the header line instead of whole session files.
+- Removed no-op abort handling from Node filesystem methods where cancellation is not meaningful while keeping the `FileSystem` interface unchanged.
+- Mapped filesystem errors crossing the session boundary to typed `SessionError`.
+- Added typed branch-summary errors and cause-aware public harness error normalization.
+- Made resource loaders report structured diagnostics for non-`not_found` filesystem failures.
 
-Still needed:
+Ongoing guardrails:
 
-- Remove remaining throws from `src/harness` APIs and helpers, except explicit adapter/test helpers such as `getOrThrow()`.
-- Convert session storage/repo/session APIs to typed result returns.
-- Convert structural `AgentHarness` operations to typed result returns for busy, missing-resource, auth, compaction, and branch-summary failures.
+- Keep low-level capability/helper APIs non-throwing where they return `Result`.
+- Keep session storage/repo/session APIs throwing typed `SessionError`.
+- Keep structural `AgentHarness` operations rejecting with `AgentHarnessError` for busy, missing-resource, auth, compaction, and branch-summary failures.
 - Keep Node-specific APIs isolated under `src/harness/env/nodejs.ts` and Node-backed storage/session implementations, or move those implementations behind explicit Node-only entry points.
 - Audit remaining generic harness utilities for Node globals as new APIs are added.
 - Audit package exports so browser/generic-JS imports do not pull Node-only modules such as `NodeExecutionEnv`.
 - Keep expanding `ExecutionEnv` and shell-output contract tests as the API evolves, especially for non-Node implementations.
-- Add tests proving harness APIs return `ok: false` instead of throwing for expected failure paths.
+- Add tests proving public harness failures reject with `AgentHarnessError` where expected.
 
 ### 8. Later coding-agent migration plan
 
