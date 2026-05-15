@@ -21,6 +21,7 @@ cargo test
 ```bash
 cd rust
 cargo run -p pi-cli -- -p "hello"
+cargo run -p pi-cli -- -p "hello" --session /tmp/pi-rs-session.jsonl
 ```
 
 ## Cross compilation

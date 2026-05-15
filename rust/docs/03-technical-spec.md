@@ -47,6 +47,22 @@ pub struct AgentSession<P: Provider> {
 }
 ```
 
+### `pi_session::SessionEntry`
+
+```rust
+pub struct SessionEntry {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub message: Message,
+}
+```
+
+Persistence format:
+
+- UTF-8 JSONL.
+- One `SessionEntry` per line.
+- `sequence` is monotonically increasing per file.
+
 State machine:
 
 ```text
@@ -142,3 +158,5 @@ For every item:
 8. Bash non-zero exit returns captured output and status.
 9. Read missing file returns typed IO error.
 10. CLI without `-p` returns usage error for MVP.
+11. Missing session file loads as an empty transcript.
+12. Existing session file appends only newly generated messages.

@@ -10,4 +10,5 @@ path = "src/main.rs"
 [dependencies]
 pi-ai = { path = "../pi-ai" }
 pi-core = { path = "../pi-core" }
+pi-session = { path = "../pi-session" }
 pi-zig = { path = "../pi-zig" }

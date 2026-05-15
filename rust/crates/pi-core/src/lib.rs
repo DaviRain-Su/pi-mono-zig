@@ -14,6 +14,10 @@ impl<P: Provider> AgentSession<P> {
         }
     }
 
+    pub fn with_messages(provider: P, messages: Vec<Message>) -> Self {
+        Self { provider, messages }
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -47,5 +51,17 @@ mod tests {
         let mut session = AgentSession::new(FauxProvider);
         let assistant = session.prompt("").unwrap();
         assert_eq!(assistant.content, "faux: ");
+    }
+
+    #[test]
+    fn with_messages_preserves_existing_transcript() {
+        let mut session = AgentSession::with_messages(
+            FauxProvider,
+            vec![Message::user("old"), Message::assistant("faux: old")],
+        );
+        let assistant = session.prompt("new").unwrap();
+
+        assert_eq!(assistant.content, "faux: new");
+        assert_eq!(session.messages().len(), 4);
     }
 }

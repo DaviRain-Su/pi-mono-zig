@@ -1,5 +1,7 @@
 use pi_ai::FauxProvider;
 use pi_core::AgentSession;
+use pi_session::SessionFile;
+use std::path::PathBuf;
 
 fn main() {
     match run(std::env::args().skip(1).collect()) {
@@ -15,12 +17,37 @@ fn main() {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliArgs {
+    prompt: String,
+    session_path: Option<PathBuf>,
+}
+
 fn run(args: Vec<String>) -> Result<Option<String>, String> {
-    let prompt = parse_print_prompt(&args)?;
+    let args = parse_args(&args)?;
     ensure_zig_kernel_linked()?;
 
-    let mut session = AgentSession::new(FauxProvider);
-    let assistant = session.prompt(prompt).map_err(|error| error.to_string())?;
+    let existing_messages = if let Some(path) = &args.session_path {
+        SessionFile::open(path)
+            .and_then(|session| session.load_messages())
+            .map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
+    let existing_len = existing_messages.len();
+
+    let mut agent = AgentSession::with_messages(FauxProvider, existing_messages);
+    let assistant = agent
+        .prompt(args.prompt)
+        .map_err(|error| error.to_string())?;
+
+    if let Some(path) = &args.session_path {
+        let mut session = SessionFile::open(path).map_err(|error| error.to_string())?;
+        session
+            .append_messages(&agent.messages()[existing_len..])
+            .map_err(|error| error.to_string())?;
+    }
+
     Ok(Some(assistant.content))
 }
 
@@ -30,25 +57,52 @@ fn ensure_zig_kernel_linked() -> Result<(), String> {
         .map_err(|error| format!("Zig kernel smoke failed: {error}"))
 }
 
-fn parse_print_prompt(args: &[String]) -> Result<String, String> {
-    let Some(flag) = args.first() else {
-        return Err(usage());
-    };
+fn parse_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut session_path = None;
+    let mut prompt_parts = Vec::new();
+    let mut print_mode = false;
+    let mut index = 0;
 
-    if flag != "-p" && flag != "--print" {
+    while index < args.len() {
+        match args[index].as_str() {
+            "-p" | "--print" => {
+                print_mode = true;
+                index += 1;
+            }
+            "--session" => {
+                let Some(path) = args.get(index + 1) else {
+                    return Err("--session requires a path".to_string());
+                };
+                session_path = Some(PathBuf::from(path));
+                index += 2;
+            }
+            value => {
+                prompt_parts.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    if !print_mode {
         return Err(usage());
     }
 
-    Ok(args[1..].join(" "))
+    Ok(CliArgs {
+        prompt: prompt_parts.join(" "),
+        session_path,
+    })
 }
 
 fn usage() -> String {
-    "usage: pi-rs -p <prompt>".to_string()
+    "usage: pi-rs -p <prompt> [--session <path>]".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_session::load_entries;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn print_mode_returns_faux_response() {
@@ -64,6 +118,39 @@ mod tests {
 
     #[test]
     fn missing_print_flag_returns_usage_error() {
-        assert_eq!(run(vec![]).unwrap_err(), "usage: pi-rs -p <prompt>");
+        assert_eq!(
+            run(vec![]).unwrap_err(),
+            "usage: pi-rs -p <prompt> [--session <path>]"
+        );
+    }
+
+    #[test]
+    fn session_path_persists_new_messages() {
+        let path = temp_session_path();
+        let output = run(vec![
+            "-p".into(),
+            "hello".into(),
+            "--session".into(),
+            path.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(output, Some("faux: hello".into()));
+
+        let entries = load_entries(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message.content, "hello");
+        assert_eq!(entries[1].message.content, "faux: hello");
+    }
+
+    fn temp_session_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut path = std::env::temp_dir();
+        path.push(format!("pi-cli-{unique}.jsonl"));
+        path
     }
 }

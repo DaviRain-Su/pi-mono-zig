@@ -28,6 +28,21 @@
 
 - Provider error is propagated and user message remains recorded.
 
+## `pi-session`
+
+### Happy Path
+
+- Appending messages writes JSONL entries that can be loaded back into `Message` values.
+- Reopening a session continues sequence numbering.
+
+### Boundary
+
+- Missing session file loads as an empty transcript.
+
+### Error
+
+- Malformed JSONL returns an invalid-data IO error.
+
 ## `pi-tools`
 
 ### Happy Path
@@ -63,6 +78,7 @@
 ### Happy Path
 
 - `pi-rs -p hello` prints faux assistant output.
+- `pi-rs -p hello --session <path>` appends user and assistant entries.
 
 ### Boundary
 
