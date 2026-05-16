@@ -105,19 +105,21 @@ pub const OpenAIResponsesProvider = struct {
         options: ?types.StreamOptions,
         stream_instance: *event_stream.AssistantMessageEventStream,
     ) !void {
-        var payload = try buildRequestPayload(allocator, model, context, options);
-        defer provider_json.freeValue(allocator, payload);
+        const callback_opt: ?*const fn (std.mem.Allocator, std.json.Value, types.Model) anyerror!?std.json.Value =
+            if (options) |o| o.on_payload else null;
 
-        if (options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
+        const json_body = blk: {
+            if (callback_opt) |callback| {
+                var payload = try buildRequestPayload(allocator, model, context, options);
+                defer provider_json.freeValue(allocator, payload);
                 if (try callback(allocator, payload, model)) |replacement| {
                     provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
+                break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
             }
-        }
-
-        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+            break :blk try buildPayloadJsonBytes(allocator, model, context, options);
+        };
         defer allocator.free(json_body);
 
         const resolved = try resolve_api_key.resolveApiKey(allocator, model, options);
@@ -179,113 +181,11 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    const compat = getCompat(model);
-    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
-
-    var input = std.json.Array.init(allocator);
-    errdefer input.deinit();
-
-    if (context.system_prompt) |system_prompt| {
-        try input.append(try buildSystemInputItem(allocator, model, system_prompt));
-    }
-
-    var normalized_tool_call_ids = std.StringHashMap([]const u8).init(allocator);
-    defer {
-        var iterator = normalized_tool_call_ids.iterator();
-        while (iterator.next()) |entry| allocator.free(entry.value_ptr.*);
-        normalized_tool_call_ids.deinit();
-    }
-
-    var replay_message_index: usize = 0;
-    for (context.messages) |message| {
-        if (try appendInputItemsForMessage(allocator, &input, model, message, replay_message_index, &normalized_tool_call_ids)) {
-            replay_message_index += 1;
-        }
-    }
-
-    var payload = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    try putStringValue(allocator, &payload, "model", model.id);
-    try putObjectValue(allocator, &payload, "input", .{ .array = input });
-    try putBoolValue(allocator, &payload, "stream", true);
-    try putBoolValue(allocator, &payload, "store", false);
-
-    if (options) |stream_options| {
-        if (stream_options.max_tokens) |max_tokens| {
-            try putIntegerValue(allocator, &payload, "max_output_tokens", max_tokens);
-        }
-        if (stream_options.temperature) |temperature| {
-            try putFloatValue(allocator, &payload, "temperature", temperature);
-        }
-        if (stream_options.metadata) |metadata| {
-            try putObjectValue(allocator, &payload, "metadata", try provider_json.cloneValue(allocator, metadata));
-        }
-        if (stream_options.session_id) |session_id| {
-            if (cache_retention != .none) {
-                try putStringValue(allocator, &payload, "prompt_cache_key", session_id);
-            }
-            if (cache_retention == .long and compat.supports_long_cache_retention) {
-                try putStringValue(allocator, &payload, "prompt_cache_retention", "24h");
-            }
-        }
-        const responses_opts = stream_options.providerOptions("responses");
-        if (responses_opts.service_tier) |service_tier| {
-            try putStringValue(allocator, &payload, "service_tier", service_tier);
-        }
-        if (model.reasoning) {
-            if (responses_opts.reasoning_effort != null or responses_opts.reasoning_summary != null) {
-                const effort = if (responses_opts.reasoning_effort) |reasoning_effort|
-                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse @tagName(reasoning_effort)
-                else
-                    "medium";
-                const summary = responses_opts.reasoning_summary orelse "auto";
-                const reasoning_value: std.json.Value = blk: {
-                    var reasoning = try initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                    try putStringValue(allocator, &reasoning, "effort", effort);
-                    try putStringValue(allocator, &reasoning, "summary", summary);
-                    break :blk .{ .object = reasoning };
-                };
-                try putObjectValue(allocator, &payload, "reasoning", reasoning_value);
-
-                var include = std.json.Array.init(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .array = include });
-                try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
-                try putObjectValue(allocator, &payload, "include", .{ .array = include });
-            } else if (!std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
-                const reasoning_value: std.json.Value = blk: {
-                    var reasoning = try initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                    try putStringValue(allocator, &reasoning, "effort", model_registry.mappedThinkingLevelValue(model, .off) orelse "none");
-                    break :blk .{ .object = reasoning };
-                };
-                try putObjectValue(allocator, &payload, "reasoning", reasoning_value);
-            }
-        }
-    }
-    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
-        const reasoning_value: std.json.Value = blk: {
-            var reasoning = try initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-            try putStringValue(allocator, &reasoning, "effort", model_registry.mappedThinkingLevelValue(model, .off) orelse "none");
-            break :blk .{ .object = reasoning };
-        };
-        try putObjectValue(allocator, &payload, "reasoning", reasoning_value);
-    }
-
-    if (context.tools) |tools| {
-        if (tools.len > 0) {
-            var tools_array = std.json.Array.init(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .array = tools_array });
-            for (tools) |tool| {
-                try tools_array.append(try buildToolObject(allocator, tool));
-            }
-            try putObjectValue(allocator, &payload, "tools", .{ .array = tools_array });
-        }
-    }
-
-    return .{ .object = payload };
+    const bytes = try buildPayloadJsonBytes(allocator, model, context, options);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn buildRequestHeaders(
@@ -1108,97 +1008,454 @@ fn continuationMessagesAreCompatible(messages: []const types.Message) bool {
     return true;
 }
 
-fn buildSystemInputItem(allocator: std.mem.Allocator, model: types.Model, system_prompt: []const u8) !std.json.Value {
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    const role = if (model.reasoning) "developer" else "system";
-    try putStringValue(allocator, &object, "role", role);
-    const sanitized = try openai.sanitizeSurrogates(allocator, system_prompt);
-    defer allocator.free(sanitized);
-    try putStringValue(allocator, &object, "content", sanitized);
-    return .{ .object = object };
+// =============================================================================
+// Declarative payload structs for Responses API.
+//
+// The Responses API has many input-item shapes (system message, user message,
+// assistant message, opaque thinking-signature value, function_call,
+// function_call_output {text|parts}). We model them as a tagged union with a
+// custom jsonStringify that emits the right field set for each variant.
+// =============================================================================
+
+const RequestPayload = struct {
+    model: []const u8,
+    input: []const InputItem,
+    stream: bool = true,
+    store: bool = false,
+    max_output_tokens: ?u32 = null,
+    temperature: ?f32 = null,
+    metadata: ?std.json.Value = null,
+    prompt_cache_key: ?[]const u8 = null,
+    prompt_cache_retention: ?[]const u8 = null,
+    service_tier: ?[]const u8 = null,
+    reasoning: ?ReasoningConfig = null,
+    include: ?[]const []const u8 = null,
+    tools: ?[]const ToolItem = null,
+};
+
+const ReasoningConfig = struct {
+    effort: []const u8,
+    summary: ?[]const u8 = null,
+};
+
+const ToolItem = struct {
+    type: []const u8 = "function",
+    name: []const u8,
+    description: []const u8,
+    parameters: std.json.Value, // cloned
+    strict: bool = false,
+};
+
+const ContentPart = union(enum) {
+    input_text: TextPart,
+    input_image: ImagePart,
+
+    pub fn jsonStringify(self: ContentPart, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .input_text => |t| {
+                try jw.objectField("type");
+                try jw.write("input_text");
+                try jw.objectField("text");
+                try jw.write(t.text);
+            },
+            .input_image => |i| {
+                try jw.objectField("type");
+                try jw.write("input_image");
+                try jw.objectField("detail");
+                try jw.write("auto");
+                try jw.objectField("image_url");
+                try jw.write(i.image_url);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+const TextPart = struct { text: []const u8 };
+const ImagePart = struct { image_url: []const u8 };
+
+const AssistantOutputPart = struct {
+    text: []const u8,
+};
+
+const InputItem = union(enum) {
+    system_message: SystemMessageItem,
+    user_message: UserMessageItem,
+    assistant_message: AssistantMessageItem,
+    passthrough_value: std.json.Value, // for opaque thinking-signature trees
+    function_call: FunctionCallItem,
+    function_call_output_text: FunctionCallOutputTextItem,
+    function_call_output_parts: FunctionCallOutputPartsItem,
+
+    pub fn jsonStringify(self: InputItem, jw: anytype) !void {
+        switch (self) {
+            .system_message => |m| {
+                try jw.beginObject();
+                try jw.objectField("role");
+                try jw.write(m.role);
+                try jw.objectField("content");
+                try jw.write(m.content);
+                try jw.endObject();
+            },
+            .user_message => |m| {
+                try jw.beginObject();
+                try jw.objectField("role");
+                try jw.write("user");
+                try jw.objectField("content");
+                try jw.write(m.content);
+                try jw.endObject();
+            },
+            .assistant_message => |m| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("message");
+                try jw.objectField("role");
+                try jw.write("assistant");
+                try jw.objectField("status");
+                try jw.write("completed");
+                try jw.objectField("id");
+                try jw.write(m.id);
+                if (m.phase) |phase| {
+                    try jw.objectField("phase");
+                    try jw.write(phase);
+                }
+                try jw.objectField("content");
+                try jw.beginArray();
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("output_text");
+                try jw.objectField("text");
+                try jw.write(m.text);
+                try jw.objectField("annotations");
+                try jw.beginArray();
+                try jw.endArray();
+                try jw.endObject();
+                try jw.endArray();
+                try jw.endObject();
+            },
+            .passthrough_value => |v| {
+                try jw.write(v);
+            },
+            .function_call => |fc| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call");
+                try jw.objectField("call_id");
+                try jw.write(fc.call_id);
+                if (fc.id) |id| {
+                    try jw.objectField("id");
+                    try jw.write(id);
+                }
+                try jw.objectField("name");
+                try jw.write(fc.name);
+                try jw.objectField("arguments");
+                try jw.write(fc.arguments);
+                try jw.endObject();
+            },
+            .function_call_output_text => |out| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call_output");
+                try jw.objectField("call_id");
+                try jw.write(out.call_id);
+                try jw.objectField("output");
+                try jw.write(out.output);
+                try jw.endObject();
+            },
+            .function_call_output_parts => |out| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call_output");
+                try jw.objectField("call_id");
+                try jw.write(out.call_id);
+                try jw.objectField("output");
+                try jw.write(out.parts);
+                try jw.endObject();
+            },
+        }
+    }
+};
+
+const SystemMessageItem = struct {
+    role: []const u8, // "system" or "developer"
+    content: []const u8, // sanitized
+};
+
+const UserMessageItem = struct {
+    content: []const ContentPart,
+};
+
+const AssistantMessageItem = struct {
+    id: []const u8,
+    phase: ?[]const u8 = null,
+    text: []const u8, // sanitized
+};
+
+const FunctionCallItem = struct {
+    call_id: []const u8,
+    id: ?[]const u8 = null,
+    name: []const u8,
+    arguments: []const u8, // pre-stringified JSON
+};
+
+const FunctionCallOutputTextItem = struct {
+    call_id: []const u8,
+    output: []const u8, // sanitized or "(see attached image)" or ""
+};
+
+const FunctionCallOutputPartsItem = struct {
+    call_id: []const u8,
+    parts: []const ContentPart,
+};
+
+const OwnedPayload = struct {
+    allocator: std.mem.Allocator,
+    payload: RequestPayload,
+    input_buf: []InputItem,
+    tools_buf: ?[]ToolItem,
+    content_lists: []const []ContentPart,
+    owned_strings: []const []const u8,
+    owned_values: []std.json.Value,
+    metadata_clone: ?std.json.Value,
+    include_buf: ?[][]const u8,
+
+    fn deinit(self: OwnedPayload) void {
+        self.allocator.free(self.input_buf);
+        if (self.tools_buf) |b| self.allocator.free(b);
+        for (self.content_lists) |list| self.allocator.free(list);
+        self.allocator.free(self.content_lists);
+        for (self.owned_strings) |s| self.allocator.free(s);
+        self.allocator.free(self.owned_strings);
+        for (self.owned_values) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_values);
+        if (self.metadata_clone) |v| provider_json.freeValue(self.allocator, v);
+        if (self.include_buf) |b| self.allocator.free(b);
+    }
+};
+
+const OwnedPayloadBuilder = struct {
+    allocator: std.mem.Allocator,
+    content_lists: std.ArrayList([]ContentPart) = .empty,
+    owned_strings: std.ArrayList([]const u8) = .empty,
+    owned_values: std.ArrayList(std.json.Value) = .empty,
+
+    fn deinit(self: *OwnedPayloadBuilder) void {
+        for (self.content_lists.items) |list| self.allocator.free(list);
+        self.content_lists.deinit(self.allocator);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
+        for (self.owned_values.items) |v| provider_json.freeValue(self.allocator, v);
+        self.owned_values.deinit(self.allocator);
+    }
+};
+
+fn buildOwnedPayload(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !OwnedPayload {
+    var builder = OwnedPayloadBuilder{ .allocator = allocator };
+    errdefer builder.deinit();
+
+    const compat = getCompat(model);
+    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
+
+    var input_list = std.ArrayList(InputItem).empty;
+    errdefer input_list.deinit(allocator);
+
+    if (context.system_prompt) |system_prompt| {
+        const sanitized = try openai.sanitizeSurrogates(allocator, system_prompt);
+        try builder.owned_strings.append(allocator, sanitized);
+        try input_list.append(allocator, .{ .system_message = .{
+            .role = if (model.reasoning) "developer" else "system",
+            .content = sanitized,
+        } });
+    }
+
+    var normalized_tool_call_ids = std.StringHashMap([]const u8).init(allocator);
+    defer {
+        var iterator = normalized_tool_call_ids.iterator();
+        while (iterator.next()) |entry| allocator.free(entry.value_ptr.*);
+        normalized_tool_call_ids.deinit();
+    }
+
+    var replay_message_index: usize = 0;
+    for (context.messages) |message| {
+        const appended = try appendInputItems(allocator, &input_list, model, message, replay_message_index, &normalized_tool_call_ids, &builder);
+        if (appended) replay_message_index += 1;
+    }
+
+    const input_buf = try input_list.toOwnedSlice(allocator);
+    errdefer allocator.free(input_buf);
+
+    // Optional top-level fields.
+    var max_output_tokens: ?u32 = null;
+    var temperature: ?f32 = null;
+    var metadata_clone: ?std.json.Value = null;
+    var prompt_cache_key: ?[]const u8 = null;
+    var prompt_cache_retention: ?[]const u8 = null;
+    var service_tier: ?[]const u8 = null;
+    var reasoning: ?ReasoningConfig = null;
+    var include_buf: ?[][]const u8 = null;
+
+    if (options) |stream_options| {
+        if (stream_options.max_tokens) |m| max_output_tokens = @intCast(m);
+        temperature = stream_options.temperature;
+        if (stream_options.metadata) |metadata| {
+            const cloned = try provider_json.cloneValue(allocator, metadata);
+            metadata_clone = cloned;
+        }
+        if (stream_options.session_id) |session_id| {
+            if (cache_retention != .none) prompt_cache_key = session_id;
+            if (cache_retention == .long and compat.supports_long_cache_retention) {
+                prompt_cache_retention = "24h";
+            }
+        }
+        const responses_opts = stream_options.providerOptions("responses");
+        if (responses_opts.service_tier) |st| service_tier = st;
+        if (model.reasoning) {
+            if (responses_opts.reasoning_effort != null or responses_opts.reasoning_summary != null) {
+                const effort = if (responses_opts.reasoning_effort) |re|
+                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(re)) orelse @tagName(re)
+                else
+                    "medium";
+                const summary = responses_opts.reasoning_summary orelse "auto";
+                reasoning = .{ .effort = effort, .summary = summary };
+
+                const buf = try allocator.alloc([]const u8, 1);
+                errdefer allocator.free(buf);
+                buf[0] = "reasoning.encrypted_content";
+                include_buf = buf;
+            } else if (!std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
+                reasoning = .{ .effort = model_registry.mappedThinkingLevelValue(model, .off) orelse "none" };
+            }
+        }
+    }
+    if (options == null and model.reasoning and !std.mem.eql(u8, model.provider, "github-copilot") and model_registry.thinkingLevelSupported(model, .off)) {
+        reasoning = .{ .effort = model_registry.mappedThinkingLevelValue(model, .off) orelse "none" };
+    }
+    errdefer if (include_buf) |b| allocator.free(b);
+
+    // Tools.
+    var tools_buf: ?[]ToolItem = null;
+    if (context.tools) |tools| if (tools.len > 0) {
+        const buf = try allocator.alloc(ToolItem, tools.len);
+        errdefer allocator.free(buf);
+        for (tools, 0..) |tool, i| {
+            const params_clone = try provider_json.cloneValue(allocator, tool.parameters);
+            try builder.owned_values.append(allocator, params_clone);
+            buf[i] = .{
+                .name = tool.name,
+                .description = tool.description,
+                .parameters = params_clone,
+            };
+        }
+        tools_buf = buf;
+    };
+    errdefer if (tools_buf) |b| allocator.free(b);
+
+    const content_lists_slice = try builder.content_lists.toOwnedSlice(allocator);
+    const owned_strings_slice = try builder.owned_strings.toOwnedSlice(allocator);
+    const owned_values_slice = try builder.owned_values.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .model = model.id,
+            .input = input_buf,
+            .max_output_tokens = max_output_tokens,
+            .temperature = temperature,
+            .metadata = metadata_clone,
+            .prompt_cache_key = prompt_cache_key,
+            .prompt_cache_retention = prompt_cache_retention,
+            .service_tier = service_tier,
+            .reasoning = reasoning,
+            .include = include_buf,
+            .tools = tools_buf,
+        },
+        .input_buf = input_buf,
+        .tools_buf = tools_buf,
+        .content_lists = content_lists_slice,
+        .owned_strings = owned_strings_slice,
+        .owned_values = owned_values_slice,
+        .metadata_clone = metadata_clone,
+        .include_buf = include_buf,
+    };
 }
 
-fn appendInputItemsForMessage(
+fn appendInputItems(
     allocator: std.mem.Allocator,
-    input: *std.json.Array,
+    input_list: *std.ArrayList(InputItem),
     model: types.Model,
     message: types.Message,
     message_index: usize,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
+    builder: *OwnedPayloadBuilder,
 ) !bool {
     switch (message) {
         .user => |user| {
-            if (try buildUserInputItem(allocator, model, user)) |item| {
-                try input.append(item);
-                return true;
-            }
-            return false;
+            return try appendUserInputItem(allocator, input_list, model, user, builder);
         },
         .assistant => |assistant| {
-            if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                return try appendAssistantInputItems(allocator, input, model, assistant, message_index, normalized_tool_call_ids);
-            }
-            return false;
+            if (!types.shouldReplayAssistantInProviderContext(assistant)) return false;
+            return try appendAssistantInputItemsStruct(allocator, input_list, model, assistant, message_index, normalized_tool_call_ids, builder);
         },
         .tool_result => |tool_result| {
-            try input.append(try buildToolResultInputItem(allocator, model, tool_result, normalized_tool_call_ids));
+            try appendToolResultInputItem(allocator, input_list, model, tool_result, normalized_tool_call_ids, builder);
             return true;
         },
     }
 }
 
-fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: types.UserMessage) !?std.json.Value {
-    var content = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = content });
-
+fn appendUserInputItem(
+    allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(InputItem),
+    model: types.Model,
+    user: types.UserMessage,
+    builder: *OwnedPayloadBuilder,
+) !bool {
     const supports_images = modelSupportsImages(model);
+    var parts = std.ArrayList(ContentPart).empty;
+    errdefer parts.deinit(allocator);
 
     for (user.content) |block| {
         switch (block) {
             .text => |text| {
-                var part = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = part });
-                try putStringValue(allocator, &part, "type", "input_text");
                 const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
-                defer allocator.free(sanitized);
-                try putStringValue(allocator, &part, "text", sanitized);
-                try content.append(.{ .object = part });
+                try builder.owned_strings.append(allocator, sanitized);
+                try parts.append(allocator, .{ .input_text = .{ .text = sanitized } });
             },
             .image => |image| {
                 if (!supports_images) continue;
-                var part = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = part });
-                try putStringValue(allocator, &part, "type", "input_image");
-                try putStringValue(allocator, &part, "detail", "auto");
                 const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                defer allocator.free(image_url);
-                try putStringValue(allocator, &part, "image_url", image_url);
-                try content.append(.{ .object = part });
+                try builder.owned_strings.append(allocator, image_url);
+                try parts.append(allocator, .{ .input_image = .{ .image_url = image_url } });
             },
             .thinking, .tool_call => {},
         }
     }
 
-    if (content.items.len == 0) {
-        content.deinit();
-        return null;
+    if (parts.items.len == 0) {
+        parts.deinit(allocator);
+        return false;
     }
-
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "role", "user");
-    try putObjectValue(allocator, &object, "content", .{ .array = content });
-    return .{ .object = object };
+    const slice = try parts.toOwnedSlice(allocator);
+    errdefer allocator.free(slice);
+    try builder.content_lists.append(allocator, slice);
+    try input_list.append(allocator, .{ .user_message = .{ .content = slice } });
+    return true;
 }
 
-fn appendAssistantInputItems(
+fn appendAssistantInputItemsStruct(
     allocator: std.mem.Allocator,
-    input: *std.json.Array,
+    input_list: *std.ArrayList(InputItem),
     model: types.Model,
     assistant: types.AssistantMessage,
     message_index: usize,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
+    builder: *OwnedPayloadBuilder,
 ) !bool {
     const is_same_provider_api =
         std.mem.eql(u8, assistant.provider, model.provider) and
@@ -1207,7 +1464,7 @@ fn appendAssistantInputItems(
         is_same_provider_api and
         std.mem.eql(u8, assistant.model, model.id);
     const is_different_model_same_provider_api = is_same_provider_api and !is_same_model;
-    const input_start_index = input.items.len;
+    const start_len = input_list.items.len;
 
     for (assistant.content) |block| {
         switch (block) {
@@ -1215,46 +1472,28 @@ fn appendAssistantInputItems(
                 if (types.thinkingSignature(thinking)) |signature| {
                     var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
                     defer parsed.deinit();
-                    try input.append(try provider_json.cloneValue(allocator, parsed.value));
+                    const cloned = try provider_json.cloneValue(allocator, parsed.value);
+                    try builder.owned_values.append(allocator, cloned);
+                    try input_list.append(allocator, .{ .passthrough_value = cloned });
                 }
             },
             .text => |text| {
-                var message_object = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = message_object });
-                try putStringValue(allocator, &message_object, "type", "message");
-                try putStringValue(allocator, &message_object, "role", "assistant");
-                try putStringValue(allocator, &message_object, "status", "completed");
+                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
+                try builder.owned_strings.append(allocator, sanitized);
+
                 const parsed_signature = if (is_same_model)
                     try parseTextSignature(allocator, text.text_signature, message_index)
                 else
                     try parseTextSignature(allocator, null, message_index);
-                defer {
-                    allocator.free(parsed_signature.id);
-                    if (parsed_signature.phase) |phase| allocator.free(phase);
-                }
-                try putStringValue(allocator, &message_object, "id", parsed_signature.id);
-                if (parsed_signature.phase) |phase| {
-                    try putStringValue(allocator, &message_object, "phase", phase);
-                }
+                try builder.owned_strings.append(allocator, parsed_signature.id);
+                const phase_opt = parsed_signature.phase;
+                if (phase_opt) |phase| try builder.owned_strings.append(allocator, phase);
 
-                const content_value: std.json.Value = blk: {
-                    var content = std.json.Array.init(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .array = content });
-                    const text_object_value: std.json.Value = inner: {
-                        var text_object = try initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = text_object });
-                        try putStringValue(allocator, &text_object, "type", "output_text");
-                        const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
-                        defer allocator.free(sanitized);
-                        try putStringValue(allocator, &text_object, "text", sanitized);
-                        try putObjectValue(allocator, &text_object, "annotations", .{ .array = std.json.Array.init(allocator) });
-                        break :inner .{ .object = text_object };
-                    };
-                    try content.append(text_object_value);
-                    break :blk .{ .array = content };
-                };
-                try putObjectValue(allocator, &message_object, "content", content_value);
-                try input.append(.{ .object = message_object });
+                try input_list.append(allocator, .{ .assistant_message = .{
+                    .id = parsed_signature.id,
+                    .phase = phase_opt,
+                    .text = sanitized,
+                } });
             },
             .image => {},
             .tool_call => {},
@@ -1277,38 +1516,48 @@ fn appendAssistantInputItems(
             if (!std.mem.eql(u8, tool_call.id, normalized_id)) {
                 if (normalized_tool_call_ids.get(tool_call.id)) |existing| {
                     allocator.free(existing);
-                    try normalized_tool_call_ids.put(tool_call.id, try allocator.dupe(u8, normalized_id));
-                } else {
-                    try normalized_tool_call_ids.put(tool_call.id, try allocator.dupe(u8, normalized_id));
                 }
+                try normalized_tool_call_ids.put(tool_call.id, try allocator.dupe(u8, normalized_id));
             }
             const split = splitToolCallId(normalized_id);
-            var tool_call_object = try initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = tool_call_object });
-            try putStringValue(allocator, &tool_call_object, "type", "function_call");
-            try putStringValue(allocator, &tool_call_object, "call_id", split.call_id);
+            const call_id_owned = try allocator.dupe(u8, split.call_id);
+            try builder.owned_strings.append(allocator, call_id_owned);
+
+            var id_owned: ?[]const u8 = null;
             if (split.item_id) |item_id| {
                 if (!(is_different_model_same_provider_api and std.mem.startsWith(u8, item_id, "fc_"))) {
-                    try putStringValue(allocator, &tool_call_object, "id", item_id);
+                    const dup = try allocator.dupe(u8, item_id);
+                    try builder.owned_strings.append(allocator, dup);
+                    id_owned = dup;
                 }
             }
-            try putStringValue(allocator, &tool_call_object, "name", tool_call.name);
+
+            const name_owned = try allocator.dupe(u8, tool_call.name);
+            try builder.owned_strings.append(allocator, name_owned);
+
             const arguments_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
-            defer allocator.free(arguments_json);
-            try putStringValue(allocator, &tool_call_object, "arguments", arguments_json);
-            try input.append(.{ .object = tool_call_object });
+            try builder.owned_strings.append(allocator, arguments_json);
+
+            try input_list.append(allocator, .{ .function_call = .{
+                .call_id = call_id_owned,
+                .id = id_owned,
+                .name = name_owned,
+                .arguments = arguments_json,
+            } });
         }
     }
 
-    return input.items.len > input_start_index;
+    return input_list.items.len > start_len;
 }
 
-fn buildToolResultInputItem(
+fn appendToolResultInputItem(
     allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(InputItem),
     model: types.Model,
     tool_result: types.ToolResultMessage,
     normalized_tool_call_ids: *std.StringHashMap([]const u8),
-) !std.json.Value {
+    builder: *OwnedPayloadBuilder,
+) !void {
     const normalized_id = normalized_tool_call_ids.get(tool_result.tool_call_id) orelse tool_result.tool_call_id;
     const supports_images = modelSupportsImages(model);
 
@@ -1321,46 +1570,39 @@ fn buildToolResultInputItem(
                 if (text_parts.items.len > 0) try text_parts.appendSlice(allocator, "\n");
                 try text_parts.appendSlice(allocator, text.text);
             },
-            .image => {
-                image_count += 1;
-            },
+            .image => image_count += 1,
             .thinking, .tool_call => {},
         }
     }
 
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "type", "function_call_output");
-    try putStringValue(allocator, &object, "call_id", splitToolCallId(normalized_id).call_id);
+    const call_id_owned = try allocator.dupe(u8, splitToolCallId(normalized_id).call_id);
+    try builder.owned_strings.append(allocator, call_id_owned);
 
     if (supports_images and image_count > 0) {
-        var output_parts = std.json.Array.init(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .array = output_parts });
+        var parts = std.ArrayList(ContentPart).empty;
+        errdefer parts.deinit(allocator);
         if (text_parts.items.len > 0) {
-            var text_object = try initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = text_object });
-            try putStringValue(allocator, &text_object, "type", "input_text");
             const sanitized = try openai.sanitizeSurrogates(allocator, text_parts.items);
-            defer allocator.free(sanitized);
-            try putStringValue(allocator, &text_object, "text", sanitized);
-            try output_parts.append(.{ .object = text_object });
+            try builder.owned_strings.append(allocator, sanitized);
+            try parts.append(allocator, .{ .input_text = .{ .text = sanitized } });
         }
         for (tool_result.content) |block| {
             switch (block) {
                 .image => |image| {
-                    var image_object = try initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = image_object });
-                    try putStringValue(allocator, &image_object, "type", "input_image");
-                    try putStringValue(allocator, &image_object, "detail", "auto");
                     const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                    defer allocator.free(image_url);
-                    try putStringValue(allocator, &image_object, "image_url", image_url);
-                    try output_parts.append(.{ .object = image_object });
+                    try builder.owned_strings.append(allocator, image_url);
+                    try parts.append(allocator, .{ .input_image = .{ .image_url = image_url } });
                 },
                 else => {},
             }
         }
-        try putObjectValue(allocator, &object, "output", .{ .array = output_parts });
+        const slice = try parts.toOwnedSlice(allocator);
+        errdefer allocator.free(slice);
+        try builder.content_lists.append(allocator, slice);
+        try input_list.append(allocator, .{ .function_call_output_parts = .{
+            .call_id = call_id_owned,
+            .parts = slice,
+        } });
     } else {
         const output_text = if (text_parts.items.len > 0)
             try openai.sanitizeSurrogates(allocator, text_parts.items)
@@ -1368,23 +1610,27 @@ fn buildToolResultInputItem(
             try allocator.dupe(u8, "(see attached image)")
         else
             try allocator.dupe(u8, "");
-        defer allocator.free(output_text);
-        try putStringValue(allocator, &object, "output", output_text);
+        try builder.owned_strings.append(allocator, output_text);
+        try input_list.append(allocator, .{ .function_call_output_text = .{
+            .call_id = call_id_owned,
+            .output = output_text,
+        } });
     }
-
-    return .{ .object = object };
 }
 
-fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Value {
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "type", "function");
-    try putStringValue(allocator, &object, "name", tool.name);
-    try putStringValue(allocator, &object, "description", tool.description);
-    try putObjectValue(allocator, &object, "parameters", try provider_json.cloneValue(allocator, tool.parameters));
-    try putBoolValue(allocator, &object, "strict", false);
-    return .{ .object = object };
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    var owned = try buildOwnedPayload(allocator, model, context, options);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
 }
+
 
 fn modelSupportsImages(model: types.Model) bool {
     for (model.input_types) |input_type| {
