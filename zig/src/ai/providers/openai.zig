@@ -1858,9 +1858,10 @@ test "parseSseStreamLines preserves successful ordered OpenAI-compatible final a
     try std.testing.expectEqualStrings("gpt-4.1-fixture", message.model);
     try std.testing.expectEqualStrings("chatcmpl_cross", message.response_id.?);
     try std.testing.expectEqual(types.StopReason.tool_use, message.stop_reason);
-    try std.testing.expectEqual(@as(u32, 7), message.usage.input);
+    // cached_tokens=3 (cache_read), cache_write=1 => input = 10 - 3 - 1 = 6
+    try std.testing.expectEqual(@as(u32, 6), message.usage.input);
     try std.testing.expectEqual(@as(u32, 5), message.usage.output);
-    try std.testing.expectEqual(@as(u32, 2), message.usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 3), message.usage.cache_read);
     try std.testing.expectEqual(@as(u32, 1), message.usage.cache_write);
     try std.testing.expectEqual(@as(u32, 15), message.usage.total_tokens);
     try std.testing.expectEqual(@as(usize, 3), message.content.len);
@@ -2152,20 +2153,19 @@ test "parseChunkUsage" {
 
     const usage = parseChunkUsage(allocator, parsed.value, model);
 
-    // input = 100 - 10 (cache read after subtracting write) - 10 (cache write) = 80
-    // Wait: normalized_cache_read = 20 - 10 = 10
-    // input = 100 - 10 - 10 = 80
+    // cache_read = cached_tokens = 20 (no subtraction per OpenRouter semantics)
+    // input = 100 - 20 - 10 = 70
     // output = 50 because completion_tokens already includes reasoning_tokens
-    try std.testing.expectEqual(@as(u32, 80), usage.input);
+    try std.testing.expectEqual(@as(u32, 70), usage.input);
     try std.testing.expectEqual(@as(u32, 50), usage.output);
-    try std.testing.expectEqual(@as(u32, 10), usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 20), usage.cache_read);
     try std.testing.expectEqual(@as(u32, 10), usage.cache_write);
     try std.testing.expectEqual(@as(u32, 150), usage.total_tokens);
 }
 
 // Regression: cache_write_tokens alone exceeding prompt_tokens must not trap.
 // prompt_tokens=15, cache_write_tokens=20, no cached_tokens.
-// normalized_cache_read=0, cache_total=20 >= 15 => input clamps to 0.
+// cache_read=0, cache_total=20 >= 15 => input clamps to 0.
 test "parseChunkUsage cache write exceeds prompt saturates to zero" {
     const allocator = std.testing.allocator;
     const usage_json = "{\"prompt_tokens\":15,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cache_write_tokens\":20}}";

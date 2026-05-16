@@ -779,27 +779,23 @@ pub fn parseChunkUsage(
         }
     }
 
-    // Normalize cache read: subtract cache writes if present
-    // Some OpenAI-compatible providers (observed on OpenRouter) report cached_tokens
-    // as (previous hits + current writes). In that case, remove cacheWrite from cacheRead.
-    // Clamp at zero: u32 subtraction would underflow, so guard with a comparison.
-    const normalized_cache_read = if (reported_cached_tokens >= cache_write_tokens)
-        reported_cached_tokens - cache_write_tokens
-    else
-        @as(u32, 0);
+    // Follow documented OpenAI/OpenRouter semantics: cached_tokens is cache-read
+    // tokens (hits). OpenAI does not document or emit cache_write_tokens, but
+    // OpenRouter-compatible providers can include it as a separate write count.
+    // Do not subtract writes from cached_tokens; otherwise spec-compliant
+    // providers are under-reported.
+    const cache_read = reported_cached_tokens;
 
     // Saturating subtraction: when cache tokens exceed prompt_tokens, clamp input to zero.
-    // Using a comparison guard because u32 subtraction would wrap on underflow,
-    // and @max(0, wrapped_u32) cannot recover from the wrap.
-    const cache_total = normalized_cache_read + cache_write_tokens;
+    const cache_total = cache_read + cache_write_tokens;
     const input = if (cache_total >= prompt_tokens) @as(u32, 0) else prompt_tokens - cache_total;
     const output = completion_tokens;
 
     usage.input = input;
     usage.output = output;
-    usage.cache_read = normalized_cache_read;
+    usage.cache_read = cache_read;
     usage.cache_write = cache_write_tokens;
-    usage.total_tokens = input + output + normalized_cache_read + cache_write_tokens;
+    usage.total_tokens = input + output + cache_read + cache_write_tokens;
 
     return usage;
 }
@@ -944,9 +940,9 @@ test "openai_chat_sse normalizes usage cache writes" {
     defer parsed.deinit();
 
     const usage = parseChunkUsage(allocator, parsed.value, testModel("https://api.openai.com/v1"));
-    try std.testing.expectEqual(@as(u32, 80), usage.input);
+    try std.testing.expectEqual(@as(u32, 70), usage.input);
     try std.testing.expectEqual(@as(u32, 50), usage.output);
-    try std.testing.expectEqual(@as(u32, 10), usage.cache_read);
+    try std.testing.expectEqual(@as(u32, 20), usage.cache_read);
     try std.testing.expectEqual(@as(u32, 10), usage.cache_write);
     try std.testing.expectEqual(@as(u32, 150), usage.total_tokens);
 }

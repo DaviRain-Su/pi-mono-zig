@@ -299,51 +299,169 @@ fn stripTrailingStatusPrefix(output: []const u8, status_prefix: []const u8) []co
 }
 
 fn stripAnsiAndNormalizeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    // Fast path: ANSI codes require ESC (0x1B) or 8-bit CSI (0x9B).
+    if (std.mem.indexOfScalar(u8, text, 0x1b) == null and std.mem.indexOfScalar(u8, text, 0x9b) == null) {
+        // No ANSI introducers — only need to normalize CR.
+        var out = try std.ArrayList(u8).initCapacity(allocator, text.len);
+        errdefer out.deinit(allocator);
+        for (text, 0..) |byte, i| {
+            if (byte == '\r') {
+                if (i + 1 >= text.len or text[i + 1] != '\n') {
+                    out.appendAssumeCapacity('\n');
+                }
+                continue;
+            }
+            out.appendAssumeCapacity(byte);
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    // Regex-based strip-ansi approach (derived from chalk/strip-ansi MIT license).
+    // Pattern: OSC sequences (ESC]...ST) | CSI sequences (ESC[/CSI ... final byte).
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, text.len);
 
     var index: usize = 0;
     while (index < text.len) {
         const byte = text[index];
+
+        // --- 8-bit C1 control codes (no ESC prefix) ---
+        if (byte == 0x9b) {
+            // 8-bit CSI: skip parameter bytes then final byte (0x40-0x7E).
+            index += 1;
+            index = skipCsiFinal(text, index);
+            continue;
+        }
+        if (byte == 0x9d or byte == 0x90 or byte == 0x9e or byte == 0x9f) {
+            // 8-bit OSC / DCS / SOS / APC: skip until String Terminator.
+            index += 1;
+            index = skipUntilStringTerminator(text, index);
+            continue;
+        }
+        if (byte == 0x9c) {
+            // 8-bit ST itself — skip.
+            index += 1;
+            continue;
+        }
+
+        // --- 7-bit ESC sequences ---
         if (byte == 0x1b and index + 1 < text.len) {
             const next = text[index + 1];
+
+            // ESC [ = CSI
             if (next == '[') {
                 index += 2;
-                while (index < text.len) : (index += 1) {
-                    const c = text[index];
-                    if (c >= 0x40 and c <= 0x7e) {
-                        index += 1;
-                        break;
-                    }
-                }
+                index = skipCsiPattern(text, index);
                 continue;
             }
-            if (next == ']') {
+
+            // ESC ] = OSC, ESC P = DCS, ESC ^ = PM, ESC _ = APC
+            if (next == ']' or next == 'P' or next == '^' or next == '_') {
                 index += 2;
-                while (index < text.len) : (index += 1) {
-                    if (text[index] == 0x07) {
-                        index += 1;
-                        break;
-                    }
-                    if (text[index] == 0x1b and index + 1 < text.len and text[index + 1] == '\\') {
-                        index += 2;
-                        break;
-                    }
-                }
+                index = skipUntilStringTerminator(text, index);
                 continue;
             }
+
+            // ESC followed by a two-character sequence: ()*+-./#
+            if (next == '(' or next == ')' or next == '*' or next == '+' or
+                next == '-' or next == '.' or next == '/' or next == '#')
+            {
+                index += 3;
+                if (index > text.len) index = text.len;
+                continue;
+            }
+
+            // ESC followed by a final byte (0x40-0x7E range excluding [): skip 2 bytes.
+            if (next >= 0x40 and next <= 0x7e) {
+                index += 2;
+                continue;
+            }
+
+            // Bare ESC at end of string or followed by something we don't handle.
+            index += 1;
+            continue;
         }
+
+        // --- Normal character: CR normalization ---
         if (byte == '\r') {
             if (index + 1 >= text.len or text[index + 1] != '\n') {
-                try out.append(allocator, '\n');
+                out.appendAssumeCapacity('\n');
             }
             index += 1;
             continue;
         }
-        try out.append(allocator, byte);
+
+        out.appendAssumeCapacity(byte);
         index += 1;
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// Skip CSI parameter/intermediate bytes then the final byte.
+/// Matches the ansi-regex CSI pattern: `[[\]()#;?]*(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]`
+fn skipCsiPattern(text: []const u8, start: usize) usize {
+    var index = start;
+    // Skip opening brackets, parens, #, ;, ?
+    while (index < text.len) {
+        const c = text[index];
+        if (c == '[' or c == '(' or c == ')' or c == '#' or c == ';' or c == '?') {
+            index += 1;
+        } else break;
+    }
+    // Skip digit groups with ; or : separators.
+    while (index < text.len) : (index += 1) {
+        const c = text[index];
+        if (c >= '0' and c <= '9') continue;
+        if (c == ';' or c == ':') continue;
+        break;
+    }
+    // Final byte: 0x40-0x7E range (but the regex uses a specific subset).
+    // Check if current byte is a valid final byte.
+    if (index < text.len) {
+        const c = text[index];
+        if (isCsiFinalByte(c)) {
+            index += 1;
+        }
+    }
+    return index;
+}
+
+/// Simplified CSI skip for 8-bit CSI (0x9B): skip to final byte 0x40-0x7E.
+fn skipCsiFinal(text: []const u8, start: usize) usize {
+    var index = start;
+    while (index < text.len) : (index += 1) {
+        const c = text[index];
+        if (c >= 0x40 and c <= 0x7e) {
+            index += 1;
+            break;
+        }
+    }
+    return index;
+}
+
+/// Skip until String Terminator: BEL (0x07), ESC \\ (0x1B 0x5C), or 8-bit ST (0x9C).
+fn skipUntilStringTerminator(text: []const u8, start: usize) usize {
+    var index = start;
+    while (index < text.len) {
+        const c = text[index];
+        if (c == 0x07) return index + 1;
+        if (c == 0x9c) return index + 1;
+        if (c == 0x1b and index + 1 < text.len and text[index + 1] == '\\') return index + 2;
+        index += 1;
+    }
+    return index;
+}
+
+/// Valid CSI final bytes per ansi-regex: [\dA-PR-TZcf-nq-uy=><~]
+fn isCsiFinalByte(c: u8) bool {
+    return (c >= '0' and c <= '9') or
+        (c >= 'A' and c <= 'P') or
+        (c >= 'R' and c <= 'T') or
+        c == 'Z' or
+        (c >= 'c' and c <= 'q') or
+        c == 'u' or c == 'y' or
+        c == '=' or c == '>' or c == '<' or c == '~';
 }
 
 test "formatBashExecutionDisplay renders TS visible states and tail preview" {

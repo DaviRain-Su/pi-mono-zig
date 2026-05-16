@@ -415,40 +415,35 @@ test "getEnvApiKey honors ordered env-var fallback for anthropic and github-copi
         try std.testing.expectEqualStrings("api-key-only", value.?);
     }
 
-    // github-copilot: COPILOT_GITHUB_TOKEN wins over GH_TOKEN and GITHUB_TOKEN.
+    // github-copilot: COPILOT_GITHUB_TOKEN is the only accepted env var.
     {
         var env_map = std.process.Environ.Map.init(allocator);
         defer env_map.deinit();
         try env_map.put("COPILOT_GITHUB_TOKEN", "copilot");
-        try env_map.put("GH_TOKEN", "gh");
-        try env_map.put("GITHUB_TOKEN", "github");
 
         const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
         defer if (value) |resolved| allocator.free(resolved);
         try std.testing.expectEqualStrings("copilot", value.?);
     }
 
-    // github-copilot: GH_TOKEN wins over GITHUB_TOKEN when COPILOT_GITHUB_TOKEN absent.
+    // github-copilot: generic GH_TOKEN is ignored.
     {
         var env_map = std.process.Environ.Map.init(allocator);
         defer env_map.deinit();
         try env_map.put("GH_TOKEN", "gh");
-        try env_map.put("GITHUB_TOKEN", "github");
 
         const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
-        defer if (value) |resolved| allocator.free(resolved);
-        try std.testing.expectEqualStrings("gh", value.?);
+        try std.testing.expect(value == null);
     }
 
-    // github-copilot: falls through to GITHUB_TOKEN as last resort.
+    // github-copilot: generic GITHUB_TOKEN is ignored.
     {
         var env_map = std.process.Environ.Map.init(allocator);
         defer env_map.deinit();
         try env_map.put("GITHUB_TOKEN", "github-only");
 
         const value = try getEnvApiKeyFromMap(allocator, &env_map, "github-copilot");
-        defer if (value) |resolved| allocator.free(resolved);
-        try std.testing.expectEqualStrings("github-only", value.?);
+        try std.testing.expect(value == null);
     }
 }
 
