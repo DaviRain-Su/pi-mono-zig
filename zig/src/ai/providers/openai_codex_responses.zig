@@ -393,7 +393,7 @@ pub fn buildRequestPayload(
                 const reasoning_value: std.json.Value = blk: {
                     var reasoning = try initObject(allocator);
                     errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                    try putStringValue(allocator, &reasoning, "effort", thinkingLevelString(reasoning_effort));
+                    try putStringValue(allocator, &reasoning, "effort", @tagName(reasoning_effort));
                     try putStringValue(allocator, &reasoning, "summary", responses_opts.reasoning_summary orelse "auto");
                     break :blk .{ .object = reasoning };
                 };
@@ -1705,15 +1705,6 @@ fn handleOutputItemAdded(
     }
 }
 
-fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .minimal => "minimal",
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-    };
-}
 
 fn stripBearerPrefix(token: []const u8) []const u8 {
     if (std.mem.startsWith(u8, token, "Bearer ")) {

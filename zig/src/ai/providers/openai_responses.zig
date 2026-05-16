@@ -236,7 +236,7 @@ pub fn buildRequestPayload(
         if (model.reasoning) {
             if (responses_opts.reasoning_effort != null or responses_opts.reasoning_summary != null) {
                 const effort = if (responses_opts.reasoning_effort) |reasoning_effort|
-                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse thinkingLevelString(reasoning_effort)
+                    model_registry.mappedThinkingLevelValue(model, modelThinkingLevel(reasoning_effort)) orelse @tagName(reasoning_effort)
                 else
                     "medium";
                 const summary = responses_opts.reasoning_summary orelse "auto";
@@ -1937,15 +1937,6 @@ fn compatBoolField(compat: ?std.json.Value, key: []const u8) ?bool {
     return field.bool;
 }
 
-fn thinkingLevelString(level: types.ThinkingLevel) []const u8 {
-    return switch (level) {
-        .minimal => "minimal",
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-    };
-}
 
 fn modelThinkingLevel(level: types.ThinkingLevel) types.ModelThinkingLevel {
     return switch (level) {

@@ -259,7 +259,7 @@ pub fn buildRequestPayload(
 
         if (model.reasoning) {
             if (anthropic_opts.thinking_enabled == true) {
-                const display = anthropicThinkingDisplayString(anthropic_opts.thinking_display orelse .summarized);
+                const display = @tagName(anthropic_opts.thinking_display orelse types.AnthropicThinkingDisplay.summarized);
                 if (supportsAdaptiveThinking(model)) {
                     const thinking_value: std.json.Value = blk: {
                         var thinking = try provider_json.initObject(allocator);
@@ -274,7 +274,7 @@ pub fn buildRequestPayload(
                         const output_config_value: std.json.Value = blk: {
                             var output_config = try provider_json.initObject(allocator);
                             errdefer provider_json.freeValue(allocator, .{ .object = output_config });
-                            try putStringValue(allocator, &output_config, "effort", anthropicEffortString(effort));
+                            try putStringValue(allocator, &output_config, "effort", @tagName(effort));
                             break :blk .{ .object = output_config };
                         };
                         try putObjectValue(allocator, &payload, "output_config", output_config_value);
@@ -340,23 +340,6 @@ fn applyProviderStopReason(allocator: std.mem.Allocator, output: *types.Assistan
         allocator.free(existing);
         output.error_message = null;
     }
-}
-
-fn anthropicEffortString(effort: types.AnthropicEffort) []const u8 {
-    return switch (effort) {
-        .low => "low",
-        .medium => "medium",
-        .high => "high",
-        .xhigh => "xhigh",
-        .max => "max",
-    };
-}
-
-fn anthropicThinkingDisplayString(display: types.AnthropicThinkingDisplay) []const u8 {
-    return switch (display) {
-        .summarized => "summarized",
-        .omitted => "omitted",
-    };
 }
 
 fn supportsAdaptiveThinking(model: types.Model) bool {

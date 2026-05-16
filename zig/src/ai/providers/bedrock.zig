@@ -842,7 +842,7 @@ fn buildAdditionalModelRequestFieldsValue(
             errdefer provider_json.freeValue(allocator, .{ .object = thinking });
             try putStringValue(allocator, &thinking, "type", "adaptive");
             if (display) |display_value| {
-                try putStringValue(allocator, &thinking, "display", thinkingDisplayString(display_value));
+                try putStringValue(allocator, &thinking, "display", @tagName(display_value));
             }
             break :blk .{ .object = thinking };
         };
@@ -869,7 +869,7 @@ fn buildAdditionalModelRequestFieldsValue(
             try putStringValue(allocator, &thinking, "type", "enabled");
             try putIntegerValue(allocator, &thinking, "budget_tokens", budget);
             if (display) |display_value| {
-                try putStringValue(allocator, &thinking, "display", thinkingDisplayString(display_value));
+                try putStringValue(allocator, &thinking, "display", @tagName(display_value));
             }
             break :blk .{ .object = thinking };
         };
@@ -883,13 +883,6 @@ fn buildAdditionalModelRequestFieldsValue(
     }
 
     return .{ .object = result };
-}
-
-fn thinkingDisplayString(display: types.AnthropicThinkingDisplay) []const u8 {
-    return switch (display) {
-        .summarized => "summarized",
-        .omitted => "omitted",
-    };
 }
 
 fn buildMessagesValue(

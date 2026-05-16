@@ -459,14 +459,45 @@ fn skipUntilStringTerminator(text: []const u8, start: usize) usize {
 }
 
 /// Valid CSI final bytes per ansi-regex: [\dA-PR-TZcf-nq-uy=><~]
+///
+/// Comptime-generated 256-bit bitmap. Lookup is one shift + one bit-test
+/// (constant time) instead of the previous chain of 7 range/equality
+/// comparisons. The bitmap itself is 32 bytes of `.rodata`, dwarfed by
+/// the function's branch table at the previous call site.
 fn isCsiFinalByte(c: u8) bool {
-    return (c >= '0' and c <= '9') or
-        (c >= 'A' and c <= 'P') or
-        (c >= 'R' and c <= 'T') or
-        c == 'Z' or
-        (c >= 'c' and c <= 'q') or
-        c == 'u' or c == 'y' or
-        c == '=' or c == '>' or c == '<' or c == '~';
+    return CSI_FINAL_BYTE_MASK.isSet(c);
+}
+
+const CSI_FINAL_BYTE_MASK: std.bit_set.IntegerBitSet(256) = blk: {
+    var mask = std.bit_set.IntegerBitSet(256).initEmpty();
+    var b: u8 = 0;
+    while (true) : (b += 1) {
+        const is_final = (b >= '0' and b <= '9') or
+            (b >= 'A' and b <= 'P') or
+            (b >= 'R' and b <= 'T') or
+            b == 'Z' or
+            (b >= 'c' and b <= 'q') or
+            b == 'u' or b == 'y' or
+            b == '=' or b == '>' or b == '<' or b == '~';
+        if (is_final) mask.set(b);
+        if (b == 255) break;
+    }
+    break :blk mask;
+};
+
+test "isCsiFinalByte matches the original predicate for every byte" {
+    var b: u8 = 0;
+    while (true) : (b += 1) {
+        const expected = (b >= '0' and b <= '9') or
+            (b >= 'A' and b <= 'P') or
+            (b >= 'R' and b <= 'T') or
+            b == 'Z' or
+            (b >= 'c' and b <= 'q') or
+            b == 'u' or b == 'y' or
+            b == '=' or b == '>' or b == '<' or b == '~';
+        try std.testing.expectEqual(expected, isCsiFinalByte(b));
+        if (b == 255) break;
+    }
 }
 
 test "formatBashExecutionDisplay renders TS visible states and tail preview" {
