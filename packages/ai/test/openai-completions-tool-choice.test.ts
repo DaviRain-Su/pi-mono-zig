@@ -819,7 +819,7 @@ describe("openai-completions tool_choice", () => {
 		expect(response.usage.totalTokens).toBe(43);
 	});
 
-	it("preserves prompt_tokens_details.cache_write_tokens from chunk usage", async () => {
+	it("preserves prompt_tokens_details cache read/write fields from chunk usage", async () => {
 		mockState.chunks = [
 			{
 				id: "chatcmpl-cache-write",
@@ -853,13 +853,14 @@ describe("openai-completions tool_choice", () => {
 			{ apiKey: "test" },
 		).result();
 
-		expect(response.usage.input).toBe(50);
-		expect(response.usage.cacheRead).toBe(20);
+		// cached_tokens is documented as cache reads; cache_write_tokens is separate.
+		expect(response.usage.input).toBe(20);
+		expect(response.usage.cacheRead).toBe(50);
 		expect(response.usage.cacheWrite).toBe(30);
 		expect(response.usage.totalTokens).toBe(105);
 	});
 
-	it("preserves prompt_tokens_details.cache_write_tokens from choice usage fallback", async () => {
+	it("preserves prompt_tokens_details cache read/write fields from choice usage fallback", async () => {
 		mockState.chunks = [
 			{
 				id: "chatcmpl-cache-write-choice",
@@ -898,8 +899,9 @@ describe("openai-completions tool_choice", () => {
 			{ apiKey: "test" },
 		).result();
 
-		expect(response.usage.input).toBe(50);
-		expect(response.usage.cacheRead).toBe(20);
+		// cached_tokens is documented as cache reads; cache_write_tokens is separate.
+		expect(response.usage.input).toBe(20);
+		expect(response.usage.cacheRead).toBe(50);
 		expect(response.usage.cacheWrite).toBe(30);
 		expect(response.usage.totalTokens).toBe(105);
 	});

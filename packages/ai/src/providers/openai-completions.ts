@@ -997,17 +997,17 @@ function parseChunkUsage(
 	model: Model<"openai-completions">,
 ): AssistantMessage["usage"] {
 	const promptTokens = rawUsage.prompt_tokens || 0;
-	const reportedCachedTokens = rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0;
+	const cacheReadTokens = rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0;
 	const cacheWriteTokens = rawUsage.prompt_tokens_details?.cache_write_tokens || 0;
 
-	// Normalize to pi-ai semantics:
-	// - cacheRead: hits from cache created by previous requests only
-	// - cacheWrite: tokens written to cache in this request
-	// Some OpenAI-compatible providers (observed on OpenRouter) report cached_tokens
-	// as (previous hits + current writes). In that case, remove cacheWrite from cacheRead.
-	const cacheReadTokens =
-		cacheWriteTokens > 0 ? Math.max(0, reportedCachedTokens - cacheWriteTokens) : reportedCachedTokens;
-
+	// Follow documented OpenAI/OpenRouter semantics: cached_tokens is cache-read
+	// tokens (hits). OpenAI does not document or emit cache_write_tokens, but
+	// OpenRouter-compatible providers can include it as a separate write count.
+	// OpenRouter's own provider/tests affirm the separate mapping:
+	// https://github.com/OpenRouterTeam/ai-sdk-provider/pull/409
+	// Do not subtract writes from cached_tokens, otherwise spec-compliant
+	// providers are under-reported. DS4 mirrors this contract too:
+	// https://github.com/antirez/ds4/pull/29
 	const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
 	// OpenAI completion_tokens already includes reasoning_tokens.
 	const outputTokens = rawUsage.completion_tokens || 0;
