@@ -156,19 +156,21 @@ pub const GoogleVertexProvider = struct {
         stream_instance: *event_stream.AssistantMessageEventStream,
         auth_header: OwnedHeader,
     ) !void {
-        var payload = try buildRequestPayload(allocator, model, context, options);
-        defer provider_json.freeValue(allocator, payload);
+        const callback_opt: ?*const fn (std.mem.Allocator, std.json.Value, types.Model) anyerror!?std.json.Value =
+            if (options) |o| o.on_payload else null;
 
-        if (options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
+        const json_body = blk: {
+            if (callback_opt) |callback| {
+                var payload = try buildRequestPayload(allocator, model, context, options);
+                defer provider_json.freeValue(allocator, payload);
                 if (try callback(allocator, payload, model)) |replacement| {
                     provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
+                break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
             }
-        }
-
-        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+            break :blk try buildPayloadJsonBytes(allocator, model, context, options);
+        };
         defer allocator.free(json_body);
 
         const url = try buildRequestUrl(allocator, model);
@@ -214,36 +216,498 @@ pub const GoogleVertexProvider = struct {
     }
 };
 
+// =============================================================================
+// Declarative payload structs (Vertex-shaped — same wire format as Gemini API,
+// but Vertex always nests tool-result images inside functionResponse.parts and
+// does not emit a separate "Tool result image:" user turn).
+// =============================================================================
+
+const RequestPayload = struct {
+    contents: []const Content,
+    systemInstruction: ?SystemInstruction = null,
+    generationConfig: GenerationConfig,
+    tools: ?[]const ToolGroup = null,
+    toolConfig: ?ToolConfig = null,
+};
+
+const SystemInstruction = struct { parts: []const TextOnlyPart };
+const TextOnlyPart = struct { text: []const u8 };
+
+const GenerationConfig = struct {
+    temperature: ?f32 = null,
+    maxOutputTokens: ?u32 = null,
+    thinkingConfig: ?ThinkingConfig = null,
+};
+
+const ThinkingConfig = struct {
+    includeThoughts: ?bool = null,
+    thinkingBudget: ?i32 = null,
+    thinkingLevel: ?[]const u8 = null,
+};
+
+const Content = struct {
+    role: []const u8,
+    parts: []const Part,
+};
+
+const Part = union(enum) {
+    text: TextPart,
+    thought: ThoughtPart,
+    function_call: FunctionCallPart,
+    image: ImagePart,
+    function_response: FunctionResponsePart,
+
+    pub fn jsonStringify(self: Part, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .text => |t| {
+                try jw.objectField("text");
+                try jw.write(t.text);
+                if (t.thought_signature) |sig| if (sig.len > 0) {
+                    try jw.objectField("thoughtSignature");
+                    try jw.write(sig);
+                };
+            },
+            .thought => |t| {
+                try jw.objectField("thought");
+                try jw.write(true);
+                try jw.objectField("text");
+                try jw.write(t.text);
+                if (t.thought_signature) |sig| {
+                    try jw.objectField("thoughtSignature");
+                    try jw.write(sig);
+                }
+            },
+            .function_call => |fc| {
+                if (fc.thought_signature) |sig| {
+                    try jw.objectField("thoughtSignature");
+                    try jw.write(sig);
+                }
+                try jw.objectField("functionCall");
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(fc.name);
+                try jw.objectField("args");
+                try jw.write(fc.args);
+                try jw.endObject();
+            },
+            .image => |i| {
+                try jw.objectField("inlineData");
+                try jw.beginObject();
+                try jw.objectField("mimeType");
+                try jw.write(i.mime_type);
+                try jw.objectField("data");
+                try jw.write(i.data);
+                try jw.endObject();
+            },
+            .function_response => |fr| {
+                try jw.objectField("functionResponse");
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(fr.name);
+                try jw.objectField("response");
+                try jw.beginObject();
+                try jw.objectField(if (fr.is_error) "error" else "output");
+                try jw.write(fr.response_text);
+                try jw.endObject();
+                if (fr.parts) |inner_parts| {
+                    try jw.objectField("parts");
+                    try jw.write(inner_parts);
+                }
+                try jw.endObject();
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+const TextPart = struct { text: []const u8, thought_signature: ?[]const u8 = null };
+const ThoughtPart = struct { text: []const u8, thought_signature: ?[]const u8 = null };
+const FunctionCallPart = struct {
+    name: []const u8,
+    args: std.json.Value, // cloned
+    thought_signature: ?[]const u8 = null,
+};
+const ImagePart = struct { mime_type: []const u8, data: []const u8 };
+const FunctionResponsePart = struct {
+    name: []const u8,
+    response_text: []const u8,
+    is_error: bool,
+    parts: ?[]const Part = null,
+};
+
+const ToolGroup = struct { functionDeclarations: []const ToolDeclaration };
+const ToolDeclaration = struct {
+    name: []const u8,
+    description: []const u8,
+    parametersJsonSchema: std.json.Value, // cloned
+};
+const ToolConfig = struct { functionCallingConfig: FunctionCallingConfig };
+const FunctionCallingConfig = struct { mode: []const u8 };
+
+const OwnedPayload = struct {
+    allocator: std.mem.Allocator,
+    payload: RequestPayload,
+    contents_buf: []Content,
+    system_parts_buf: ?[]TextOnlyPart,
+    tool_groups_buf: ?[]ToolGroup,
+    tool_decls_buf: ?[]ToolDeclaration,
+    parts_lists: []const []Part,
+    owned_strings: []const []const u8,
+    owned_clones: []std.json.Value,
+
+    fn deinit(self: OwnedPayload) void {
+        self.allocator.free(self.contents_buf);
+        if (self.system_parts_buf) |s| self.allocator.free(s);
+        if (self.tool_groups_buf) |g| self.allocator.free(g);
+        if (self.tool_decls_buf) |d| self.allocator.free(d);
+        for (self.parts_lists) |list| self.allocator.free(list);
+        self.allocator.free(self.parts_lists);
+        for (self.owned_strings) |s| self.allocator.free(s);
+        self.allocator.free(self.owned_strings);
+        for (self.owned_clones) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_clones);
+    }
+};
+
+const OwnedPayloadBuilder = struct {
+    allocator: std.mem.Allocator,
+    parts_lists: std.ArrayList([]Part) = .empty,
+    owned_strings: std.ArrayList([]const u8) = .empty,
+    owned_clones: std.ArrayList(std.json.Value) = .empty,
+
+    fn deinit(self: *OwnedPayloadBuilder) void {
+        for (self.parts_lists.items) |list| self.allocator.free(list);
+        self.parts_lists.deinit(self.allocator);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
+        for (self.owned_clones.items) |v| provider_json.freeValue(self.allocator, v);
+        self.owned_clones.deinit(self.allocator);
+    }
+};
+
+fn buildOwnedPayload(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !OwnedPayload {
+    var builder = OwnedPayloadBuilder{ .allocator = allocator };
+    errdefer builder.deinit();
+
+    var contents_list = std.ArrayList(Content).empty;
+    errdefer contents_list.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < context.messages.len) : (index += 1) {
+        switch (context.messages[index]) {
+            .user => |user| {
+                const content = try buildUserContent(allocator, model, user, &builder);
+                try contents_list.append(allocator, content);
+            },
+            .assistant => |assistant| {
+                if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                    if (try buildAssistantContent(allocator, assistant, &builder)) |content| {
+                        try contents_list.append(allocator, content);
+                    }
+                }
+            },
+            .tool_result => {
+                const result = try buildToolResultContents(allocator, model, context.messages[index..], &builder);
+                try contents_list.append(allocator, result.function_response_content);
+                index += result.consumed - 1;
+            },
+        }
+    }
+
+    const contents_buf = try contents_list.toOwnedSlice(allocator);
+    errdefer allocator.free(contents_buf);
+
+    var system_parts_buf: ?[]TextOnlyPart = null;
+    var system_instruction: ?SystemInstruction = null;
+    if (context.system_prompt) |system_prompt| {
+        const parts = try allocator.alloc(TextOnlyPart, 1);
+        errdefer allocator.free(parts);
+        parts[0] = .{ .text = system_prompt };
+        system_parts_buf = parts;
+        system_instruction = .{ .parts = parts };
+    }
+    errdefer if (system_parts_buf) |p| allocator.free(p);
+
+    var generation_config = GenerationConfig{};
+    if (options) |stream_options| {
+        generation_config.temperature = stream_options.temperature;
+        if (stream_options.max_tokens) |m| generation_config.maxOutputTokens = @intCast(m);
+        const google_opts = stream_options.providerOptions("google");
+        if (google_opts.thinking) |thinking| {
+            if (model.reasoning) {
+                var thinking_config = ThinkingConfig{};
+                if (thinking.enabled) {
+                    thinking_config.includeThoughts = true;
+                    if (thinking.budget_tokens) |budget_tokens| {
+                        thinking_config.thinkingBudget = @intCast(budget_tokens);
+                    }
+                    if (thinking.level) |level| {
+                        thinking_config.thinkingLevel = level;
+                    }
+                } else {
+                    thinking_config.thinkingBudget = 0;
+                }
+                generation_config.thinkingConfig = thinking_config;
+            }
+        }
+    }
+
+    var tool_groups_buf: ?[]ToolGroup = null;
+    var tool_decls_buf: ?[]ToolDeclaration = null;
+    var tool_config: ?ToolConfig = null;
+    if (context.tools) |tools| if (tools.len > 0) {
+        const decls = try allocator.alloc(ToolDeclaration, tools.len);
+        errdefer allocator.free(decls);
+        for (tools, 0..) |tool, i| {
+            const params_clone = try provider_json.cloneValue(allocator, tool.parameters);
+            try builder.owned_clones.append(allocator, params_clone);
+            decls[i] = .{
+                .name = tool.name,
+                .description = tool.description,
+                .parametersJsonSchema = params_clone,
+            };
+        }
+        tool_decls_buf = decls;
+
+        const groups = try allocator.alloc(ToolGroup, 1);
+        errdefer allocator.free(groups);
+        groups[0] = .{ .functionDeclarations = decls };
+        tool_groups_buf = groups;
+
+        if (options) |stream_options| {
+            const google_opts = stream_options.providerOptions("google");
+            if (google_opts.tool_choice) |tool_choice| {
+                tool_config = .{ .functionCallingConfig = .{ .mode = mapToolChoice(tool_choice) } };
+            }
+        }
+    };
+    errdefer {
+        if (tool_decls_buf) |d| allocator.free(d);
+        if (tool_groups_buf) |g| allocator.free(g);
+    }
+
+    const parts_lists_slice = try builder.parts_lists.toOwnedSlice(allocator);
+    const owned_strings_slice = try builder.owned_strings.toOwnedSlice(allocator);
+    const owned_clones_slice = try builder.owned_clones.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .contents = contents_buf,
+            .systemInstruction = system_instruction,
+            .generationConfig = generation_config,
+            .tools = tool_groups_buf,
+            .toolConfig = tool_config,
+        },
+        .contents_buf = contents_buf,
+        .system_parts_buf = system_parts_buf,
+        .tool_groups_buf = tool_groups_buf,
+        .tool_decls_buf = tool_decls_buf,
+        .parts_lists = parts_lists_slice,
+        .owned_strings = owned_strings_slice,
+        .owned_clones = owned_clones_slice,
+    };
+}
+
+fn buildUserContent(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    user: types.UserMessage,
+    builder: *OwnedPayloadBuilder,
+) !Content {
+    const supports_images = modelSupportsImages(model);
+    var parts = std.ArrayList(Part).empty;
+    errdefer parts.deinit(allocator);
+
+    var inserted_placeholder = false;
+    for (user.content) |block| {
+        switch (block) {
+            .text => |text| {
+                try parts.append(allocator, .{ .text = .{ .text = text.text } });
+                inserted_placeholder = false;
+            },
+            .image => |image| {
+                if (supports_images) {
+                    try parts.append(allocator, .{ .image = .{ .mime_type = image.mime_type, .data = image.data } });
+                } else if (!inserted_placeholder) {
+                    try parts.append(allocator, .{ .text = .{ .text = "(image omitted: model does not support images)" } });
+                    inserted_placeholder = true;
+                }
+            },
+            .thinking, .tool_call => {},
+        }
+    }
+
+    if (parts.items.len == 0) {
+        try parts.append(allocator, .{ .text = .{ .text = "" } });
+    }
+
+    const slice = try parts.toOwnedSlice(allocator);
+    errdefer allocator.free(slice);
+    try builder.parts_lists.append(allocator, slice);
+    return .{ .role = "user", .parts = slice };
+}
+
+fn buildAssistantContent(
+    allocator: std.mem.Allocator,
+    assistant: types.AssistantMessage,
+    builder: *OwnedPayloadBuilder,
+) !?Content {
+    var parts = std.ArrayList(Part).empty;
+    errdefer parts.deinit(allocator);
+
+    for (assistant.content) |block| {
+        switch (block) {
+            .text => |text| {
+                if (std.mem.trim(u8, text.text, " \t\r\n").len == 0) continue;
+                try parts.append(allocator, .{ .text = .{ .text = text.text, .thought_signature = text.text_signature } });
+            },
+            .thinking => |thinking| {
+                if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
+                try parts.append(allocator, .{ .thought = .{
+                    .text = thinking.thinking,
+                    .thought_signature = types.thinkingSignature(thinking),
+                } });
+            },
+            .image => {},
+            .tool_call => |tool_call| {
+                const args_clone = try provider_json.cloneValue(allocator, tool_call.arguments);
+                try builder.owned_clones.append(allocator, args_clone);
+                try parts.append(allocator, .{ .function_call = .{
+                    .name = tool_call.name,
+                    .args = args_clone,
+                    .thought_signature = tool_call.thought_signature,
+                } });
+            },
+        }
+    }
+
+    if (!types.hasInlineToolCalls(assistant)) {
+        if (assistant.tool_calls) |tool_calls| {
+            for (tool_calls) |tool_call| {
+                const args_clone = try provider_json.cloneValue(allocator, tool_call.arguments);
+                try builder.owned_clones.append(allocator, args_clone);
+                try parts.append(allocator, .{ .function_call = .{
+                    .name = tool_call.name,
+                    .args = args_clone,
+                    .thought_signature = tool_call.thought_signature,
+                } });
+            }
+        }
+    }
+
+    if (parts.items.len == 0) return null;
+
+    const slice = try parts.toOwnedSlice(allocator);
+    errdefer allocator.free(slice);
+    try builder.parts_lists.append(allocator, slice);
+    return .{ .role = "model", .parts = slice };
+}
+
+const ToolResultContents = struct {
+    function_response_content: Content,
+    consumed: usize,
+};
+
+fn buildToolResultContents(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    messages: []const types.Message,
+    builder: *OwnedPayloadBuilder,
+) !ToolResultContents {
+    const supports_images = modelSupportsImages(model);
+
+    var parts = std.ArrayList(Part).empty;
+    errdefer parts.deinit(allocator);
+
+    var consumed: usize = 0;
+    while (consumed < messages.len) : (consumed += 1) {
+        switch (messages[consumed]) {
+            .tool_result => |tool_result| {
+                const text_response = try buildToolResultText(allocator, model, tool_result.content);
+                try builder.owned_strings.append(allocator, text_response);
+
+                var inner_image_parts: ?[]Part = null;
+                if (supports_images) {
+                    if (try collectImageParts(allocator, tool_result.content, builder)) |inner| {
+                        inner_image_parts = inner;
+                    }
+                }
+
+                try parts.append(allocator, .{ .function_response = .{
+                    .name = tool_result.tool_name,
+                    .response_text = text_response,
+                    .is_error = tool_result.is_error,
+                    .parts = inner_image_parts,
+                } });
+            },
+            else => break,
+        }
+    }
+
+    const parts_slice = try parts.toOwnedSlice(allocator);
+    errdefer allocator.free(parts_slice);
+    try builder.parts_lists.append(allocator, parts_slice);
+
+    return .{
+        .function_response_content = .{ .role = "user", .parts = parts_slice },
+        .consumed = consumed,
+    };
+}
+
+fn collectImageParts(
+    allocator: std.mem.Allocator,
+    content: []const types.ContentBlock,
+    builder: *OwnedPayloadBuilder,
+) !?[]Part {
+    var count: usize = 0;
+    for (content) |block| {
+        if (block == .image) count += 1;
+    }
+    if (count == 0) return null;
+    const arr = try allocator.alloc(Part, count);
+    errdefer allocator.free(arr);
+    var i: usize = 0;
+    for (content) |block| {
+        if (block == .image) {
+            arr[i] = .{ .image = .{ .mime_type = block.image.mime_type, .data = block.image.data } };
+            i += 1;
+        }
+    }
+    try builder.parts_lists.append(allocator, arr);
+    return arr;
+}
+
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    var owned = try buildOwnedPayload(allocator, model, context, options);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    var payload = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    try putObjectValue(allocator, &payload, "contents", try buildContentsValue(allocator, model, context.messages));
-
-    if (context.system_prompt) |system_prompt| {
-        try putObjectValue(allocator, &payload, "systemInstruction", try buildSystemInstructionValue(allocator, system_prompt));
-    }
-
-    try putObjectValue(allocator, &payload, "generationConfig", try buildGenerationConfigValue(allocator, model, options));
-
-    if (context.tools) |tools| {
-        if (tools.len > 0) {
-            try putObjectValue(allocator, &payload, "tools", try buildToolsValue(allocator, tools));
-            if (options) |stream_options| {
-                const google_opts = stream_options.providerOptions("google");
-                if (google_opts.tool_choice) |tool_choice| {
-                    try putObjectValue(allocator, &payload, "toolConfig", try buildToolConfigValue(allocator, tool_choice));
-                }
-            }
-        }
-    }
-
-    return .{ .object = payload };
+    const bytes = try buildPayloadJsonBytes(allocator, model, context, options);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn buildRequestUrl(allocator: std.mem.Allocator, model: types.Model) ![]const u8 {
@@ -1146,328 +1610,6 @@ fn authErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn buildContentsValue(
-    allocator: std.mem.Allocator,
-    model: types.Model,
-    messages: []const types.Message,
-) !std.json.Value {
-    var contents = std.json.Array.init(allocator);
-    errdefer contents.deinit();
-
-    var index: usize = 0;
-    while (index < messages.len) : (index += 1) {
-        switch (messages[index]) {
-            .user => |user| try contents.append(try buildUserMessageValue(allocator, model, user)),
-            .assistant => |assistant| {
-                if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                    if (try buildAssistantMessageValue(allocator, assistant)) |assistant_value| {
-                        try contents.append(assistant_value);
-                    }
-                }
-            },
-            .tool_result => {
-                const grouped = try buildToolResultMessageValue(allocator, model, messages[index..]);
-                try contents.append(grouped.value);
-                index += grouped.consumed - 1;
-            },
-        }
-    }
-
-    return .{ .array = contents };
-}
-
-fn buildSystemInstructionValue(allocator: std.mem.Allocator, system_prompt: []const u8) !std.json.Value {
-    var parts = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = parts });
-    try parts.append(try buildTextPartValue(allocator, system_prompt));
-
-    var object = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putObjectValue(allocator, &object, "parts", .{ .array = parts });
-    return .{ .object = object };
-}
-
-fn buildGenerationConfigValue(
-    allocator: std.mem.Allocator,
-    model: types.Model,
-    options: ?types.StreamOptions,
-) !std.json.Value {
-    var generation_config = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = generation_config });
-
-    if (options) |stream_options| {
-        if (stream_options.temperature) |temperature| {
-            try putFloatValue(allocator, &generation_config, "temperature", temperature);
-        }
-        if (stream_options.max_tokens) |max_tokens| {
-            try putIntegerValue(allocator, &generation_config, "maxOutputTokens", max_tokens);
-        }
-        const google_opts = stream_options.providerOptions("google");
-        if (google_opts.thinking) |thinking| {
-            if (model.reasoning) {
-                const thinking_config_value: std.json.Value = blk: {
-                    var thinking_config = try provider_json.initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = thinking_config });
-                    if (thinking.enabled) {
-                        try putBoolValue(allocator, &thinking_config, "includeThoughts", true);
-                        if (thinking.budget_tokens) |budget_tokens| {
-                            try putIntegerValue(allocator, &thinking_config, "thinkingBudget", budget_tokens);
-                        }
-                        if (thinking.level) |level| {
-                            try putStringValue(allocator, &thinking_config, "thinkingLevel", level);
-                        }
-                    } else {
-                        try putIntegerValue(allocator, &thinking_config, "thinkingBudget", 0);
-                    }
-                    break :blk .{ .object = thinking_config };
-                };
-                try putObjectValue(allocator, &generation_config, "thinkingConfig", thinking_config_value);
-            }
-        }
-    }
-
-    return .{ .object = generation_config };
-}
-
-fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std.json.Value {
-    var function_declarations = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = function_declarations });
-
-    for (tools) |tool| {
-        const declaration_value: std.json.Value = blk: {
-            var declaration = try provider_json.initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = declaration });
-            try putStringValue(allocator, &declaration, "name", tool.name);
-            try putStringValue(allocator, &declaration, "description", tool.description);
-            try putObjectValue(allocator, &declaration, "parametersJsonSchema", try provider_json.cloneValue(allocator, tool.parameters));
-            break :blk .{ .object = declaration };
-        };
-        try function_declarations.append(declaration_value);
-    }
-
-    var tool_entry = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = tool_entry });
-    try putObjectValue(allocator, &tool_entry, "functionDeclarations", .{ .array = function_declarations });
-
-    var tools_array = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = tools_array });
-    try tools_array.append(.{ .object = tool_entry });
-    return .{ .array = tools_array };
-}
-
-fn buildToolConfigValue(allocator: std.mem.Allocator, tool_choice: []const u8) !std.json.Value {
-    const function_calling_config_value: std.json.Value = blk: {
-        var function_calling_config = try provider_json.initObject(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .object = function_calling_config });
-        try putStringValue(allocator, &function_calling_config, "mode", mapToolChoice(tool_choice));
-        break :blk .{ .object = function_calling_config };
-    };
-
-    var tool_config = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = tool_config });
-    try putObjectValue(allocator, &tool_config, "functionCallingConfig", function_calling_config_value);
-    return .{ .object = tool_config };
-}
-
-fn buildUserMessageValue(
-    allocator: std.mem.Allocator,
-    model: types.Model,
-    user: types.UserMessage,
-) !std.json.Value {
-    const parts = try buildPartsArray(allocator, user.content, modelSupportsImages(model));
-    return try buildRoleMessageValue(allocator, "user", .{ .array = parts });
-}
-
-fn buildAssistantMessageValue(
-    allocator: std.mem.Allocator,
-    assistant: types.AssistantMessage,
-) !?std.json.Value {
-    var parts = std.json.Array.init(allocator);
-    errdefer parts.deinit();
-
-    for (assistant.content) |block| {
-        switch (block) {
-            .text => |text| {
-                if (std.mem.trim(u8, text.text, " \t\r\n").len == 0) continue;
-                try parts.append(try buildTextPartWithSignatureValue(allocator, text.text, text.text_signature));
-            },
-            .thinking => |thinking| {
-                if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
-                try parts.append(try buildThoughtPartValue(allocator, thinking.thinking, types.thinkingSignature(thinking)));
-            },
-            .image => {},
-            .tool_call => |tool_call| {
-                try parts.append(try buildFunctionCallPartValue(allocator, tool_call));
-            },
-        }
-    }
-
-    if (!types.hasInlineToolCalls(assistant)) {
-        if (assistant.tool_calls) |tool_calls| {
-            for (tool_calls) |tool_call| {
-                try parts.append(try buildFunctionCallPartValue(allocator, tool_call));
-            }
-        }
-    }
-
-    if (parts.items.len == 0) return null;
-    return try buildRoleMessageValue(allocator, "model", .{ .array = parts });
-}
-
-fn buildToolResultMessageValue(
-    allocator: std.mem.Allocator,
-    model: types.Model,
-    messages: []const types.Message,
-) !struct { value: std.json.Value, consumed: usize } {
-    var parts = std.json.Array.init(allocator);
-    errdefer parts.deinit();
-
-    var consumed: usize = 0;
-    while (consumed < messages.len) : (consumed += 1) {
-        switch (messages[consumed]) {
-            .tool_result => |tool_result| {
-                const function_response_value: std.json.Value = blk: {
-                    var function_response = try provider_json.initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = function_response });
-                    try putStringValue(allocator, &function_response, "name", tool_result.tool_name);
-
-                    const response_value: std.json.Value = inner: {
-                        var response = try provider_json.initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = response });
-                        const text_response = try buildToolResultText(allocator, model, tool_result.content);
-                        defer allocator.free(text_response);
-                        try putStringValue(
-                            allocator,
-                            &response,
-                            if (tool_result.is_error) "error" else "output",
-                            text_response,
-                        );
-                        break :inner .{ .object = response };
-                    };
-                    try putObjectValue(allocator, &function_response, "response", response_value);
-
-                    if (modelSupportsImages(model)) {
-                        if (try buildToolResultImageParts(allocator, tool_result.content)) |image_parts| {
-                            try putObjectValue(allocator, &function_response, "parts", .{ .array = image_parts });
-                        }
-                    }
-                    break :blk .{ .object = function_response };
-                };
-
-                var part = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = part });
-                try putObjectValue(allocator, &part, "functionResponse", function_response_value);
-                try parts.append(.{ .object = part });
-            },
-            else => break,
-        }
-    }
-
-    return .{
-        .value = try buildRoleMessageValue(allocator, "user", .{ .array = parts }),
-        .consumed = consumed,
-    };
-}
-
-fn buildPartsArray(
-    allocator: std.mem.Allocator,
-    content: []const types.ContentBlock,
-    supports_images: bool,
-) !std.json.Array {
-    var parts = std.json.Array.init(allocator);
-    errdefer parts.deinit();
-
-    var inserted_placeholder = false;
-    for (content) |block| {
-        switch (block) {
-            .text => |text| {
-                try parts.append(try buildTextPartValue(allocator, text.text));
-                inserted_placeholder = false;
-            },
-            .image => |image| {
-                if (supports_images) {
-                    try parts.append(try buildImagePartValue(allocator, image.mime_type, image.data));
-                } else if (!inserted_placeholder) {
-                    try parts.append(try buildTextPartValue(allocator, "(image omitted: model does not support images)"));
-                    inserted_placeholder = true;
-                }
-            },
-            .thinking, .tool_call => {},
-        }
-    }
-
-    if (parts.items.len == 0) {
-        try parts.append(try buildTextPartValue(allocator, ""));
-    }
-    return parts;
-}
-
-fn buildTextPartValue(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
-    return buildTextPartWithSignatureValue(allocator, text, null);
-}
-
-fn buildTextPartWithSignatureValue(allocator: std.mem.Allocator, text: []const u8, signature: ?[]const u8) !std.json.Value {
-    var part = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = part });
-    try putStringValue(allocator, &part, "text", text);
-    if (signature) |thought_signature| {
-        if (thought_signature.len > 0) {
-            try putStringValue(allocator, &part, "thoughtSignature", thought_signature);
-        }
-    }
-    return .{ .object = part };
-}
-
-fn buildThoughtPartValue(allocator: std.mem.Allocator, thinking_text: []const u8, signature: ?[]const u8) !std.json.Value {
-    var part = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = part });
-    try putBoolValue(allocator, &part, "thought", true);
-    try putStringValue(allocator, &part, "text", thinking_text);
-    if (signature) |value| {
-        try putStringValue(allocator, &part, "thoughtSignature", value);
-    }
-    return .{ .object = part };
-}
-
-fn buildFunctionCallPartValue(allocator: std.mem.Allocator, tool_call: types.ToolCall) !std.json.Value {
-    const function_call_value: std.json.Value = blk: {
-        var function_call = try provider_json.initObject(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .object = function_call });
-        try putStringValue(allocator, &function_call, "name", tool_call.name);
-        try putObjectValue(allocator, &function_call, "args", try provider_json.cloneValue(allocator, tool_call.arguments));
-        break :blk .{ .object = function_call };
-    };
-    var part = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = part });
-    if (tool_call.thought_signature) |signature| {
-        try putStringValue(allocator, &part, "thoughtSignature", signature);
-    }
-    try putObjectValue(allocator, &part, "functionCall", function_call_value);
-    return .{ .object = part };
-}
-
-fn buildImagePartValue(allocator: std.mem.Allocator, mime_type: []const u8, data: []const u8) !std.json.Value {
-    const inline_data_value: std.json.Value = blk: {
-        var inline_data = try provider_json.initObject(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .object = inline_data });
-        try putStringValue(allocator, &inline_data, "mimeType", mime_type);
-        try putStringValue(allocator, &inline_data, "data", data);
-        break :blk .{ .object = inline_data };
-    };
-    var part = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = part });
-    try putObjectValue(allocator, &part, "inlineData", inline_data_value);
-    return .{ .object = part };
-}
-
-fn buildRoleMessageValue(allocator: std.mem.Allocator, role: []const u8, parts: std.json.Value) !std.json.Value {
-    var message = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = message });
-    try putStringValue(allocator, &message, "role", role);
-    try putObjectValue(allocator, &message, "parts", parts);
-    return .{ .object = message };
-}
-
 fn buildToolResultText(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -1500,21 +1642,6 @@ fn buildToolResultText(
     }
 
     return try allocator.dupe(u8, text.items);
-}
-
-fn buildToolResultImageParts(allocator: std.mem.Allocator, content: []const types.ContentBlock) !?std.json.Array {
-    var parts = std.json.Array.init(allocator);
-    errdefer parts.deinit();
-
-    for (content) |block| {
-        switch (block) {
-            .image => |image| try parts.append(try buildImagePartValue(allocator, image.mime_type, image.data)),
-            else => {},
-        }
-    }
-
-    if (parts.items.len == 0) return null;
-    return parts;
 }
 
 fn finalizeOutputFromPartials(
