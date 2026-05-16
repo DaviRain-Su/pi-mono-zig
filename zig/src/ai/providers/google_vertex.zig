@@ -8,7 +8,14 @@ const provider_error = @import("../shared/provider_error.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_json_put = @import("../shared/provider_json_put.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
+
+const putBoolValue = provider_json_put.putBoolValue;
+const putStringValue = provider_json_put.putStringValue;
+const putIntegerValue = provider_json_put.putIntegerValue;
+const putFloatValue = provider_json_put.putFloatValue;
+const putObjectValue = provider_json_put.putObjectValue;
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const test_stream_server = @import("test_stream_server.zig");
 const asn1 = std.crypto.codecs.asn1;
@@ -213,24 +220,24 @@ pub fn buildRequestPayload(
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer payload.deinit(allocator);
+    var payload = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = payload });
 
-    try payload.put(allocator, try allocator.dupe(u8, "contents"), try buildContentsValue(allocator, model, context.messages));
+    try putObjectValue(allocator, &payload, "contents", try buildContentsValue(allocator, model, context.messages));
 
     if (context.system_prompt) |system_prompt| {
-        try payload.put(allocator, try allocator.dupe(u8, "systemInstruction"), try buildSystemInstructionValue(allocator, system_prompt));
+        try putObjectValue(allocator, &payload, "systemInstruction", try buildSystemInstructionValue(allocator, system_prompt));
     }
 
-    try payload.put(allocator, try allocator.dupe(u8, "generationConfig"), try buildGenerationConfigValue(allocator, model, options));
+    try putObjectValue(allocator, &payload, "generationConfig", try buildGenerationConfigValue(allocator, model, options));
 
     if (context.tools) |tools| {
         if (tools.len > 0) {
-            try payload.put(allocator, try allocator.dupe(u8, "tools"), try buildToolsValue(allocator, tools));
+            try putObjectValue(allocator, &payload, "tools", try buildToolsValue(allocator, tools));
             if (options) |stream_options| {
                 const google_opts = stream_options.providerOptions("google");
                 if (google_opts.tool_choice) |tool_choice| {
-                    try payload.put(allocator, try allocator.dupe(u8, "toolConfig"), try buildToolConfigValue(allocator, tool_choice));
+                    try putObjectValue(allocator, &payload, "toolConfig", try buildToolConfigValue(allocator, tool_choice));
                 }
             }
         }
@@ -1171,10 +1178,12 @@ fn buildContentsValue(
 
 fn buildSystemInstructionValue(allocator: std.mem.Allocator, system_prompt: []const u8) !std.json.Value {
     var parts = std.json.Array.init(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .array = parts });
     try parts.append(try buildTextPartValue(allocator, system_prompt));
 
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try object.put(allocator, try allocator.dupe(u8, "parts"), .{ .array = parts });
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putObjectValue(allocator, &object, "parts", .{ .array = parts });
     return .{ .object = object };
 }
 
@@ -1183,32 +1192,36 @@ fn buildGenerationConfigValue(
     model: types.Model,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    var generation_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer generation_config.deinit(allocator);
+    var generation_config = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = generation_config });
 
     if (options) |stream_options| {
         if (stream_options.temperature) |temperature| {
-            try generation_config.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
+            try putFloatValue(allocator, &generation_config, "temperature", temperature);
         }
         if (stream_options.max_tokens) |max_tokens| {
-            try generation_config.put(allocator, try allocator.dupe(u8, "maxOutputTokens"), .{ .integer = @intCast(max_tokens) });
+            try putIntegerValue(allocator, &generation_config, "maxOutputTokens", max_tokens);
         }
         const google_opts = stream_options.providerOptions("google");
         if (google_opts.thinking) |thinking| {
             if (model.reasoning) {
-                var thinking_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                if (thinking.enabled) {
-                    try thinking_config.put(allocator, try allocator.dupe(u8, "includeThoughts"), .{ .bool = true });
-                    if (thinking.budget_tokens) |budget_tokens| {
-                        try thinking_config.put(allocator, try allocator.dupe(u8, "thinkingBudget"), .{ .integer = @intCast(budget_tokens) });
+                const thinking_config_value: std.json.Value = blk: {
+                    var thinking_config = try provider_json.initObject(allocator);
+                    errdefer provider_json.freeValue(allocator, .{ .object = thinking_config });
+                    if (thinking.enabled) {
+                        try putBoolValue(allocator, &thinking_config, "includeThoughts", true);
+                        if (thinking.budget_tokens) |budget_tokens| {
+                            try putIntegerValue(allocator, &thinking_config, "thinkingBudget", budget_tokens);
+                        }
+                        if (thinking.level) |level| {
+                            try putStringValue(allocator, &thinking_config, "thinkingLevel", level);
+                        }
+                    } else {
+                        try putIntegerValue(allocator, &thinking_config, "thinkingBudget", 0);
                     }
-                    if (thinking.level) |level| {
-                        try thinking_config.put(allocator, try allocator.dupe(u8, "thinkingLevel"), .{ .string = try allocator.dupe(u8, level) });
-                    }
-                } else {
-                    try thinking_config.put(allocator, try allocator.dupe(u8, "thinkingBudget"), .{ .integer = 0 });
-                }
-                try generation_config.put(allocator, try allocator.dupe(u8, "thinkingConfig"), .{ .object = thinking_config });
+                    break :blk .{ .object = thinking_config };
+                };
+                try putObjectValue(allocator, &generation_config, "thinkingConfig", thinking_config_value);
             }
         }
     }
@@ -1218,30 +1231,41 @@ fn buildGenerationConfigValue(
 
 fn buildToolsValue(allocator: std.mem.Allocator, tools: []const types.Tool) !std.json.Value {
     var function_declarations = std.json.Array.init(allocator);
-    errdefer function_declarations.deinit();
+    errdefer provider_json.freeValue(allocator, .{ .array = function_declarations });
 
     for (tools) |tool| {
-        var declaration = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try declaration.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
-        try declaration.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
-        try declaration.put(allocator, try allocator.dupe(u8, "parametersJsonSchema"), try provider_json.cloneValue(allocator, tool.parameters));
-        try function_declarations.append(.{ .object = declaration });
+        const declaration_value: std.json.Value = blk: {
+            var declaration = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = declaration });
+            try putStringValue(allocator, &declaration, "name", tool.name);
+            try putStringValue(allocator, &declaration, "description", tool.description);
+            try putObjectValue(allocator, &declaration, "parametersJsonSchema", try provider_json.cloneValue(allocator, tool.parameters));
+            break :blk .{ .object = declaration };
+        };
+        try function_declarations.append(declaration_value);
     }
 
-    var tool_entry = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try tool_entry.put(allocator, try allocator.dupe(u8, "functionDeclarations"), .{ .array = function_declarations });
+    var tool_entry = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = tool_entry });
+    try putObjectValue(allocator, &tool_entry, "functionDeclarations", .{ .array = function_declarations });
 
     var tools_array = std.json.Array.init(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .array = tools_array });
     try tools_array.append(.{ .object = tool_entry });
     return .{ .array = tools_array };
 }
 
 fn buildToolConfigValue(allocator: std.mem.Allocator, tool_choice: []const u8) !std.json.Value {
-    var function_calling_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try function_calling_config.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, mapToolChoice(tool_choice)) });
+    const function_calling_config_value: std.json.Value = blk: {
+        var function_calling_config = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = function_calling_config });
+        try putStringValue(allocator, &function_calling_config, "mode", mapToolChoice(tool_choice));
+        break :blk .{ .object = function_calling_config };
+    };
 
-    var tool_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try tool_config.put(allocator, try allocator.dupe(u8, "functionCallingConfig"), .{ .object = function_calling_config });
+    var tool_config = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = tool_config });
+    try putObjectValue(allocator, &tool_config, "functionCallingConfig", function_calling_config_value);
     return .{ .object = tool_config };
 }
 
@@ -1269,26 +1293,11 @@ fn buildAssistantMessageValue(
             },
             .thinking => |thinking| {
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
-                var thought_part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try thought_part.put(allocator, try allocator.dupe(u8, "thought"), .{ .bool = true });
-                try thought_part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, thinking.thinking) });
-                if (types.thinkingSignature(thinking)) |signature| {
-                    try thought_part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
-                }
-                try parts.append(.{ .object = thought_part });
+                try parts.append(try buildThoughtPartValue(allocator, thinking.thinking, types.thinkingSignature(thinking)));
             },
             .image => {},
             .tool_call => |tool_call| {
-                var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
-
-                var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                if (tool_call.thought_signature) |signature| {
-                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
-                }
-                try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
-                try parts.append(.{ .object = part });
+                try parts.append(try buildFunctionCallPartValue(allocator, tool_call));
             },
         }
     }
@@ -1296,16 +1305,7 @@ fn buildAssistantMessageValue(
     if (!types.hasInlineToolCalls(assistant)) {
         if (assistant.tool_calls) |tool_calls| {
             for (tool_calls) |tool_call| {
-                var function_call = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try function_call.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try function_call.put(allocator, try allocator.dupe(u8, "args"), try provider_json.cloneValue(allocator, tool_call.arguments));
-
-                var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                if (tool_call.thought_signature) |signature| {
-                    try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, signature) });
-                }
-                try part.put(allocator, try allocator.dupe(u8, "functionCall"), .{ .object = function_call });
-                try parts.append(.{ .object = part });
+                try parts.append(try buildFunctionCallPartValue(allocator, tool_call));
             }
         }
     }
@@ -1326,27 +1326,37 @@ fn buildToolResultMessageValue(
     while (consumed < messages.len) : (consumed += 1) {
         switch (messages[consumed]) {
             .tool_result => |tool_result| {
-                var function_response = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try function_response.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_result.tool_name) });
+                const function_response_value: std.json.Value = blk: {
+                    var function_response = try provider_json.initObject(allocator);
+                    errdefer provider_json.freeValue(allocator, .{ .object = function_response });
+                    try putStringValue(allocator, &function_response, "name", tool_result.tool_name);
 
-                var response = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                const text_response = try buildToolResultText(allocator, model, tool_result.content);
-                defer allocator.free(text_response);
-                try response.put(
-                    allocator,
-                    try allocator.dupe(u8, if (tool_result.is_error) "error" else "output"),
-                    .{ .string = try allocator.dupe(u8, text_response) },
-                );
-                try function_response.put(allocator, try allocator.dupe(u8, "response"), .{ .object = response });
+                    const response_value: std.json.Value = inner: {
+                        var response = try provider_json.initObject(allocator);
+                        errdefer provider_json.freeValue(allocator, .{ .object = response });
+                        const text_response = try buildToolResultText(allocator, model, tool_result.content);
+                        defer allocator.free(text_response);
+                        try putStringValue(
+                            allocator,
+                            &response,
+                            if (tool_result.is_error) "error" else "output",
+                            text_response,
+                        );
+                        break :inner .{ .object = response };
+                    };
+                    try putObjectValue(allocator, &function_response, "response", response_value);
 
-                if (modelSupportsImages(model)) {
-                    if (try buildToolResultImageParts(allocator, tool_result.content)) |image_parts| {
-                        try function_response.put(allocator, try allocator.dupe(u8, "parts"), .{ .array = image_parts });
+                    if (modelSupportsImages(model)) {
+                        if (try buildToolResultImageParts(allocator, tool_result.content)) |image_parts| {
+                            try putObjectValue(allocator, &function_response, "parts", .{ .array = image_parts });
+                        }
                     }
-                }
+                    break :blk .{ .object = function_response };
+                };
 
-                var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try part.put(allocator, try allocator.dupe(u8, "functionResponse"), .{ .object = function_response });
+                var part = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = part });
+                try putObjectValue(allocator, &part, "functionResponse", function_response_value);
                 try parts.append(.{ .object = part });
             },
             else => break,
@@ -1397,30 +1407,64 @@ fn buildTextPartValue(allocator: std.mem.Allocator, text: []const u8) !std.json.
 }
 
 fn buildTextPartWithSignatureValue(allocator: std.mem.Allocator, text: []const u8, signature: ?[]const u8) !std.json.Value {
-    var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try part.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, text) });
+    var part = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = part });
+    try putStringValue(allocator, &part, "text", text);
     if (signature) |thought_signature| {
         if (thought_signature.len > 0) {
-            try part.put(allocator, try allocator.dupe(u8, "thoughtSignature"), .{ .string = try allocator.dupe(u8, thought_signature) });
+            try putStringValue(allocator, &part, "thoughtSignature", thought_signature);
         }
     }
     return .{ .object = part };
 }
 
-fn buildImagePartValue(allocator: std.mem.Allocator, mime_type: []const u8, data: []const u8) !std.json.Value {
-    var inline_data = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try inline_data.put(allocator, try allocator.dupe(u8, "mimeType"), .{ .string = try allocator.dupe(u8, mime_type) });
-    try inline_data.put(allocator, try allocator.dupe(u8, "data"), .{ .string = try allocator.dupe(u8, data) });
+fn buildThoughtPartValue(allocator: std.mem.Allocator, thinking_text: []const u8, signature: ?[]const u8) !std.json.Value {
+    var part = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = part });
+    try putBoolValue(allocator, &part, "thought", true);
+    try putStringValue(allocator, &part, "text", thinking_text);
+    if (signature) |value| {
+        try putStringValue(allocator, &part, "thoughtSignature", value);
+    }
+    return .{ .object = part };
+}
 
-    var part = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try part.put(allocator, try allocator.dupe(u8, "inlineData"), .{ .object = inline_data });
+fn buildFunctionCallPartValue(allocator: std.mem.Allocator, tool_call: types.ToolCall) !std.json.Value {
+    const function_call_value: std.json.Value = blk: {
+        var function_call = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = function_call });
+        try putStringValue(allocator, &function_call, "name", tool_call.name);
+        try putObjectValue(allocator, &function_call, "args", try provider_json.cloneValue(allocator, tool_call.arguments));
+        break :blk .{ .object = function_call };
+    };
+    var part = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = part });
+    if (tool_call.thought_signature) |signature| {
+        try putStringValue(allocator, &part, "thoughtSignature", signature);
+    }
+    try putObjectValue(allocator, &part, "functionCall", function_call_value);
+    return .{ .object = part };
+}
+
+fn buildImagePartValue(allocator: std.mem.Allocator, mime_type: []const u8, data: []const u8) !std.json.Value {
+    const inline_data_value: std.json.Value = blk: {
+        var inline_data = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = inline_data });
+        try putStringValue(allocator, &inline_data, "mimeType", mime_type);
+        try putStringValue(allocator, &inline_data, "data", data);
+        break :blk .{ .object = inline_data };
+    };
+    var part = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = part });
+    try putObjectValue(allocator, &part, "inlineData", inline_data_value);
     return .{ .object = part };
 }
 
 fn buildRoleMessageValue(allocator: std.mem.Allocator, role: []const u8, parts: std.json.Value) !std.json.Value {
-    var message = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try message.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
-    try message.put(allocator, try allocator.dupe(u8, "parts"), parts);
+    var message = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = message });
+    try putStringValue(allocator, &message, "role", role);
+    try putObjectValue(allocator, &message, "parts", parts);
     return .{ .object = message };
 }
 
@@ -1624,8 +1668,8 @@ test "buildRequestPayload includes Vertex contents, tools, and thinking config" 
     const allocator = std.testing.allocator;
 
     var tool_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try tool_schema.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
-    try tool_schema.put(allocator, try allocator.dupe(u8, "properties"), .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) });
+    try putStringValue(allocator, &tool_schema, "type", "object");
+    try putObjectValue(allocator, &tool_schema, "properties", try provider_json.emptyObjectValue(allocator));
     const tool_schema_value = std.json.Value{ .object = tool_schema };
     defer provider_json.freeValue(allocator, tool_schema_value);
 
