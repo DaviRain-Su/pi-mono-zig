@@ -11,7 +11,12 @@ const provider_json_put = @import("../shared/provider_json_put.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
 
 const putStringField = provider_json_put.putStringValue;
+const putStringValue = provider_json_put.putStringValue;
 const putIntegerField = provider_json_put.putIntegerValue;
+const putIntegerValue = provider_json_put.putIntegerValue;
+const putBoolValue = provider_json_put.putBoolValue;
+const putFloatValue = provider_json_put.putFloatValue;
+const putObjectValue = provider_json_put.putObjectValue;
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const transform_messages = @import("../shared/transform_messages.zig");
@@ -323,23 +328,23 @@ fn buildRequestPayloadWithFixtureEnv(
     options: ?types.StreamOptions,
     fixture_env: ?FixtureEnv,
 ) !std.json.Value {
-    var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer payload.deinit(allocator);
+    var payload = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = payload });
 
     const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
 
-    try payload.put(allocator, try allocator.dupe(u8, "messages"), try buildMessagesValue(allocator, model, context.messages, cache_retention));
+    try putObjectValue(allocator, &payload, "messages", try buildMessagesValue(allocator, model, context.messages, cache_retention));
 
     if (context.system_prompt) |system_prompt| {
-        try payload.put(allocator, try allocator.dupe(u8, "system"), try buildSystemValue(allocator, system_prompt, model, cache_retention));
+        try putObjectValue(allocator, &payload, "system", try buildSystemValue(allocator, system_prompt, model, cache_retention));
     }
 
-    try payload.put(allocator, try allocator.dupe(u8, "inferenceConfig"), try buildInferenceConfigValue(allocator, model, options));
+    try putObjectValue(allocator, &payload, "inferenceConfig", try buildInferenceConfigValue(allocator, model, options));
 
     if (context.tools) |tools| {
         if (tools.len > 0) {
             if (try buildToolConfigValue(allocator, tools, options)) |tool_config| {
-                try payload.put(allocator, try allocator.dupe(u8, "toolConfig"), tool_config);
+                try putObjectValue(allocator, &payload, "toolConfig", tool_config);
             }
         }
     }
@@ -347,10 +352,10 @@ fn buildRequestPayloadWithFixtureEnv(
     if (options) |stream_options| {
         const bedrock_opts = stream_options.providerOptions("bedrock");
         if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |request_metadata| {
-            try payload.put(allocator, try allocator.dupe(u8, "requestMetadata"), request_metadata);
+            try putObjectValue(allocator, &payload, "requestMetadata", request_metadata);
         }
         if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options, fixture_env)) |additional_fields| {
-            try payload.put(allocator, try allocator.dupe(u8, "additionalModelRequestFields"), additional_fields);
+            try putObjectValue(allocator, &payload, "additionalModelRequestFields", additional_fields);
         }
     }
 
@@ -375,9 +380,9 @@ pub fn buildRequestSnapshotValueWithFixtureEnv(
     mode: []const u8,
     fixture_env: ?FixtureEnv,
 ) !std.json.Value {
-    var request = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer request.deinit(allocator);
-    try request.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, mode) });
+    var request = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = request });
+    try putStringValue(allocator, &request, "mode", mode);
 
     var snapshot_options = options;
     var simple_snapshot_options: types.StreamOptions = undefined;
@@ -388,7 +393,7 @@ pub fn buildRequestSnapshotValueWithFixtureEnv(
 
     var payload = try buildRequestPayloadWithFixtureEnv(allocator, model, context, snapshot_options, fixture_env);
     errdefer provider_json.freeValue(allocator, payload);
-    try payload.object.put(allocator, try allocator.dupe(u8, "modelId"), .{ .string = try allocator.dupe(u8, model.id) });
+    try putStringValue(allocator, &payload.object, "modelId", model.id);
     if (snapshot_options) |stream_options| {
         if (stream_options.on_payload) |callback| {
             if (try callback(allocator, payload, model)) |replacement| {
@@ -397,7 +402,7 @@ pub fn buildRequestSnapshotValueWithFixtureEnv(
             }
         }
     }
-    try request.put(allocator, try allocator.dupe(u8, "payload"), payload);
+    try putObjectValue(allocator, &request, "payload", payload);
     return .{ .object = request };
 }
 
@@ -436,44 +441,58 @@ pub fn buildRequestSurfaceSnapshotValue(
         std.StringHashMap([]const u8).init(allocator);
     defer deinitHeaderMap(allocator, &headers);
 
-    var root = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer root.deinit(allocator);
-    try root.put(allocator, try allocator.dupe(u8, "boundary"), .{ .string = try allocator.dupe(u8, if (use_http_boundary) "aws-sdk-finalized-http-request" else "aws-sdk-client-config-boundary") });
-    try root.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
-    try root.put(allocator, try allocator.dupe(u8, "path"), .{ .string = try allocator.dupe(u8, request_path) });
+    var root = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = root });
+    try putStringValue(allocator, &root, "boundary", if (use_http_boundary) "aws-sdk-finalized-http-request" else "aws-sdk-client-config-boundary");
+    try putStringValue(allocator, &root, "method", "POST");
+    try putStringValue(allocator, &root, "path", request_path);
     const surface_endpoint = requestSurfaceEndpointSnapshot(model.base_url, options, fixture_env, endpoint, use_http_boundary);
     if (surface_endpoint.value) |base_url| {
+        // url uses allocPrint which returns an owned string we must transfer via put_string-like.
         const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, request_path });
+        errdefer allocator.free(url);
         try root.put(allocator, try allocator.dupe(u8, "url"), .{ .string = url });
     } else {
-        try root.put(allocator, try allocator.dupe(u8, "url"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
+        try putStringValue(allocator, &root, "url", "sdk-profile-resolution");
     }
 
-    var endpoint_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try endpoint_object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, surface_endpoint.mode) });
-    if (surface_endpoint.value) |value| try endpoint_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
-    try root.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .object = endpoint_object });
+    const endpoint_value: std.json.Value = blk: {
+        var endpoint_object = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = endpoint_object });
+        try putStringValue(allocator, &endpoint_object, "mode", surface_endpoint.mode);
+        if (surface_endpoint.value) |value| try putStringValue(allocator, &endpoint_object, "value", value);
+        break :blk .{ .object = endpoint_object };
+    };
+    try putObjectValue(allocator, &root, "endpoint", endpoint_value);
 
-    var region_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try region_object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, region.source) });
-    if (region.value) |value| try region_object.put(allocator, try allocator.dupe(u8, "value"), .{ .string = try allocator.dupe(u8, value) });
-    try root.put(allocator, try allocator.dupe(u8, "region"), .{ .object = region_object });
+    const region_value: std.json.Value = blk: {
+        var region_object = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = region_object });
+        try putStringValue(allocator, &region_object, "source", region.source);
+        if (region.value) |value| try putStringValue(allocator, &region_object, "value", value);
+        break :blk .{ .object = region_object };
+    };
+    try putObjectValue(allocator, &root, "region", region_value);
 
-    var client_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    if (options) |stream_options| {
-        const bedrock_opts = stream_options.providerOptions("bedrock");
-        if (bedrock_opts.profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "profile"), .{ .string = try allocator.dupe(u8, profile) });
-    }
-    if (fixture_env.aws_profile) |profile| try client_config.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-    if (!use_http_boundary and std.mem.eql(u8, surface_endpoint.mode, "explicit")) {
-        if (surface_endpoint.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "endpoint"), .{ .string = try allocator.dupe(u8, value) });
-    }
-    if (region.value) |value| try client_config.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, value) });
-    try root.put(allocator, try allocator.dupe(u8, "clientConfig"), .{ .object = client_config });
+    const client_config_value: std.json.Value = blk: {
+        var client_config = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = client_config });
+        if (options) |stream_options| {
+            const bedrock_opts = stream_options.providerOptions("bedrock");
+            if (bedrock_opts.profile) |profile| try putStringValue(allocator, &client_config, "profile", profile);
+        }
+        if (fixture_env.aws_profile) |profile| try putStringValue(allocator, &client_config, "envProfile", profile);
+        if (!use_http_boundary and std.mem.eql(u8, surface_endpoint.mode, "explicit")) {
+            if (surface_endpoint.value) |value| try putStringValue(allocator, &client_config, "endpoint", value);
+        }
+        if (region.value) |value| try putStringValue(allocator, &client_config, "region", value);
+        break :blk .{ .object = client_config };
+    };
+    try putObjectValue(allocator, &root, "clientConfig", client_config_value);
 
     const auth_snapshot = try buildProductionAuthSnapshot(allocator, auth, options, fixture_env, region, &headers);
-    try root.put(allocator, try allocator.dupe(u8, "auth"), auth_snapshot);
-    try root.put(allocator, try allocator.dupe(u8, "redaction"), .{ .string = try allocator.dupe(u8, "secrets-redacted") });
+    try putObjectValue(allocator, &root, "auth", auth_snapshot);
+    try putStringValue(allocator, &root, "redaction", "secrets-redacted");
     return .{ .object = root };
 }
 
@@ -594,15 +613,15 @@ fn buildInferenceConfigValue(
     options: ?types.StreamOptions,
 ) !std.json.Value {
     _ = model;
-    var config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer config.deinit(allocator);
+    var config = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = config });
 
     if (options) |stream_options| {
         if (stream_options.max_tokens) |max_tokens| {
-            try config.put(allocator, try allocator.dupe(u8, "maxTokens"), .{ .integer = @intCast(max_tokens) });
+            try putIntegerValue(allocator, &config, "maxTokens", max_tokens);
         }
         if (stream_options.temperature) |temperature| {
-            try config.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
+            try putFloatValue(allocator, &config, "temperature", temperature);
         }
     }
 
@@ -612,13 +631,13 @@ fn buildInferenceConfigValue(
 fn buildRequestMetadataValue(allocator: std.mem.Allocator, metadata: ?std.json.Value) !?std.json.Value {
     if (metadata) |value| {
         if (value != .object) return null;
-        var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        errdefer object.deinit(allocator);
+        var object = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = object });
 
         var iterator = value.object.iterator();
         while (iterator.next()) |entry| {
             if (entry.value_ptr.* != .string) continue;
-            try object.put(allocator, try allocator.dupe(u8, entry.key_ptr.*), .{ .string = try allocator.dupe(u8, entry.value_ptr.*.string) });
+            try putStringValue(allocator, &object, entry.key_ptr.*, entry.value_ptr.*.string);
         }
         return .{ .object = object };
     }
@@ -645,29 +664,42 @@ fn resolveOptionsCacheRetention(options: ?types.StreamOptions, pi_cache_retentio
 }
 
 fn buildCachePointBlockObject(allocator: std.mem.Allocator, cache_retention: types.CacheRetention) !std.json.Value {
-    var cache_point = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try cache_point.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "default") });
-    if (cache_retention == .long) {
-        try cache_point.put(allocator, try allocator.dupe(u8, "ttl"), .{ .string = try allocator.dupe(u8, "1h") });
-    }
+    const cache_point_value: std.json.Value = blk: {
+        var cache_point = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = cache_point });
+        try putStringValue(allocator, &cache_point, "type", "default");
+        if (cache_retention == .long) {
+            try putStringValue(allocator, &cache_point, "ttl", "1h");
+        }
+        break :blk .{ .object = cache_point };
+    };
 
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try object.put(allocator, try allocator.dupe(u8, "cachePoint"), .{ .object = cache_point });
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putObjectValue(allocator, &object, "cachePoint", cache_point_value);
     return .{ .object = object };
 }
 
 fn buildImageBlockObject(allocator: std.mem.Allocator, image: types.ImageContent) !std.json.Value {
     const format = try bedrockImageFormat(image.mime_type);
 
-    var source = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try source.put(allocator, try allocator.dupe(u8, "bytes"), .{ .string = try allocator.dupe(u8, image.data) });
+    const image_object_value: std.json.Value = blk: {
+        var image_object = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = image_object });
+        const source_value: std.json.Value = inner: {
+            var source = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = source });
+            try putStringValue(allocator, &source, "bytes", image.data);
+            break :inner .{ .object = source };
+        };
+        try putObjectValue(allocator, &image_object, "source", source_value);
+        try putStringValue(allocator, &image_object, "format", format);
+        break :blk .{ .object = image_object };
+    };
 
-    var image_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try image_object.put(allocator, try allocator.dupe(u8, "source"), .{ .object = source });
-    try image_object.put(allocator, try allocator.dupe(u8, "format"), .{ .string = try allocator.dupe(u8, format) });
-
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try object.put(allocator, try allocator.dupe(u8, "image"), .{ .object = image_object });
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putObjectValue(allocator, &object, "image", image_object_value);
     return .{ .object = object };
 }
 
@@ -801,20 +833,28 @@ fn buildAdditionalModelRequestFieldsValue(
     if (!model.reasoning or !isAnthropicClaudeModel(model)) return null;
 
     const display = if (isGovCloudBedrockTarget(model, options, fixture_env)) null else bedrock_opts.thinking_display orelse .summarized;
-    var result = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer result.deinit(allocator);
+    var result = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = result });
 
     if (supportsAdaptiveThinking(model.id, model.name)) {
-        var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "adaptive") });
-        if (display) |display_value| {
-            try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, thinkingDisplayString(display_value)) });
-        }
-        try result.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+        const thinking_value: std.json.Value = blk: {
+            var thinking = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = thinking });
+            try putStringValue(allocator, &thinking, "type", "adaptive");
+            if (display) |display_value| {
+                try putStringValue(allocator, &thinking, "display", thinkingDisplayString(display_value));
+            }
+            break :blk .{ .object = thinking };
+        };
+        try putObjectValue(allocator, &result, "thinking", thinking_value);
 
-        var output_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, mapThinkingLevelToEffort(reasoning, model)) });
-        try result.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
+        const output_config_value: std.json.Value = blk: {
+            var output_config = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = output_config });
+            try putStringValue(allocator, &output_config, "effort", mapThinkingLevelToEffort(reasoning, model));
+            break :blk .{ .object = output_config };
+        };
+        try putObjectValue(allocator, &result, "output_config", output_config_value);
     } else {
         const budgets = bedrock_opts.thinking_budgets orelse types.ThinkingBudgets{};
         const budget = switch (reasoning) {
@@ -823,17 +863,22 @@ fn buildAdditionalModelRequestFieldsValue(
             .medium => budgets.medium,
             .high, .xhigh => budgets.high,
         };
-        var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "enabled") });
-        try thinking.put(allocator, try allocator.dupe(u8, "budget_tokens"), .{ .integer = budget });
-        if (display) |display_value| {
-            try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, thinkingDisplayString(display_value)) });
-        }
-        try result.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+        const thinking_value: std.json.Value = blk: {
+            var thinking = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = thinking });
+            try putStringValue(allocator, &thinking, "type", "enabled");
+            try putIntegerValue(allocator, &thinking, "budget_tokens", budget);
+            if (display) |display_value| {
+                try putStringValue(allocator, &thinking, "display", thinkingDisplayString(display_value));
+            }
+            break :blk .{ .object = thinking };
+        };
+        try putObjectValue(allocator, &result, "thinking", thinking_value);
         if (bedrock_opts.interleaved_thinking orelse true) {
             var beta = std.json.Array.init(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .array = beta });
             try beta.append(.{ .string = try allocator.dupe(u8, "interleaved-thinking-2025-05-14") });
-            try result.put(allocator, try allocator.dupe(u8, "anthropic_beta"), .{ .array = beta });
+            try putObjectValue(allocator, &result, "anthropic_beta", .{ .array = beta });
         }
     }
 
@@ -926,45 +971,17 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, model: types.Model, 
                 if (std.mem.trim(u8, thinking.thinking, " \t\r\n").len == 0) continue;
                 if (isAnthropicClaudeModel(model)) {
                     if (types.thinkingSignature(thinking)) |signature| {
-                        var reasoning_text = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                        const sanitized = try openai.sanitizeSurrogates(allocator, thinking.thinking);
-                        defer allocator.free(sanitized);
-                        try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
-                        try reasoning_text.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, signature) });
-
-                        var reasoning_content = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                        try reasoning_content.put(allocator, try allocator.dupe(u8, "reasoningText"), .{ .object = reasoning_text });
-
-                        var block_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                        try block_object.put(allocator, try allocator.dupe(u8, "reasoningContent"), .{ .object = reasoning_content });
-                        try content.append(.{ .object = block_object });
+                        try content.append(try buildReasoningContentBlock(allocator, thinking.thinking, signature));
                     } else {
                         try content.append(try buildTextBlockObject(allocator, thinking.thinking));
                     }
                 } else {
-                    var reasoning_text = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                    const sanitized = try openai.sanitizeSurrogates(allocator, thinking.thinking);
-                    defer allocator.free(sanitized);
-                    try reasoning_text.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
-
-                    var reasoning_content = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                    try reasoning_content.put(allocator, try allocator.dupe(u8, "reasoningText"), .{ .object = reasoning_text });
-
-                    var block_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                    try block_object.put(allocator, try allocator.dupe(u8, "reasoningContent"), .{ .object = reasoning_content });
-                    try content.append(.{ .object = block_object });
+                    try content.append(try buildReasoningContentBlock(allocator, thinking.thinking, null));
                 }
             },
             .image => |image| try content.append(try buildImageBlockObject(allocator, image)),
             .tool_call => |tool_call| {
-                var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
-
-                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
-                try content.append(.{ .object = object });
+                try content.append(try buildToolUseBlock(allocator, tool_call));
             },
         }
     }
@@ -972,14 +989,7 @@ fn buildAssistantMessageValue(allocator: std.mem.Allocator, model: types.Model, 
     if (!types.hasInlineToolCalls(assistant)) {
         if (assistant.tool_calls) |tool_calls| {
             for (tool_calls) |tool_call| {
-                var tool_use = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try tool_use.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_call.id) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool_call.name) });
-                try tool_use.put(allocator, try allocator.dupe(u8, "input"), try provider_json.cloneValue(allocator, tool_call.arguments));
-
-                var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try object.put(allocator, try allocator.dupe(u8, "toolUse"), .{ .object = tool_use });
-                try content.append(.{ .object = object });
+                try content.append(try buildToolUseBlock(allocator, tool_call));
             }
         }
     }
@@ -1015,17 +1025,18 @@ fn buildToolResultMessageValue(
                     try tool_result_blocks.append(try buildTextBlockObject(allocator, ""));
                 }
 
-                var tool_result_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try tool_result_obj.put(allocator, try allocator.dupe(u8, "toolUseId"), .{ .string = try allocator.dupe(u8, tool_result.tool_call_id) });
-                try tool_result_obj.put(allocator, try allocator.dupe(u8, "content"), .{ .array = tool_result_blocks });
-                try tool_result_obj.put(
-                    allocator,
-                    try allocator.dupe(u8, "status"),
-                    .{ .string = try allocator.dupe(u8, if (tool_result.is_error) "error" else "success") },
-                );
+                const tool_result_value: std.json.Value = blk: {
+                    var tool_result_obj = try provider_json.initObject(allocator);
+                    errdefer provider_json.freeValue(allocator, .{ .object = tool_result_obj });
+                    try putStringValue(allocator, &tool_result_obj, "toolUseId", tool_result.tool_call_id);
+                    try putObjectValue(allocator, &tool_result_obj, "content", .{ .array = tool_result_blocks });
+                    try putStringValue(allocator, &tool_result_obj, "status", if (tool_result.is_error) "error" else "success");
+                    break :blk .{ .object = tool_result_obj };
+                };
 
-                var wrapper = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try wrapper.put(allocator, try allocator.dupe(u8, "toolResult"), .{ .object = tool_result_obj });
+                var wrapper = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = wrapper });
+                try putObjectValue(allocator, &wrapper, "toolResult", tool_result_value);
                 try content.append(.{ .object = wrapper });
             },
             else => break,
@@ -1051,29 +1062,39 @@ fn buildToolConfigValue(
     }
 
     var tool_entries = std.json.Array.init(allocator);
-    errdefer tool_entries.deinit();
+    errdefer provider_json.freeValue(allocator, .{ .array = tool_entries });
     for (tools) |tool| {
-        var tool_spec = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try tool_spec.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, tool.name) });
-        try tool_spec.put(allocator, try allocator.dupe(u8, "description"), .{ .string = try allocator.dupe(u8, tool.description) });
+        const tool_object_value: std.json.Value = blk: {
+            var tool_spec = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = tool_spec });
+            try putStringValue(allocator, &tool_spec, "name", tool.name);
+            try putStringValue(allocator, &tool_spec, "description", tool.description);
 
-        var input_schema = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try input_schema.put(allocator, try allocator.dupe(u8, "json"), try provider_json.cloneValue(allocator, tool.parameters));
-        try tool_spec.put(allocator, try allocator.dupe(u8, "inputSchema"), .{ .object = input_schema });
+            const input_schema_value: std.json.Value = inner: {
+                var input_schema = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = input_schema });
+                try putObjectValue(allocator, &input_schema, "json", try provider_json.cloneValue(allocator, tool.parameters));
+                break :inner .{ .object = input_schema };
+            };
+            try putObjectValue(allocator, &tool_spec, "inputSchema", input_schema_value);
 
-        var tool_object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        try tool_object.put(allocator, try allocator.dupe(u8, "toolSpec"), .{ .object = tool_spec });
-        try tool_entries.append(.{ .object = tool_object });
+            var tool_object = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = tool_object });
+            try putObjectValue(allocator, &tool_object, "toolSpec", .{ .object = tool_spec });
+            break :blk .{ .object = tool_object };
+        };
+        try tool_entries.append(tool_object_value);
     }
 
-    var config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try config.put(allocator, try allocator.dupe(u8, "tools"), .{ .array = tool_entries });
+    var config = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = config });
+    try putObjectValue(allocator, &config, "tools", .{ .array = tool_entries });
 
     if (options) |stream_options| {
         const bedrock_opts = stream_options.providerOptions("bedrock");
         if (bedrock_opts.tool_choice) |tool_choice| {
             if (try buildToolChoiceValue(allocator, tool_choice)) |choice_value| {
-                try config.put(allocator, try allocator.dupe(u8, "toolChoice"), choice_value);
+                try putObjectValue(allocator, &config, "toolChoice", choice_value);
             }
         }
     }
@@ -1084,30 +1105,85 @@ fn buildToolConfigValue(
 fn buildToolChoiceValue(allocator: std.mem.Allocator, tool_choice: types.BedrockToolChoice) !?std.json.Value {
     switch (tool_choice) {
         .none => return null,
-        .auto => return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "auto")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) },
-        .any => return .{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{try allocator.dupe(u8, "any")}, &[_]std.json.Value{.{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) }}) },
+        .auto => return try buildWrappedEmptyObject(allocator, "auto"),
+        .any => return try buildWrappedEmptyObject(allocator, "any"),
         .tool => |name| {
-            var tool = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try tool.put(allocator, try allocator.dupe(u8, "name"), .{ .string = try allocator.dupe(u8, name) });
-            var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            try object.put(allocator, try allocator.dupe(u8, "tool"), .{ .object = tool });
+            const tool_value: std.json.Value = blk: {
+                var tool = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = tool });
+                try putStringValue(allocator, &tool, "name", name);
+                break :blk .{ .object = tool };
+            };
+            var object = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = object });
+            try putObjectValue(allocator, &object, "tool", tool_value);
             return .{ .object = object };
         },
     }
 }
 
+fn buildWrappedEmptyObject(allocator: std.mem.Allocator, key: []const u8) !std.json.Value {
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putObjectValue(allocator, &object, key, try provider_json.emptyObjectValue(allocator));
+    return .{ .object = object };
+}
+
 fn buildTextBlockObject(allocator: std.mem.Allocator, text: []const u8) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
     const sanitized = try openai.sanitizeSurrogates(allocator, text);
     defer allocator.free(sanitized);
-    try object.put(allocator, try allocator.dupe(u8, "text"), .{ .string = try allocator.dupe(u8, sanitized) });
+    try putStringValue(allocator, &object, "text", sanitized);
     return .{ .object = object };
 }
 
 fn buildRoleMessageObject(allocator: std.mem.Allocator, role: []const u8, content: std.json.Value) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try object.put(allocator, try allocator.dupe(u8, "role"), .{ .string = try allocator.dupe(u8, role) });
-    try object.put(allocator, try allocator.dupe(u8, "content"), content);
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putStringValue(allocator, &object, "role", role);
+    try putObjectValue(allocator, &object, "content", content);
+    return .{ .object = object };
+}
+
+fn buildReasoningContentBlock(allocator: std.mem.Allocator, thinking_text: []const u8, signature: ?[]const u8) !std.json.Value {
+    const reasoning_text_value: std.json.Value = blk: {
+        var reasoning_text = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = reasoning_text });
+        const sanitized = try openai.sanitizeSurrogates(allocator, thinking_text);
+        defer allocator.free(sanitized);
+        try putStringValue(allocator, &reasoning_text, "text", sanitized);
+        if (signature) |sig| {
+            try putStringValue(allocator, &reasoning_text, "signature", sig);
+        }
+        break :blk .{ .object = reasoning_text };
+    };
+
+    const reasoning_content_value: std.json.Value = blk: {
+        var reasoning_content = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = reasoning_content });
+        try putObjectValue(allocator, &reasoning_content, "reasoningText", reasoning_text_value);
+        break :blk .{ .object = reasoning_content };
+    };
+
+    var block_object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = block_object });
+    try putObjectValue(allocator, &block_object, "reasoningContent", reasoning_content_value);
+    return .{ .object = block_object };
+}
+
+fn buildToolUseBlock(allocator: std.mem.Allocator, tool_call: types.ToolCall) !std.json.Value {
+    const tool_use_value: std.json.Value = blk: {
+        var tool_use = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = tool_use });
+        try putStringValue(allocator, &tool_use, "toolUseId", tool_call.id);
+        try putStringValue(allocator, &tool_use, "name", tool_call.name);
+        try putObjectValue(allocator, &tool_use, "input", try provider_json.cloneValue(allocator, tool_call.arguments));
+        break :blk .{ .object = tool_use };
+    };
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putObjectValue(allocator, &object, "toolUse", tool_use_value);
     return .{ .object = object };
 }
 
@@ -2677,72 +2753,75 @@ fn buildProductionAuthSnapshot(
     region: FixtureRegion,
     headers: *const std.StringHashMap([]const u8),
 ) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer object.deinit(allocator);
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
 
     const option_bearer = if (options) |stream_options| nonEmpty(stream_options.providerOptions("bedrock").bearer_token) else null;
     const env_bearer = nonEmpty(env.aws_bearer_token_bedrock);
 
     if (std.mem.eql(u8, nonEmpty(env.aws_bedrock_skip_auth) orelse "", "1")) {
-        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "skip-auth") });
-        try object.put(allocator, try allocator.dupe(u8, "credentialSource"), .{ .string = try allocator.dupe(u8, "proxy-dummy") });
-        try object.put(allocator, try allocator.dupe(u8, "bearerSuppressed"), .{ .bool = option_bearer != null or env_bearer != null });
-        try object.put(allocator, try allocator.dupe(u8, "secrets"), .{ .string = try allocator.dupe(u8, "redacted") });
+        try putStringValue(allocator, &object, "mode", "skip-auth");
+        try putStringValue(allocator, &object, "credentialSource", "proxy-dummy");
+        try putBoolValue(allocator, &object, "bearerSuppressed", option_bearer != null or env_bearer != null);
+        try putStringValue(allocator, &object, "secrets", "redacted");
         return .{ .object = object };
     }
 
     const resolved_auth = auth orelse {
-        try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "missing-credentials") });
-        try object.put(allocator, try allocator.dupe(u8, "errorSurface"), .{ .string = try allocator.dupe(u8, "async-stream-error") });
-        try object.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, "Bedrock requires AWS_ACCESS_KEY_ID.") });
-        try object.put(allocator, try allocator.dupe(u8, "network"), .{ .string = try allocator.dupe(u8, "not-attempted") });
+        try putStringValue(allocator, &object, "mode", "missing-credentials");
+        try putStringValue(allocator, &object, "errorSurface", "async-stream-error");
+        try putStringValue(allocator, &object, "message", "Bedrock requires AWS_ACCESS_KEY_ID.");
+        try putStringValue(allocator, &object, "network", "not-attempted");
         return .{ .object = object };
     };
 
     switch (resolved_auth) {
         .bearer => {
-            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "bearer") });
-            try object.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, if (option_bearer != null) "options.bearerToken" else "env.bearerToken") });
-            try object.put(allocator, try allocator.dupe(u8, "token"), .{ .string = try allocator.dupe(u8, "redacted") });
-            try object.put(allocator, try allocator.dupe(u8, "sigv4"), .{ .bool = false });
+            try putStringValue(allocator, &object, "mode", "bearer");
+            try putStringValue(allocator, &object, "source", if (option_bearer != null) "options.bearerToken" else "env.bearerToken");
+            try putStringValue(allocator, &object, "token", "redacted");
+            try putBoolValue(allocator, &object, "sigv4", false);
         },
         .profile => {
-            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "profile") });
-            var profile_boundary = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-            errdefer profile_boundary.deinit(allocator);
-            try profile_boundary.put(allocator, try allocator.dupe(u8, "source"), .{ .string = try allocator.dupe(u8, "aws-sdk-shared-ini-profile-resolution") });
-            const configured_profile = if (options) |stream_options| nonEmpty(stream_options.providerOptions("bedrock").profile) else null;
-            const env_profile = nonEmpty(env.aws_profile);
-            try profile_boundary.put(allocator, try allocator.dupe(u8, "selectedProfile"), .{ .string = try allocator.dupe(u8, configured_profile orelse env_profile orelse "default") });
-            if (options) |stream_options| {
-                if (nonEmpty(stream_options.providerOptions("bedrock").profile)) |profile| {
-                    try object.put(allocator, try allocator.dupe(u8, "optionsProfile"), .{ .string = try allocator.dupe(u8, profile) });
-                    try profile_boundary.put(allocator, try allocator.dupe(u8, "configuredProfile"), .{ .string = try allocator.dupe(u8, profile) });
+            try putStringValue(allocator, &object, "mode", "profile");
+            const profile_boundary_value: std.json.Value = blk: {
+                var profile_boundary = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = profile_boundary });
+                try putStringValue(allocator, &profile_boundary, "source", "aws-sdk-shared-ini-profile-resolution");
+                const configured_profile = if (options) |stream_options| nonEmpty(stream_options.providerOptions("bedrock").profile) else null;
+                const env_profile = nonEmpty(env.aws_profile);
+                try putStringValue(allocator, &profile_boundary, "selectedProfile", configured_profile orelse env_profile orelse "default");
+                if (options) |stream_options| {
+                    if (nonEmpty(stream_options.providerOptions("bedrock").profile)) |profile| {
+                        try putStringValue(allocator, &object, "optionsProfile", profile);
+                        try putStringValue(allocator, &profile_boundary, "configuredProfile", profile);
+                    }
                 }
-            }
-            if (nonEmpty(env.aws_profile)) |profile| {
-                try object.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-                try profile_boundary.put(allocator, try allocator.dupe(u8, "envProfile"), .{ .string = try allocator.dupe(u8, profile) });
-            }
-            try object.put(allocator, try allocator.dupe(u8, "credentialDiscovery"), .{ .string = try allocator.dupe(u8, "sdk-profile-resolution") });
-            try object.put(allocator, try allocator.dupe(u8, "profileBoundary"), .{ .object = profile_boundary });
+                if (nonEmpty(env.aws_profile)) |profile| {
+                    try putStringValue(allocator, &object, "envProfile", profile);
+                    try putStringValue(allocator, &profile_boundary, "envProfile", profile);
+                }
+                break :blk .{ .object = profile_boundary };
+            };
+            try putStringValue(allocator, &object, "credentialDiscovery", "sdk-profile-resolution");
+            try putObjectValue(allocator, &object, "profileBoundary", profile_boundary_value);
         },
         .sigv4 => {
             const authorization = headerValueIgnoreCase(headers, "authorization");
             const credential_scope = if (authorization) |value| try parseCredentialScope(allocator, value, region.value orelse "us-east-1") else try defaultCredentialScope(allocator, region.value orelse "us-east-1");
 
-            try object.put(allocator, try allocator.dupe(u8, "mode"), .{ .string = try allocator.dupe(u8, "sigv4") });
-            try object.put(allocator, try allocator.dupe(u8, "method"), .{ .string = try allocator.dupe(u8, "POST") });
-            try object.put(allocator, try allocator.dupe(u8, "query"), .{ .string = try allocator.dupe(u8, "") });
-            try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
-            try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, credential_scope.get("region").?.string) });
-            try object.put(allocator, try allocator.dupe(u8, "amzDate"), .{ .string = try allocator.dupe(u8, "20250115T120000Z") });
-            try object.put(allocator, try allocator.dupe(u8, "credentialScope"), .{ .object = credential_scope });
-            try object.put(allocator, try allocator.dupe(u8, "signedHeaders"), try parseSignedHeadersValue(allocator, authorization orelse ""));
-            try object.put(allocator, try allocator.dupe(u8, "bodySha256"), .{ .string = try allocator.dupe(u8, if (headerValueIgnoreCase(headers, "x-amz-content-sha256") != null) "normalized-payload-sha256" else "missing") });
-            if (headerValueIgnoreCase(headers, "x-amz-security-token") != null) try object.put(allocator, try allocator.dupe(u8, "sessionToken"), .{ .string = try allocator.dupe(u8, "redacted") });
-            try object.put(allocator, try allocator.dupe(u8, "accessKeyId"), .{ .string = try allocator.dupe(u8, "redacted") });
-            try object.put(allocator, try allocator.dupe(u8, "signature"), .{ .string = try allocator.dupe(u8, "normalized") });
+            try putStringValue(allocator, &object, "mode", "sigv4");
+            try putStringValue(allocator, &object, "method", "POST");
+            try putStringValue(allocator, &object, "query", "");
+            try putStringValue(allocator, &object, "service", SERVICE_NAME);
+            try putStringValue(allocator, &object, "region", credential_scope.get("region").?.string);
+            try putStringValue(allocator, &object, "amzDate", "20250115T120000Z");
+            try putObjectValue(allocator, &object, "credentialScope", .{ .object = credential_scope });
+            try putObjectValue(allocator, &object, "signedHeaders", try parseSignedHeadersValue(allocator, authorization orelse ""));
+            try putStringValue(allocator, &object, "bodySha256", if (headerValueIgnoreCase(headers, "x-amz-content-sha256") != null) "normalized-payload-sha256" else "missing");
+            if (headerValueIgnoreCase(headers, "x-amz-security-token") != null) try putStringValue(allocator, &object, "sessionToken", "redacted");
+            try putStringValue(allocator, &object, "accessKeyId", "redacted");
+            try putStringValue(allocator, &object, "signature", "normalized");
         },
     }
     return .{ .object = object };
@@ -2765,22 +2844,22 @@ fn parseCredentialScope(allocator: std.mem.Allocator, authorization: []const u8,
     const parsed_service = parts.next() orelse SERVICE_NAME;
     const parsed_terminal = parts.next() orelse "aws4_request";
 
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer object.deinit(allocator);
-    try object.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
-    try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, parsed_region) });
-    try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, parsed_service) });
-    try object.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, parsed_terminal) });
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putStringValue(allocator, &object, "date", "20250115");
+    try putStringValue(allocator, &object, "region", parsed_region);
+    try putStringValue(allocator, &object, "service", parsed_service);
+    try putStringValue(allocator, &object, "terminal", parsed_terminal);
     return object;
 }
 
 fn defaultCredentialScope(allocator: std.mem.Allocator, region: []const u8) !std.json.ObjectMap {
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer object.deinit(allocator);
-    try object.put(allocator, try allocator.dupe(u8, "date"), .{ .string = try allocator.dupe(u8, "20250115") });
-    try object.put(allocator, try allocator.dupe(u8, "region"), .{ .string = try allocator.dupe(u8, region) });
-    try object.put(allocator, try allocator.dupe(u8, "service"), .{ .string = try allocator.dupe(u8, SERVICE_NAME) });
-    try object.put(allocator, try allocator.dupe(u8, "terminal"), .{ .string = try allocator.dupe(u8, "aws4_request") });
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
+    try putStringValue(allocator, &object, "date", "20250115");
+    try putStringValue(allocator, &object, "region", region);
+    try putStringValue(allocator, &object, "service", SERVICE_NAME);
+    try putStringValue(allocator, &object, "terminal", "aws4_request");
     return object;
 }
 
