@@ -1,5 +1,36 @@
 const std = @import("std");
 const types = @import("../types.zig");
+const provider_stream = @import("../shared/provider_stream.zig");
+
+const COPILOT_PROVIDER_ID = "github-copilot";
+
+/// One-liner for the verbatim block every provider's streamProduction
+/// repeats to layer github-copilot's dynamic per-request headers onto an
+/// already-built header map:
+/// ```zig
+/// if (std.mem.eql(u8, model.provider, "github-copilot")) {
+///     var copilot_hdrs = try github_copilot_headers.buildCopilotDynamicHeaders(allocator, context.messages);
+///     defer { /* iterate + free values + deinit */ }
+///     try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, copilot_hdrs);
+/// }
+/// ```
+/// Noop for non-copilot providers; otherwise applies the dynamic headers
+/// case-insensitively to the existing header map.
+pub fn applyDynamicHeadersIfCopilot(
+    allocator: std.mem.Allocator,
+    headers: *std.StringHashMap([]const u8),
+    model: types.Model,
+    messages: []const types.Message,
+) !void {
+    if (!std.mem.eql(u8, model.provider, COPILOT_PROVIDER_ID)) return;
+    var copilot_hdrs = try buildCopilotDynamicHeaders(allocator, messages);
+    defer {
+        var it = copilot_hdrs.valueIterator();
+        while (it.next()) |v| allocator.free(v.*);
+        copilot_hdrs.deinit();
+    }
+    try provider_stream.mergeHeadersCaseInsensitive(allocator, headers, copilot_hdrs);
+}
 
 /// Infers the Copilot initiator based on the last message in the conversation.
 /// Returns "user" if the last message is from a user, otherwise "agent" (for assistant or tool messages).

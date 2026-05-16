@@ -130,10 +130,7 @@ pub const OpenAIResponsesProvider = struct {
 
         const api_key = resolved.?.key;
 
-        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
-            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
-        else
-            null;
+        const resolved_base_url = try cloudflare.resolveBaseUrlOrNull(allocator, model);
         defer if (resolved_base_url) |base_url| allocator.free(base_url);
 
         const url = try buildRequestUrl(allocator, resolved_base_url orelse model.base_url);

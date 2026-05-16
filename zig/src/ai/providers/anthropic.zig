@@ -103,22 +103,12 @@ pub const AnthropicProvider = struct {
         var payload = try buildRequestPayload(allocator, model, context, resolved_options.options);
         defer provider_json.freeValue(allocator, payload);
 
-        if (resolved_options.options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
-                if (try callback(allocator, payload, model)) |replacement| {
-                    provider_json.freeValue(allocator, payload);
-                    payload = replacement;
-                }
-            }
-        }
+        try provider_stream.applyOnPayloadCallback(allocator, &payload, model, resolved_options.options);
 
         const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
         defer allocator.free(json_body);
 
-        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
-            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
-        else
-            null;
+        const resolved_base_url = try cloudflare.resolveBaseUrlOrNull(allocator, model);
         defer if (resolved_base_url) |b| allocator.free(b);
 
         const url = try buildMessagesUrl(allocator, resolved_base_url orelse model.base_url);
@@ -135,15 +125,7 @@ pub const AnthropicProvider = struct {
             try mergeHeaders(allocator, &headers, stream_options.headers);
         }
 
-        if (std.mem.eql(u8, model.provider, "github-copilot")) {
-            var copilot_hdrs = try github_copilot_headers.buildCopilotDynamicHeaders(allocator, context.messages);
-            defer {
-                var it = copilot_hdrs.valueIterator();
-                while (it.next()) |v| allocator.free(v.*);
-                copilot_hdrs.deinit();
-            }
-            try mergeHeaders(allocator, &headers, copilot_hdrs);
-        }
+        try github_copilot_headers.applyDynamicHeadersIfCopilot(allocator, &headers, model, context.messages);
 
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();

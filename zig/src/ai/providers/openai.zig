@@ -63,20 +63,9 @@ pub const OpenAIProvider = struct {
         var headers = try buildRequestHeaders(allocator, model, resolved_options);
         defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
-        if (std.mem.eql(u8, model.provider, "github-copilot")) {
-            var copilot_hdrs = try github_copilot_headers.buildCopilotDynamicHeaders(allocator, context.messages);
-            defer {
-                var it = copilot_hdrs.valueIterator();
-                while (it.next()) |v| allocator.free(v.*);
-                copilot_hdrs.deinit();
-            }
-            try provider_stream.mergeHeadersCaseInsensitive(allocator, &headers, copilot_hdrs);
-        }
+        try github_copilot_headers.applyDynamicHeadersIfCopilot(allocator, &headers, model, context.messages);
 
-        const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
-            try cloudflare.resolveCloudflareBaseUrl(allocator, model)
-        else
-            null;
+        const resolved_base_url = try cloudflare.resolveBaseUrlOrNull(allocator, model);
         defer if (resolved_base_url) |url| allocator.free(url);
 
         const request_target = try buildOpenAIChatRequestTarget(allocator, resolved_base_url orelse model.base_url);

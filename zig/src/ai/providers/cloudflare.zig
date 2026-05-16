@@ -20,6 +20,24 @@ pub fn isCloudflareProvider(provider: []const u8) bool {
         std.mem.eql(u8, provider, "cloudflare-ai-gateway");
 }
 
+/// One-liner for the verbatim block every provider's streamProduction
+/// repeats:
+/// ```zig
+/// const resolved_base_url: ?[]const u8 = if (cloudflare.isCloudflareProvider(model.provider))
+///     try cloudflare.resolveCloudflareBaseUrl(allocator, model)
+/// else
+///     null;
+/// defer if (resolved_base_url) |b| allocator.free(b);
+/// // ... use `resolved_base_url orelse model.base_url`
+/// ```
+/// Returns null for non-Cloudflare providers (caller falls back to
+/// `model.base_url`); returns an owned URL slice for Cloudflare providers
+/// that the caller must `free` once the request is built.
+pub fn resolveBaseUrlOrNull(allocator: std.mem.Allocator, model: types.Model) !?[]const u8 {
+    if (!isCloudflareProvider(model.provider)) return null;
+    return try resolveCloudflareBaseUrl(allocator, model);
+}
+
 /// Substitute `{VAR}` placeholders in a model's base_url using the provided env map.
 /// Always returns an owned slice that the caller must free.
 /// Returns a Cloudflare-specific error if a required Cloudflare env var is missing or empty.

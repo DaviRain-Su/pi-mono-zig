@@ -189,6 +189,47 @@ pub fn invokeOnResponse(
     try callback(status, response_headers, model);
 }
 
+/// Type-erased payload-replacement callback. Mirrors
+/// `types.StreamOptions.on_payload`: the callback may return null (keep
+/// the existing payload) or a fully-owned replacement value that the
+/// caller takes ownership of (in which case the old payload must be
+/// freed first).
+const OnPayloadCallback = *const fn (
+    std.mem.Allocator,
+    std.json.Value,
+    types.Model,
+) anyerror!?std.json.Value;
+
+/// Apply the `on_payload` replacement callback if present. Every
+/// provider's streamProduction repeats the same block:
+/// ```zig
+/// if (options) |stream_options| {
+///     if (stream_options.on_payload) |callback| {
+///         if (try callback(allocator, payload, model)) |replacement| {
+///             provider_json.freeValue(allocator, payload);
+///             payload = replacement;
+///         }
+///     }
+/// }
+/// ```
+/// This collapses it to a single line that mutates `payload` in place.
+/// Lives here (not in shared/provider_json.zig) because it deals with
+/// the StreamOptions callback contract, not generic JSON utilities.
+pub fn applyOnPayloadCallback(
+    allocator: std.mem.Allocator,
+    payload: *std.json.Value,
+    model: types.Model,
+    options: ?types.StreamOptions,
+) !void {
+    const stream_options = options orelse return;
+    const callback = stream_options.on_payload orelse return;
+    if (try callback(allocator, payload.*, model)) |replacement| {
+        const provider_json = @import("provider_json.zig");
+        provider_json.freeValue(allocator, payload.*);
+        payload.* = replacement;
+    }
+}
+
 pub fn parseCanonicalSseDataLine(line: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, line, " \t\r");
     const prefix = "data: ";
