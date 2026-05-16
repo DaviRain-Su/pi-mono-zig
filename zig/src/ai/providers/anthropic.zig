@@ -212,118 +212,204 @@ fn resolveStreamOptionsWithEnvMap(
     return resolved;
 }
 
+// =============================================================================
+// Outer-envelope payload struct for Anthropic Messages API.
+//
+// The inner content trees (system, messages, tools) are Value-typed
+// passthroughs because cache_control markers are inserted by the
+// build*Value helpers during construction; expressing those marker
+// insertions declaratively would require modeling the entire Anthropic
+// content block taxonomy (text/image/thinking/tool_use/tool_result with
+// per-block cache_control sidecars) as structs, which is a larger refactor.
+// =============================================================================
+
+const RequestPayload = struct {
+    model: []const u8,
+    max_tokens: u32,
+    stream: bool = true,
+    system: ?std.json.Value = null,
+    messages: std.json.Value,
+    tools: ?std.json.Value = null,
+    temperature: ?f32 = null,
+    thinking: ?Thinking = null,
+    output_config: ?OutputConfig = null,
+    metadata: ?Metadata = null,
+    tool_choice: ?std.json.Value = null,
+};
+
+const Thinking = union(enum) {
+    adaptive: struct { display: []const u8 },
+    enabled: struct { budget_tokens: i64, display: []const u8 },
+    disabled,
+
+    pub fn jsonStringify(self: Thinking, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .adaptive => |a| {
+                try jw.objectField("type");
+                try jw.write("adaptive");
+                try jw.objectField("display");
+                try jw.write(a.display);
+            },
+            .enabled => |e| {
+                try jw.objectField("type");
+                try jw.write("enabled");
+                try jw.objectField("budget_tokens");
+                try jw.write(e.budget_tokens);
+                try jw.objectField("display");
+                try jw.write(e.display);
+            },
+            .disabled => {
+                try jw.objectField("type");
+                try jw.write("disabled");
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+const OutputConfig = struct { effort: []const u8 };
+const Metadata = struct { user_id: []const u8 };
+
+const OwnedAnthropic = struct {
+    allocator: std.mem.Allocator,
+    payload: RequestPayload,
+    owned_values: []std.json.Value,
+
+    fn deinit(self: OwnedAnthropic) void {
+        for (self.owned_values) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_values);
+    }
+};
+
+fn buildOwnedAnthropic(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !OwnedAnthropic {
+    var owned_values_list = std.ArrayList(std.json.Value).empty;
+    errdefer {
+        for (owned_values_list.items) |v| provider_json.freeValue(allocator, v);
+        owned_values_list.deinit(allocator);
+    }
+
+    const compat = getAnthropicCompat(model);
+    const cache_retention = resolveOptionsCacheRetention(options);
+    const cache_control = try buildCacheControl(allocator, compat, cache_retention);
+    defer if (cache_control) |value| provider_json.freeValue(allocator, value);
+
+    const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
+
+    var system_owned: ?std.json.Value = null;
+    if (try buildSystemPromptValue(allocator, context.system_prompt, is_oauth, cache_control)) |v| {
+        try owned_values_list.append(allocator, v);
+        system_owned = v;
+    }
+
+    const messages_value = try buildMessagesValue(allocator, context.messages, context.tools, is_oauth, cache_control);
+    try owned_values_list.append(allocator, messages_value);
+
+    var tools_owned: ?std.json.Value = null;
+    if (context.tools) |tools| {
+        const tool_cache_control = if (compat.supports_cache_control_on_tools) cache_control else null;
+        const tv = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, tool_cache_control);
+        try owned_values_list.append(allocator, tv);
+        tools_owned = tv;
+    }
+
+    var temperature: ?f32 = null;
+    var thinking: ?Thinking = null;
+    var output_config: ?OutputConfig = null;
+    var metadata: ?Metadata = null;
+    var tool_choice_owned: ?std.json.Value = null;
+
+    if (options) |stream_options| {
+        const anthropic_opts = stream_options.providerOptions("anthropic");
+        if (stream_options.temperature) |t| {
+            if (anthropic_opts.thinking_enabled != true) temperature = t;
+        }
+        if (model.reasoning) {
+            if (anthropic_opts.thinking_enabled == true) {
+                const display = @tagName(anthropic_opts.thinking_display orelse types.AnthropicThinkingDisplay.summarized);
+                if (supportsAdaptiveThinking(model)) {
+                    thinking = .{ .adaptive = .{ .display = display } };
+                    if (anthropic_opts.effort) |effort| {
+                        output_config = .{ .effort = @tagName(effort) };
+                    }
+                } else {
+                    thinking = .{ .enabled = .{
+                        .budget_tokens = @intCast(anthropic_opts.thinking_budget_tokens orelse 1024),
+                        .display = display,
+                    } };
+                }
+            } else if (anthropic_opts.thinking_enabled == false) {
+                thinking = .disabled;
+            }
+        }
+        if (stream_options.metadata) |md| {
+            if (md == .object) {
+                if (md.object.get("user_id")) |user_id| {
+                    if (user_id == .string) metadata = .{ .user_id = user_id.string };
+                }
+            }
+        }
+        if (anthropic_opts.tool_choice) |tc| {
+            const tcv = try buildToolChoiceValue(allocator, tc, is_oauth);
+            try owned_values_list.append(allocator, tcv);
+            tool_choice_owned = tcv;
+        }
+    }
+
+    const resolved_max_tokens: u32 = if (options) |stream_options|
+        if (stream_options.max_tokens) |m| @intCast(m) else @intCast(model.max_tokens / 3)
+    else
+        @intCast(model.max_tokens / 3);
+
+    const owned_values_slice = try owned_values_list.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .model = model.id,
+            .max_tokens = resolved_max_tokens,
+            .system = system_owned,
+            .messages = messages_value,
+            .tools = tools_owned,
+            .temperature = temperature,
+            .thinking = thinking,
+            .output_config = output_config,
+            .metadata = metadata,
+            .tool_choice = tool_choice_owned,
+        },
+        .owned_values = owned_values_slice,
+    };
+}
+
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    var owned = try buildOwnedAnthropic(allocator, model, context, options);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
 ) !std.json.Value {
-    const compat = getAnthropicCompat(model);
-    var payload = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    try putStringValue(allocator, &payload, "model", model.id);
-    const resolved_max_tokens = if (options) |stream_options|
-        stream_options.max_tokens orelse (model.max_tokens / 3)
-    else
-        (model.max_tokens / 3);
-    try putIntegerValue(allocator, &payload, "max_tokens", resolved_max_tokens);
-    try putBoolValue(allocator, &payload, "stream", true);
-
-    const cache_retention = resolveOptionsCacheRetention(options);
-    const cache_control = try buildCacheControl(allocator, compat, cache_retention);
-    defer if (cache_control) |value| provider_json.freeValue(allocator, value);
-
-    const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
-    const system_value = try buildSystemPromptValue(allocator, context.system_prompt, is_oauth, cache_control);
-    if (system_value) |value| {
-        try putObjectValue(allocator, &payload, "system", value);
-    }
-
-    const messages_value = try buildMessagesValue(allocator, context.messages, context.tools, is_oauth, cache_control);
-    try putObjectValue(allocator, &payload, "messages", messages_value);
-
-    if (context.tools) |tools| {
-        const tool_cache_control = if (compat.supports_cache_control_on_tools) cache_control else null;
-        const tools_value = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, tool_cache_control);
-        try putObjectValue(allocator, &payload, "tools", tools_value);
-    }
-
-    if (options) |stream_options| {
-        const anthropic_opts = stream_options.providerOptions("anthropic");
-        if (stream_options.temperature) |temperature| {
-            if (anthropic_opts.thinking_enabled != true) {
-                try putFloatValue(allocator, &payload, "temperature", temperature);
-            }
-        }
-
-        if (model.reasoning) {
-            if (anthropic_opts.thinking_enabled == true) {
-                const display = @tagName(anthropic_opts.thinking_display orelse types.AnthropicThinkingDisplay.summarized);
-                if (supportsAdaptiveThinking(model)) {
-                    const thinking_value: std.json.Value = blk: {
-                        var thinking = try provider_json.initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = thinking });
-                        try putStringValue(allocator, &thinking, "type", "adaptive");
-                        try putStringValue(allocator, &thinking, "display", display);
-                        break :blk .{ .object = thinking };
-                    };
-                    try putObjectValue(allocator, &payload, "thinking", thinking_value);
-
-                    if (anthropic_opts.effort) |effort| {
-                        const output_config_value: std.json.Value = blk: {
-                            var output_config = try provider_json.initObject(allocator);
-                            errdefer provider_json.freeValue(allocator, .{ .object = output_config });
-                            try putStringValue(allocator, &output_config, "effort", @tagName(effort));
-                            break :blk .{ .object = output_config };
-                        };
-                        try putObjectValue(allocator, &payload, "output_config", output_config_value);
-                    }
-                } else {
-                    const thinking_value: std.json.Value = blk: {
-                        var thinking = try provider_json.initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = thinking });
-                        try putStringValue(allocator, &thinking, "type", "enabled");
-                        try putIntegerValue(allocator, &thinking, "budget_tokens", anthropic_opts.thinking_budget_tokens orelse 1024);
-                        try putStringValue(allocator, &thinking, "display", display);
-                        break :blk .{ .object = thinking };
-                    };
-                    try putObjectValue(allocator, &payload, "thinking", thinking_value);
-                }
-            } else if (anthropic_opts.thinking_enabled == false) {
-                const thinking_value: std.json.Value = blk: {
-                    var thinking = try provider_json.initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = thinking });
-                    try putStringValue(allocator, &thinking, "type", "disabled");
-                    break :blk .{ .object = thinking };
-                };
-                try putObjectValue(allocator, &payload, "thinking", thinking_value);
-            }
-        }
-
-        if (stream_options.metadata) |metadata| {
-            if (metadata == .object) {
-                if (metadata.object.get("user_id")) |user_id| {
-                    if (user_id == .string) {
-                        const metadata_value: std.json.Value = blk: {
-                            var metadata_obj = try provider_json.initObject(allocator);
-                            errdefer provider_json.freeValue(allocator, .{ .object = metadata_obj });
-                            try putStringValue(allocator, &metadata_obj, "user_id", user_id.string);
-                            break :blk .{ .object = metadata_obj };
-                        };
-                        try putObjectValue(allocator, &payload, "metadata", metadata_value);
-                    }
-                }
-            }
-        }
-
-        if (anthropic_opts.tool_choice) |tool_choice| {
-            const tool_choice_value = try buildToolChoiceValue(allocator, tool_choice, is_oauth);
-            try putObjectValue(allocator, &payload, "tool_choice", tool_choice_value);
-        }
-    }
-
-    return .{ .object = payload };
+    const bytes = try buildPayloadJsonBytes(allocator, model, context, options);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 pub fn mapStopReason(reason: []const u8) types.StopReason {
