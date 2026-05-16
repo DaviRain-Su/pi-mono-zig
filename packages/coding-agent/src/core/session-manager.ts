@@ -617,6 +617,48 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 
 export type SessionListProgress = (loaded: number, total: number) => void;
 
+const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+
+async function buildSessionInfosWithConcurrency(
+	files: string[],
+	onLoaded: () => void,
+): Promise<(SessionInfo | null)[]> {
+	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
+	const inFlight = new Set<Promise<void>>();
+	let nextIndex = 0;
+
+	const startNext = (): void => {
+		const index = nextIndex++;
+		const file = files[index];
+		if (!file) return;
+
+		let task: Promise<void>;
+		task = buildSessionInfo(file)
+			.then((info) => {
+				results[index] = info;
+			})
+			.catch(() => {
+				results[index] = null;
+			})
+			.finally(() => {
+				inFlight.delete(task);
+				onLoaded();
+			});
+		inFlight.add(task);
+	};
+
+	while (nextIndex < files.length || inFlight.size > 0) {
+		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
+			startNext();
+		}
+		if (inFlight.size > 0) {
+			await Promise.race(inFlight);
+		}
+	}
+
+	return results;
+}
+
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
@@ -634,14 +676,10 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
-		const results = await Promise.all(
-			files.map(async (file) => {
-				const info = await buildSessionInfo(file);
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-				return info;
-			}),
-		);
+		const results = await buildSessionInfosWithConcurrency(files, () => {
+			loaded++;
+			onProgress?.(progressOffset + loaded, total);
+		});
 		for (const info of results) {
 			if (info) {
 				sessions.push(info);
@@ -1400,14 +1438,10 @@ export class SessionManager {
 			const sessions: SessionInfo[] = [];
 			const allFiles = dirFiles.flat();
 
-			const results = await Promise.all(
-				allFiles.map(async (file) => {
-					const info = await buildSessionInfo(file);
-					loaded++;
-					onProgress?.(loaded, totalFiles);
-					return info;
-				}),
-			);
+			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
+				loaded++;
+				onProgress?.(loaded, totalFiles);
+			});
 
 			for (const info of results) {
 				if (info) {
