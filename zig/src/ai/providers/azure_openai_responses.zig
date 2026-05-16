@@ -59,19 +59,21 @@ pub const AzureOpenAIResponsesProvider = struct {
         var request_model = model;
         request_model.id = deployment_name;
 
-        var payload = try buildAzureRequestPayload(allocator, request_model, context, options);
-        defer provider_json.freeValue(allocator, payload);
+        const callback_opt: ?*const fn (std.mem.Allocator, std.json.Value, types.Model) anyerror!?std.json.Value =
+            if (options) |o| o.on_payload else null;
 
-        if (options) |stream_options| {
-            if (stream_options.on_payload) |callback| {
+        const json_body = blk: {
+            if (callback_opt) |callback| {
+                var payload = try buildAzureRequestPayload(allocator, request_model, context, options);
+                defer provider_json.freeValue(allocator, payload);
                 if (try callback(allocator, payload, model)) |replacement| {
                     provider_json.freeValue(allocator, payload);
                     payload = replacement;
                 }
+                break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
             }
-        }
-
-        const json_body = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+            break :blk try buildAzurePayloadJsonBytes(allocator, request_model, context, options);
+        };
         defer allocator.free(json_body);
 
         const base_url = try resolveAzureBaseUrl(allocator, model, options);
@@ -144,6 +146,47 @@ pub fn buildAzureRequestPayload(
     }
 
     return payload;
+}
+
+/// Bytes-native fast path: pulls openai_responses bytes directly (struct →
+/// Stringify) and applies Azure's field-removal / prompt_cache_key swap
+/// in the parsed Value tree before re-stringifying. Saves the extra
+/// parse+clone round-trip that buildAzureRequestPayload incurs through
+/// openai_responses.buildRequestPayload.
+pub fn buildAzurePayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    request_model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    const upstream_bytes = try openai_responses.buildPayloadJsonBytes(allocator, request_model, context, options);
+    defer allocator.free(upstream_bytes);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, upstream_bytes, .{});
+    defer parsed.deinit();
+
+    var payload = try provider_json.cloneValue(allocator, parsed.value);
+    defer provider_json.freeValue(allocator, payload);
+
+    try removeObjectField(allocator, &payload, "store");
+    try removeObjectField(allocator, &payload, "prompt_cache_retention");
+    try removeObjectField(allocator, &payload, "service_tier");
+    try removeObjectField(allocator, &payload, "metadata");
+
+    if (options) |stream_options| {
+        if (stream_options.session_id) |session_id| {
+            try removeObjectField(allocator, &payload, "prompt_cache_key");
+            if (payload == .object) {
+                try payload.object.put(
+                    allocator,
+                    try allocator.dupe(u8, "prompt_cache_key"),
+                    .{ .string = try allocator.dupe(u8, session_id) },
+                );
+            }
+        }
+    }
+
+    return try std.json.Stringify.valueAlloc(allocator, payload, .{});
 }
 
 const ResolvedApiVersion = struct {
