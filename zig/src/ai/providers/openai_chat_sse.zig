@@ -84,6 +84,7 @@ const SseParseState = struct {
     content_blocks: std.ArrayList(types.ContentBlock) = .empty,
     tool_calls: std.ArrayList(types.ToolCall) = .empty,
     tool_calls_transferred: bool = false,
+    has_finish_reason: bool = false,
 };
 
 fn initSseParseState(
@@ -229,6 +230,24 @@ fn finishParserState(state: *SseParseState) !void {
         if (state.output.stop_reason == .stop) state.output.stop_reason = .tool_use;
     }
 
+    // Mirror TS fix(ai): openai-completions - throw error on missing
+    // finish-reason (closes #4345). Truncated streams that never emit a
+    // finish_reason must surface as a terminal error, not be reported as a
+    // successful "stop". The error_event preserves any partial content
+    // accumulated so far so callers can still inspect what was streamed.
+    if (!state.has_finish_reason and state.output.stop_reason != .error_reason) {
+        state.output.stop_reason = .error_reason;
+        if (state.output.error_message) |previous| allocator.free(previous);
+        state.output.error_message = try allocator.dupe(u8, "Stream ended without finish_reason");
+        state.stream_ptr.push(.{
+            .event_type = .error_event,
+            .error_message = state.output.error_message,
+            .message = state.output,
+        });
+        state.stream_ptr.end(state.output);
+        return;
+    }
+
     state.stream_ptr.push(.{ .event_type = .done, .message = state.output });
     state.stream_ptr.end(state.output);
 }
@@ -284,6 +303,7 @@ fn processChoiceUsageAndFinish(
 
     if (choice.object.get("finish_reason")) |finish_reason| {
         if (finish_reason == .string) {
+            state.has_finish_reason = true;
             const result = try mapStopReason(state.allocator, finish_reason.string);
             state.output.stop_reason = result.stop_reason;
             if (result.error_message) |em| {
@@ -887,6 +907,7 @@ test "openai_chat_sse keeps interleaved indexed tool arguments separated" {
 
     const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"unit\\\":\\\"\"}},{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Ber\"}}]}}]}\n" ++
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_city\",\"function\":{\"name\":\"get_city\",\"arguments\":\"lin\\\"}\"}},{\"index\":1,\"id\":\"call_unit\",\"function\":{\"name\":\"get_unit\",\"arguments\":\"C\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
         "data: [DONE]\n");
 
     var streaming = http_client.StreamingResponse{
@@ -1067,15 +1088,63 @@ test "openai_chat_sse finalizes text and tool call on EOF mid-block" {
     try std.testing.expectEqualStrings("lookup", tool_end.tool_call.?.name);
     try std.testing.expectEqualStrings("local", tool_end.tool_call.?.arguments.object.get("query").?.string);
 
-    const done = stream.next().?;
-    try std.testing.expectEqual(types.EventType.done, done.event_type);
-    try std.testing.expectEqual(types.StopReason.tool_use, done.message.?.stop_reason);
-    try std.testing.expectEqualStrings("chatcmpl_eof", done.message.?.response_id.?);
-    try std.testing.expectEqual(@as(usize, 2), done.message.?.content.len);
-    try std.testing.expectEqualStrings("before tool", done.message.?.content[0].text.text);
-    try std.testing.expectEqualStrings("lookup", done.message.?.content[1].tool_call.name);
-    try std.testing.expectEqualStrings("local", done.message.?.content[1].tool_call.arguments.object.get("query").?.string);
+    // EOF mid-block without finish_reason is now a terminal error
+    // (mirror TS fix(ai) #4345). Partial content + tool call are still
+    // preserved in the error_event.message so callers can inspect them.
+    const terminal = stream.next().?;
+    try std.testing.expectEqual(types.EventType.error_event, terminal.event_type);
+    try std.testing.expectEqualStrings("Stream ended without finish_reason", terminal.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.message.?.stop_reason);
+    try std.testing.expectEqualStrings("chatcmpl_eof", terminal.message.?.response_id.?);
+    try std.testing.expectEqual(@as(usize, 2), terminal.message.?.content.len);
+    try std.testing.expectEqualStrings("before tool", terminal.message.?.content[0].text.text);
+    try std.testing.expectEqualStrings("lookup", terminal.message.?.content[1].tool_call.name);
+    try std.testing.expectEqualStrings("local", terminal.message.?.content[1].tool_call.arguments.object.get("query").?.string);
     try std.testing.expect(stream.next() == null);
+}
+
+test "openai_chat_sse errors when stream ends after only null finish_reason chunks" {
+    // Port of TS regression test for fix(ai) #4345
+    // (packages/ai/test/openai-completions-tool-choice.test.ts —
+    // "errors when a stream ends after only null finish_reason chunks").
+    // A stream that only ever delivers null finish_reason chunks and then
+    // ends without a terminal finish_reason must surface as a terminal
+    // error_event rather than be reported as a successful stop.
+    const allocator = std.heap.page_allocator;
+    const io = std.Io.failing;
+
+    const body = try allocator.dupe(
+        u8,
+        "data: {\"id\":\"chatcmpl-truncated\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"},\"finish_reason\":null}]}\n" ++
+            "data: {\"id\":\"chatcmpl-truncated\",\"choices\":[{\"delta\":{\"content\":\"partial answer\"},\"finish_reason\":null}]}\n" ++
+            "data: [DONE]\n",
+    );
+
+    var streaming = http_client.StreamingResponse{
+        .status = 200,
+        .body = body,
+        .buffer = .empty,
+        .allocator = allocator,
+    };
+    defer streaming.deinit();
+
+    var stream = event_stream.createAssistantMessageEventStream(allocator, io);
+    defer stream.deinit();
+
+    try parseSseStreamLines(allocator, &stream, &streaming, testModel("https://api.openai.com/v1"), null);
+
+    // Drain everything up to the terminal event.
+    var terminal: ?@TypeOf(stream.next().?) = null;
+    while (stream.next()) |event| {
+        if (event.event_type == .error_event or event.event_type == .done) {
+            terminal = event;
+            break;
+        }
+    }
+    try std.testing.expect(terminal != null);
+    try std.testing.expectEqual(types.EventType.error_event, terminal.?.event_type);
+    try std.testing.expectEqualStrings("Stream ended without finish_reason", terminal.?.error_message.?);
+    try std.testing.expectEqual(types.StopReason.error_reason, terminal.?.message.?.stop_reason);
 }
 
 test "openai_chat_sse accumulates mixed content reasoning and parallel tool deltas independently" {

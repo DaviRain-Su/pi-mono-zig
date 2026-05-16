@@ -852,7 +852,10 @@ test "streamSimple maps Anthropic reasoning to provider options" {
 
     try std.testing.expectEqual(@as(?bool, true), recording_state.saw_anthropic_options.?.thinking_enabled);
     try std.testing.expectEqual(@as(?u32, 4096), recording_state.saw_anthropic_options.?.thinking_budget_tokens);
-    try std.testing.expectEqual(@as(?u32, 32000 + 4096), recording_state.saw_max_tokens);
+    // Mirror TS fix(ai) #4539: defaultMaxTokens no longer caps at 32000;
+    // adjustMaxTokensForThinking now clamps to model.max_tokens (64000)
+    // when base + budget would exceed it.
+    try std.testing.expectEqual(@as(?u32, 64000), recording_state.saw_max_tokens);
 }
 
 test "streamSimple preserves xhigh reasoning for Codex GPT-5.5" {

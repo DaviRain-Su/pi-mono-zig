@@ -1448,6 +1448,7 @@ test "stream on_response observes mocked status and normalized headers before bo
     OnResponseCapture.reset();
 
     const body = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n" ++
         "data: [DONE]\n";
     var server = try provider_error.TestStatusServer.init(
         io,
@@ -1893,6 +1894,7 @@ test "parseSseStream with tool calls" {
     const io = std.Io.failing;
 
     const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
         "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 
@@ -1960,6 +1962,7 @@ test "parseSseStream keeps interleaved indexed tool arguments separated" {
 
     const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"unit\\\":\\\"\"}},{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"Ber\"}}]}}]}\n" ++
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_city\",\"function\":{\"name\":\"get_city\",\"arguments\":\"lin\\\"}\"}},{\"index\":1,\"id\":\"call_unit\",\"function\":{\"name\":\"get_unit\",\"arguments\":\"C\\\"}\"}}]}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n" ++
         "data: [DONE]\n");
 
     var stream = event_stream.createAssistantMessageEventStream(allocator, io);
@@ -2035,6 +2038,7 @@ test "parseSseStream with reasoning content" {
     const io = std.Io.failing;
 
     const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think...\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n" ++
         "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 
@@ -2088,7 +2092,7 @@ test "parseSseStream with usage" {
     const allocator = std.heap.page_allocator;
     const io = std.Io.failing;
 
-    const body = try allocator.dupe(u8, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n" ++
+    const body = try allocator.dupe(u8, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n" ++
         "data: [DONE]\n");
     // body is owned by StreamingResponse, do not free here
 

@@ -139,6 +139,23 @@ pub const StdinBuffer = struct {
                     const candidate = remaining[0..seq_end];
                     switch (isCompleteSequence(candidate)) {
                         .complete => {
+                            // Mirror TS fix: WezTerm with enable_kitty_keyboard
+                            // sends Escape press as raw '\x1b' and release as a
+                            // full Kitty CSI-u, concatenated as '\x1b\x1b[27;...u'.
+                            // The buffer would otherwise treat '\x1b\x1b' as a
+                            // complete meta-key sequence (Alt+ESC), leaving the
+                            // following CSI to be typed as plain text. If the
+                            // character after '\x1b\x1b' would begin a new escape
+                            // sequence ([, ], O, P, _), emit only the first ESC
+                            // and restart parsing from the second.
+                            if (candidate.len == 2 and candidate[0] == 0x1b and candidate[1] == 0x1b and seq_end < remaining.len) {
+                                const next_char = remaining[seq_end];
+                                if (next_char == '[' or next_char == ']' or next_char == 'O' or next_char == 'P' or next_char == '_') {
+                                    try self.emitDataSequence(events, remaining[0..1]);
+                                    pos += 1;
+                                    break;
+                                }
+                            }
                             try self.emitDataSequence(events, candidate);
                             pos += seq_end;
                             break;
@@ -261,4 +278,49 @@ test "StdinBuffer joins partial escape sequences and emits paste" {
     }
     try std.testing.expectEqual(@as(usize, 1), events3.len);
     try std.testing.expectEqualStrings("hello", events3[0].paste);
+}
+
+test "StdinBuffer splits WezTerm kitty ESC+ESC+CSI-u into ESC and Kitty release" {
+    var buffer = StdinBuffer.init(std.testing.allocator, .{});
+    defer buffer.deinit();
+
+    // WezTerm with enable_kitty_keyboard concatenates Escape press (\x1b)
+    // and release (\x1b[27;129:3u with num_lock).
+    const events = try buffer.process("\x1b\x1b[27;129:3u");
+    defer {
+        for (events) |event| event.deinit(std.testing.allocator);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("\x1b", events[0].data);
+    try std.testing.expectEqualStrings("\x1b[27;129:3u", events[1].data);
+}
+
+test "StdinBuffer splits WezTerm kitty ESC+ESC+CSI-u without num_lock" {
+    var buffer = StdinBuffer.init(std.testing.allocator, .{});
+    defer buffer.deinit();
+
+    const events = try buffer.process("\x1b\x1b[27;1:3u");
+    defer {
+        for (events) |event| event.deinit(std.testing.allocator);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("\x1b", events[0].data);
+    try std.testing.expectEqualStrings("\x1b[27;1:3u", events[1].data);
+}
+
+test "StdinBuffer preserves ctrl+alt+[ when ESC+ESC has no trailing CSI" {
+    var buffer = StdinBuffer.init(std.testing.allocator, .{});
+    defer buffer.deinit();
+
+    // Without a following CSI/OSC/SS3/DCS/APC start, '\x1b\x1b' must still
+    // emit as a meta-key sequence (Ctrl+Alt+[).
+    const events = try buffer.process("\x1b\x1b");
+    defer {
+        for (events) |event| event.deinit(std.testing.allocator);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("\x1b\x1b", events[0].data);
 }

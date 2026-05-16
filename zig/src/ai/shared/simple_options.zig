@@ -76,7 +76,7 @@ pub fn adjustMaxTokensForThinking(
 
 fn defaultMaxTokens(model: types.Model) ?u32 {
     if (model.max_tokens == 0) return null;
-    return @min(model.max_tokens, @as(u32, 32000));
+    return model.max_tokens;
 }
 
 test "buildBaseOptions applies defaults and explicit api key override" {
@@ -101,7 +101,7 @@ test "buildBaseOptions applies defaults and explicit api key override" {
 
     const base = buildBaseOptions(model, options, "provided-key");
     try std.testing.expectEqual(@as(?f32, 0.25), base.temperature);
-    try std.testing.expectEqual(@as(?u32, 32000), base.max_tokens);
+    try std.testing.expectEqual(@as(?u32, 64000), base.max_tokens);
     try std.testing.expectEqualStrings("provided-key", base.api_key.?);
     try std.testing.expectEqual(types.CacheRetention.long, base.cache_retention);
     try std.testing.expectEqualStrings("session-123", base.session_id.?);

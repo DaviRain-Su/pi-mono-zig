@@ -64,13 +64,18 @@ pub fn parseCommandArgs(allocator: std.mem.Allocator, args_string: []const u8) !
             continue;
         }
 
-        switch (char) {
-            '"', '\'' => in_quote = char,
-            ' ', '\t' => if (current.items.len > 0) {
+        // Mirror TS fix(coding-agent) #4553: split on any whitespace, not
+        // just space/tab — multi-line prompt template args should also
+        // tokenize at newline/CR boundaries.
+        if (char == '"' or char == '\'') {
+            in_quote = char;
+        } else if (std.ascii.isWhitespace(char)) {
+            if (current.items.len > 0) {
                 try args.append(allocator, try current.toOwnedSlice(allocator));
                 current = .empty;
-            },
-            else => try current.append(allocator, char),
+            }
+        } else {
+            try current.append(allocator, char);
         }
     }
 
@@ -133,9 +138,21 @@ pub fn substituteArgs(allocator: std.mem.Allocator, content: []const u8, args: [
 
 pub fn expandPromptTemplate(allocator: std.mem.Allocator, text: []const u8, templates: []const PromptTemplate) ![]u8 {
     if (text.len == 0 or text[0] != '/') return allocator.dupe(u8, text);
-    const space_index = std.mem.indexOfScalar(u8, text, ' ');
-    const template_name = if (space_index) |value| text[1..value] else text[1..];
-    const args_string = if (space_index) |value| text[value + 1 ..] else "";
+    // Mirror TS fix(coding-agent) #4553: split at the first whitespace (not
+    // just ' ') so multi-line prompt template args after `/cmd\n...` are
+    // parsed correctly, and skip the contiguous whitespace block before
+    // the args body so `/cmd  arg` and `/cmd\n\targ` both work.
+    var name_end: usize = text.len;
+    for (text[1..], 1..) |ch, idx| {
+        if (std.ascii.isWhitespace(ch)) {
+            name_end = idx;
+            break;
+        }
+    }
+    const template_name = text[1..name_end];
+    var args_start = name_end;
+    while (args_start < text.len and std.ascii.isWhitespace(text[args_start])) : (args_start += 1) {}
+    const args_string = text[args_start..];
     for (templates) |template| {
         if (!std.mem.eql(u8, template.name, template_name)) continue;
         const args = try parseCommandArgs(allocator, args_string);

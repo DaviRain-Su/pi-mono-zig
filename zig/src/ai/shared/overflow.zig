@@ -11,6 +11,7 @@ const overflow_patterns = [_][]const u8{
     "maximum prompt length is",
     "reduce the length of the messages",
     "maximum context length is",
+    "maximum context length of", // OpenAI-compatible proxies (LiteLLM)
     "is longer than the model's context length",
     "is longer than the models context length",
     "exceeds the limit of",
@@ -88,6 +89,21 @@ test "isContextOverflow detects provider error patterns" {
     };
 
     try std.testing.expect(isContextOverflow(message, 32768));
+}
+
+test "isContextOverflow detects LiteLLM-wrapped OpenAI maximum context length errors" {
+    const message = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .api = "openai-completions",
+        .provider = "litellm",
+        .model = "gpt-4o-mini",
+        .usage = types.Usage.init(),
+        .stop_reason = .error_reason,
+        .error_message = "Error: 503 litellm.ServiceUnavailableError: litellm.MidStreamFallbackError: litellm.APIConnectionError: APIConnectionError: OpenAIException - Requested token count exceeds the model's maximum context length of 131072 tokens.",
+        .timestamp = 0,
+    };
+
+    try std.testing.expect(isContextOverflow(message, 131072));
 }
 
 test "isContextOverflow detects Together context length messages" {

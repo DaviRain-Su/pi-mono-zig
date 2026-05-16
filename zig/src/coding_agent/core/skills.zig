@@ -43,12 +43,9 @@ pub const LoadSkillsOptions = struct {
     include_defaults: bool = true,
 };
 
-pub fn validateName(allocator: std.mem.Allocator, name: []const u8, parent_dir_name: []const u8) ![][]u8 {
+pub fn validateName(allocator: std.mem.Allocator, name: []const u8) ![][]u8 {
     var errors: std.ArrayList([]u8) = .empty;
     errdefer freeStringList(allocator, errors.items);
-    if (!std.mem.eql(u8, name, parent_dir_name)) {
-        try errors.append(allocator, try std.fmt.allocPrint(allocator, "name \"{s}\" does not match parent directory \"{s}\"", .{ name, parent_dir_name }));
-    }
     if (name.len > MAX_NAME_LENGTH) {
         try errors.append(allocator, try std.fmt.allocPrint(allocator, "name exceeds {d} characters ({d})", .{ MAX_NAME_LENGTH, name.len }));
     }
@@ -95,7 +92,7 @@ pub fn loadSkillFromContent(
     for (desc_errors) |message| try diagnostics.append(allocator, .{ .message = message, .path = file_path });
 
     const name = metadata.name orelse parent_dir_name;
-    const name_errors = try validateName(allocator, name, parent_dir_name);
+    const name_errors = try validateName(allocator, name);
     defer allocator.free(name_errors);
     for (name_errors) |message| try diagnostics.append(allocator, .{ .message = message, .path = file_path });
 
@@ -239,7 +236,7 @@ pub fn deinitSkill(allocator: std.mem.Allocator, skill: *Skill) void {
 
 test "validateName reports invalid skill names" {
     const allocator = std.testing.allocator;
-    const errors = try validateName(allocator, "Bad--Name", "good-name");
+    const errors = try validateName(allocator, "Bad--Name");
     defer freeStringList(allocator, errors);
     try std.testing.expect(errors.len >= 2);
 }

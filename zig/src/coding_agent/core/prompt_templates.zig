@@ -26,7 +26,8 @@ pub fn parseCommandArgs(allocator: std.mem.Allocator, args_string: []const u8) !
             }
         } else if (ch == '"' or ch == '\'') {
             quote = ch;
-        } else if (ch == ' ' or ch == '\t') {
+        } else if (std.ascii.isWhitespace(ch)) {
+            // Mirror TS fix(coding-agent) #4553: split on any whitespace.
             if (current.items.len > 0) {
                 try args.append(allocator, try current.toOwnedSlice(allocator));
                 current.clearRetainingCapacity();
