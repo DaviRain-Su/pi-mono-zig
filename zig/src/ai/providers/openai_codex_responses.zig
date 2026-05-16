@@ -114,7 +114,22 @@ fn buildResponseItemsForContinuation(
     if (types.shouldReplayAssistantInProviderContext(output)) {
         // message_index = 0 is fine because we only use the items for
         // equality comparison; the synthesized `msg_0` id is stable.
-        try appendAssistantInputItems(allocator, &input, output, 0);
+        // Build via the struct path, then roundtrip the items to std.json.Value
+        // so the downstream filter (which inspects .object/.string) still works.
+        var builder = CodexBuilder{ .allocator = allocator };
+        defer builder.deinit();
+        var input_struct = std.ArrayList(CodexInputItem).empty;
+        defer input_struct.deinit(allocator);
+        try appendCodexAssistant(allocator, &input_struct, output, 0, &builder);
+        for (input_struct.items) |item| {
+            const bytes = try std.json.Stringify.valueAlloc(allocator, item, .{
+                .emit_null_optional_fields = false,
+            });
+            defer allocator.free(bytes);
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+            defer parsed.deinit();
+            try input.append(try provider_json.cloneValue(allocator, parsed.value));
+        }
     }
     // Filter out function_call_output (defensive — assistant outputs
     // shouldn't carry them, but the TS reference does the filter so we
@@ -331,89 +346,507 @@ pub const OpenAICodexResponsesProvider = struct {
     }
 };
 
-pub fn buildRequestPayload(
+// =============================================================================
+// Declarative payload structs for Codex Responses API.
+// Differs from openai_responses: instructions string instead of system msg,
+// always-on tool_choice/parallel_tool_calls/text.verbosity/include, no compat,
+// no cache_retention, no normalized_tool_call_ids, simpler reasoning block.
+// =============================================================================
+
+const CodexRequestPayload = struct {
+    model: []const u8,
+    input: []const CodexInputItem,
+    store: bool = false,
+    stream: bool = true,
+    tool_choice: []const u8 = "auto",
+    parallel_tool_calls: bool = true,
+    text: CodexTextConfig,
+    include: []const []const u8,
+    instructions: []const u8,
+    temperature: ?f32 = null,
+    service_tier: ?[]const u8 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    reasoning: ?CodexReasoning = null,
+    tools: ?[]const CodexToolItem = null,
+};
+
+const CodexTextConfig = struct { verbosity: []const u8 };
+const CodexReasoning = struct { effort: []const u8, summary: []const u8 };
+const CodexToolItem = struct {
+    type: []const u8 = "function",
+    name: []const u8,
+    description: []const u8,
+    parameters: std.json.Value, // cloned
+    strict: ?bool = null, // emitted as null in JSON
+
+    pub fn jsonStringify(self: CodexToolItem, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("description");
+        try jw.write(self.description);
+        try jw.objectField("parameters");
+        try jw.write(self.parameters);
+        try jw.objectField("strict");
+        try jw.write(@as(?bool, null));
+        try jw.endObject();
+    }
+};
+
+const CodexContentPart = union(enum) {
+    input_text: struct { text: []const u8 },
+    input_image: struct { image_url: []const u8 },
+
+    pub fn jsonStringify(self: CodexContentPart, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .input_text => |t| {
+                try jw.objectField("type");
+                try jw.write("input_text");
+                try jw.objectField("text");
+                try jw.write(t.text);
+            },
+            .input_image => |i| {
+                try jw.objectField("type");
+                try jw.write("input_image");
+                try jw.objectField("detail");
+                try jw.write("auto");
+                try jw.objectField("image_url");
+                try jw.write(i.image_url);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+const CodexInputItem = union(enum) {
+    user_message: struct { content: []const CodexContentPart },
+    assistant_message: struct { id: []const u8, text: []const u8 },
+    passthrough_value: std.json.Value,
+    function_call: struct {
+        call_id: []const u8,
+        id: ?[]const u8,
+        name: []const u8,
+        arguments: []const u8, // pre-stringified JSON
+    },
+    function_call_output_text: struct { call_id: []const u8, output: []const u8 },
+    function_call_output_parts: struct { call_id: []const u8, parts: []const CodexContentPart },
+
+    pub fn jsonStringify(self: CodexInputItem, jw: anytype) !void {
+        switch (self) {
+            .user_message => |m| {
+                try jw.beginObject();
+                try jw.objectField("role");
+                try jw.write("user");
+                try jw.objectField("content");
+                try jw.write(m.content);
+                try jw.endObject();
+            },
+            .assistant_message => |m| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("message");
+                try jw.objectField("role");
+                try jw.write("assistant");
+                try jw.objectField("status");
+                try jw.write("completed");
+                try jw.objectField("id");
+                try jw.write(m.id);
+                try jw.objectField("content");
+                try jw.beginArray();
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("output_text");
+                try jw.objectField("text");
+                try jw.write(m.text);
+                try jw.objectField("annotations");
+                try jw.beginArray();
+                try jw.endArray();
+                try jw.endObject();
+                try jw.endArray();
+                try jw.endObject();
+            },
+            .passthrough_value => |v| try jw.write(v),
+            .function_call => |fc| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call");
+                try jw.objectField("call_id");
+                try jw.write(fc.call_id);
+                if (fc.id) |id| {
+                    try jw.objectField("id");
+                    try jw.write(id);
+                }
+                try jw.objectField("name");
+                try jw.write(fc.name);
+                try jw.objectField("arguments");
+                try jw.write(fc.arguments);
+                try jw.endObject();
+            },
+            .function_call_output_text => |out| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call_output");
+                try jw.objectField("call_id");
+                try jw.write(out.call_id);
+                try jw.objectField("output");
+                try jw.write(out.output);
+                try jw.endObject();
+            },
+            .function_call_output_parts => |out| {
+                try jw.beginObject();
+                try jw.objectField("type");
+                try jw.write("function_call_output");
+                try jw.objectField("call_id");
+                try jw.write(out.call_id);
+                try jw.objectField("output");
+                try jw.write(out.parts);
+                try jw.endObject();
+            },
+        }
+    }
+};
+
+const CodexOwned = struct {
+    allocator: std.mem.Allocator,
+    payload: CodexRequestPayload,
+    input_buf: []CodexInputItem,
+    tools_buf: ?[]CodexToolItem,
+    content_lists: []const []CodexContentPart,
+    owned_strings: []const []const u8,
+    owned_values: []std.json.Value,
+    include_buf: [][]const u8,
+
+    fn deinit(self: CodexOwned) void {
+        self.allocator.free(self.input_buf);
+        if (self.tools_buf) |b| self.allocator.free(b);
+        for (self.content_lists) |list| self.allocator.free(list);
+        self.allocator.free(self.content_lists);
+        for (self.owned_strings) |s| self.allocator.free(s);
+        self.allocator.free(self.owned_strings);
+        for (self.owned_values) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_values);
+        self.allocator.free(self.include_buf);
+    }
+};
+
+const CodexBuilder = struct {
+    allocator: std.mem.Allocator,
+    content_lists: std.ArrayList([]CodexContentPart) = .empty,
+    owned_strings: std.ArrayList([]const u8) = .empty,
+    owned_values: std.ArrayList(std.json.Value) = .empty,
+
+    fn deinit(self: *CodexBuilder) void {
+        for (self.content_lists.items) |list| self.allocator.free(list);
+        self.content_lists.deinit(self.allocator);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
+        for (self.owned_values.items) |v| provider_json.freeValue(self.allocator, v);
+        self.owned_values.deinit(self.allocator);
+    }
+};
+
+fn buildOwnedCodex(
     allocator: std.mem.Allocator,
     model: types.Model,
     context: types.Context,
     options: ?types.StreamOptions,
-) !std.json.Value {
-    var input = std.json.Array.init(allocator);
-    errdefer input.deinit();
+) !CodexOwned {
+    var builder = CodexBuilder{ .allocator = allocator };
+    errdefer builder.deinit();
+
+    var input_list = std.ArrayList(CodexInputItem).empty;
+    errdefer input_list.deinit(allocator);
 
     for (context.messages, 0..) |message, message_index| {
-        try appendInputItemsForMessage(allocator, &input, model, message, message_index);
+        try appendCodexInputItems(allocator, &input_list, model, message, message_index, &builder);
     }
 
-    var payload = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    try putStringValue(allocator, &payload, "model", model.id);
-    try putObjectValue(allocator, &payload, "input", .{ .array = input });
-    try putBoolValue(allocator, &payload, "store", false);
-    try putBoolValue(allocator, &payload, "stream", true);
-    try putStringValue(allocator, &payload, "tool_choice", "auto");
-    try putBoolValue(allocator, &payload, "parallel_tool_calls", true);
+    const input_buf = try input_list.toOwnedSlice(allocator);
+    errdefer allocator.free(input_buf);
 
     var responses_opts = if (options) |stream_options| stream_options.providerOptions("responses") else types.ResponsesStreamOptions{};
-    const text_verbosity = responses_opts.text_verbosity orelse "low";
-    const text_config_value: std.json.Value = blk: {
-        var text_config = try initObject(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .object = text_config });
-        try putStringValue(allocator, &text_config, "verbosity", text_verbosity);
-        break :blk .{ .object = text_config };
-    };
-    try putObjectValue(allocator, &payload, "text", text_config_value);
-
-    var include = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = include });
-    try include.append(.{ .string = try allocator.dupe(u8, "reasoning.encrypted_content") });
-    try putObjectValue(allocator, &payload, "include", .{ .array = include });
+    const verbosity = responses_opts.text_verbosity orelse "low";
 
     const raw_instructions = if (context.system_prompt) |system_prompt|
         if (system_prompt.len > 0) system_prompt else DEFAULT_CODEX_SYSTEM_PROMPT
     else
         DEFAULT_CODEX_SYSTEM_PROMPT;
     const instructions = try openai.sanitizeSurrogates(allocator, raw_instructions);
-    defer allocator.free(instructions);
-    try putStringValue(allocator, &payload, "instructions", instructions);
+    try builder.owned_strings.append(allocator, instructions);
 
+    var temperature: ?f32 = null;
+    var service_tier: ?[]const u8 = null;
+    var prompt_cache_key: ?[]const u8 = null;
+    var reasoning: ?CodexReasoning = null;
     if (options) |stream_options| {
         responses_opts = stream_options.providerOptions("responses");
-        if (stream_options.temperature) |temperature| {
-            try putFloatValue(allocator, &payload, "temperature", temperature);
-        }
-        if (responses_opts.service_tier) |service_tier| {
-            try putStringValue(allocator, &payload, "service_tier", service_tier);
-        }
-        if (stream_options.session_id) |session_id| {
-            try putStringValue(allocator, &payload, "prompt_cache_key", session_id);
-        }
+        temperature = stream_options.temperature;
+        if (responses_opts.service_tier) |st| service_tier = st;
+        if (stream_options.session_id) |sid| prompt_cache_key = sid;
         if (model.reasoning) {
-            if (responses_opts.reasoning_effort) |reasoning_effort| {
-                const reasoning_value: std.json.Value = blk: {
-                    var reasoning = try initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                    try putStringValue(allocator, &reasoning, "effort", @tagName(reasoning_effort));
-                    try putStringValue(allocator, &reasoning, "summary", responses_opts.reasoning_summary orelse "auto");
-                    break :blk .{ .object = reasoning };
+            if (responses_opts.reasoning_effort) |re| {
+                reasoning = .{
+                    .effort = @tagName(re),
+                    .summary = responses_opts.reasoning_summary orelse "auto",
                 };
-                try putObjectValue(allocator, &payload, "reasoning", reasoning_value);
             }
         }
     }
 
-    if (context.tools) |tools| {
-        if (tools.len > 0) {
-            var tools_array = std.json.Array.init(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .array = tools_array });
-            for (tools) |tool| {
-                try tools_array.append(try buildToolObject(allocator, tool));
+    // include is always a single-element array.
+    const include_buf = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(include_buf);
+    include_buf[0] = "reasoning.encrypted_content";
+
+    var tools_buf: ?[]CodexToolItem = null;
+    if (context.tools) |tools| if (tools.len > 0) {
+        const buf = try allocator.alloc(CodexToolItem, tools.len);
+        errdefer allocator.free(buf);
+        for (tools, 0..) |tool, i| {
+            const params_clone = try provider_json.cloneValue(allocator, tool.parameters);
+            try builder.owned_values.append(allocator, params_clone);
+            buf[i] = .{
+                .name = tool.name,
+                .description = tool.description,
+                .parameters = params_clone,
+            };
+        }
+        tools_buf = buf;
+    };
+    errdefer if (tools_buf) |b| allocator.free(b);
+
+    const content_lists_slice = try builder.content_lists.toOwnedSlice(allocator);
+    const owned_strings_slice = try builder.owned_strings.toOwnedSlice(allocator);
+    const owned_values_slice = try builder.owned_values.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .model = model.id,
+            .input = input_buf,
+            .text = .{ .verbosity = verbosity },
+            .include = include_buf,
+            .instructions = instructions,
+            .temperature = temperature,
+            .service_tier = service_tier,
+            .prompt_cache_key = prompt_cache_key,
+            .reasoning = reasoning,
+            .tools = tools_buf,
+        },
+        .input_buf = input_buf,
+        .tools_buf = tools_buf,
+        .content_lists = content_lists_slice,
+        .owned_strings = owned_strings_slice,
+        .owned_values = owned_values_slice,
+        .include_buf = include_buf,
+    };
+}
+
+fn appendCodexInputItems(
+    allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(CodexInputItem),
+    model: types.Model,
+    message: types.Message,
+    message_index: usize,
+    builder: *CodexBuilder,
+) !void {
+    switch (message) {
+        .user => |user| try appendCodexUser(allocator, input_list, model, user, builder),
+        .assistant => |assistant| {
+            if (types.shouldReplayAssistantInProviderContext(assistant)) {
+                try appendCodexAssistant(allocator, input_list, assistant, message_index, builder);
             }
-            try putObjectValue(allocator, &payload, "tools", .{ .array = tools_array });
+        },
+        .tool_result => |tool_result| try appendCodexToolResult(allocator, input_list, model, tool_result, builder),
+    }
+}
+
+fn appendCodexUser(
+    allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(CodexInputItem),
+    model: types.Model,
+    user: types.UserMessage,
+    builder: *CodexBuilder,
+) !void {
+    const supports_images = modelSupportsImages(model);
+    var parts = std.ArrayList(CodexContentPart).empty;
+    errdefer parts.deinit(allocator);
+    for (user.content) |block| {
+        switch (block) {
+            .text => |text| {
+                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
+                try builder.owned_strings.append(allocator, sanitized);
+                try parts.append(allocator, .{ .input_text = .{ .text = sanitized } });
+            },
+            .image => |image| {
+                if (!supports_images) continue;
+                const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                try builder.owned_strings.append(allocator, image_url);
+                try parts.append(allocator, .{ .input_image = .{ .image_url = image_url } });
+            },
+            .thinking, .tool_call => {},
+        }
+    }
+    const slice = try parts.toOwnedSlice(allocator);
+    errdefer allocator.free(slice);
+    try builder.content_lists.append(allocator, slice);
+    try input_list.append(allocator, .{ .user_message = .{ .content = slice } });
+}
+
+fn appendCodexAssistant(
+    allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(CodexInputItem),
+    assistant: types.AssistantMessage,
+    message_index: usize,
+    builder: *CodexBuilder,
+) !void {
+    for (assistant.content) |block| {
+        switch (block) {
+            .thinking => |thinking| {
+                if (types.thinkingSignature(thinking)) |signature| {
+                    var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
+                    defer parsed.deinit();
+                    const cloned = try provider_json.cloneValue(allocator, parsed.value);
+                    try builder.owned_values.append(allocator, cloned);
+                    try input_list.append(allocator, .{ .passthrough_value = cloned });
+                }
+            },
+            .text => |text| {
+                const message_id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index});
+                try builder.owned_strings.append(allocator, message_id);
+                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
+                try builder.owned_strings.append(allocator, sanitized);
+                try input_list.append(allocator, .{ .assistant_message = .{
+                    .id = message_id,
+                    .text = sanitized,
+                } });
+            },
+            .image, .tool_call => {},
         }
     }
 
-    return .{ .object = payload };
+    const tool_calls_source = if (types.hasInlineToolCalls(assistant))
+        try types.collectAssistantToolCalls(allocator, assistant)
+    else
+        null;
+    defer if (tool_calls_source) |calls| allocator.free(calls);
+
+    if (tool_calls_source orelse assistant.tool_calls) |tool_calls| {
+        for (tool_calls) |tool_call| {
+            const split = splitToolCallId(tool_call.id);
+            const call_id_owned = try allocator.dupe(u8, split.call_id);
+            try builder.owned_strings.append(allocator, call_id_owned);
+            var id_owned: ?[]const u8 = null;
+            if (split.item_id) |item_id| {
+                const dup = try allocator.dupe(u8, item_id);
+                try builder.owned_strings.append(allocator, dup);
+                id_owned = dup;
+            }
+            const name_owned = try allocator.dupe(u8, tool_call.name);
+            try builder.owned_strings.append(allocator, name_owned);
+            const arguments_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
+            try builder.owned_strings.append(allocator, arguments_json);
+            try input_list.append(allocator, .{ .function_call = .{
+                .call_id = call_id_owned,
+                .id = id_owned,
+                .name = name_owned,
+                .arguments = arguments_json,
+            } });
+        }
+    }
+}
+
+fn appendCodexToolResult(
+    allocator: std.mem.Allocator,
+    input_list: *std.ArrayList(CodexInputItem),
+    model: types.Model,
+    tool_result: types.ToolResultMessage,
+    builder: *CodexBuilder,
+) !void {
+    const supports_images = modelSupportsImages(model);
+    var text_parts = std.ArrayList(u8).empty;
+    defer text_parts.deinit(allocator);
+    var image_count: usize = 0;
+    for (tool_result.content) |block| {
+        switch (block) {
+            .text => |text| {
+                if (text_parts.items.len > 0) try text_parts.appendSlice(allocator, "\n");
+                try text_parts.appendSlice(allocator, text.text);
+            },
+            .image => image_count += 1,
+            .thinking, .tool_call => {},
+        }
+    }
+    const call_id_owned = try allocator.dupe(u8, splitToolCallId(tool_result.tool_call_id).call_id);
+    try builder.owned_strings.append(allocator, call_id_owned);
+
+    if (supports_images and image_count > 0) {
+        var parts = std.ArrayList(CodexContentPart).empty;
+        errdefer parts.deinit(allocator);
+        if (text_parts.items.len > 0) {
+            const sanitized = try openai.sanitizeSurrogates(allocator, text_parts.items);
+            try builder.owned_strings.append(allocator, sanitized);
+            try parts.append(allocator, .{ .input_text = .{ .text = sanitized } });
+        }
+        for (tool_result.content) |block| {
+            switch (block) {
+                .image => |image| {
+                    const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
+                    try builder.owned_strings.append(allocator, image_url);
+                    try parts.append(allocator, .{ .input_image = .{ .image_url = image_url } });
+                },
+                else => {},
+            }
+        }
+        const slice = try parts.toOwnedSlice(allocator);
+        errdefer allocator.free(slice);
+        try builder.content_lists.append(allocator, slice);
+        try input_list.append(allocator, .{ .function_call_output_parts = .{
+            .call_id = call_id_owned,
+            .parts = slice,
+        } });
+    } else {
+        const output_text = if (text_parts.items.len > 0)
+            try openai.sanitizeSurrogates(allocator, text_parts.items)
+        else if (image_count > 0)
+            try allocator.dupe(u8, "(see attached image)")
+        else
+            try allocator.dupe(u8, "");
+        try builder.owned_strings.append(allocator, output_text);
+        try input_list.append(allocator, .{ .function_call_output_text = .{
+            .call_id = call_id_owned,
+            .output = output_text,
+        } });
+    }
+}
+
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    var owned = try buildOwnedCodex(allocator, model, context, options);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
+pub fn buildRequestPayload(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) !std.json.Value {
+    const bytes = try buildPayloadJsonBytes(allocator, model, context, options);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 pub fn buildRequestSnapshotValue(
@@ -479,218 +912,6 @@ pub fn buildRequestSnapshotValue(
     try putStringValue(allocator, &snapshot, "url", url);
 
     return .{ .object = snapshot };
-}
-
-fn appendInputItemsForMessage(
-    allocator: std.mem.Allocator,
-    input: *std.json.Array,
-    model: types.Model,
-    message: types.Message,
-    message_index: usize,
-) !void {
-    switch (message) {
-        .user => |user| try input.append(try buildUserInputItem(allocator, model, user)),
-        .assistant => |assistant| {
-            if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                try appendAssistantInputItems(allocator, input, assistant, message_index);
-            }
-        },
-        .tool_result => |tool_result| try input.append(try buildToolResultInputItem(allocator, model, tool_result)),
-    }
-}
-
-fn buildUserInputItem(allocator: std.mem.Allocator, model: types.Model, user: types.UserMessage) !std.json.Value {
-    var content = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = content });
-
-    const supports_images = modelSupportsImages(model);
-
-    for (user.content) |block| {
-        switch (block) {
-            .text => |text| {
-                var part = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = part });
-                try putStringValue(allocator, &part, "type", "input_text");
-                const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
-                defer allocator.free(sanitized);
-                try putStringValue(allocator, &part, "text", sanitized);
-                try content.append(.{ .object = part });
-            },
-            .image => |image| {
-                if (!supports_images) continue;
-                var part = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = part });
-                try putStringValue(allocator, &part, "type", "input_image");
-                try putStringValue(allocator, &part, "detail", "auto");
-                const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                defer allocator.free(image_url);
-                try putStringValue(allocator, &part, "image_url", image_url);
-                try content.append(.{ .object = part });
-            },
-            .thinking, .tool_call => {},
-        }
-    }
-
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "role", "user");
-    try putObjectValue(allocator, &object, "content", .{ .array = content });
-    return .{ .object = object };
-}
-
-fn appendAssistantInputItems(
-    allocator: std.mem.Allocator,
-    input: *std.json.Array,
-    assistant: types.AssistantMessage,
-    message_index: usize,
-) !void {
-    for (assistant.content) |block| {
-        switch (block) {
-            .thinking => |thinking| {
-                if (types.thinkingSignature(thinking)) |signature| {
-                    var parsed = std.json.parseFromSlice(std.json.Value, allocator, signature, .{}) catch continue;
-                    defer parsed.deinit();
-                    try input.append(try provider_json.cloneValue(allocator, parsed.value));
-                }
-            },
-            .text => |text| {
-                var message_object = try initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = message_object });
-                try putStringValue(allocator, &message_object, "type", "message");
-                try putStringValue(allocator, &message_object, "role", "assistant");
-                try putStringValue(allocator, &message_object, "status", "completed");
-                const message_id = try std.fmt.allocPrint(allocator, "msg_{d}", .{message_index});
-                defer allocator.free(message_id);
-                try putStringValue(allocator, &message_object, "id", message_id);
-
-                const content_value: std.json.Value = blk: {
-                    var content = std.json.Array.init(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .array = content });
-                    const text_object_value: std.json.Value = inner: {
-                        var text_object = try initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = text_object });
-                        try putStringValue(allocator, &text_object, "type", "output_text");
-                        const sanitized = try openai.sanitizeSurrogates(allocator, text.text);
-                        defer allocator.free(sanitized);
-                        try putStringValue(allocator, &text_object, "text", sanitized);
-                        try putObjectValue(allocator, &text_object, "annotations", .{ .array = std.json.Array.init(allocator) });
-                        break :inner .{ .object = text_object };
-                    };
-                    try content.append(text_object_value);
-                    break :blk .{ .array = content };
-                };
-                try putObjectValue(allocator, &message_object, "content", content_value);
-                try input.append(.{ .object = message_object });
-            },
-            .image => {},
-            .tool_call => {},
-        }
-    }
-
-    const tool_calls_source = if (types.hasInlineToolCalls(assistant))
-        try types.collectAssistantToolCalls(allocator, assistant)
-    else
-        null;
-    defer if (tool_calls_source) |calls| allocator.free(calls);
-
-    if (tool_calls_source orelse assistant.tool_calls) |tool_calls| {
-        for (tool_calls) |tool_call| {
-            const split = splitToolCallId(tool_call.id);
-            var tool_call_object = try initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = tool_call_object });
-            try putStringValue(allocator, &tool_call_object, "type", "function_call");
-            try putStringValue(allocator, &tool_call_object, "call_id", split.call_id);
-            if (split.item_id) |item_id| {
-                try putStringValue(allocator, &tool_call_object, "id", item_id);
-            }
-            try putStringValue(allocator, &tool_call_object, "name", tool_call.name);
-            const arguments_json = try std.json.Stringify.valueAlloc(allocator, tool_call.arguments, .{});
-            defer allocator.free(arguments_json);
-            try putStringValue(allocator, &tool_call_object, "arguments", arguments_json);
-            try input.append(.{ .object = tool_call_object });
-        }
-    }
-}
-
-fn buildToolResultInputItem(
-    allocator: std.mem.Allocator,
-    model: types.Model,
-    tool_result: types.ToolResultMessage,
-) !std.json.Value {
-    const supports_images = modelSupportsImages(model);
-
-    var text_parts = std.ArrayList(u8).empty;
-    defer text_parts.deinit(allocator);
-    var image_count: usize = 0;
-    for (tool_result.content) |block| {
-        switch (block) {
-            .text => |text| {
-                if (text_parts.items.len > 0) try text_parts.appendSlice(allocator, "\n");
-                try text_parts.appendSlice(allocator, text.text);
-            },
-            .image => {
-                image_count += 1;
-            },
-            .thinking, .tool_call => {},
-        }
-    }
-
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "type", "function_call_output");
-    try putStringValue(allocator, &object, "call_id", splitToolCallId(tool_result.tool_call_id).call_id);
-
-    if (supports_images and image_count > 0) {
-        var output_parts = std.json.Array.init(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .array = output_parts });
-        if (text_parts.items.len > 0) {
-            var text_object = try initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = text_object });
-            try putStringValue(allocator, &text_object, "type", "input_text");
-            const sanitized = try openai.sanitizeSurrogates(allocator, text_parts.items);
-            defer allocator.free(sanitized);
-            try putStringValue(allocator, &text_object, "text", sanitized);
-            try output_parts.append(.{ .object = text_object });
-        }
-        for (tool_result.content) |block| {
-            switch (block) {
-                .image => |image| {
-                    var image_object = try initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = image_object });
-                    try putStringValue(allocator, &image_object, "type", "input_image");
-                    try putStringValue(allocator, &image_object, "detail", "auto");
-                    const image_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                    defer allocator.free(image_url);
-                    try putStringValue(allocator, &image_object, "image_url", image_url);
-                    try output_parts.append(.{ .object = image_object });
-                },
-                else => {},
-            }
-        }
-        try putObjectValue(allocator, &object, "output", .{ .array = output_parts });
-    } else {
-        const output_text = if (text_parts.items.len > 0)
-            try openai.sanitizeSurrogates(allocator, text_parts.items)
-        else if (image_count > 0)
-            try allocator.dupe(u8, "(see attached image)")
-        else
-            try allocator.dupe(u8, "");
-        defer allocator.free(output_text);
-        try putStringValue(allocator, &object, "output", output_text);
-    }
-
-    return .{ .object = object };
-}
-
-fn buildToolObject(allocator: std.mem.Allocator, tool: types.Tool) !std.json.Value {
-    var object = try initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = object });
-    try putStringValue(allocator, &object, "type", "function");
-    try putStringValue(allocator, &object, "name", tool.name);
-    try putStringValue(allocator, &object, "description", tool.description);
-    try putObjectValue(allocator, &object, "parameters", try provider_json.cloneValue(allocator, tool.parameters));
-    try putObjectValue(allocator, &object, "strict", .null);
-    return .{ .object = object };
 }
 
 fn modelSupportsImages(model: types.Model) bool {
