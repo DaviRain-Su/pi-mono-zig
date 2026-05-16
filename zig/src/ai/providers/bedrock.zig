@@ -321,6 +321,118 @@ pub fn buildRequestPayload(
     return try buildRequestPayloadWithFixtureEnv(allocator, model, context, options, null);
 }
 
+// =============================================================================
+// Outer-envelope payload struct for Bedrock Converse Stream.
+//
+// Inner blocks (messages, system, inferenceConfig, toolConfig,
+// requestMetadata, additionalModelRequestFields) stay as Value passthroughs
+// because they involve Bedrock-specific block taxonomy (text/image/
+// reasoningContent/toolUse/toolResult, cachePoint markers, image base64
+// transcoding, additional model fields like Claude thinking config) that
+// would require a substantial separate refactor to model declaratively.
+// =============================================================================
+
+const BedrockRequestPayload = struct {
+    messages: std.json.Value,
+    system: ?std.json.Value = null,
+    inferenceConfig: std.json.Value,
+    toolConfig: ?std.json.Value = null,
+    requestMetadata: ?std.json.Value = null,
+    additionalModelRequestFields: ?std.json.Value = null,
+};
+
+const BedrockOwned = struct {
+    allocator: std.mem.Allocator,
+    payload: BedrockRequestPayload,
+    owned_values: []std.json.Value,
+
+    fn deinit(self: BedrockOwned) void {
+        for (self.owned_values) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_values);
+    }
+};
+
+fn buildOwnedBedrock(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    fixture_env: ?FixtureEnv,
+) !BedrockOwned {
+    var owned_values_list = std.ArrayList(std.json.Value).empty;
+    errdefer {
+        for (owned_values_list.items) |v| provider_json.freeValue(allocator, v);
+        owned_values_list.deinit(allocator);
+    }
+
+    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
+
+    const messages_value = try buildMessagesValue(allocator, model, context.messages, cache_retention);
+    try owned_values_list.append(allocator, messages_value);
+
+    var system_owned: ?std.json.Value = null;
+    if (context.system_prompt) |system_prompt| {
+        const v = try buildSystemValue(allocator, system_prompt, model, cache_retention);
+        try owned_values_list.append(allocator, v);
+        system_owned = v;
+    }
+
+    const inference_config = try buildInferenceConfigValue(allocator, model, options);
+    try owned_values_list.append(allocator, inference_config);
+
+    var tool_config_owned: ?std.json.Value = null;
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            if (try buildToolConfigValue(allocator, tools, options)) |tc| {
+                try owned_values_list.append(allocator, tc);
+                tool_config_owned = tc;
+            }
+        }
+    }
+
+    var request_metadata_owned: ?std.json.Value = null;
+    var additional_fields_owned: ?std.json.Value = null;
+    if (options) |stream_options| {
+        const bedrock_opts = stream_options.providerOptions("bedrock");
+        if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |rm| {
+            try owned_values_list.append(allocator, rm);
+            request_metadata_owned = rm;
+        }
+        if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options, fixture_env)) |af| {
+            try owned_values_list.append(allocator, af);
+            additional_fields_owned = af;
+        }
+    }
+
+    const owned_values_slice = try owned_values_list.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .messages = messages_value,
+            .system = system_owned,
+            .inferenceConfig = inference_config,
+            .toolConfig = tool_config_owned,
+            .requestMetadata = request_metadata_owned,
+            .additionalModelRequestFields = additional_fields_owned,
+        },
+        .owned_values = owned_values_slice,
+    };
+}
+
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    var owned = try buildOwnedBedrock(allocator, model, context, options, null);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
 fn buildRequestPayloadWithFixtureEnv(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -328,38 +440,15 @@ fn buildRequestPayloadWithFixtureEnv(
     options: ?types.StreamOptions,
     fixture_env: ?FixtureEnv,
 ) !std.json.Value {
-    var payload = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    const cache_retention = resolveOptionsCacheRetention(options, processCacheRetentionEnv());
-
-    try putObjectValue(allocator, &payload, "messages", try buildMessagesValue(allocator, model, context.messages, cache_retention));
-
-    if (context.system_prompt) |system_prompt| {
-        try putObjectValue(allocator, &payload, "system", try buildSystemValue(allocator, system_prompt, model, cache_retention));
-    }
-
-    try putObjectValue(allocator, &payload, "inferenceConfig", try buildInferenceConfigValue(allocator, model, options));
-
-    if (context.tools) |tools| {
-        if (tools.len > 0) {
-            if (try buildToolConfigValue(allocator, tools, options)) |tool_config| {
-                try putObjectValue(allocator, &payload, "toolConfig", tool_config);
-            }
-        }
-    }
-
-    if (options) |stream_options| {
-        const bedrock_opts = stream_options.providerOptions("bedrock");
-        if (try buildRequestMetadataValue(allocator, bedrock_opts.request_metadata)) |request_metadata| {
-            try putObjectValue(allocator, &payload, "requestMetadata", request_metadata);
-        }
-        if (try buildAdditionalModelRequestFieldsValue(allocator, model, stream_options, fixture_env)) |additional_fields| {
-            try putObjectValue(allocator, &payload, "additionalModelRequestFields", additional_fields);
-        }
-    }
-
-    return .{ .object = payload };
+    var owned = try buildOwnedBedrock(allocator, model, context, options, fixture_env);
+    defer owned.deinit();
+    const bytes = try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 pub fn buildRequestSnapshotValue(
