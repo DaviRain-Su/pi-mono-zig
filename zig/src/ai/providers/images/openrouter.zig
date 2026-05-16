@@ -31,24 +31,33 @@ pub fn generateImagesOpenRouter(
         return output;
     }
 
-    const payload = try buildParams(allocator, model, context);
-    defer provider_json.freeValue(allocator, payload);
+    const owned = try buildOwnedPayload(allocator, model, context);
+    defer owned.deinit();
 
-    var final_payload = payload;
-    var final_payload_owned = false;
-    defer if (final_payload_owned) provider_json.freeValue(allocator, final_payload);
+    // Fast path: serialize the declarative struct directly to a writer —
+    // zero intermediate ObjectMap, zero key dupes.
+    var json_out: std.Io.Writer.Allocating = .init(allocator);
+    defer json_out.deinit();
+    try std.json.Stringify.value(owned.payload, .{}, &json_out.writer);
+
+    // Test-fixture path: on_payload still expects a `std.json.Value`.
+    // Pay one parse + (conditional) stringify roundtrip ONLY when the
+    // callback is set; production never hits this branch.
     if (options) |opts| {
         if (opts.on_payload) |on_payload| {
-            if (try on_payload(allocator, payload, model)) |next_payload| {
-                final_payload = next_payload;
-                final_payload_owned = true;
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_out.written(), .{}) catch |err| {
+                try setRuntimeError(allocator, &output, options, err);
+                return output;
+            };
+            defer parsed.deinit();
+            if (try on_payload(allocator, parsed.value, model)) |next_payload| {
+                defer provider_json.freeValue(allocator, next_payload);
+                json_out.deinit();
+                json_out = .init(allocator);
+                try std.json.Stringify.value(next_payload, .{}, &json_out.writer);
             }
         }
     }
-
-    var json_out: std.Io.Writer.Allocating = .init(allocator);
-    defer json_out.deinit();
-    try std.json.Stringify.value(final_payload, .{}, &json_out.writer);
 
     var headers = try buildRequestHeaders(allocator, model, api_key.?, options);
     defer provider_stream.deinitOwnedHeaders(allocator, &headers);
@@ -153,65 +162,147 @@ fn buildRequestHeaders(
     return headers;
 }
 
-fn buildParams(allocator: std.mem.Allocator, model: types.ImagesModel, context: types.ImagesContext) !std.json.Value {
-    var root = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = root });
+// =============================================================================
+// Payload structs (declarative shape used by std.json.Stringify reflection).
+// Keys go through Zig's comptime metadata, not allocator.dupe; values are
+// either inline literals or owned slices freed via OwnedPayload.deinit.
+// =============================================================================
 
-    try putOwnedValue(allocator, &root, "model", .{ .string = try allocator.dupe(u8, model.id) });
+const RequestPayload = struct {
+    model: []const u8,
+    messages: []const UserMessage,
+    stream: bool = false,
+    modalities: []const []const u8,
+};
 
-    var messages = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = messages });
-    var user_message = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = user_message });
-    try putOwnedValue(allocator, &user_message, "role", .{ .string = try allocator.dupe(u8, "user") });
-    try putOwnedValue(allocator, &user_message, "content", try buildContentParts(allocator, context));
-    try appendOwnedValue(allocator, &messages, .{ .object = user_message });
-    try putOwnedValue(allocator, &root, "messages", .{ .array = messages });
+const UserMessage = struct {
+    role: []const u8 = "user",
+    content: []const ContentPart,
+};
 
-    try putOwnedValue(allocator, &root, "stream", .{ .bool = false });
-    try putOwnedValue(allocator, &root, "modalities", try buildModalities(allocator, model));
-    return .{ .object = root };
-}
+const ContentPart = union(enum) {
+    text: TextPart,
+    image: ImagePart,
 
-fn buildContentParts(allocator: std.mem.Allocator, context: types.ImagesContext) !std.json.Value {
-    var content = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = content });
+    pub fn jsonStringify(self: ContentPart, jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        switch (self) {
+            .text => |t| {
+                try jw.write("text");
+                try jw.objectField("text");
+                try jw.write(t.text);
+            },
+            .image => |i| {
+                try jw.write("image_url");
+                try jw.objectField("image_url");
+                try jw.beginObject();
+                try jw.objectField("url");
+                try jw.write(i.url);
+                try jw.endObject();
+            },
+        }
+        try jw.endObject();
+    }
+};
 
-    for (context.input) |item| {
-        var part = try provider_json.initObject(allocator);
-        errdefer provider_json.freeValue(allocator, .{ .object = part });
+const TextPart = struct { text: []const u8 };
+const ImagePart = struct { url: []const u8 };
 
+/// Owns the runtime-allocated slices referenced by a `RequestPayload`
+/// (sanitized text bodies, base64 data URLs). Free with `deinit` AFTER
+/// the payload has been serialized.
+const OwnedPayload = struct {
+    allocator: std.mem.Allocator,
+    payload: RequestPayload,
+    messages_buf: []UserMessage,
+    parts_buf: []ContentPart,
+    modalities_buf: []const []const u8,
+    owned_text_slices: []const []const u8,
+    owned_url_slices: []const []const u8,
+
+    fn deinit(self: OwnedPayload) void {
+        for (self.owned_text_slices) |s| self.allocator.free(s);
+        self.allocator.free(self.owned_text_slices);
+        for (self.owned_url_slices) |s| self.allocator.free(s);
+        self.allocator.free(self.owned_url_slices);
+        self.allocator.free(self.parts_buf);
+        self.allocator.free(self.messages_buf);
+        self.allocator.free(self.modalities_buf);
+    }
+};
+
+fn buildOwnedPayload(
+    allocator: std.mem.Allocator,
+    model: types.ImagesModel,
+    context: types.ImagesContext,
+) !OwnedPayload {
+    // Compute modalities array length up front.
+    const include_text = containsString(model.output, "text");
+    var modalities_buf = try allocator.alloc([]const u8, if (include_text) 2 else 1);
+    errdefer allocator.free(modalities_buf);
+    modalities_buf[0] = "image";
+    if (include_text) modalities_buf[1] = "text";
+
+    // Allocate content-part array. Sanitized text and base64 data URLs need
+    // runtime storage we track in parallel arrays for deinit.
+    var parts_buf = try allocator.alloc(ContentPart, context.input.len);
+    errdefer allocator.free(parts_buf);
+
+    var owned_text_list = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (owned_text_list.items) |s| allocator.free(s);
+        owned_text_list.deinit(allocator);
+    }
+    var owned_url_list = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (owned_url_list.items) |s| allocator.free(s);
+        owned_url_list.deinit(allocator);
+    }
+
+    for (context.input, 0..) |item, i| {
         switch (item) {
             .text => |text| {
                 const sanitized = try chat_payload.sanitizeSurrogates(allocator, text.text);
-                errdefer allocator.free(sanitized);
-                try putOwnedValue(allocator, &part, "type", .{ .string = try allocator.dupe(u8, "text") });
-                try putOwnedValue(allocator, &part, "text", .{ .string = sanitized });
+                try owned_text_list.append(allocator, sanitized);
+                parts_buf[i] = .{ .text = .{ .text = sanitized } };
             },
             .image => |image| {
-                var image_url = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = image_url });
                 const data_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.mime_type, image.data });
-                errdefer allocator.free(data_url);
-                try putOwnedValue(allocator, &image_url, "url", .{ .string = data_url });
-                try putOwnedValue(allocator, &part, "type", .{ .string = try allocator.dupe(u8, "image_url") });
-                try putOwnedValue(allocator, &part, "image_url", .{ .object = image_url });
+                try owned_url_list.append(allocator, data_url);
+                parts_buf[i] = .{ .image = .{ .url = data_url } };
             },
         }
-
-        try appendOwnedValue(allocator, &content, .{ .object = part });
     }
-    return .{ .array = content };
-}
 
-fn buildModalities(allocator: std.mem.Allocator, model: types.ImagesModel) !std.json.Value {
-    var modalities = std.json.Array.init(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .array = modalities });
-    try appendOwnedValue(allocator, &modalities, .{ .string = try allocator.dupe(u8, "image") });
-    if (containsString(model.output, "text")) {
-        try appendOwnedValue(allocator, &modalities, .{ .string = try allocator.dupe(u8, "text") });
+    var messages_buf = try allocator.alloc(UserMessage, 1);
+    errdefer allocator.free(messages_buf);
+    messages_buf[0] = .{ .content = parts_buf };
+
+    const owned_text_slice = try owned_text_list.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_text_slice) |s| allocator.free(s);
+        allocator.free(owned_text_slice);
     }
-    return .{ .array = modalities };
+    const owned_url_slice = try owned_url_list.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_url_slice) |s| allocator.free(s);
+        allocator.free(owned_url_slice);
+    }
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .model = model.id,
+            .messages = messages_buf,
+            .modalities = modalities_buf,
+        },
+        .messages_buf = messages_buf,
+        .parts_buf = parts_buf,
+        .modalities_buf = modalities_buf,
+        .owned_text_slices = owned_text_slice,
+        .owned_url_slices = owned_url_slice,
+    };
 }
 
 fn containsString(values: []const []const u8, needle: []const u8) bool {
@@ -219,18 +310,6 @@ fn containsString(values: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, value, needle)) return true;
     }
     return false;
-}
-
-fn putOwnedValue(allocator: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.Value) !void {
-    errdefer provider_json.freeValue(allocator, value);
-    const owned_key = try allocator.dupe(u8, key);
-    errdefer allocator.free(owned_key);
-    try object.put(allocator, owned_key, value);
-}
-
-fn appendOwnedValue(allocator: std.mem.Allocator, array: *std.json.Array, value: std.json.Value) !void {
-    errdefer provider_json.freeValue(allocator, value);
-    try array.append(value);
 }
 
 fn parseResponseIntoOutput(
@@ -404,10 +483,16 @@ test "OpenRouter image payload mirrors TS request shape" {
         .input = &[_][]const u8{ "text", "image" },
         .output = &[_][]const u8{ "image", "text" },
     };
-    const payload = try buildParams(allocator, model, .{ .input = &input });
-    defer provider_json.freeValue(allocator, payload);
+    const owned = try buildOwnedPayload(allocator, model, .{ .input = &input });
+    defer owned.deinit();
 
-    const object = payload.object;
+    // Stringify then parse back so we can assert on the wire shape.
+    const json_bytes = try std.json.Stringify.valueAlloc(allocator, owned.payload, .{});
+    defer allocator.free(json_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+
     try std.testing.expectEqualStrings("openrouter/auto", object.get("model").?.string);
     try std.testing.expectEqual(false, object.get("stream").?.bool);
     try std.testing.expectEqual(@as(usize, 2), object.get("modalities").?.array.items.len);
