@@ -57,7 +57,7 @@ pub const BuiltinSlashCommand = struct {
     argument_hint: ?[]const u8 = null,
     kind: SlashCommandKind,
     /// Hidden entries participate in parsing and dispatch but are excluded from
-    /// the autocomplete matrix, the `/help` listing, and the webview catalog
+    /// the autocomplete matrix, the `/help` listing, and the catalog
     /// "builtins" array. They exist so the table can remain the single source of
     /// truth for every `SlashCommandKind` variant while preserving the historical
     /// behavior of not advertising certain commands in primary UI surfaces.
@@ -116,7 +116,7 @@ const VISIBLE_BUILTIN_SLASH_COMMANDS_COUNT = blk: {
 };
 
 /// Subset of BUILTIN_SLASH_COMMANDS without `.hidden` entries, in declaration
-/// order. Used by autocomplete, `/help`, and the webview catalog "builtins"
+/// order. Used by autocomplete, `/help`, and the "builtins"
 /// array so hidden commands stay reachable via the parser without appearing in
 /// primary UI surfaces.
 pub const VISIBLE_BUILTIN_SLASH_COMMANDS: [VISIBLE_BUILTIN_SLASH_COMMANDS_COUNT]BuiltinSlashCommand = blk: {

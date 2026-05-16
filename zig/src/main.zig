@@ -173,10 +173,6 @@ fn runCliWithInput(
         return 1;
     }
 
-    if (options.webview) {
-        if (try validateWebViewModeCombinations(&options, stderr)) |exit_code| return exit_code;
-    }
-
     if ((options.mode == .rpc or options.mode == .ts_rpc) and options.messages != null) {
         try stderr.writeAll("Error: Prompt arguments are not supported in RPC mode\n");
         return 1;
@@ -187,7 +183,7 @@ fn runCliWithInput(
         return 1;
     }
 
-    const app_mode = bootstrap.resolveAppMode(options.mode, options.print, options.webview, detected_stdin.is_tty);
+    const app_mode = bootstrap.resolveAppMode(options.mode, options.print, detected_stdin.is_tty);
     const selected_tools = bootstrap.effectiveToolSelection(&options);
     const cwd = if (cwd_override) |override| blk: {
         break :blk try allocator.dupe(u8, override);
@@ -234,17 +230,6 @@ fn runCliWithInput(
         preflight_continue_confirmed = preflight_result.continue_confirmed;
     }
 
-    var webview_backend: ?coding_agent.webview_platform.AvailableBackend = null;
-    if (app_mode == .webview) {
-        switch (coding_agent.webview_platform.preflightHostBackend()) {
-            .available => |backend| webview_backend = backend,
-            .unavailable => |diagnostic| {
-                try writeWebViewBackendDiagnostic(stderr, diagnostic);
-                return 1;
-            },
-        }
-    }
-
     var prepared = try runtime_prep.prepareCliRuntime(allocator, io, &effective_env_map, cwd, &options, selected_tools);
     defer prepared.deinit(allocator);
     try output.writeResourceDiagnostics(stderr, prepared.resource_bundle.diagnostics);
@@ -277,46 +262,10 @@ fn runCliWithInput(
             .app_mode = app_mode,
             .selected_tools = selected_tools,
             .preflight_continue_confirmed = preflight_continue_confirmed,
-            .webview_backend = webview_backend,
             .version = VERSION,
         },
         stdout,
         stderr,
-    );
-}
-
-fn validateWebViewModeCombinations(options: *const cli.Args, stderr: *std.Io.Writer) !?u8 {
-    if (options.print) {
-        try stderr.writeAll("Error: --webview cannot be combined with --print\n");
-        return 1;
-    }
-
-    switch (options.mode) {
-        .text => {},
-        .json => {
-            try stderr.writeAll("Error: --webview cannot be combined with --mode json\n");
-            return 1;
-        },
-        .rpc => {
-            try stderr.writeAll("Error: --webview cannot be combined with --mode json-rpc\n");
-            return 1;
-        },
-        .ts_rpc => {
-            try stderr.writeAll("Error: --webview cannot be combined with --mode rpc or --mode ts-rpc\n");
-            return 1;
-        },
-    }
-
-    return null;
-}
-
-fn writeWebViewBackendDiagnostic(
-    stderr: *std.Io.Writer,
-    diagnostic: coding_agent.webview_platform.BackendDiagnostic,
-) !void {
-    try stderr.print(
-        "Error: WebView mode unavailable on {s}: {s}. Requirements: {s}\n",
-        .{ @tagName(diagnostic.platform), diagnostic.message, diagnostic.requirements },
     );
 }
 

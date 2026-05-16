@@ -4,9 +4,9 @@ const std = @import("std");
 /// fully escaped per RFC 8259.
 ///
 /// Several modules used to ship a private copy of this helper (ts_rpc_wire,
-/// webview_mode, webview_bridge, extension_dialog, plus a same-shape
-/// writeJsonStringValue in main.zig). Centralizing the implementation here
-/// keeps the escape rules consistent and makes it the single place to
+/// extension_dialog, plus a same-shape writeJsonStringValue in main.zig).
+/// Centralizing the implementation here keeps the escape rules consistent
+/// and makes it the single place to
 /// touch when std.json's stringify API evolves.
 pub fn writeJsonString(allocator: std.mem.Allocator, writer: *std.Io.Writer, value: []const u8) !void {
     const encoded = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = value }, .{});

@@ -76,7 +76,6 @@ test "main help text includes expected CLI options" {
     try std.testing.expect(std.mem.indexOf(u8, help, "--models <patterns>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--list-models [search]") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--print, -p") != null);
-    try std.testing.expect(std.mem.indexOf(u8, help, "--webview") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--mode, -mode <mode>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "rpc, json-rpc") != null);
     try std.testing.expect(std.mem.indexOf(u8, help, "--tools, -t <names>") != null);

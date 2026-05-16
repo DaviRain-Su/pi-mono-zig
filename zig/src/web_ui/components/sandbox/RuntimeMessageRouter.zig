@@ -3,5 +3,5 @@ pub const descriptor = common.descriptor("RuntimeMessageRouter", "components/san
 
 pub fn isTrustedRuntimeMessageOrigin(origin: []const u8) bool {
     const std = @import("std");
-    return std.mem.eql(u8, origin, "pi-webview://bundle");
+    return std.mem.eql(u8, origin, "pi://bundle");
 }

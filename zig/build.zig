@@ -121,10 +121,7 @@ pub fn build(b: *std.Build) void {
         .name = "pi",
         .root_module = mod,
     });
-    addMacosWebViewSupport(b, exe, target);
     b.installArtifact(exe);
-    const install_webview_asset = b.addInstallFile(b.path("assets/webview/index.html"), "share/pi/webview/index.html");
-    b.getInstallStep().dependOn(&install_webview_asset.step);
     b.getInstallStep().dependOn(external_tool_check_step);
 
     // Run command
@@ -266,7 +263,6 @@ pub fn build(b: *std.Build) void {
         .root_module = coding_agent_mod,
         .filters = coding_agent_test_filters,
     });
-    addMacosWebViewSupport(b, coding_agent_tests, target);
     const run_coding_agent_tests = b.addRunArtifact(coding_agent_tests);
     run_coding_agent_tests.setCwd(b.path("."));
     test_step.dependOn(&run_coding_agent_tests.step);
@@ -290,7 +286,6 @@ pub fn build(b: *std.Build) void {
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,
     });
-    addMacosWebViewSupport(b, main_tests, target);
     const run_main_tests = b.addRunArtifact(main_tests);
     run_main_tests.step.dependOn(b.getInstallStep());
     run_main_tests.step.dependOn(&run_coding_agent_tests.step);
@@ -369,21 +364,6 @@ pub fn build(b: *std.Build) void {
     tui_test_step.dependOn(&run_tui_tests.step);
 }
 
-fn addMacosWebViewSupport(
-    b: *std.Build,
-    compile: *std.Build.Step.Compile,
-    target: std.Build.ResolvedTarget,
-) void {
-    if (target.result.os.tag != .macos) return;
-
-    compile.root_module.addCSourceFile(.{
-        .file = b.path("src/coding_agent/modes/webview_macos.m"),
-        .flags = &.{"-fobjc-arc"},
-    });
-    compile.root_module.linkFramework("WebKit", .{});
-    compile.root_module.linkFramework("AppKit", .{});
-    compile.root_module.linkFramework("Foundation", .{});
-}
 
 fn getExtraToolPaths(allocator: std.mem.Allocator) []const []const u8 {
     const home = std.process.Environ.getAlloc(.{ .block = .empty }, allocator, "HOME") catch return &[_][]const u8{};

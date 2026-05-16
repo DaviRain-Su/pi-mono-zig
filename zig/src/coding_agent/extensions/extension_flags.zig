@@ -428,7 +428,6 @@ fn isBuiltinFlagName(name: []const u8) bool {
         "resume",
         "fork",
         "print",
-        "webview",
         "provider",
         "model",
         "models",
@@ -636,7 +635,7 @@ test "loadFromExtensionPaths diagnoses built-in and extension flag collisions" {
         \\{ "flags": [
         \\  { "name": "plan", "type": "boolean" },
         \\  { "name": "model", "type": "string" },
-        \\  { "name": "webview", "type": "boolean" }
+        \\  { "name": "print", "type": "boolean" }
         \\] }
         ,
     });
@@ -673,6 +672,6 @@ test "loadFromExtensionPaths diagnoses built-in and extension flag collisions" {
     try std.testing.expectEqualStrings("extension_flag.builtin_collision", result.diagnostics[1].code);
     try std.testing.expectEqualStrings("extension_flag.owner_collision", result.diagnostics[2].code);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "collides with a built-in option") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[1].message, "--webview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[1].message, "--print") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[2].message, "collides with another extension flag owner") != null);
 }
