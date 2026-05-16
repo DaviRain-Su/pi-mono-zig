@@ -243,6 +243,51 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						body: bodyJson,
 						signal: options?.signal,
 					});
+					await options?.onResponse?.(
+						{ status: response.status, headers: headersToRecord(response.headers) },
+						model,
+					);
+
+					if (response.ok) {
+						break;
+					}
+
+					const errorText = await response.text();
+					if (attempt < MAX_RETRIES && isRetryableError(response.status, errorText)) {
+						let delayMs = BASE_DELAY_MS * 2 ** attempt;
+
+						const retryAfterMs = response.headers.get("retry-after-ms");
+						if (retryAfterMs !== null) {
+							const millis = Number(retryAfterMs);
+							if (Number.isFinite(millis)) {
+								delayMs = Math.max(0, millis);
+							}
+						} else {
+							const retryAfter = response.headers.get("retry-after");
+							if (retryAfter) {
+								const seconds = Number(retryAfter);
+								if (Number.isFinite(seconds)) {
+									delayMs = Math.max(0, seconds * 1000);
+								} else {
+									const date = Date.parse(retryAfter);
+									if (!Number.isNaN(date)) {
+										delayMs = Math.max(0, date - Date.now());
+									}
+								}
+							}
+						}
+
+						await sleep(delayMs, options?.signal);
+						continue;
+					}
+
+					// Parse error for friendly message on final attempt or non-retryable error
+					const fakeResponse = new Response(errorText, {
+						status: response.status,
+						statusText: response.statusText,
+					});
+					const info = await parseErrorResponse(fakeResponse);
+					throw new Error(info.friendlyMessage || info.message);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -258,27 +303,6 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 					}
 					throw lastError;
 				}
-
-				await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-
-				if (response.ok) {
-					break;
-				}
-
-				const errorText = await response.text();
-				if (attempt < MAX_RETRIES && isRetryableError(response.status, errorText)) {
-					const delayMs = BASE_DELAY_MS * 2 ** attempt;
-					await sleep(delayMs, options?.signal);
-					continue;
-				}
-
-				// Parse error for friendly message on final attempt or non-retryable error
-				const fakeResponse = new Response(errorText, {
-					status: response.status,
-					statusText: response.statusText,
-				});
-				const info = await parseErrorResponse(fakeResponse);
-				throw new Error(info.friendlyMessage || info.message);
 			}
 
 			if (!response?.ok) {
