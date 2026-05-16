@@ -103,6 +103,294 @@ pub fn buildRequestPayload(
     return buildRequestPayloadWithCacheRetentionEnv(allocator, model, context, options, processCacheRetentionEnv());
 }
 
+// =============================================================================
+// Outer-envelope payload struct for OpenAI chat completions API
+// (and OpenAI-compatible providers — many flavors via OpenAICompat matrix).
+//
+// `messages` and `tools` are kept as std.json.Value passthroughs because
+// the Anthropic-on-OpenRouter cache_control surgery
+// (applyCacheControlOnArrays) mutates individual blocks/items in those
+// Value subtrees. The surgery now runs BEFORE struct assembly so the
+// passthrough Values reach the serializer already-mutated and the
+// serializer is single-pass (no parse+remutate+restringify).
+//
+// The 5-branch thinking_format conditional (zai/qwen, qwen-chat-template,
+// deepseek, openrouter, together, plus plain reasoning_effort) maps onto
+// optional struct fields where each branch sets the 1-2 fields it cares
+// about; the rest stay null and are skipped via emit_null_optional_fields.
+// =============================================================================
+
+const ChatRequestPayload = struct {
+    model: []const u8,
+    messages: std.json.Value, // passthrough Array (already cache_control-patched)
+    stream: bool = true,
+    stream_options: ?StreamOptionsField = null,
+    store: ?bool = null,
+    prompt_cache_key: ?[]const u8 = null,
+    temperature: ?f32 = null,
+    // Only one of max_tokens / max_completion_tokens is non-null at a time
+    // (mutual exclusion enforced by buildOwnedChat via compat.max_tokens_field).
+    max_tokens: ?u64 = null,
+    max_completion_tokens: ?u64 = null,
+    tool_choice: ?std.json.Value = null,
+    prompt_cache_retention: ?[]const u8 = null,
+    tools: ?std.json.Value = null,
+    tool_stream: ?bool = null,
+    // Reasoning shape variants — at most a few are non-null per request:
+    enable_thinking: ?bool = null,
+    chat_template_kwargs: ?QwenChatTemplateKwargs = null,
+    thinking: ?DeepseekThinking = null,
+    reasoning_effort: ?[]const u8 = null,
+    reasoning: ?std.json.Value = null, // openrouter / together — already shaped
+    // Routing variants:
+    provider: ?std.json.Value = null, // openrouter routing block (cloned)
+    providerOptions: ?std.json.Value = null, // vercel gateway routing block (built)
+};
+
+const StreamOptionsField = struct { include_usage: bool };
+const QwenChatTemplateKwargs = struct { enable_thinking: bool, preserve_thinking: bool };
+const DeepseekThinking = struct { type: []const u8 };
+
+const ChatOwned = struct {
+    allocator: std.mem.Allocator,
+    payload: ChatRequestPayload,
+    owned_values: []std.json.Value,
+
+    fn deinit(self: ChatOwned) void {
+        for (self.owned_values) |v| provider_json.freeValue(self.allocator, v);
+        self.allocator.free(self.owned_values);
+    }
+};
+
+fn buildOwnedChat(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) !ChatOwned {
+    var owned_values_list = std.ArrayList(std.json.Value).empty;
+    errdefer {
+        for (owned_values_list.items) |v| provider_json.freeValue(allocator, v);
+        owned_values_list.deinit(allocator);
+    }
+
+    const compat = getCompat(model);
+    const cache_retention = resolveOptionsCacheRetention(options, pi_cache_retention_env);
+    const has_tool_history = hasToolHistory(context.messages);
+
+    // Build messages Array (Value passthrough).
+    const messages_array = try buildMessages(allocator, model, context, compat);
+    errdefer provider_json.freeValue(allocator, .{ .array = messages_array });
+    var messages_value: std.json.Value = .{ .array = messages_array };
+
+    // Build tools Array (Value passthrough), if applicable.
+    var tools_value: ?std.json.Value = null;
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            var arr = std.json.Array.init(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .array = arr });
+            for (tools) |tool| try arr.append(try buildToolObject(allocator, tool, compat));
+            tools_value = .{ .array = arr };
+        } else if (has_tool_history) {
+            tools_value = .{ .array = std.json.Array.init(allocator) };
+        }
+    } else if (has_tool_history) {
+        tools_value = .{ .array = std.json.Array.init(allocator) };
+    }
+    errdefer if (tools_value) |tv| provider_json.freeValue(allocator, tv);
+
+    // Apply cache_control mutations on the messages/tools Arrays BEFORE
+    // they are handed to the serializer (mirrors the legacy
+    // applyAnthropicCacheControl payload-walk, but operating on the
+    // subtrees directly so we stay single-pass).
+    if (try buildCompatCacheControl(allocator, compat, cache_retention)) |cache_control| {
+        defer provider_json.freeValue(allocator, cache_control);
+        if (messages_value == .array) {
+            try addCacheControlToInstructionMessage(allocator, &messages_value.array, cache_control);
+            try addCacheControlToLastConversationMessage(allocator, &messages_value.array, cache_control);
+        }
+        if (tools_value) |tv| {
+            if (tv == .array and tv.array.items.len > 0) {
+                const last_tool = &tv.array.items[tv.array.items.len - 1];
+                if (last_tool.* == .object) {
+                    try putJsonObjectFieldReplacing(allocator, &last_tool.object, "cache_control", try provider_json.cloneValue(allocator, cache_control));
+                }
+            }
+        }
+    }
+
+    // Record subtrees as owned so deinit() releases them.
+    try owned_values_list.append(allocator, messages_value);
+    if (tools_value) |tv| try owned_values_list.append(allocator, tv);
+
+    // Common (compat-driven) fields.
+    var stream_options_field: ?StreamOptionsField = null;
+    if (compat.supports_usage_in_streaming) stream_options_field = .{ .include_usage = true };
+    var store: ?bool = null;
+    if (compat.supports_store) store = false;
+    const tool_stream: ?bool = if (tools_value != null and tools_value.?.array.items.len > 0 and compat.zai_tool_stream) true else null;
+
+    // Option-driven fields.
+    var prompt_cache_key: ?[]const u8 = null;
+    var prompt_cache_retention: ?[]const u8 = null;
+    var temperature: ?f32 = null;
+    var max_tokens: ?u64 = null;
+    var max_completion_tokens: ?u64 = null;
+    var tool_choice_owned: ?std.json.Value = null;
+
+    if (options) |opts| {
+        if (opts.session_id) |session_id| {
+            if ((std.mem.indexOf(u8, model.base_url, "api.openai.com") != null and cache_retention != .none) or
+                (cache_retention == .long and compat.supports_long_cache_retention))
+            {
+                prompt_cache_key = session_id;
+            }
+        }
+        if (opts.temperature) |t| temperature = t;
+        if (opts.max_tokens) |m| {
+            if (std.mem.eql(u8, compat.max_tokens_field, "max_tokens")) {
+                max_tokens = m;
+            } else {
+                max_completion_tokens = m;
+            }
+        }
+        const openai_opts = opts.providerOptions("openai");
+        if (openai_opts.tool_choice) |tc| {
+            const tcv = try provider_json.cloneValue(allocator, tc);
+            try owned_values_list.append(allocator, tcv);
+            tool_choice_owned = tcv;
+        }
+    }
+    if (cache_retention == .long and compat.supports_long_cache_retention) {
+        prompt_cache_retention = "24h";
+    }
+
+    // Reasoning fields (5-branch dispatch on compat.thinking_format).
+    var enable_thinking_field: ?bool = null;
+    var chat_template_kwargs: ?QwenChatTemplateKwargs = null;
+    var thinking_field: ?DeepseekThinking = null;
+    var reasoning_effort: ?[]const u8 = null;
+    var reasoning_owned: ?std.json.Value = null;
+
+    if (model.reasoning) {
+        const openai_opts = if (options) |opts| opts.providerOptions("openai") else types.OpenAIChatStreamOptions{};
+        const effort = openai_opts.reasoning_effort;
+        if (std.mem.eql(u8, compat.thinking_format, "zai") or std.mem.eql(u8, compat.thinking_format, "qwen")) {
+            enable_thinking_field = (effort != null);
+        } else if (std.mem.eql(u8, compat.thinking_format, "qwen-chat-template")) {
+            chat_template_kwargs = .{ .enable_thinking = (effort != null), .preserve_thinking = true };
+        } else if (std.mem.eql(u8, compat.thinking_format, "deepseek")) {
+            thinking_field = .{ .type = if (effort != null) "enabled" else "disabled" };
+            if (effort) |value| reasoning_effort = value;
+        } else if (std.mem.eql(u8, compat.thinking_format, "openrouter")) {
+            var reasoning_obj = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = reasoning_obj });
+            const value = effort orelse "none";
+            try putStringValue(allocator, &reasoning_obj, "effort", value);
+            const rv: std.json.Value = .{ .object = reasoning_obj };
+            try owned_values_list.append(allocator, rv);
+            reasoning_owned = rv;
+        } else if (std.mem.eql(u8, compat.thinking_format, "together")) {
+            var reasoning_obj = try provider_json.initObject(allocator);
+            errdefer provider_json.freeValue(allocator, .{ .object = reasoning_obj });
+            try putBoolValue(allocator, &reasoning_obj, "enabled", effort != null);
+            const rv: std.json.Value = .{ .object = reasoning_obj };
+            try owned_values_list.append(allocator, rv);
+            reasoning_owned = rv;
+            if (effort) |value| {
+                if (compat.supports_reasoning_effort) {
+                    reasoning_effort = mappedReasoningEffort(model, value);
+                }
+            }
+        } else if (effort) |value| {
+            if (compat.supports_reasoning_effort) reasoning_effort = value;
+        }
+    }
+
+    // Routing fields.
+    var provider_owned: ?std.json.Value = null;
+    var provider_options_owned: ?std.json.Value = null;
+    if (std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null) {
+        if (compat.open_router_routing) |routing| {
+            const cloned = try provider_json.cloneValue(allocator, routing);
+            try owned_values_list.append(allocator, cloned);
+            provider_owned = cloned;
+        }
+    }
+    if (std.mem.indexOf(u8, model.base_url, "ai-gateway.vercel.sh") != null) {
+        if (compat.vercel_gateway_routing) |routing| {
+            if (routing == .object and (routing.object.get("only") != null or routing.object.get("order") != null)) {
+                var provider_options = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = provider_options });
+                var gateway = try provider_json.initObject(allocator);
+                errdefer provider_json.freeValue(allocator, .{ .object = gateway });
+                if (routing.object.get("only")) |only| {
+                    try putObjectValue(allocator, &gateway, "only", try provider_json.cloneValue(allocator, only));
+                }
+                if (routing.object.get("order")) |order| {
+                    try putObjectValue(allocator, &gateway, "order", try provider_json.cloneValue(allocator, order));
+                }
+                try putObjectValue(allocator, &provider_options, "gateway", .{ .object = gateway });
+                const pv: std.json.Value = .{ .object = provider_options };
+                try owned_values_list.append(allocator, pv);
+                provider_options_owned = pv;
+            }
+        }
+    }
+
+    const owned_values_slice = try owned_values_list.toOwnedSlice(allocator);
+
+    return .{
+        .allocator = allocator,
+        .payload = .{
+            .model = model.id,
+            .messages = messages_value,
+            .stream_options = stream_options_field,
+            .store = store,
+            .prompt_cache_key = prompt_cache_key,
+            .temperature = temperature,
+            .max_tokens = max_tokens,
+            .max_completion_tokens = max_completion_tokens,
+            .tool_choice = tool_choice_owned,
+            .prompt_cache_retention = prompt_cache_retention,
+            .tools = tools_value,
+            .tool_stream = tool_stream,
+            .enable_thinking = enable_thinking_field,
+            .chat_template_kwargs = chat_template_kwargs,
+            .thinking = thinking_field,
+            .reasoning_effort = reasoning_effort,
+            .reasoning = reasoning_owned,
+            .provider = provider_owned,
+            .providerOptions = provider_options_owned,
+        },
+        .owned_values = owned_values_slice,
+    };
+}
+
+pub fn buildPayloadJsonBytes(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+) ![]u8 {
+    return buildPayloadJsonBytesWithCacheRetentionEnv(allocator, model, context, options, processCacheRetentionEnv());
+}
+
+pub fn buildPayloadJsonBytesWithCacheRetentionEnv(
+    allocator: std.mem.Allocator,
+    model: types.Model,
+    context: types.Context,
+    options: ?types.StreamOptions,
+    pi_cache_retention_env: ?[]const u8,
+) ![]u8 {
+    var owned = try buildOwnedChat(allocator, model, context, options, pi_cache_retention_env);
+    defer owned.deinit();
+    return try std.json.Stringify.valueAlloc(allocator, owned.payload, .{
+        .emit_null_optional_fields = false,
+    });
+}
+
 pub fn buildRequestPayloadWithCacheRetentionEnv(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -110,33 +398,11 @@ pub fn buildRequestPayloadWithCacheRetentionEnv(
     options: ?types.StreamOptions,
     pi_cache_retention_env: ?[]const u8,
 ) !std.json.Value {
-    const compat = getCompat(model);
-    const cache_retention = resolveOptionsCacheRetention(options, pi_cache_retention_env);
-    var messages = try buildMessages(allocator, model, context, compat);
-    errdefer messages.deinit();
-
-    const has_tool_history = hasToolHistory(context.messages);
-
-    var payload = try provider_json.initObject(allocator);
-    errdefer provider_json.freeValue(allocator, .{ .object = payload });
-
-    try putStringValue(allocator, &payload, "model", model.id);
-    try putObjectValue(allocator, &payload, "messages", .{ .array = messages });
-    try putBoolValue(allocator, &payload, "stream", true);
-
-    try appendCommonPayloadFields(allocator, &payload, compat);
-    try appendOptionPayloadFields(allocator, &payload, model, compat, cache_retention, options);
-    try appendToolPayloadFields(allocator, &payload, context, compat, has_tool_history);
-
-    if (try buildCompatCacheControl(allocator, compat, cache_retention)) |cache_control| {
-        defer provider_json.freeValue(allocator, cache_control);
-        try applyAnthropicCacheControl(allocator, &payload, cache_control);
-    }
-
-    try appendReasoningPayloadFields(allocator, &payload, model, compat, options);
-    try appendRoutingPayloadFields(allocator, &payload, model, compat);
-
-    return std.json.Value{ .object = payload };
+    const bytes = try buildPayloadJsonBytesWithCacheRetentionEnv(allocator, model, context, options, pi_cache_retention_env);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    return try provider_json.cloneValue(allocator, parsed.value);
 }
 
 fn buildMessages(
@@ -198,148 +464,6 @@ fn buildMessages(
     return messages;
 }
 
-fn appendCommonPayloadFields(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    compat: OpenAICompat,
-) !void {
-    if (compat.supports_usage_in_streaming) {
-        const stream_options_value: std.json.Value = blk: {
-            var stream_options = try provider_json.initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = stream_options });
-            try putBoolValue(allocator, &stream_options, "include_usage", true);
-            break :blk .{ .object = stream_options };
-        };
-        try putObjectValue(allocator, payload, "stream_options", stream_options_value);
-    }
-
-    if (compat.supports_store) {
-        try putBoolValue(allocator, payload, "store", false);
-    }
-}
-
-fn appendOptionPayloadFields(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    model: types.Model,
-    compat: OpenAICompat,
-    cache_retention: types.CacheRetention,
-    options: ?types.StreamOptions,
-) !void {
-    if (options) |opts| {
-        if (opts.session_id) |session_id| {
-            if ((std.mem.indexOf(u8, model.base_url, "api.openai.com") != null and cache_retention != .none) or
-                (cache_retention == .long and compat.supports_long_cache_retention))
-            {
-                try putStringValue(allocator, payload, "prompt_cache_key", session_id);
-            }
-        }
-        if (opts.temperature) |temp| {
-            try putFloatValue(allocator, payload, "temperature", temp);
-        }
-        if (opts.max_tokens) |max| {
-            const field = if (std.mem.eql(u8, compat.max_tokens_field, "max_tokens")) "max_tokens" else "max_completion_tokens";
-            try putIntegerValue(allocator, payload, field, max);
-        }
-        const openai_opts = opts.providerOptions("openai");
-        if (openai_opts.tool_choice) |tool_choice| {
-            try putObjectValue(allocator, payload, "tool_choice", try provider_json.cloneValue(allocator, tool_choice));
-        }
-    }
-
-    if (cache_retention == .long and compat.supports_long_cache_retention) {
-        try putStringValue(allocator, payload, "prompt_cache_retention", "24h");
-    }
-}
-
-fn appendToolPayloadFields(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    context: types.Context,
-    compat: OpenAICompat,
-    has_tool_history: bool,
-) !void {
-    if (context.tools) |tools| {
-        if (tools.len > 0) {
-            var tools_array = std.json.Array.init(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .array = tools_array });
-            for (tools) |tool| {
-                try tools_array.append(try buildToolObject(allocator, tool, compat));
-            }
-            try putObjectValue(allocator, payload, "tools", .{ .array = tools_array });
-            if (compat.zai_tool_stream) {
-                try putBoolValue(allocator, payload, "tool_stream", true);
-            }
-        } else if (has_tool_history) {
-            try putObjectValue(allocator, payload, "tools", .{ .array = std.json.Array.init(allocator) });
-        }
-    } else if (has_tool_history) {
-        try putObjectValue(allocator, payload, "tools", .{ .array = std.json.Array.init(allocator) });
-    }
-}
-
-fn appendReasoningPayloadFields(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    model: types.Model,
-    compat: OpenAICompat,
-    options: ?types.StreamOptions,
-) !void {
-    if (model.reasoning) {
-        const openai_opts = if (options) |opts| opts.providerOptions("openai") else types.OpenAIChatStreamOptions{};
-        const effort = openai_opts.reasoning_effort;
-        if (std.mem.eql(u8, compat.thinking_format, "zai") or std.mem.eql(u8, compat.thinking_format, "qwen")) {
-            try putBoolValue(allocator, payload, "enable_thinking", effort != null);
-        } else if (std.mem.eql(u8, compat.thinking_format, "qwen-chat-template")) {
-            const template_kwargs_value: std.json.Value = blk: {
-                var template_kwargs = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = template_kwargs });
-                try putBoolValue(allocator, &template_kwargs, "enable_thinking", effort != null);
-                try putBoolValue(allocator, &template_kwargs, "preserve_thinking", true);
-                break :blk .{ .object = template_kwargs };
-            };
-            try putObjectValue(allocator, payload, "chat_template_kwargs", template_kwargs_value);
-        } else if (std.mem.eql(u8, compat.thinking_format, "deepseek")) {
-            const thinking_value: std.json.Value = blk: {
-                var thinking = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = thinking });
-                try putStringValue(allocator, &thinking, "type", if (effort != null) "enabled" else "disabled");
-                break :blk .{ .object = thinking };
-            };
-            try putObjectValue(allocator, payload, "thinking", thinking_value);
-            if (effort) |value| {
-                try putStringValue(allocator, payload, "reasoning_effort", value);
-            }
-        } else if (std.mem.eql(u8, compat.thinking_format, "openrouter")) {
-            const reasoning_value: std.json.Value = blk: {
-                var reasoning = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                const value = effort orelse "none";
-                try putStringValue(allocator, &reasoning, "effort", value);
-                break :blk .{ .object = reasoning };
-            };
-            try putObjectValue(allocator, payload, "reasoning", reasoning_value);
-        } else if (std.mem.eql(u8, compat.thinking_format, "together")) {
-            const reasoning_value: std.json.Value = blk: {
-                var reasoning = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = reasoning });
-                try putBoolValue(allocator, &reasoning, "enabled", effort != null);
-                break :blk .{ .object = reasoning };
-            };
-            try putObjectValue(allocator, payload, "reasoning", reasoning_value);
-            if (effort) |value| {
-                if (compat.supports_reasoning_effort) {
-                    try putStringValue(allocator, payload, "reasoning_effort", mappedReasoningEffort(model, value));
-                }
-            }
-        } else if (effort) |value| {
-            if (compat.supports_reasoning_effort) {
-                try putStringValue(allocator, payload, "reasoning_effort", value);
-            }
-        }
-    }
-}
-
 fn mappedReasoningEffort(model: types.Model, effort: []const u8) []const u8 {
     const level = modelThinkingLevel(effort) orelse return effort;
     const map = model.thinking_level_map orelse return effort;
@@ -360,44 +484,6 @@ fn modelThinkingLevel(effort: []const u8) ?types.ModelThinkingLevel {
     return null;
 }
 
-fn appendRoutingPayloadFields(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    model: types.Model,
-    compat: OpenAICompat,
-) !void {
-    if (std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null) {
-        if (compat.open_router_routing) |routing| {
-            try putObjectValue(allocator, payload, "provider", try provider_json.cloneValue(allocator, routing));
-        }
-    }
-
-    if (std.mem.indexOf(u8, model.base_url, "ai-gateway.vercel.sh") != null) {
-        if (compat.vercel_gateway_routing) |routing| {
-            if (routing == .object and (routing.object.get("only") != null or routing.object.get("order") != null)) {
-                const provider_options_value: std.json.Value = blk: {
-                    var provider_options = try provider_json.initObject(allocator);
-                    errdefer provider_json.freeValue(allocator, .{ .object = provider_options });
-                    const gateway_value: std.json.Value = inner: {
-                        var gateway = try provider_json.initObject(allocator);
-                        errdefer provider_json.freeValue(allocator, .{ .object = gateway });
-                        if (routing.object.get("only")) |only| {
-                            try putObjectValue(allocator, &gateway, "only", try provider_json.cloneValue(allocator, only));
-                        }
-                        if (routing.object.get("order")) |order| {
-                            try putObjectValue(allocator, &gateway, "order", try provider_json.cloneValue(allocator, order));
-                        }
-                        break :inner .{ .object = gateway };
-                    };
-                    try putObjectValue(allocator, &provider_options, "gateway", gateway_value);
-                    break :blk .{ .object = provider_options };
-                };
-                try putObjectValue(allocator, payload, "providerOptions", provider_options_value);
-            }
-        }
-    }
-}
-
 fn buildCompatCacheControl(
     allocator: std.mem.Allocator,
     compat: OpenAICompat,
@@ -413,28 +499,6 @@ fn buildCompatCacheControl(
         try putStringValue(allocator, &object, "ttl", "1h");
     }
     return .{ .object = object };
-}
-
-fn applyAnthropicCacheControl(
-    allocator: std.mem.Allocator,
-    payload: *std.json.ObjectMap,
-    cache_control: std.json.Value,
-) !void {
-    if (payload.getPtr("messages")) |messages_value| {
-        if (messages_value.* == .array) {
-            try addCacheControlToInstructionMessage(allocator, &messages_value.array, cache_control);
-            try addCacheControlToLastConversationMessage(allocator, &messages_value.array, cache_control);
-        }
-    }
-
-    if (payload.getPtr("tools")) |tools_value| {
-        if (tools_value.* == .array and tools_value.array.items.len > 0) {
-            const last_tool = &tools_value.array.items[tools_value.array.items.len - 1];
-            if (last_tool.* == .object) {
-                try putJsonObjectFieldReplacing(allocator, &last_tool.object, "cache_control", try provider_json.cloneValue(allocator, cache_control));
-            }
-        }
-    }
 }
 
 fn addCacheControlToInstructionMessage(
