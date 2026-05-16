@@ -1,9 +1,0 @@
-[package]
-name = "pi-zig-sys"
-version = "0.1.0"
-edition = "2021"
-links = "pi_zig_kernel"
-build = "build.rs"
-
-[lib]
-path = "src/lib.rs"
