@@ -4,7 +4,12 @@ const http_client = @import("../http_client.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_json_put = @import("../shared/provider_json_put.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
+
+const putBoolValue = provider_json_put.putBoolValue;
+const putStringValue = provider_json_put.putStringValue;
+const putObjectValue = provider_json_put.putObjectValue;
 const resolve_api_key = @import("../shared/resolve_api_key.zig");
 const shared_url = @import("../shared/url.zig");
 const cloudflare = @import("cloudflare.zig");
@@ -285,19 +290,21 @@ pub fn buildRequestSnapshotValueWithCacheRetentionEnv(
     var headers = try buildRequestHeadersWithCacheRetentionEnv(allocator, model, options, pi_cache_retention_env);
     defer provider_stream.deinitOwnedHeaders(allocator, &headers);
 
-    var snapshot = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer snapshot.deinit(allocator);
+    // Use provider_json.freeValue (full deep-free) instead of snapshot.deinit
+    // (shallow map-only deinit) so duped keys + string values cannot leak.
+    var snapshot = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = snapshot });
 
     const request_target = try buildOpenAIChatRequestTarget(allocator, model.base_url);
     defer request_target.deinit(allocator);
 
-    try snapshot.put(allocator, try allocator.dupe(u8, "baseUrl"), std.json.Value{ .string = try allocator.dupe(u8, model.base_url) });
-    try snapshot.put(allocator, try allocator.dupe(u8, "headers"), .{ .object = try normalizeSemanticHeaders(allocator, headers) });
-    try snapshot.put(allocator, try allocator.dupe(u8, "jsonPayload"), payload);
+    try putStringValue(allocator, &snapshot, "baseUrl", model.base_url);
+    try putObjectValue(allocator, &snapshot, "headers", .{ .object = try normalizeSemanticHeaders(allocator, headers) });
+    try putObjectValue(allocator, &snapshot, "jsonPayload", payload);
     payload = .null;
-    try snapshot.put(allocator, try allocator.dupe(u8, "method"), std.json.Value{ .string = try allocator.dupe(u8, "POST") });
-    try snapshot.put(allocator, try allocator.dupe(u8, "path"), std.json.Value{ .string = try allocator.dupe(u8, request_target.path) });
-    try snapshot.put(allocator, try allocator.dupe(u8, "url"), std.json.Value{ .string = try allocator.dupe(u8, request_target.url) });
+    try putStringValue(allocator, &snapshot, "method", "POST");
+    try putStringValue(allocator, &snapshot, "path", request_target.path);
+    try putStringValue(allocator, &snapshot, "url", request_target.url);
 
     return .{ .object = snapshot };
 }
@@ -473,7 +480,7 @@ test "buildRequestPayload with tools" {
 
     var tool_schema = std.json.Value{ .object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{}) };
     defer provider_json.freeValue(allocator, tool_schema);
-    try tool_schema.object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "object") });
+    try putStringValue(allocator, &tool_schema.object, "type", "object");
 
     const tools = &[_]types.Tool{
         .{
@@ -505,7 +512,7 @@ test "buildRequestPayload with tools" {
 
     const schema_type = tool_schema.object.get("type").?;
     try std.testing.expectEqualStrings("object", schema_type.string);
-    try tool_schema.object.put(allocator, try allocator.dupe(u8, "required"), .{ .array = std.json.Array.init(allocator) });
+    try putObjectValue(allocator, &tool_schema.object, "required", .{ .array = std.json.Array.init(allocator) });
 }
 
 test "buildRequestPayload with image content" {
@@ -789,8 +796,8 @@ test "buildRequestPayload uses production cache retention resolver for prompt ca
 test "buildRequestHeaders uses production cache retention resolver for session affinity" {
     const allocator = std.testing.allocator;
 
-    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try compat.put(allocator, try allocator.dupe(u8, "sendSessionAffinityHeaders"), .{ .bool = true });
+    var compat = try provider_json.initObject(allocator);
+    try putBoolValue(allocator, &compat, "sendSessionAffinityHeaders", true);
     const compat_value = std.json.Value{ .object = compat };
     defer provider_json.freeValue(allocator, compat_value);
 
@@ -828,8 +835,8 @@ test "buildRequestHeaders uses production cache retention resolver for session a
 test "buildRequestPayload uses production cache retention resolver for Anthropic cache control" {
     const allocator = std.testing.allocator;
 
-    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try compat.put(allocator, try allocator.dupe(u8, "cacheControlFormat"), .{ .string = try allocator.dupe(u8, "anthropic") });
+    var compat = try provider_json.initObject(allocator);
+    try putStringValue(allocator, &compat, "cacheControlFormat", "anthropic");
     const compat_value = std.json.Value{ .object = compat };
     defer provider_json.freeValue(allocator, compat_value);
 
@@ -966,9 +973,9 @@ test "buildRequestPayload omits empty tools array" {
 test "buildAssistantMessage separates thinking from text" {
     const allocator = std.testing.allocator;
 
-    var compat = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    try compat.put(allocator, try allocator.dupe(u8, "requiresThinkingAsText"), .{ .bool = false });
-    try compat.put(allocator, try allocator.dupe(u8, "requiresReasoningContentOnAssistantMessages"), .{ .bool = true });
+    var compat = try provider_json.initObject(allocator);
+    try putBoolValue(allocator, &compat, "requiresThinkingAsText", false);
+    try putBoolValue(allocator, &compat, "requiresReasoningContentOnAssistantMessages", true);
     const compat_value = std.json.Value{ .object = compat };
     defer provider_json.freeValue(allocator, compat_value);
 
@@ -1300,10 +1307,10 @@ const OnPayloadReplacement = struct {
         try std.testing.expect(payload == .object);
         try std.testing.expect(payload.object.get("messages") != null);
 
-        var replacement = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-        errdefer replacement.deinit(allocator);
-        try replacement.put(allocator, try allocator.dupe(u8, "fixture_marker"), .{ .string = try allocator.dupe(u8, "replacement") });
-        try replacement.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
+        var replacement = try provider_json.initObject(allocator);
+        errdefer provider_json.freeValue(allocator, .{ .object = replacement });
+        try putStringValue(allocator, &replacement, "fixture_marker", "replacement");
+        try putBoolValue(allocator, &replacement, "stream", true);
         return .{ .object = replacement };
     }
 };

@@ -17,6 +17,7 @@ const json_parse = @import("../json_parse.zig");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const openai_usage = @import("../shared/openai_usage.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 
@@ -720,6 +721,9 @@ fn parseStreamingJsonToValue(allocator: std.mem.Allocator, input: []const u8) !s
     return provider_json.cloneValue(allocator, parsed.value);
 }
 
+/// Thin wrapper preserving the legacy `(allocator, value, model)` signature.
+/// Both `allocator` and `model` were unused; new callers should use
+/// `openai_usage.parseChatUsage` directly.
 pub fn parseChunkUsage(
     allocator: std.mem.Allocator,
     usage_val: std.json.Value,
@@ -727,77 +731,7 @@ pub fn parseChunkUsage(
 ) types.Usage {
     _ = allocator;
     _ = model;
-
-    var usage = types.Usage.init();
-
-    if (usage_val != .object) return usage;
-
-    const prompt_tokens = if (usage_val.object.get("prompt_tokens")) |v|
-        if (v == .integer) @as(u32, @intCast(v.integer)) else @as(u32, 0)
-    else
-        @as(u32, 0);
-
-    const completion_tokens = if (usage_val.object.get("completion_tokens")) |v|
-        if (v == .integer) @as(u32, @intCast(v.integer)) else @as(u32, 0)
-    else
-        @as(u32, 0);
-
-    // Resolve cached token source matching TypeScript precedence:
-    // prompt_tokens_details.cached_tokens ?? prompt_cache_hit_tokens ?? 0
-    // A boolean flag is needed because cached_tokens=0 is a valid explicit value
-    // that must not trigger the fallback (matching TS nullish coalescing semantics).
-    var reported_cached_tokens: u32 = 0;
-    var found_cached_tokens = false;
-    var cache_write_tokens: u32 = 0;
-
-    if (usage_val.object.get("prompt_tokens_details")) |details| {
-        if (details == .object) {
-            if (details.object.get("cached_tokens")) |ct| {
-                if (ct == .integer) {
-                    reported_cached_tokens = @as(u32, @intCast(ct.integer));
-                    found_cached_tokens = true;
-                }
-            }
-            if (details.object.get("cache_write_tokens")) |cwt| {
-                if (cwt == .integer) cache_write_tokens = @as(u32, @intCast(cwt.integer));
-            }
-        }
-    }
-
-    // Fallback: prompt_cache_hit_tokens when prompt_tokens_details.cached_tokens
-    // is absent. This matches TypeScript:
-    // rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0
-    if (!found_cached_tokens) {
-        if (usage_val.object.get("prompt_cache_hit_tokens")) |pcht| {
-            if (pcht == .integer) reported_cached_tokens = @as(u32, @intCast(pcht.integer));
-        }
-    }
-
-    if (usage_val.object.get("completion_tokens_details")) |details| {
-        if (details == .object) {
-            _ = details.object.get("reasoning_tokens");
-        }
-    }
-
-    // Follow documented OpenAI/OpenRouter semantics: cached_tokens is cache-read
-    // tokens (hits). OpenAI does not document or emit cache_write_tokens, but
-    // OpenRouter-compatible providers can include it as a separate write count.
-    // Do not subtract writes from cached_tokens; otherwise spec-compliant
-    // providers are under-reported.
-    const cache_read = reported_cached_tokens;
-
-    // Saturating subtraction: when cache tokens exceed prompt_tokens, clamp input to zero.
-    const cache_total = cache_read + cache_write_tokens;
-    const input = if (cache_total >= prompt_tokens) @as(u32, 0) else prompt_tokens - cache_total;
-    const output = completion_tokens;
-
-    usage.input = input;
-    usage.output = output;
-    usage.cache_read = cache_read;
-    usage.cache_write = cache_write_tokens;
-    usage.total_tokens = input + output + cache_read + cache_write_tokens;
-
-    return usage;
+    return openai_usage.parseChatUsage(usage_val);
 }
 
 pub fn mapStopReason(

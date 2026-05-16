@@ -53,9 +53,6 @@ pub const ModelThinkingLevelMap = struct {
     }
 };
 
-pub const ThinkingLevelMapEntry = ThinkingLevelMapping;
-pub const ThinkingLevelMap = ModelThinkingLevelMap;
-
 pub const AnthropicEffort = enum {
     low,
     medium,

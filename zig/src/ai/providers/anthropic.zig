@@ -8,7 +8,14 @@ const event_stream = @import("../event_stream.zig");
 const finalize = @import("../shared/finalize.zig");
 const provider_error = @import("../shared/provider_error.zig");
 const provider_json = @import("../shared/provider_json.zig");
+const provider_json_put = @import("../shared/provider_json_put.zig");
 const provider_stream = @import("../shared/provider_stream.zig");
+
+const putBoolValue = provider_json_put.putBoolValue;
+const putStringValue = provider_json_put.putStringValue;
+const putIntegerValue = provider_json_put.putIntegerValue;
+const putFloatValue = provider_json_put.putFloatValue;
+const putObjectValue = provider_json_put.putObjectValue;
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const shared_url = @import("../shared/url.zig");
@@ -230,16 +237,16 @@ pub fn buildRequestPayload(
     options: ?types.StreamOptions,
 ) !std.json.Value {
     const compat = getAnthropicCompat(model);
-    var payload = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-    errdefer payload.deinit(allocator);
+    var payload = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = payload });
 
-    try payload.put(allocator, try allocator.dupe(u8, "model"), .{ .string = try allocator.dupe(u8, model.id) });
-    try payload.put(
-        allocator,
-        try allocator.dupe(u8, "max_tokens"),
-        .{ .integer = @intCast(if (options) |stream_options| stream_options.max_tokens orelse (model.max_tokens / 3) else (model.max_tokens / 3)) },
-    );
-    try payload.put(allocator, try allocator.dupe(u8, "stream"), .{ .bool = true });
+    try putStringValue(allocator, &payload, "model", model.id);
+    const resolved_max_tokens = if (options) |stream_options|
+        stream_options.max_tokens orelse (model.max_tokens / 3)
+    else
+        (model.max_tokens / 3);
+    try putIntegerValue(allocator, &payload, "max_tokens", resolved_max_tokens);
+    try putBoolValue(allocator, &payload, "stream", true);
 
     const cache_retention = resolveOptionsCacheRetention(options);
     const cache_control = try buildCacheControl(allocator, compat, cache_retention);
@@ -248,54 +255,67 @@ pub fn buildRequestPayload(
     const is_oauth = usesAnthropicOAuth(model, if (options) |stream_options| stream_options.api_key orelse "" else "");
     const system_value = try buildSystemPromptValue(allocator, context.system_prompt, is_oauth, cache_control);
     if (system_value) |value| {
-        try payload.put(allocator, try allocator.dupe(u8, "system"), value);
+        try putObjectValue(allocator, &payload, "system", value);
     }
 
     const messages_value = try buildMessagesValue(allocator, context.messages, context.tools, is_oauth, cache_control);
-    try payload.put(allocator, try allocator.dupe(u8, "messages"), messages_value);
+    try putObjectValue(allocator, &payload, "messages", messages_value);
 
     if (context.tools) |tools| {
         const tool_cache_control = if (compat.supports_cache_control_on_tools) cache_control else null;
         const tools_value = try buildToolsValue(allocator, tools, is_oauth, compat.supports_eager_tool_input_streaming, tool_cache_control);
-        try payload.put(allocator, try allocator.dupe(u8, "tools"), tools_value);
+        try putObjectValue(allocator, &payload, "tools", tools_value);
     }
 
     if (options) |stream_options| {
         const anthropic_opts = stream_options.providerOptions("anthropic");
         if (stream_options.temperature) |temperature| {
             if (anthropic_opts.thinking_enabled != true) {
-                try payload.put(allocator, try allocator.dupe(u8, "temperature"), .{ .float = temperature });
+                try putFloatValue(allocator, &payload, "temperature", temperature);
             }
         }
 
         if (model.reasoning) {
             if (anthropic_opts.thinking_enabled == true) {
                 const display = anthropicThinkingDisplayString(anthropic_opts.thinking_display orelse .summarized);
-                var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
                 if (supportsAdaptiveThinking(model)) {
-                    try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "adaptive") });
-                    try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
-                    try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+                    const thinking_value: std.json.Value = blk: {
+                        var thinking = try provider_json.initObject(allocator);
+                        errdefer provider_json.freeValue(allocator, .{ .object = thinking });
+                        try putStringValue(allocator, &thinking, "type", "adaptive");
+                        try putStringValue(allocator, &thinking, "display", display);
+                        break :blk .{ .object = thinking };
+                    };
+                    try putObjectValue(allocator, &payload, "thinking", thinking_value);
 
                     if (anthropic_opts.effort) |effort| {
-                        var output_config = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                        try output_config.put(allocator, try allocator.dupe(u8, "effort"), .{ .string = try allocator.dupe(u8, anthropicEffortString(effort)) });
-                        try payload.put(allocator, try allocator.dupe(u8, "output_config"), .{ .object = output_config });
+                        const output_config_value: std.json.Value = blk: {
+                            var output_config = try provider_json.initObject(allocator);
+                            errdefer provider_json.freeValue(allocator, .{ .object = output_config });
+                            try putStringValue(allocator, &output_config, "effort", anthropicEffortString(effort));
+                            break :blk .{ .object = output_config };
+                        };
+                        try putObjectValue(allocator, &payload, "output_config", output_config_value);
                     }
                 } else {
-                    try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "enabled") });
-                    try thinking.put(
-                        allocator,
-                        try allocator.dupe(u8, "budget_tokens"),
-                        .{ .integer = @intCast(anthropic_opts.thinking_budget_tokens orelse 1024) },
-                    );
-                    try thinking.put(allocator, try allocator.dupe(u8, "display"), .{ .string = try allocator.dupe(u8, display) });
-                    try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+                    const thinking_value: std.json.Value = blk: {
+                        var thinking = try provider_json.initObject(allocator);
+                        errdefer provider_json.freeValue(allocator, .{ .object = thinking });
+                        try putStringValue(allocator, &thinking, "type", "enabled");
+                        try putIntegerValue(allocator, &thinking, "budget_tokens", anthropic_opts.thinking_budget_tokens orelse 1024);
+                        try putStringValue(allocator, &thinking, "display", display);
+                        break :blk .{ .object = thinking };
+                    };
+                    try putObjectValue(allocator, &payload, "thinking", thinking_value);
                 }
             } else if (anthropic_opts.thinking_enabled == false) {
-                var thinking = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                try thinking.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "disabled") });
-                try payload.put(allocator, try allocator.dupe(u8, "thinking"), .{ .object = thinking });
+                const thinking_value: std.json.Value = blk: {
+                    var thinking = try provider_json.initObject(allocator);
+                    errdefer provider_json.freeValue(allocator, .{ .object = thinking });
+                    try putStringValue(allocator, &thinking, "type", "disabled");
+                    break :blk .{ .object = thinking };
+                };
+                try putObjectValue(allocator, &payload, "thinking", thinking_value);
             }
         }
 
@@ -303,16 +323,21 @@ pub fn buildRequestPayload(
             if (metadata == .object) {
                 if (metadata.object.get("user_id")) |user_id| {
                     if (user_id == .string) {
-                        var metadata_obj = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
-                        try metadata_obj.put(allocator, try allocator.dupe(u8, "user_id"), .{ .string = try allocator.dupe(u8, user_id.string) });
-                        try payload.put(allocator, try allocator.dupe(u8, "metadata"), .{ .object = metadata_obj });
+                        const metadata_value: std.json.Value = blk: {
+                            var metadata_obj = try provider_json.initObject(allocator);
+                            errdefer provider_json.freeValue(allocator, .{ .object = metadata_obj });
+                            try putStringValue(allocator, &metadata_obj, "user_id", user_id.string);
+                            break :blk .{ .object = metadata_obj };
+                        };
+                        try putObjectValue(allocator, &payload, "metadata", metadata_value);
                     }
                 }
             }
         }
 
         if (anthropic_opts.tool_choice) |tool_choice| {
-            try payload.put(allocator, try allocator.dupe(u8, "tool_choice"), try buildToolChoiceValue(allocator, tool_choice, is_oauth));
+            const tool_choice_value = try buildToolChoiceValue(allocator, tool_choice, is_oauth);
+            try putObjectValue(allocator, &payload, "tool_choice", tool_choice_value);
         }
     }
 
@@ -366,18 +391,15 @@ fn buildToolChoiceValue(
     tool_choice: types.AnthropicToolChoice,
     is_oauth: bool,
 ) !std.json.Value {
-    var object = try std.json.ObjectMap.init(allocator, &[_][]const u8{}, &[_]std.json.Value{});
+    var object = try provider_json.initObject(allocator);
+    errdefer provider_json.freeValue(allocator, .{ .object = object });
     switch (tool_choice) {
-        .auto => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "auto") }),
-        .any => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "any") }),
-        .none => try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "none") }),
+        .auto => try putStringValue(allocator, &object, "type", "auto"),
+        .any => try putStringValue(allocator, &object, "type", "any"),
+        .none => try putStringValue(allocator, &object, "type", "none"),
         .tool => |name| {
-            try object.put(allocator, try allocator.dupe(u8, "type"), .{ .string = try allocator.dupe(u8, "tool") });
-            try object.put(
-                allocator,
-                try allocator.dupe(u8, "name"),
-                .{ .string = try allocator.dupe(u8, if (is_oauth) canonicalClaudeCodeToolName(name) else name) },
-            );
+            try putStringValue(allocator, &object, "type", "tool");
+            try putStringValue(allocator, &object, "name", if (is_oauth) canonicalClaudeCodeToolName(name) else name);
         },
     }
     return .{ .object = object };

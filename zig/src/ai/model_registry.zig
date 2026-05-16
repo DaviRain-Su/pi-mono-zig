@@ -862,7 +862,7 @@ fn thinkingLevelIndex(level: types.ModelThinkingLevel) usize {
 const TEXT_INPUTS = [_][]const u8{"text"};
 const TEXT_AND_IMAGE_INPUTS = [_][]const u8{ "text", "image" };
 
-const THINKING_MAP_OFF_UNSUPPORTED = types.ThinkingLevelMap{ .off = .unsupported };
+const THINKING_MAP_OFF_UNSUPPORTED = types.ModelThinkingLevelMap{ .off = .unsupported };
 
 const CURATED_PROVIDER_CONFIGS = [_]ProviderConfig{
     .{ .provider = "kimi", .api = "kimi-completions", .base_url = "https://api.moonshot.cn/v1", .default_model_id = "kimi-k2.6" },

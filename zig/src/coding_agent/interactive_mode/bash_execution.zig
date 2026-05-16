@@ -299,6 +299,11 @@ fn stripTrailingStatusPrefix(output: []const u8, status_prefix: []const u8) []co
 }
 
 fn stripAnsiAndNormalizeAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    // Fastest path: nothing to strip and nothing to normalize — single memcpy.
+    if (std.mem.indexOfAny(u8, text, &.{ 0x1b, 0x9b, '\r' }) == null) {
+        return try allocator.dupe(u8, text);
+    }
+
     // Fast path: ANSI codes require ESC (0x1B) or 8-bit CSI (0x9B).
     if (std.mem.indexOfScalar(u8, text, 0x1b) == null and std.mem.indexOfScalar(u8, text, 0x9b) == null) {
         // No ANSI introducers — only need to normalize CR.

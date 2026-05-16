@@ -33,13 +33,44 @@ const STATIC_BUILTINS = blk: {
     break :blk std.StaticStringMap(ApiProvider).initComptime(entries);
 };
 
+// Process-wide override table. Mutated at startup (provider registration) and
+// in tests; reads happen on every `ai.stream` call from any thread.
+//
+// Allocator choice: c_allocator gives small-grained heap allocations (the
+// override map is typically empty or holds <10 entries). The previous
+// page_allocator wasted a full page per HashMap grow.
+//
+// Init synchronization: `init_state` uses Acquire/Release ordering so a thread
+// that observes init_state == done can safely read `overrides`. The double-
+// checked pattern (cheap unsynchronized read in `get`) is safe because once
+// init_state transitions to done it never goes back.
+const InitState = enum(u8) { uninitialized = 0, initializing = 1, done = 2 };
+var init_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(InitState.uninitialized));
 var overrides: std.StringHashMap(ApiProvider) = undefined;
-var initialized = false;
 
 pub fn init() void {
-    if (initialized) return;
-    overrides = std.StringHashMap(ApiProvider).init(std.heap.page_allocator);
-    initialized = true;
+    if (init_state.load(.acquire) == @intFromEnum(InitState.done)) return;
+    // Race the .initializing slot. Loser spins until winner transitions to done.
+    if (init_state.cmpxchgStrong(
+        @intFromEnum(InitState.uninitialized),
+        @intFromEnum(InitState.initializing),
+        .acq_rel,
+        .acquire,
+    )) |actual| {
+        // Lost the race; another thread is initializing. Spin briefly.
+        _ = actual;
+        while (init_state.load(.acquire) != @intFromEnum(InitState.done)) {
+            std.Thread.yield() catch {};
+        }
+        return;
+    }
+    overrides = std.StringHashMap(ApiProvider).init(std.heap.c_allocator);
+    init_state.store(@intFromEnum(InitState.done), .release);
+}
+
+/// True iff the override table has been initialized. Read-side fast path.
+fn isInitialized() bool {
+    return init_state.load(.acquire) == @intFromEnum(InitState.done);
 }
 
 pub fn register(provider: ApiProvider) !void {
@@ -48,7 +79,7 @@ pub fn register(provider: ApiProvider) !void {
 }
 
 pub fn get(api: types.Api) ?ApiProvider {
-    if (initialized) {
+    if (isInitialized()) {
         if (overrides.get(api)) |provider| return provider;
     }
     return STATIC_BUILTINS.get(api);
@@ -56,21 +87,21 @@ pub fn get(api: types.Api) ?ApiProvider {
 
 pub fn getApiCount() usize {
     const static_count: usize = STATIC_BUILTINS.kvs.len;
-    return static_count + if (initialized) overrides.count() else 0;
+    return static_count + if (isInitialized()) overrides.count() else 0;
 }
 
 pub fn unregister(api: types.Api) void {
-    if (!initialized) return;
+    if (!isInitialized()) return;
     _ = overrides.remove(api);
 }
 
 pub fn clear() void {
-    if (!initialized) return;
+    if (!isInitialized()) return;
     overrides.clearAndFree();
 }
 
 pub fn resetForTesting() void {
-    if (initialized) {
+    if (isInitialized()) {
         overrides.clearAndFree();
     }
     register_builtins.clearProviderOverrides();

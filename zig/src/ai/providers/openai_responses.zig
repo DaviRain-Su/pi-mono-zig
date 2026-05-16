@@ -13,6 +13,7 @@ const provider_stream = @import("../shared/provider_stream.zig");
 const sse_loop = @import("../shared/sse_loop.zig");
 const stop_reason_mod = @import("../shared/stop_reason.zig");
 const responses_api = @import("../shared/responses_api.zig");
+const openai_usage = @import("../shared/openai_usage.zig");
 const shared_url = @import("../shared/url.zig");
 const cloudflare = @import("cloudflare.zig");
 const openai = @import("openai.zig");
@@ -1813,31 +1814,7 @@ fn getServiceTierCostMultiplier(model: types.Model, service_tier: ?[]const u8) f
     return 1.0;
 }
 
-fn parseUsage(value: std.json.Value) types.Usage {
-    var usage = types.Usage.init();
-    if (value != .object) return usage;
-
-    const input_tokens = jsonIntegerToU32(value.object.get("input_tokens"));
-    const output_tokens = jsonIntegerToU32(value.object.get("output_tokens"));
-    const total_tokens = jsonIntegerToU32(value.object.get("total_tokens"));
-
-    var cached_tokens: u32 = 0;
-    if (value.object.get("input_tokens_details")) |details| {
-        if (details == .object) {
-            cached_tokens = jsonIntegerToU32(details.object.get("cached_tokens"));
-        }
-    }
-
-    usage.input = if (input_tokens >= cached_tokens) input_tokens - cached_tokens else 0;
-    usage.output = output_tokens;
-    usage.cache_read = cached_tokens;
-    usage.cache_write = 0;
-    usage.total_tokens = if (total_tokens > 0)
-        total_tokens
-    else
-        usage.input + usage.output + usage.cache_read + usage.cache_write;
-    return usage;
-}
+pub const parseUsage = openai_usage.parseResponsesUsage;
 
 fn extractFailureMessage(allocator: std.mem.Allocator, response_value: ?std.json.Value) ![]const u8 {
     const response = response_value orelse return try sanitizeProviderTerminalError(allocator, "Unknown error (no error details in response)");
@@ -1896,13 +1873,7 @@ fn mapStopReason(status: []const u8) types.StopReason {
     return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.openai_responses_mappings, status, .error_reason);
 }
 
-fn jsonIntegerToU32(maybe_value: ?std.json.Value) u32 {
-    const value = maybe_value orelse return 0;
-    return switch (value) {
-        .integer => |integer| @intCast(@max(@as(i64, 0), integer)),
-        else => 0,
-    };
-}
+const jsonIntegerToU32 = openai_usage.jsonIntegerToU32;
 
 fn getCompat(model: types.Model) ResponsesCompat {
     return .{
