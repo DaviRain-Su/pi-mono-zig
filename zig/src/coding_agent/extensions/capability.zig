@@ -10,14 +10,8 @@ pub const LifecyclePhase = enum {
     unload,
 
     pub fn jsonName(self: LifecyclePhase) []const u8 {
-        return switch (self) {
-            .discover => "discover",
-            .validate => "validate",
-            .load => "load",
-            .initialize => "initialize",
-            .call => "call",
-            .unload => "unload",
-        };
+        // All LifecyclePhase tag names are valid JSON names verbatim.
+        return @tagName(self);
     }
 };
 
@@ -62,22 +56,23 @@ pub const CapabilityEnforcementBranch = enum {
     agent_delegate,
 
     pub fn jsonName(self: CapabilityEnforcementBranch) []const u8 {
+        // Every CapabilityEnforcementBranch tag is `<area>_<verb>` and
+        // maps to JSON `<area>.<verb>`. Build the dotted form at
+        // comptime per variant — saves a hand-written switch table.
         return switch (self) {
-            .filesystem_read => "filesystem.read",
-            .filesystem_write => "filesystem.write",
-            .network_request => "network.request",
-            .shell_process => "shell.process",
-            .environment_variable => "environment.variable",
-            .model_call => "model.call",
-            .session_read => "session.read",
-            .session_write => "session.write",
-            .ui_notification => "ui.notification",
-            .tool_execution => "tool.execution",
-            .agent_spawn => "agent.spawn",
-            .agent_delegate => "agent.delegate",
+            inline else => |tag| comptime underscoreToDot(@tagName(tag)),
         };
     }
 };
+
+fn underscoreToDot(comptime name: []const u8) []const u8 {
+    comptime {
+        var arr: [name.len]u8 = undefined;
+        for (name, 0..) |c, i| arr[i] = if (c == '_') '.' else c;
+        const result = arr;
+        return &result;
+    }
+}
 
 const CapabilitySpec = struct {
     capability: Capability,

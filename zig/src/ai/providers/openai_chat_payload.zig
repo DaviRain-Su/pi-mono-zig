@@ -141,15 +141,52 @@ const ChatRequestPayload = struct {
     chat_template_kwargs: ?QwenChatTemplateKwargs = null,
     thinking: ?DeepseekThinking = null,
     reasoning_effort: ?[]const u8 = null,
-    reasoning: ?std.json.Value = null, // openrouter / together — already shaped
+    reasoning: ?ReasoningBlock = null, // openrouter / together
     // Routing variants:
     provider: ?std.json.Value = null, // openrouter routing block (cloned)
-    providerOptions: ?std.json.Value = null, // vercel gateway routing block (built)
+    providerOptions: ?VercelGatewayRouting = null, // vercel gateway routing block
 };
 
 const StreamOptionsField = struct { include_usage: bool };
 const QwenChatTemplateKwargs = struct { enable_thinking: bool, preserve_thinking: bool };
 const DeepseekThinking = struct { type: []const u8 };
+
+/// Reasoning block emitted by openrouter/together thinking_format
+/// branches. Replaces the two per-request ObjectMap allocations that
+/// previously built `{effort: "..."}` and `{enabled: bool}` trees.
+const ReasoningBlock = union(enum) {
+    openrouter: struct { effort: []const u8 },
+    together: struct { enabled: bool },
+
+    pub fn jsonStringify(self: ReasoningBlock, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .openrouter => |o| {
+                try jw.objectField("effort");
+                try jw.write(o.effort);
+            },
+            .together => |t| {
+                try jw.objectField("enabled");
+                try jw.write(t.enabled);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+/// Vercel AI Gateway routing block. Replaces the two per-request
+/// ObjectMap allocations (`providerOptions` and inner `gateway` wrapper).
+/// The leaf `only`/`order` fields stay as std.json.Value passthroughs
+/// because the cloned routing data may be any shape (string, array,
+/// object) the Vercel Gateway upstream accepts.
+const VercelGatewayRouting = struct {
+    gateway: VercelGatewayInner,
+};
+
+const VercelGatewayInner = struct {
+    only: ?std.json.Value = null,
+    order: ?std.json.Value = null,
+};
 
 const ChatOwned = struct {
     allocator: std.mem.Allocator,
@@ -271,7 +308,7 @@ fn buildOwnedChat(
     var chat_template_kwargs: ?QwenChatTemplateKwargs = null;
     var thinking_field: ?DeepseekThinking = null;
     var reasoning_effort: ?[]const u8 = null;
-    var reasoning_owned: ?std.json.Value = null;
+    var reasoning_block: ?ReasoningBlock = null;
 
     if (model.reasoning) {
         const openai_opts = if (options) |opts| opts.providerOptions("openai") else types.OpenAIChatStreamOptions{};
@@ -284,20 +321,9 @@ fn buildOwnedChat(
             thinking_field = .{ .type = if (effort != null) "enabled" else "disabled" };
             if (effort) |value| reasoning_effort = value;
         } else if (std.mem.eql(u8, compat.thinking_format, "openrouter")) {
-            var reasoning_obj = try provider_json.initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = reasoning_obj });
-            const value = effort orelse "none";
-            try putStringValue(allocator, &reasoning_obj, "effort", value);
-            const rv: std.json.Value = .{ .object = reasoning_obj };
-            try owned_values_list.append(allocator, rv);
-            reasoning_owned = rv;
+            reasoning_block = .{ .openrouter = .{ .effort = effort orelse "none" } };
         } else if (std.mem.eql(u8, compat.thinking_format, "together")) {
-            var reasoning_obj = try provider_json.initObject(allocator);
-            errdefer provider_json.freeValue(allocator, .{ .object = reasoning_obj });
-            try putBoolValue(allocator, &reasoning_obj, "enabled", effort != null);
-            const rv: std.json.Value = .{ .object = reasoning_obj };
-            try owned_values_list.append(allocator, rv);
-            reasoning_owned = rv;
+            reasoning_block = .{ .together = .{ .enabled = effort != null } };
             if (effort) |value| {
                 if (compat.supports_reasoning_effort) {
                     reasoning_effort = mappedReasoningEffort(model, value);
@@ -310,7 +336,6 @@ fn buildOwnedChat(
 
     // Routing fields.
     var provider_owned: ?std.json.Value = null;
-    var provider_options_owned: ?std.json.Value = null;
     if (std.mem.indexOf(u8, model.base_url, "openrouter.ai") != null) {
         if (compat.open_router_routing) |routing| {
             const cloned = try provider_json.cloneValue(allocator, routing);
@@ -318,23 +343,23 @@ fn buildOwnedChat(
             provider_owned = cloned;
         }
     }
+    var gateway_routing_owned: ?VercelGatewayRouting = null;
     if (std.mem.indexOf(u8, model.base_url, "ai-gateway.vercel.sh") != null) {
         if (compat.vercel_gateway_routing) |routing| {
             if (routing == .object and (routing.object.get("only") != null or routing.object.get("order") != null)) {
-                var provider_options = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = provider_options });
-                var gateway = try provider_json.initObject(allocator);
-                errdefer provider_json.freeValue(allocator, .{ .object = gateway });
+                var only_value: ?std.json.Value = null;
+                var order_value: ?std.json.Value = null;
                 if (routing.object.get("only")) |only| {
-                    try putObjectValue(allocator, &gateway, "only", try provider_json.cloneValue(allocator, only));
+                    const cloned = try provider_json.cloneValue(allocator, only);
+                    try owned_values_list.append(allocator, cloned);
+                    only_value = cloned;
                 }
                 if (routing.object.get("order")) |order| {
-                    try putObjectValue(allocator, &gateway, "order", try provider_json.cloneValue(allocator, order));
+                    const cloned = try provider_json.cloneValue(allocator, order);
+                    try owned_values_list.append(allocator, cloned);
+                    order_value = cloned;
                 }
-                try putObjectValue(allocator, &provider_options, "gateway", .{ .object = gateway });
-                const pv: std.json.Value = .{ .object = provider_options };
-                try owned_values_list.append(allocator, pv);
-                provider_options_owned = pv;
+                gateway_routing_owned = .{ .gateway = .{ .only = only_value, .order = order_value } };
             }
         }
     }
@@ -360,9 +385,9 @@ fn buildOwnedChat(
             .chat_template_kwargs = chat_template_kwargs,
             .thinking = thinking_field,
             .reasoning_effort = reasoning_effort,
-            .reasoning = reasoning_owned,
+            .reasoning = reasoning_block,
             .provider = provider_owned,
-            .providerOptions = provider_options_owned,
+            .providerOptions = gateway_routing_owned,
         },
         .owned_values = owned_values_slice,
     };
