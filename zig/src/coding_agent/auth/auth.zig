@@ -19,6 +19,7 @@ pub const defaultOAuthCallbackPort = oauth_callback_listener.defaultCallbackPort
 const DEFAULT_ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const DEFAULT_GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98";
 const DEFAULT_OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEFAULT_XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
 
 const ANTHROPIC_AUTHORIZE_URL = "https://claude.ai/oauth/authorize";
 const ANTHROPIC_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
@@ -32,6 +33,11 @@ const OPENAI_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const OPENAI_CODEX_SCOPES = "openid profile email offline_access";
 const OPENAI_CODEX_ORIGINATOR = "pi";
 const OPENAI_CODEX_AUTH_CLAIM = "https://api.openai.com/auth";
+
+const XAI_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize";
+const XAI_TOKEN_URL = "https://auth.x.ai/oauth2/token";
+const XAI_REDIRECT_URI = "http://127.0.0.1:56121/callback";
+const XAI_SCOPES = "openid profile email offline_access grok-cli:access api:access";
 
 const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -54,6 +60,7 @@ const OAuthRefreshEndpoints = struct {
     anthropic_token_url: []const u8 = ANTHROPIC_TOKEN_URL,
     github_copilot_token_url: []const u8 = GITHUB_COPILOT_TOKEN_URL,
     openai_codex_token_url: []const u8 = OPENAI_CODEX_TOKEN_URL,
+    xai_token_url: []const u8 = XAI_TOKEN_URL,
 };
 
 pub const OAuthClientCredentials = struct {
@@ -81,6 +88,7 @@ pub const ProviderInfo = struct {
 pub const OAUTH_LOGIN_PROVIDERS = [_]ProviderInfo{
     .{ .id = "anthropic", .name = "Anthropic (Claude Pro/Max)", .auth_type = .oauth },
     .{ .id = "openai-codex", .name = "ChatGPT Plus/Pro (Codex Subscription)", .auth_type = .oauth },
+    .{ .id = "xai-oauth", .name = "xAI Grok OAuth", .auth_type = .oauth },
     .{ .id = "github-copilot", .name = "GitHub Copilot", .auth_type = .oauth },
 };
 
@@ -194,6 +202,7 @@ pub const ResolvedApiKey = struct {
 pub const BrowserLoginKind = enum {
     anthropic,
     openai_codex,
+    xai_oauth,
 };
 
 pub const BrowserLoginSession = struct {
@@ -315,6 +324,11 @@ const AUTH_PROVIDERS = [_]AuthProviderInfo{
         .default_public_client_id = DEFAULT_OPENAI_CODEX_CLIENT_ID,
         .uses_hex_oauth_state = true,
     },
+    .{
+        .id = "xai-oauth",
+        .default_public_client_id = DEFAULT_XAI_CLIENT_ID,
+        .uses_hex_oauth_state = true,
+    },
 };
 
 fn authInfoFor(id: []const u8) ?*const AuthProviderInfo {
@@ -359,6 +373,7 @@ const OAuthLoginProvider = struct {
     scope: []const u8,
     /// Extra query-string parameters appended to the authorization URL.
     extra_params: []const u8 = "",
+    include_nonce: bool = false,
     /// When set, the initial `code=true` parameter is added.
     has_code_param: bool = false,
     require_client_secret: bool = false,
@@ -380,6 +395,15 @@ const OAUTH_LOGIN_PROVIDERS_REGISTRY = [_]OAuthLoginProvider{
         .redirect_uri = OPENAI_CODEX_REDIRECT_URI,
         .scope = OPENAI_CODEX_SCOPES,
         .extra_params = "&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=" ++ OPENAI_CODEX_ORIGINATOR,
+    },
+    .{
+        .id = "xai-oauth",
+        .kind = .xai_oauth,
+        .authorize_url = XAI_AUTHORIZE_URL,
+        .redirect_uri = XAI_REDIRECT_URI,
+        .scope = XAI_SCOPES,
+        .extra_params = "&plan=generic&referrer=hermes-agent",
+        .include_nonce = true,
     },
 };
 
@@ -423,6 +447,14 @@ pub fn startOpenAICodexBrowserLogin(
     return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[1]);
 }
 
+pub fn startXAIBrowserLogin(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+) !BrowserLoginSession {
+    return startBrowserLoginForDescriptor(allocator, io, env_map, OAUTH_LOGIN_PROVIDERS_REGISTRY[2]);
+}
+
 fn startBrowserLoginForDescriptor(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -464,10 +496,16 @@ fn startBrowserLoginForDescriptor(
     const encoded_state = try formEncode(allocator, state);
     defer allocator.free(encoded_state);
 
+    const nonce_param = if (desc.include_nonce)
+        try std.fmt.allocPrint(allocator, "&nonce={s}", .{encoded_state})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(nonce_param);
+
     const code_param = if (desc.has_code_param) "code=true&" else "";
     const base_url = try std.fmt.allocPrint(
         allocator,
-        "{s}?{s}client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}{s}",
+        "{s}?{s}client_id={s}&response_type=code&redirect_uri={s}&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}{s}{s}",
         .{
             desc.authorize_url,
             code_param,
@@ -476,6 +514,7 @@ fn startBrowserLoginForDescriptor(
             encoded_scope,
             encoded_challenge,
             encoded_state,
+            nonce_param,
             desc.extra_params,
         },
     );
@@ -501,6 +540,7 @@ pub fn completeBrowserLogin(
     return switch (session.kind) {
         .anthropic => .{ .oauth = try exchangeAnthropicAuthorizationCode(allocator, io, session, input) },
         .openai_codex => .{ .oauth = try exchangeOpenAICodexAuthorizationCode(allocator, io, session, input) },
+        .xai_oauth => .{ .oauth = try exchangeXAIAuthorizationCode(allocator, io, session, input) },
     };
 }
 
@@ -1366,6 +1406,53 @@ fn buildOpenAICodexTokenExchangeBody(
     });
 }
 
+fn exchangeXAIAuthorizationCode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const BrowserLoginSession,
+    input: []const u8,
+) !OAuthCredential {
+    return exchangeXAIAuthorizationCodeWithTokenUrl(allocator, io, session, input, XAI_TOKEN_URL);
+}
+
+fn exchangeXAIAuthorizationCodeWithTokenUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session: *const BrowserLoginSession,
+    input: []const u8,
+    token_url: []const u8,
+) !OAuthCredential {
+    if (session.kind != .xai_oauth) return error.UnsupportedProvider;
+    const parsed = try parseAuthorizationInput(allocator, input);
+    defer parsed.deinit(allocator);
+
+    if (parsed.state) |state| {
+        if (!std.mem.eql(u8, state, session.state)) return error.InvalidOAuthState;
+    }
+
+    const code = parsed.code orelse return error.MissingAuthorizationCode;
+    const body = try buildXAITokenExchangeBody(allocator, session, code);
+    defer allocator.free(body);
+
+    const response_body = try postForm(allocator, io, token_url, body, null);
+    defer allocator.free(response_body);
+    return try parseOAuthRefreshResponse(allocator, io, response_body, .exact);
+}
+
+fn buildXAITokenExchangeBody(
+    allocator: std.mem.Allocator,
+    session: *const BrowserLoginSession,
+    code: []const u8,
+) ![]u8 {
+    return buildFormBody(allocator, &.{
+        .{ .name = "grant_type", .value = "authorization_code" },
+        .{ .name = "client_id", .value = session.oauth_client.client_id },
+        .{ .name = "code", .value = code },
+        .{ .name = "code_verifier", .value = session.verifier },
+        .{ .name = "redirect_uri", .value = XAI_REDIRECT_URI },
+    });
+}
+
 fn refreshGitHubCopilotToken(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1427,6 +1514,9 @@ fn refreshOAuthCredentialWithEndpoints(
     if (std.mem.eql(u8, provider_id, "openai-codex")) {
         return refreshOpenAICodexStoredTokenWithUrl(allocator, io, credential.refresh, endpoints.openai_codex_token_url);
     }
+    if (std.mem.eql(u8, provider_id, "xai-oauth")) {
+        return refreshXAIStoredTokenWithUrl(allocator, io, credential.refresh, endpoints.xai_token_url);
+    }
     _ = env_map;
     return error.UnsupportedProvider;
 }
@@ -1477,6 +1567,24 @@ fn refreshOpenAICodexStoredTokenWithUrl(
     const account_id = try extractOpenAICodexAccountId(allocator, credential.access);
     defer allocator.free(account_id);
     return credential;
+}
+
+fn refreshXAIStoredTokenWithUrl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    refresh_token: []const u8,
+    token_url: []const u8,
+) !OAuthCredential {
+    const body = try buildFormBody(allocator, &.{
+        .{ .name = "grant_type", .value = "refresh_token" },
+        .{ .name = "refresh_token", .value = refresh_token },
+        .{ .name = "client_id", .value = DEFAULT_XAI_CLIENT_ID },
+    });
+    defer allocator.free(body);
+
+    const response_body = try postForm(allocator, io, token_url, body, null);
+    defer allocator.free(response_body);
+    return parseOAuthRefreshResponse(allocator, io, response_body, .exact);
 }
 
 const RefreshExpiryMode = enum {
@@ -1909,6 +2017,39 @@ test "startOpenAICodexBrowserLogin builds TS-equivalent OAuth URL" {
     try std.testing.expect(std.mem.indexOf(u8, session.auth_url, session.state) != null);
 }
 
+test "startXAIBrowserLogin builds TS-equivalent OAuth URL" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startXAIBrowserLogin(allocator, std.testing.io, &env_map);
+    defer session.deinit(allocator);
+
+    try std.testing.expectEqual(BrowserLoginKind.xai_oauth, session.kind);
+    try std.testing.expectEqualStrings("xai-oauth", session.provider_id);
+    try std.testing.expectEqualStrings("xAI Grok OAuth", session.provider_name);
+    try std.testing.expectEqualStrings(DEFAULT_XAI_CLIENT_ID, session.oauth_client.client_id);
+    try std.testing.expect(session.oauth_client.client_secret == null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, XAI_AUTHORIZE_URL) != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "response_type=code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "client_id=b1a00492-073a-47ea-816f-4c329264a828") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "scope=openid%20profile%20email%20offline_access%20grok-cli%3Aaccess%20api%3Aaccess") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "nonce=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "plan=generic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, "referrer=hermes-agent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session.auth_url, session.state) != null);
+}
+
 test "loadOAuthClientCredentials uses public built-in client ids without oauth config" {
     const allocator = std.testing.allocator;
 
@@ -1936,6 +2077,11 @@ test "loadOAuthClientCredentials uses public built-in client ids without oauth c
     defer codex.deinit(allocator);
     try std.testing.expectEqualStrings(DEFAULT_OPENAI_CODEX_CLIENT_ID, codex.client_id);
     try std.testing.expect(codex.client_secret == null);
+
+    var xai = try loadOAuthClientCredentials(allocator, std.testing.io, &env_map, "xai-oauth", false);
+    defer xai.deinit(allocator);
+    try std.testing.expectEqualStrings(DEFAULT_XAI_CLIENT_ID, xai.client_id);
+    try std.testing.expect(xai.client_secret == null);
 
     const copilot_body = try buildFormBody(allocator, &.{
         .{ .name = "client_id", .value = copilot.client_id },
@@ -2054,6 +2200,62 @@ test "OpenAI Codex OAuth token exchange uses fake callback and local token endpo
             io,
             &session,
             "http://localhost:1455/auth/callback?code=fake-code&state=wrong-state",
+            token_url,
+        ),
+    );
+}
+
+test "xAI OAuth token exchange uses fake callback and local token endpoint" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeAuthTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var session = try startXAIBrowserLogin(allocator, io, &env_map);
+    defer session.deinit(allocator);
+
+    const body = try buildXAITokenExchangeBody(allocator, &session, "code 123");
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "grant_type=authorization_code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "client_id=b1a00492-073a-47ea-816f-4c329264a828") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "code=code%20123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "code_verifier=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback") != null);
+
+    var server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"xai-access\",\"refresh_token\":\"xai-refresh\",\"expires_in\":3600}");
+    defer server.deinit();
+    try server.start();
+    const token_url = try server.url(allocator);
+    defer allocator.free(token_url);
+
+    const callback = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:56121/callback?code=fake-code&state={s}",
+        .{session.state},
+    );
+    defer allocator.free(callback);
+
+    var credential = try exchangeXAIAuthorizationCodeWithTokenUrl(allocator, io, &session, callback, token_url);
+    defer credential.deinit(allocator);
+    try std.testing.expectEqualStrings("xai-access", credential.access);
+    try std.testing.expectEqualStrings("xai-refresh", credential.refresh);
+    try std.testing.expect(credential.expires > 0);
+
+    try std.testing.expectError(
+        error.InvalidOAuthState,
+        exchangeXAIAuthorizationCodeWithTokenUrl(
+            allocator,
+            io,
+            &session,
+            "http://127.0.0.1:56121/callback?code=fake-code&state=wrong-state",
             token_url,
         ),
     );
@@ -2213,6 +2415,19 @@ test "valid stored OAuth credentials resolve without refresh for supported famil
     defer allocator.free(codex_key);
     try std.testing.expectEqualStrings("codex-access", codex_key);
 
+    var xai = try makeOAuthTestObject(allocator, "xai-access", "xai-refresh", future_expires, null);
+    defer deinitOAuthTestObject(allocator, &xai);
+    const xai_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        null,
+        "xai-oauth",
+        xai,
+        .{ .xai_token_url = "http://127.0.0.1:1" },
+    )).?;
+    defer allocator.free(xai_key);
+    try std.testing.expectEqualStrings("xai-access", xai_key);
 }
 
 test "expired stored OAuth credentials refresh before use and persist refreshed tokens" {
@@ -2297,21 +2512,42 @@ test "expired stored OAuth credentials refresh before use and persist refreshed 
     defer allocator.free(codex_key);
     try std.testing.expectEqualStrings(codex_access, codex_key);
 
+    var xai_server = try ai.provider_error.TestStatusServer.init(io, 200, "OK", "", "{\"access_token\":\"xai-new\",\"refresh_token\":\"xai-refresh-new\",\"expires_in\":3600}");
+    defer xai_server.deinit();
+    try xai_server.start();
+    const xai_url = try xai_server.url(allocator);
+    defer allocator.free(xai_url);
+    var xai = try makeOAuthTestObject(allocator, "xai-old", "xai-refresh-old", 0, null);
+    defer deinitOAuthTestObject(allocator, &xai);
+    const xai_key = (try buildApiKeyFromStoredEntryWithRefreshEndpoints(
+        allocator,
+        io,
+        &env_map,
+        auth_path,
+        "xai-oauth",
+        xai,
+        .{ .xai_token_url = xai_url },
+    )).?;
+    defer allocator.free(xai_key);
+    try std.testing.expectEqualStrings("xai-new", xai_key);
+
     const persisted = try std.Io.Dir.readFileAlloc(.cwd(), io, auth_path, allocator, .limited(1024 * 1024));
     defer allocator.free(persisted);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "anthropic-new") != null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, "copilot-new") != null);
     try std.testing.expect(std.mem.indexOf(u8, persisted, codex_access) != null);
+    try std.testing.expect(std.mem.indexOf(u8, persisted, "xai-new") != null);
 }
 
 test "isApiKeyLoginProvider keeps built-in API key providers separate from OAuth-only providers" {
-    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "custom-oauth" };
-    const built_in_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "amazon-bedrock", "openai" };
+    const oauth_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "xai-oauth", "custom-oauth" };
+    const built_in_provider_ids = [_][]const u8{ "anthropic", "github-copilot", "xai-oauth", "amazon-bedrock", "openai" };
 
     try std.testing.expect(isApiKeyLoginProvider("anthropic", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expectEqualStrings("Anthropic", getApiKeyProviderDisplayName("anthropic"));
     try std.testing.expect(isApiKeyLoginProvider("openai", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(!isApiKeyLoginProvider("github-copilot", oauth_provider_ids[0..], built_in_provider_ids[0..]));
+    try std.testing.expect(!isApiKeyLoginProvider("xai-oauth", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(isApiKeyLoginProvider("amazon-bedrock", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(!isApiKeyLoginProvider("custom-oauth", oauth_provider_ids[0..], built_in_provider_ids[0..]));
     try std.testing.expect(isApiKeyLoginProvider("custom-api", oauth_provider_ids[0..], built_in_provider_ids[0..]));

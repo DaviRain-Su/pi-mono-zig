@@ -1451,6 +1451,7 @@ test "handleLoginSlashCommand opens auth provider selector" {
 
     var saw_copilot = false;
     var saw_codex_subscription = false;
+    var saw_xai_oauth = false;
     var saw_openai = false;
     for (overlay.?.auth.items) |item| {
         if (std.mem.eql(u8, item.value, "github-copilot")) {
@@ -1462,6 +1463,10 @@ test "handleLoginSlashCommand opens auth provider selector" {
             saw_codex_subscription = true;
             try std.testing.expectEqualStrings("ChatGPT Plus/Pro (Codex Subscription)", item.label);
         }
+        if (std.mem.eql(u8, item.value, "xai-oauth") and std.mem.eql(u8, item.description.?, "OAuth login")) {
+            saw_xai_oauth = true;
+            try std.testing.expectEqualStrings("xAI Grok OAuth", item.label);
+        }
         if (std.mem.eql(u8, item.value, "openai")) {
             saw_openai = true;
             try std.testing.expectEqualStrings("OpenAI", item.label);
@@ -1470,6 +1475,7 @@ test "handleLoginSlashCommand opens auth provider selector" {
     }
     try std.testing.expect(saw_copilot);
     try std.testing.expect(saw_codex_subscription);
+    try std.testing.expect(saw_xai_oauth);
     try std.testing.expect(saw_openai);
 }
 
@@ -1664,6 +1670,67 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
     defer state.mutex.unlock(state.io);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "ChatGPT Plus/Pro (Codex Subscription) login started") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.openai.com/oauth/authorize") != null);
+}
+
+test "beginLoginFlow starts xAI Grok OAuth prompt state" {
+    const allocator = std.testing.allocator;
+
+    var oauth_callback_lock = try OAuthCallbackTestLock.acquire(std.testing.io);
+    defer oauth_callback_lock.release(std.testing.io);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const agent_dir = try makeInteractiveTestPath(allocator, tmp, "agent-home");
+    defer allocator.free(agent_dir);
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+    try env_map.put("PI_CODING_AGENT_DIR", agent_dir);
+
+    var state = try AppState.init(allocator, std.testing.io);
+    defer state.deinit();
+
+    auth_flow_mod.test_auth_flow = null;
+    defer if (auth_flow_mod.test_auth_flow) |*value| {
+        value.deinit(allocator);
+        auth_flow_mod.test_auth_flow = null;
+    };
+    var browser_open_capture = BrowserOpenCapture{};
+    const previous_browser_open_context = auth_flow_mod.open_browser_context;
+    const previous_browser_open_fn = auth_flow_mod.open_browser_fn;
+    auth_flow_mod.open_browser_context = &browser_open_capture;
+    auth_flow_mod.open_browser_fn = BrowserOpenCapture.capture;
+    defer {
+        auth_flow_mod.open_browser_context = previous_browser_open_context;
+        auth_flow_mod.open_browser_fn = previous_browser_open_fn;
+    }
+    const previous_start_callback_listener_fn = auth_flow_mod.start_callback_listener_for_session_fn;
+    auth_flow_mod.start_callback_listener_for_session_fn = startEphemeralCallbackListenerForTest;
+    defer auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+
+    try beginLoginFlow(allocator, std.testing.io, &env_map, "xai-oauth", .oauth, &state, &auth_flow_mod.test_auth_flow);
+    auth_flow_mod.start_callback_listener_for_session_fn = previous_start_callback_listener_fn;
+
+    try std.testing.expect(auth_flow_mod.test_auth_flow != null);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.? == .browser_redirect);
+    try std.testing.expectEqual(auth.BrowserLoginKind.xai_oauth, auth_flow_mod.test_auth_flow.?.browser_redirect.session.kind);
+    try std.testing.expectEqualStrings("xai-oauth", auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_id);
+    try std.testing.expectEqualStrings("xAI Grok OAuth", auth_flow_mod.test_auth_flow.?.browser_redirect.session.provider_name);
+    try std.testing.expect(auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener != null);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        auth_flow_mod.test_auth_flow.?.browser_redirect.callback_listener.?.redirect_uri,
+        "/callback",
+    ));
+    try std.testing.expect(browser_open_capture.called);
+    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "redirect_uri=http%3A%2F%2F127.0.0.1%3A56121%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, browser_open_capture.url.?, "referrer=hermes-agent") != null);
+
+    state.mutex.lockUncancelable(state.io);
+    defer state.mutex.unlock(state.io);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "xAI Grok OAuth login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.x.ai/oauth2/authorize") != null);
 }
 
 test "beginLoginFlow starts API key prompt state for built-in provider" {
@@ -5607,6 +5674,7 @@ fn callbackProviderKindForTest(kind: auth.BrowserLoginKind) auth.OAuthCallbackPr
     return switch (kind) {
         .anthropic => .anthropic,
         .openai_codex => .openai_codex,
+        .xai_oauth => .xai_oauth,
     };
 }
 

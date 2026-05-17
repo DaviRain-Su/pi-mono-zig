@@ -178,8 +178,7 @@ fn resolveProviderConfigWithPolicy(
     errdefer ai.model_registry.deinitOwnedModel(allocator, &owned_model);
     const auth_status: ProviderAuthStatus = if (resolved_api_key) |api_key|
         authStatusFromSource(api_key.source)
-    else
-        if (local_provider) .local else .missing;
+    else if (local_provider) .local else .missing;
 
     return .{
         .model = owned_model,
@@ -855,6 +854,14 @@ test "resolveProviderConfig uses configured api key when env is missing" {
     try std.testing.expectEqualStrings("configured-openai-key", resolved.api_key.?);
     try std.testing.expectEqual(ProviderAuthStatus.stored, resolved.auth_status);
     try std.testing.expectEqualStrings("gpt-5.4", resolved.model.id);
+
+    var xai_oauth = try resolveProviderConfig(allocator, std.testing.io, &env_map, "xai-oauth", null, null, "stored-xai-oauth-token");
+    defer xai_oauth.deinit(allocator);
+
+    try std.testing.expectEqualStrings("stored-xai-oauth-token", xai_oauth.api_key.?);
+    try std.testing.expectEqual(ProviderAuthStatus.stored, xai_oauth.auth_status);
+    try std.testing.expectEqualStrings("grok-4.3", xai_oauth.model.id);
+    try std.testing.expectEqualStrings("openai-responses", xai_oauth.model.api);
 }
 
 test "resolveProviderConfigAllowMissingCredentials returns safe missing auth state" {
@@ -949,6 +956,7 @@ test "listAvailableModels enumerates all built-in providers" {
     var found_groq = false;
     var found_cerebras = false;
     var found_xai = false;
+    var found_xai_oauth = false;
     var found_fireworks = false;
     var found_huggingface = false;
     var found_openrouter = false;
@@ -983,6 +991,13 @@ test "listAvailableModels enumerates all built-in providers" {
             found_cerebras = true;
         } else if (std.mem.eql(u8, entry.provider, "xai")) {
             found_xai = true;
+        } else if (std.mem.eql(u8, entry.provider, "xai-oauth")) {
+            found_xai_oauth = true;
+            if (std.mem.eql(u8, entry.model_id, "grok-4.3")) {
+                try std.testing.expect(!entry.available);
+                try std.testing.expect(entry.supports_images);
+                try std.testing.expect(entry.reasoning);
+            }
         } else if (std.mem.eql(u8, entry.provider, "fireworks")) {
             found_fireworks = true;
         } else if (std.mem.eql(u8, entry.provider, "huggingface")) {
@@ -1005,6 +1020,7 @@ test "listAvailableModels enumerates all built-in providers" {
     try std.testing.expect(found_groq);
     try std.testing.expect(found_cerebras);
     try std.testing.expect(found_xai);
+    try std.testing.expect(found_xai_oauth);
     try std.testing.expect(found_fireworks);
     try std.testing.expect(found_huggingface);
     try std.testing.expect(found_openrouter);

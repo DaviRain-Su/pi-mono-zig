@@ -202,6 +202,7 @@ test {
     _ = @import("utils/oauth/openai_codex.zig");
     _ = @import("utils/oauth/pkce.zig");
     _ = @import("utils/oauth/types.zig");
+    _ = @import("utils/oauth/xai.zig");
     _ = @import("utils/overflow.zig");
     _ = @import("utils/sanitize_unicode.zig");
     _ = @import("utils/typebox_helpers.zig");

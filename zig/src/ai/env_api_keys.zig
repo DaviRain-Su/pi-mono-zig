@@ -166,6 +166,7 @@ test "resolveEnvVar returns previously-known single-key mappings" {
         "amazon-bedrock",
         "anthropic",
         "github-copilot",
+        "xai-oauth",
         "google-vertex",
     };
     for (multi_cred) |provider| {

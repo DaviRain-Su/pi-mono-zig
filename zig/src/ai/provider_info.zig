@@ -31,7 +31,7 @@
 //!   - `oauth_default_client_id`  — built-in public OAuth client id for
 //!                                  providers shipping a hard-coded "public"
 //!                                  OAuth app (Anthropic, GitHub Copilot,
-//!                                  OpenAI Codex).
+//!                                  OpenAI Codex, xAI Grok OAuth).
 //!
 //! Where bespoke logic lives
 //! -------------------------
@@ -95,8 +95,9 @@ pub const ProviderInfo = struct {
     prefer_initial: ?[]const u8 = null,
     /// Built-in public OAuth client id shipped with the binary for providers
     /// that expose a hard-coded "public" OAuth application (Anthropic Claude
-    /// Pro/Max, GitHub Copilot, OpenAI Codex); the auth-layer cross-check test
-    /// asserts agreement between this field and the `AuthProviderInfo` table.
+    /// Pro/Max, GitHub Copilot, OpenAI Codex, xAI Grok OAuth); the auth-layer
+    /// cross-check test asserts agreement between this field and the
+    /// `AuthProviderInfo` table.
     oauth_default_client_id: ?[]const u8 = null,
 };
 
@@ -340,6 +341,14 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .missing_api_key_message = "xAI credentials required.\nSet XAI_API_KEY, pass --api-key, or run /login xai.",
         .env_var = "XAI_API_KEY",
         .default_api = "openai-completions",
+    },
+    .{
+        .id = "xai-oauth",
+        .display_name = "xAI Grok OAuth",
+        .default_model = "grok-4.3",
+        .missing_api_key_message = "xAI Grok OAuth credentials required.\nRun /login xai-oauth for SuperGrok subscription auth.",
+        .default_api = "openai-responses",
+        .oauth_default_client_id = "b1a00492-073a-47ea-816f-4c329264a828",
     },
     .{
         .id = "xiaomi",
@@ -615,6 +624,10 @@ test "oauthDefaultClientIdFor returns the canonical public client ids" {
     try std.testing.expectEqualStrings(
         "app_EMoamEEZ73f0CkXaXp7hrann",
         oauthDefaultClientIdFor("openai-codex").?,
+    );
+    try std.testing.expectEqualStrings(
+        "b1a00492-073a-47ea-816f-4c329264a828",
+        oauthDefaultClientIdFor("xai-oauth").?,
     );
     try std.testing.expectEqual(@as(?[]const u8, null), oauthDefaultClientIdFor("openai"));
 }

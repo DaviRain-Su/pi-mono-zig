@@ -3,8 +3,8 @@
 
 const model_registry = @import("model_registry.zig");
 
-pub const provider_count = 33;
-pub const model_count = 987;
+pub const provider_count = 34;
+pub const model_count = 991;
 
 pub const provider_configs = [_]model_registry.ProviderConfig{
     .{ .provider = "amazon-bedrock", .api = "bedrock-converse-stream", .base_url = "https://bedrock-runtime.us-east-1.amazonaws.com", .default_model_id = "us.anthropic.claude-opus-4-6-v1" },
@@ -35,6 +35,7 @@ pub const provider_configs = [_]model_registry.ProviderConfig{
     .{ .provider = "together", .api = "openai-completions", .base_url = "https://api.together.ai/v1", .default_model_id = "moonshotai/Kimi-K2.6" },
     .{ .provider = "vercel-ai-gateway", .api = "anthropic-messages", .base_url = "https://ai-gateway.vercel.sh", .default_model_id = "zai/glm-5.1" },
     .{ .provider = "xai", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.20-0309-reasoning" },
+    .{ .provider = "xai-oauth", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.3" },
     .{ .provider = "xiaomi", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-ams", .api = "anthropic-messages", .base_url = "https://token-plan-ams.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
     .{ .provider = "xiaomi-token-plan-cn", .api = "anthropic-messages", .base_url = "https://token-plan-cn.xiaomimimo.com/anthropic", .default_model_id = "mimo-v2.5-pro" },
@@ -1005,6 +1006,10 @@ pub const models = [_]model_registry.ModelDefinition{
     .{ .provider = "xai", .id = "grok-beta", .name = "Grok Beta", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .reasoning = false, .input_types = &[_][]const u8{"text"}, .cost = .{ .input = 5, .output = 15, .cache_read = 5, .cache_write = 0 }, .context_window = 131072, .max_tokens = 4096 },
     .{ .provider = "xai", .id = "grok-code-fast-1", .name = "Grok Code Fast 1", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .reasoning = true, .input_types = &[_][]const u8{"text"}, .cost = .{ .input = 0.2, .output = 1.5, .cache_read = 0.02, .cache_write = 0 }, .context_window = 256000, .max_tokens = 10000 },
     .{ .provider = "xai", .id = "grok-vision-beta", .name = "Grok Vision Beta", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .reasoning = false, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 5, .output = 15, .cache_read = 5, .cache_write = 0 }, .context_window = 8192, .max_tokens = 4096 },
+    .{ .provider = "xai-oauth", .id = "grok-4.20-0309-non-reasoning", .name = "Grok 4.20 (Non-Reasoning)", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .reasoning = false, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 2, .output = 6, .cache_read = 0.2, .cache_write = 0 }, .context_window = 2000000, .max_tokens = 30000, .compat_json = "{\"sendSessionIdHeader\":false,\"supportsLongCacheRetention\":false}" },
+    .{ .provider = "xai-oauth", .id = "grok-4.20-0309-reasoning", .name = "Grok 4.20 (Reasoning)", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .reasoning = true, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 2, .output = 6, .cache_read = 0.2, .cache_write = 0 }, .context_window = 2000000, .max_tokens = 30000, .compat_json = "{\"sendSessionIdHeader\":false,\"supportsLongCacheRetention\":false}" },
+    .{ .provider = "xai-oauth", .id = "grok-4.20-multi-agent-0309", .name = "Grok 4.20 Multi-Agent", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .reasoning = true, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 1.25, .output = 2.5, .cache_read = 0.2, .cache_write = 0 }, .context_window = 2000000, .max_tokens = 30000, .compat_json = "{\"sendSessionIdHeader\":false,\"supportsLongCacheRetention\":false}" },
+    .{ .provider = "xai-oauth", .id = "grok-4.3", .name = "Grok 4.3", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .reasoning = true, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 1.25, .output = 2.5, .cache_read = 0.2, .cache_write = 0 }, .context_window = 1000000, .max_tokens = 30000, .compat_json = "{\"sendSessionIdHeader\":false,\"supportsLongCacheRetention\":false}" },
     .{ .provider = "xiaomi", .id = "mimo-v2-flash", .name = "MiMo-V2-Flash", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .reasoning = true, .input_types = &[_][]const u8{"text"}, .cost = .{ .input = 0.1, .output = 0.3, .cache_read = 0.01, .cache_write = 0 }, .context_window = 262144, .max_tokens = 65536 },
     .{ .provider = "xiaomi", .id = "mimo-v2-omni", .name = "MiMo-V2-Omni", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .reasoning = true, .input_types = &[_][]const u8{ "text", "image" }, .cost = .{ .input = 0.4, .output = 2, .cache_read = 0.08, .cache_write = 0 }, .context_window = 262144, .max_tokens = 131072 },
     .{ .provider = "xiaomi", .id = "mimo-v2-pro", .name = "MiMo-V2-Pro", .api = "anthropic-messages", .base_url = "https://api.xiaomimimo.com/anthropic", .reasoning = true, .input_types = &[_][]const u8{"text"}, .cost = .{ .input = 1, .output = 3, .cache_read = 0.2, .cache_write = 0 }, .context_window = 1048576, .max_tokens = 131072 },

@@ -3,12 +3,14 @@ const std = @import("std");
 pub const ProviderKind = enum {
     anthropic,
     openai_codex,
+    xai_oauth,
 };
 
 pub fn defaultCallbackPath(kind: ProviderKind) []const u8 {
     return switch (kind) {
         .anthropic => "/callback",
         .openai_codex => "/auth/callback",
+        .xai_oauth => "/callback",
     };
 }
 
@@ -16,6 +18,7 @@ pub fn defaultCallbackPort(kind: ProviderKind) u16 {
     return switch (kind) {
         .anthropic => 53692,
         .openai_codex => 1455,
+        .xai_oauth => 56121,
     };
 }
 
@@ -143,17 +146,26 @@ pub const OAuthCallbackListener = struct {
         const request_head = try readRequestHead(self.allocator, self.io, stream);
         defer self.allocator.free(request_head);
 
-        const target = parseRequestTarget(request_head) orelse {
+        const request = parseRequestLine(request_head) orelse {
             try writeCallbackResponse(stream, self.io, 400, "Bad Request", errorBody("Invalid OAuth callback request."));
             return false;
         };
 
-        const query_index = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
-        const path = target[0..query_index];
-        const query = if (query_index < target.len) target[query_index + 1 ..] else "";
+        const query_index = std.mem.indexOfScalar(u8, request.target, '?') orelse request.target.len;
+        const path = request.target[0..query_index];
+        const query = if (query_index < request.target.len) request.target[query_index + 1 ..] else "";
 
         if (!std.mem.eql(u8, path, self.expected_path)) {
             try writeCallbackResponse(stream, self.io, 404, "Not Found", errorBody("Callback route not found."));
+            return false;
+        }
+
+        if (request.method == .OPTIONS) {
+            try writePreflightResponse(stream, self.io);
+            return false;
+        }
+        if (request.method != .GET) {
+            try writeCallbackResponse(stream, self.io, 405, "Method Not Allowed", errorBody("Unsupported OAuth callback method."));
             return false;
         }
 
@@ -231,13 +243,32 @@ fn readRequestHead(allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.
     return try head.toOwnedSlice(allocator);
 }
 
-fn parseRequestTarget(request_head: []const u8) ?[]const u8 {
+const RequestMethod = enum {
+    GET,
+    OPTIONS,
+    other,
+};
+
+const RequestLine = struct {
+    method: RequestMethod,
+    target: []const u8,
+};
+
+fn parseRequestLine(request_head: []const u8) ?RequestLine {
     const first_line_end = std.mem.indexOf(u8, request_head, "\r\n") orelse return null;
     const first_line = request_head[0..first_line_end];
     var parts = std.mem.splitScalar(u8, first_line, ' ');
     const method = parts.next() orelse return null;
-    if (!std.mem.eql(u8, method, "GET")) return null;
-    return parts.next();
+    const request_method: RequestMethod = if (std.mem.eql(u8, method, "GET"))
+        .GET
+    else if (std.mem.eql(u8, method, "OPTIONS"))
+        .OPTIONS
+    else
+        .other;
+    return .{
+        .method = request_method,
+        .target = parts.next() orelse return null,
+    };
 }
 
 fn parseCallbackQuery(allocator: std.mem.Allocator, query: []const u8) !CallbackQuery {
@@ -301,8 +332,17 @@ fn writeCallbackResponse(
     var writer_buffer: [1024]u8 = undefined;
     var writer = stream.writer(io, &writer_buffer);
     try writer.interface.print(
-        "HTTP/1.1 {d} {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        "HTTP/1.1 {d} {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n\r\n{s}",
         .{ status_code, reason, body.len, body },
+    );
+    try writer.interface.flush();
+}
+
+fn writePreflightResponse(stream: std.Io.net.Stream, io: std.Io) !void {
+    var writer_buffer: [1024]u8 = undefined;
+    var writer = stream.writer(io, &writer_buffer);
+    try writer.interface.writeAll(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\n\r\n",
     );
     try writer.interface.flush();
 }
@@ -326,14 +366,14 @@ const RawHttpResponse = struct {
     }
 };
 
-fn rawHttpGet(allocator: std.mem.Allocator, io: std.Io, port: u16, target: []const u8) !RawHttpResponse {
+fn rawHttpRequest(allocator: std.mem.Allocator, io: std.Io, port: u16, method: []const u8, target: []const u8) !RawHttpResponse {
     const address = std.Io.net.IpAddress{ .ip4 = .loopback(port) };
     const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 
     var writer_buffer: [1024]u8 = undefined;
     var writer = stream.writer(io, &writer_buffer);
-    try writer.interface.print("GET {s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n", .{ target, port });
+    try writer.interface.print("{s} {s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n", .{ method, target, port });
     try writer.interface.flush();
 
     var reader_buffer: [1024]u8 = undefined;
@@ -362,9 +402,13 @@ fn rawHttpGet(allocator: std.mem.Allocator, io: std.Io, port: u16, target: []con
     };
 }
 
+fn rawHttpGet(allocator: std.mem.Allocator, io: std.Io, port: u16, target: []const u8) !RawHttpResponse {
+    return rawHttpRequest(allocator, io, port, "GET", target);
+}
+
 test "OAuth callback listener accepts provider paths and captures callback URL" {
     const allocator = std.testing.allocator;
-    const cases = [_]ProviderKind{ .anthropic, .openai_codex };
+    const cases = [_]ProviderKind{ .anthropic, .openai_codex, .xai_oauth };
 
     for (cases) |kind| {
         var listener = try OAuthCallbackListener.createForTesting(allocator, std.testing.io, kind, "expected-state", 0);
@@ -386,6 +430,19 @@ test "OAuth callback listener accepts provider paths and captures callback URL" 
         defer allocator.free(expected);
         try std.testing.expectEqualStrings(expected, completed);
     }
+}
+
+test "OAuth callback listener answers preflight requests" {
+    const allocator = std.testing.allocator;
+
+    var listener = try OAuthCallbackListener.createForTesting(allocator, std.testing.io, .xai_oauth, "expected-state", 0);
+    defer listener.destroy();
+    try listener.start();
+
+    var response = try rawHttpRequest(allocator, std.testing.io, listener.port(), "OPTIONS", "/callback");
+    defer response.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 204), response.status_code);
+    try std.testing.expect(listener.takeCompletedCallbackUrl() == null);
 }
 
 test "OAuth callback listener rejects bad callbacks without completing login" {

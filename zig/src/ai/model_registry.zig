@@ -910,6 +910,7 @@ test "built-in models are registered at startup" {
     try std.testing.expect(find("xiaomi-token-plan-cn", "mimo-v2.5-pro") != null);
     try std.testing.expect(find("xiaomi-token-plan-ams", "mimo-v2.5-pro") != null);
     try std.testing.expect(find("xiaomi-token-plan-sgp", "mimo-v2.5-pro") != null);
+    try std.testing.expect(find("xai-oauth", "grok-4.3") != null);
 
     const provider = getProviderConfig("openai").?;
     try std.testing.expectEqualStrings("openai-responses", provider.api);
@@ -968,6 +969,7 @@ test "phase4 provider expansion registers configs and default models" {
         default_model_id: []const u8,
     }{
         .{ .provider = "xai", .api = "openai-completions", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.20-0309-reasoning" },
+        .{ .provider = "xai-oauth", .api = "openai-responses", .base_url = "https://api.x.ai/v1", .default_model_id = "grok-4.3" },
         .{ .provider = "groq", .api = "openai-completions", .base_url = "https://api.groq.com/openai/v1", .default_model_id = "openai/gpt-oss-120b" },
         .{ .provider = "cerebras", .api = "openai-completions", .base_url = "https://api.cerebras.ai/v1", .default_model_id = "zai-glm-4.7" },
         .{ .provider = "openrouter", .api = "openai-completions", .base_url = "https://openrouter.ai/api/v1", .default_model_id = "moonshotai/kimi-k2.6" },
@@ -1017,6 +1019,10 @@ test "phase4 provider expansion registers configs and default models" {
     try expectCompatBool(kimi_code_openai, "supportsReasoningEffort", false);
     try expectCompatString(kimi_code_openai, "maxTokensField", "max_tokens");
     try expectCompatBool(kimi_code_openai, "supportsStrictMode", false);
+
+    const xai_oauth = find("xai-oauth", "grok-4.3").?;
+    try expectCompatBool(xai_oauth, "sendSessionIdHeader", false);
+    try expectCompatBool(xai_oauth, "supportsLongCacheRetention", false);
 
     const together = find("together", "moonshotai/Kimi-K2.6").?;
     try std.testing.expectEqualStrings("Kimi K2.6", together.name);
