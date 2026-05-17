@@ -31,6 +31,7 @@ export type KnownProvider =
 	| "deepseek"
 	| "github-copilot"
 	| "xai"
+	| "xai-oauth"
 	| "groq"
 	| "cerebras"
 	| "openrouter"

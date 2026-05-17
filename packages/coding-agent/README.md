@@ -104,6 +104,7 @@ For each built-in provider, pi maintains a list of tool-capable models, updated 
 **Subscriptions:**
 - Anthropic Claude Pro/Max
 - OpenAI ChatGPT Plus/Pro (Codex)
+- xAI SuperGrok (Grok OAuth)
 - GitHub Copilot
 
 **API keys:**

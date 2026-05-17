@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added xAI Grok OAuth provider support for using SuperGrok subscriptions through `xai-oauth`.
+
 ## [0.74.1] - 2026-05-16
 
 ### Added

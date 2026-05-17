@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added xAI Grok OAuth login and default model support for SuperGrok subscriptions through `xai-oauth`.
+
 ## [0.74.1] - 2026-05-16
 
 ### New Features

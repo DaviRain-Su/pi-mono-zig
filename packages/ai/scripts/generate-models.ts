@@ -15,6 +15,7 @@ import {
 	KnownProvider,
 	Model,
 	type OpenAICompletionsCompat,
+	type OpenAIResponsesCompat,
 } from "../src/types.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -123,6 +124,7 @@ const TOGETHER_TOGGLE_REASONING_LEVEL_MAP = {
 
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
+const XAI_OAUTH_BASE_URL = "https://api.x.ai/v1";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
 const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-haiku-4.5",
@@ -1669,6 +1671,66 @@ async function generateModels() {
 			allModels.push(model);
 		}
 	}
+
+	const xaiOAuthResponsesCompat: OpenAIResponsesCompat = {
+		sendSessionIdHeader: false,
+		supportsLongCacheRetention: false,
+	};
+	const xaiOAuthModels: Model<"openai-responses">[] = [
+		{
+			id: "grok-4.3",
+			name: "Grok 4.3",
+			api: "openai-responses",
+			baseUrl: XAI_OAUTH_BASE_URL,
+			provider: "xai-oauth",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
+			contextWindow: 1000000,
+			maxTokens: 30000,
+			compat: xaiOAuthResponsesCompat,
+		},
+		{
+			id: "grok-4.20-0309-reasoning",
+			name: "Grok 4.20 (Reasoning)",
+			api: "openai-responses",
+			baseUrl: XAI_OAUTH_BASE_URL,
+			provider: "xai-oauth",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
+			contextWindow: 2000000,
+			maxTokens: 30000,
+			compat: xaiOAuthResponsesCompat,
+		},
+		{
+			id: "grok-4.20-0309-non-reasoning",
+			name: "Grok 4.20 (Non-Reasoning)",
+			api: "openai-responses",
+			baseUrl: XAI_OAUTH_BASE_URL,
+			provider: "xai-oauth",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
+			contextWindow: 2000000,
+			maxTokens: 30000,
+			compat: xaiOAuthResponsesCompat,
+		},
+		{
+			id: "grok-4.20-multi-agent-0309",
+			name: "Grok 4.20 Multi-Agent",
+			api: "openai-responses",
+			baseUrl: XAI_OAUTH_BASE_URL,
+			provider: "xai-oauth",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
+			contextWindow: 2000000,
+			maxTokens: 30000,
+			compat: xaiOAuthResponsesCompat,
+		},
+	];
+	allModels.push(...xaiOAuthModels);
 
 	// Add missing Mistral Medium 3.5 model until models.dev includes it
 	if (!allModels.some(m => m.provider === "mistral" && m.id === "mistral-medium-3.5")) {

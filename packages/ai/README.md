@@ -53,6 +53,7 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **OpenAI**
 - **Azure OpenAI (Responses)**
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, requires OAuth, see below)
+- **xAI Grok OAuth** (SuperGrok subscription, requires OAuth, see below)
 - **DeepSeek**
 - **Anthropic**
 - **Google**
@@ -1152,6 +1153,7 @@ Several providers require OAuth authentication instead of static API keys:
 
 - **Anthropic** (Claude Pro/Max subscription)
 - **OpenAI Codex** (ChatGPT Plus/Pro subscription, access to GPT-5.x Codex models)
+- **xAI Grok OAuth** (SuperGrok subscription, access to Grok models through `xai-oauth`)
 - **GitHub Copilot** (Copilot subscription)
 
 For paid Cloud Code Assist subscriptions, set `GOOGLE_CLOUD_PROJECT` or `GOOGLE_CLOUD_PROJECT_ID` to your project ID.
@@ -1204,6 +1206,7 @@ The quickest way to authenticate:
 ```bash
 npx @earendil-works/pi-ai login              # interactive provider selection
 npx @earendil-works/pi-ai login anthropic    # login to specific provider
+npx @earendil-works/pi-ai login xai-oauth    # login with a SuperGrok subscription
 npx @earendil-works/pi-ai list               # list available providers
 ```
 
@@ -1218,6 +1221,7 @@ import {
   // Login functions (return credentials, do not store)
   loginAnthropic,
   loginOpenAICodex,
+  loginXAI,
   loginGitHubCopilot,
   loginGeminiCli,
 
