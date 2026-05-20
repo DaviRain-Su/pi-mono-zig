@@ -658,7 +658,7 @@ test "interactive mode renders streaming assistant updates through a mock backen
 
     try std.testing.expect(renderedLinesContain(lines, ASSISTANT_PREFIX));
     try std.testing.expect(renderedLinesContain(lines, "streaming reply"));
-    try std.testing.expectEqualStrings("streaming", state.status);
+    try std.testing.expectEqualStrings("streaming", state.footer.status);
 }
 
 test "interactive mode renders thinking placeholder before assistant text" {
@@ -695,7 +695,7 @@ test "interactive mode renders thinking placeholder before assistant text" {
     try std.testing.expect(renderedLinesContain(lines, "You: hello"));
     try std.testing.expect(renderedLinesContain(lines, ASSISTANT_PREFIX));
     try std.testing.expect(renderedLinesContain(lines, "Thinking..."));
-    try std.testing.expectEqualStrings("thinking", state.status);
+    try std.testing.expectEqualStrings("thinking", state.footer.status);
 }
 
 test "interactive mode renders tool execution details through a mock backend" {
@@ -1066,7 +1066,7 @@ test "handleInputKey dispatches interrupt exit and clear actions" {
     );
 
     state.mutex.lockUncancelable(state.io);
-    try std.testing.expectEqualStrings("interrupt requested", state.status);
+    try std.testing.expectEqualStrings("interrupt requested", state.footer.status);
     state.mutex.unlock(state.io);
 
     prompt_worker_active = false;
@@ -1232,8 +1232,8 @@ test "submitEditorText queues steering messages while streaming" {
     try std.testing.expectEqualStrings("", editor.text());
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqual(@as(usize, 1), state.queued_steering.items.len);
-    try std.testing.expectEqualStrings("queued steering message", state.status);
+    try std.testing.expectEqual(@as(usize, 1), state.queue.steering.items.len);
+    try std.testing.expectEqualStrings("queued steering message", state.footer.status);
 }
 
 test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued drafts" {
@@ -1320,7 +1320,7 @@ test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued d
     try std.testing.expectEqual(@as(usize, 1), session.agent.followUpQueueLen());
     try std.testing.expectEqualStrings("", editor.text());
     state.mutex.lockUncancelable(state.io);
-    try std.testing.expectEqual(@as(usize, 1), state.queued_follow_up.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.queue.follow_up.items.len);
     state.mutex.unlock(state.io);
 
     const queued_image = ai.ImageContent{
@@ -1370,8 +1370,8 @@ test "dispatchInputEvent alt-enter queues follow-up and alt-up restores queued d
     try std.testing.expectEqual(@as(usize, 1), restored_images.len);
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqual(@as(usize, 0), state.queued_follow_up.items.len);
-    try std.testing.expectEqualStrings("Restored 2 queued messages to the editor", state.status);
+    try std.testing.expectEqual(@as(usize, 0), state.queue.follow_up.items.len);
+    try std.testing.expectEqualStrings("Restored 2 queued messages to the editor", state.footer.status);
 }
 
 test "parseSlashCommand recognizes builtins and arguments" {
@@ -1533,8 +1533,8 @@ test "beginLoginFlow starts anthropic oauth prompt state" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "You will be prompted") == null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Anthropic (Claude Pro/Max) login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "You will be prompted") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[1].text, "Anthropic (Claude Pro/Max) login started") != null);
 }
 
 test "beginLoginFlow falls back to manual paste when OAuth callback listener bind fails" {
@@ -1595,18 +1595,18 @@ test "beginLoginFlow falls back to manual paste when OAuth callback listener bin
     try std.testing.expect(browser_open_capture.called);
     try std.testing.expectEqualStrings(
         "Local callback listener unavailable. Paste the callback URL manually, or Esc to cancel",
-        state.status,
+        state.footer.status,
     );
 
     {
         state.mutex.lockUncancelable(state.io);
         defer state.mutex.unlock(state.io);
-        try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "Could not start the local callback listener") != null);
+        try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[1].text, "Could not start the local callback listener") != null);
     }
 
     try cancelAuthFlow(allocator, &auth_flow_mod.test_auth_flow, &state);
     try std.testing.expect(auth_flow_mod.test_auth_flow == null);
-    try std.testing.expectEqualStrings("login cancelled", state.status);
+    try std.testing.expectEqualStrings("login cancelled", state.footer.status);
 }
 
 test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
@@ -1668,8 +1668,8 @@ test "beginLoginFlow starts OpenAI Codex OAuth subscription prompt state" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "ChatGPT Plus/Pro (Codex Subscription) login started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.openai.com/oauth/authorize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[1].text, "ChatGPT Plus/Pro (Codex Subscription) login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[2].text, "auth.openai.com/oauth/authorize") != null);
 }
 
 test "beginLoginFlow starts xAI Grok OAuth prompt state" {
@@ -1729,8 +1729,8 @@ test "beginLoginFlow starts xAI Grok OAuth prompt state" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "xAI Grok OAuth login started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[2].text, "auth.x.ai/oauth2/authorize") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[1].text, "xAI Grok OAuth login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[2].text, "auth.x.ai/oauth2/authorize") != null);
 }
 
 test "beginLoginFlow starts API key prompt state for built-in provider" {
@@ -1756,7 +1756,7 @@ test "beginLoginFlow starts API key prompt state for built-in provider" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[1].text, "OpenAI API key login started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[1].text, "OpenAI API key login started") != null);
 }
 
 test "persistLoginCredential writes auth.json for slash login flows" {
@@ -2498,7 +2498,7 @@ test "handleInputKey appends hotkeys markdown for slash hotkeys command" {
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
     var hotkeys_item: ?rendering.ChatItem = null;
-    for (state.items.items) |item| {
+    for (state.chat.items.items) |item| {
         if (item.kind == .markdown and std.mem.indexOf(u8, item.text, "Keyboard shortcuts") != null) {
             hotkeys_item = item;
             break;
@@ -3067,7 +3067,7 @@ test "handleInputKey reports unknown slash commands" {
     try std.testing.expect(overlay == null);
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Unknown slash command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "Unknown slash command") != null);
 }
 
 test "handleInputKey updates session name for slash name command" {
@@ -3143,8 +3143,8 @@ test "handleInputKey updates session name for slash name command" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("Night Shift", state.session_label);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Session name set: Night Shift") != null);
+    try std.testing.expectEqualStrings("Night Shift", state.footer.session_label);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "Session name set: Night Shift") != null);
 }
 
 test "handleInputKey updates current entry labels and tree overlay renders them" {
@@ -3226,8 +3226,8 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     {
         state.mutex.lockUncancelable(state.io);
         defer state.mutex.unlock(state.io);
-        try std.testing.expectEqualStrings("label updated", state.status);
-        try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Label set: bookmark") != null);
+        try std.testing.expectEqualStrings("label updated", state.footer.status);
+        try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "Label set: bookmark") != null);
     }
 
     _ = try editor.handlePaste("/tree");
@@ -3299,8 +3299,8 @@ test "handleInputKey updates current entry labels and tree overlay renders them"
     {
         state.mutex.lockUncancelable(state.io);
         defer state.mutex.unlock(state.io);
-        try std.testing.expectEqualStrings("label cleared", state.status);
-        try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Label cleared") != null);
+        try std.testing.expectEqualStrings("label cleared", state.footer.status);
+        try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "Label cleared") != null);
     }
 
     _ = try editor.handlePaste("/tree");
@@ -3412,7 +3412,7 @@ test "submitEditorText resets editor autocomplete state after submit" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("thinking", state.status);
+    try std.testing.expectEqualStrings("thinking", state.footer.status);
 }
 
 test "handleInputKey pastes a clipboard image into the pending prompt attachments" {
@@ -3510,7 +3510,7 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
     try std.testing.expectEqualStrings("", editor.text());
 
     state.mutex.lockUncancelable(state.io);
-    try std.testing.expectEqualStrings("pasting clipboard image...", state.status);
+    try std.testing.expectEqualStrings("pasting clipboard image...", state.footer.status);
     state.mutex.unlock(state.io);
 
     var attempts: usize = 0;
@@ -3528,7 +3528,7 @@ test "handleInputKey pastes a clipboard image into the pending prompt attachment
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("clipboard image pasted", state.status);
+    try std.testing.expectEqualStrings("clipboard image pasted", state.footer.status);
 }
 
 test "submitEditorText includes pending clipboard images and clears the draft attachments" {
@@ -3736,7 +3736,7 @@ test "reload slash command refreshes the selected theme from disk" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("Reloaded keybindings, extensions, skills, prompts, and themes", state.status);
+    try std.testing.expectEqualStrings("Reloaded keybindings, extensions, skills, prompts, and themes", state.footer.status);
 }
 
 test "reload preserves startup explicit extension sources" {
@@ -3872,7 +3872,7 @@ test "handleInputKey shows session stats for slash session command" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    const info = state.items.items[state.items.items.len - 1].text;
+    const info = state.chat.items.items[state.chat.items.items.len - 1].text;
     try std.testing.expect(std.mem.indexOf(u8, info, "Messages: user=1, assistant=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Tokens: input=11, output=7, cache_read=2, cache_write=1, total=21") != null);
     try std.testing.expect(std.mem.indexOf(u8, info, "Context:") != null);
@@ -4006,10 +4006,10 @@ test "handleInputKey appends condensed changelog markdown for slash changelog co
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqual(ChatKind.markdown, state.items.items[state.items.items.len - 1].kind);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "## [2.0.0]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "## [1.9.0]") == null);
-    try std.testing.expectEqualStrings("showing condensed changelog", state.status);
+    try std.testing.expectEqual(ChatKind.markdown, state.chat.items.items[state.chat.items.items.len - 1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "## [2.0.0]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "## [1.9.0]") == null);
+    try std.testing.expectEqualStrings("showing condensed changelog", state.footer.status);
 }
 
 test "session overlays use persisted session names and labels" {
@@ -4259,7 +4259,7 @@ test "handleInputKey starts a fresh session for slash new command" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "New session started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "New session started") != null);
 }
 
 test "handleInputKey exports session transcript to explicit html and jsonl paths" {
@@ -4437,8 +4437,8 @@ test "app state streams assistant updates and records tool results" {
 
     state.mutex.lockUncancelable(state.io);
     defer state.mutex.unlock(state.io);
-    try std.testing.expectEqualStrings("partial", state.items.items[state.items.items.len - 2].text);
-    try std.testing.expect(std.mem.indexOf(u8, state.items.items[state.items.items.len - 1].text, "Tool result bash: /tmp") != null);
+    try std.testing.expectEqualStrings("partial", state.chat.items.items[state.chat.items.items.len - 2].text);
+    try std.testing.expect(std.mem.indexOf(u8, state.chat.items.items[state.chat.items.items.len - 1].text, "Tool result bash: /tmp") != null);
 }
 
 test "app state aggregates usage totals and footer renders git branch stats" {
@@ -4486,8 +4486,8 @@ test "app state aggregates usage totals and footer renders git branch stats" {
     });
 
     state.mutex.lockUncancelable(state.io);
-    try std.testing.expectEqual(@as(u64, 0), state.usage_totals.input);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0109375), state.context_percent.?, @as(f64, 0.0000001));
+    try std.testing.expectEqual(@as(u64, 0), state.footer.usage_totals.input);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0109375), state.footer.context_percent.?, @as(f64, 0.0000001));
     state.mutex.unlock(state.io);
 
     try state.handleAgentEvent(.{
@@ -4508,12 +4508,12 @@ test "app state aggregates usage totals and footer renders git branch stats" {
     {
         state.mutex.lockUncancelable(state.io);
         defer state.mutex.unlock(state.io);
-        try std.testing.expectEqual(@as(u64, 11), state.usage_totals.input);
-        try std.testing.expectEqual(@as(u64, 7), state.usage_totals.output);
-        try std.testing.expectEqual(@as(u64, 2), state.usage_totals.cache_read);
-        try std.testing.expectEqual(@as(u64, 1), state.usage_totals.cache_write);
-        try std.testing.expectEqual(@as(u32, 14), state.context_tokens.?);
-        try std.testing.expectApproxEqAbs(@as(f64, 0.42), state.usage_totals.cost, @as(f64, 0.0000001));
+        try std.testing.expectEqual(@as(u64, 11), state.footer.usage_totals.input);
+        try std.testing.expectEqual(@as(u64, 7), state.footer.usage_totals.output);
+        try std.testing.expectEqual(@as(u64, 2), state.footer.usage_totals.cache_read);
+        try std.testing.expectEqual(@as(u64, 1), state.footer.usage_totals.cache_write);
+        try std.testing.expectEqual(@as(u32, 14), state.footer.context_tokens.?);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.42), state.footer.usage_totals.cost, @as(f64, 0.0000001));
     }
 
     var snapshot = try state.snapshotForRender(allocator);
@@ -4965,10 +4965,10 @@ fn expectShareTmpRemoved(path: []const u8) !void {
 }
 
 fn lastItemKindContains(state: *const AppState, kind: rendering.ChatKind, needle: []const u8) bool {
-    var index = state.items.items.len;
+    var index = state.chat.items.items.len;
     while (index > 0) {
         index -= 1;
-        const item = state.items.items[index];
+        const item = state.chat.items.items[index];
         if (item.kind != kind) continue;
         if (std.mem.indexOf(u8, item.text, needle) != null) return true;
         return false;
@@ -4977,7 +4977,7 @@ fn lastItemKindContains(state: *const AppState, kind: rendering.ChatKind, needle
 }
 
 fn hasItemKind(state: *const AppState, kind: rendering.ChatKind) bool {
-    for (state.items.items) |item| {
+    for (state.chat.items.items) |item| {
         if (item.kind == kind) return true;
     }
     return false;
@@ -5145,7 +5145,7 @@ test "handleShareSlashCommand falls back to clipboard when gh not installed" {
     // Clipboard should have been called with session markdown
     try std.testing.expect(capture.text != null);
     // Status should be "copied", not "share failed"
-    try std.testing.expectEqualStrings("copied", state.status);
+    try std.testing.expectEqualStrings("copied", state.footer.status);
     // An info item (not error) about clipboard should be present
     try std.testing.expect(lastItemKindContains(&state, .info, "clipboard"));
     // tmp file must not exist (no HTML export was attempted)
@@ -5232,7 +5232,7 @@ test "handleShareSlashCommand creates secret gist and uses default viewer URL" {
 
     try std.testing.expect(lastItemKindContains(&state, .info, "https://pi.dev/session/#abc123def456"));
     try std.testing.expect(lastItemKindContains(&state, .info, "https://gist.github.com/octocat/abc123def456"));
-    try std.testing.expectEqualStrings("shared", state.status);
+    try std.testing.expectEqualStrings("shared", state.footer.status);
     try expectShareTmpRemoved(tmp_file);
 }
 
@@ -5399,7 +5399,7 @@ test "handleShareSlashCommand clipboard fallback does not call gist create" {
     // Only auth status was invoked - no gist create
     try std.testing.expectEqual(@as(usize, 1), stub.invocations.items.len);
     // Should show copied status, not share failed
-    try std.testing.expectEqualStrings("copied", state.status);
+    try std.testing.expectEqualStrings("copied", state.footer.status);
 }
 
 test "handleLogoutSlashCommand opens selector for stored auth providers" {

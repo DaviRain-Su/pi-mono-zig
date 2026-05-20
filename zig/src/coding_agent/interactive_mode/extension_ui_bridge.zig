@@ -701,5 +701,5 @@ test "extension bridge editor APIs mutate editor and hidden thinking label" {
     defer label_request.deinit(allocator);
     try state.setThinkingBlockVisibility(true);
     try bridge.handleHostRequest(label_request, &env_map, tmp_path, &terminal, &editor, &overlay, &state, &live, &session, 0);
-    try std.testing.expectEqualStrings("Hidden thoughts", state.items.items[1].text);
+    try std.testing.expectEqualStrings("Hidden thoughts", state.chat.items.items[1].text);
 }

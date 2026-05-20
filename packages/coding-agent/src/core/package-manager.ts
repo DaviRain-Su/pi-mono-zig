@@ -49,6 +49,7 @@ export interface PathMetadata {
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
+	provenance?: import("./source-info.ts").SourceProvenanceBinding;
 }
 
 export interface ResolvedResource {

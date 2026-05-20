@@ -1019,6 +1019,32 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
+
+				// Also register the OpenAI-compatible variant
+				models.push({
+					id: normalizedId,
+					name: normalizedName,
+					api: "openai-completions",
+					provider: "kimi-code-openai",
+					baseUrl: "https://api.kimi.com/coding/v1",
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+					compat: {
+						supportsStore: false,
+						supportsDeveloperRole: false,
+						supportsReasoningEffort: false,
+						maxTokensField: "max_tokens",
+						supportsStrictMode: false,
+					},
+				});
 			}
 		}
 

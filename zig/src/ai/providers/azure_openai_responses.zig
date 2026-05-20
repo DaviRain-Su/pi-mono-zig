@@ -90,21 +90,15 @@ pub const AzureOpenAIResponsesProvider = struct {
         var client = try http_client.HttpClient.init(allocator, io);
         defer client.deinit();
 
-        var response = try client.requestStreaming(.{
-            .method = .POST,
-            .url = url,
-            .headers = headers,
-            .body = json_body,
-            .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
-            .aborted = if (options) |stream_options| stream_options.signal else null,
-        });
+        var response = try provider_stream.executeStreamingRequest(
+            &client,
+            url,
+            headers,
+            json_body,
+            options,
+            model,
+        );
         defer response.deinit();
-
-        if (options) |stream_options| {
-            if (stream_options.on_response) |callback| {
-                try provider_stream.invokeOnResponse(allocator, callback, response.status, response.response_headers, model);
-            }
-        }
 
         if (response.status != 200) {
             const response_body = try response.readAllBounded(allocator, provider_error.MAX_PROVIDER_ERROR_BODY_READ_BYTES);

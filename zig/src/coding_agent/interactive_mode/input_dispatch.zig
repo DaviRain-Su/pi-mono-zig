@@ -115,354 +115,481 @@ pub fn handleInputKeyWithModifiers(
     app_context: *AppContext,
     live_resources: *LiveResources,
 ) !void {
-    if (overlay.*) |*overlay_value| {
-        if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
-            if (action == .exit) {
-                should_exit.* = true;
-                if (prompt_worker_active.*) session.agent.abort();
-                return;
-            }
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .settings_editor) {
-            switch (key) {
-                .escape => {
-                    overlay_value.deinit(allocator);
-                    overlay.* = null;
-                    return;
-                },
-                .ctrl => |ctrl| {
-                    if (ctrl == 's') {
-                        try saveSettingsEditorOverlay(
-                            allocator,
-                            io,
-                            env_map,
-                            session,
-                            options,
-                            app_state,
-                            editor,
-                            overlay,
-                            live_resources,
-                        );
-                        return;
-                    }
-                },
-                else => {},
-            }
-
-            _ = try overlay_value.settings_editor.editor.handleKey(key);
-            return;
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .settings) {
-            try handleSettingsOverlayKey(
-                allocator,
-                io,
-                env_map,
-                key,
-                session,
-                options,
-                app_state,
-                editor,
-                overlay,
-                live_resources,
-            );
-            return;
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .model) {
-            if (try overlay_input.handleModelOverlayInteractiveKey(allocator, key, modifiers, &overlay_value.model, live_resources.keybindings)) {
-                return;
-            }
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .session) {
-            if (try overlay_input.handleSessionOverlayInteractiveKey(
-                allocator,
-                io,
-                key,
-                modifiers,
-                &overlay_value.session,
-                live_resources.keybindings,
-                app_state,
-            )) {
-                return;
-            }
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .scoped_models) {
-            try overlay_input.handleScopedModelsOverlayKey(
-                allocator,
-                io,
-                key,
-                modifiers,
-                &overlay_value.scoped_models,
-                app_state,
-                live_resources.runtime_config,
-                live_resources.keybindings,
-                overlay,
-            );
-            return;
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .tree) {
-            if (try overlay_input.handleTreeOverlayInteractiveKey(
-                allocator,
-                key,
-                modifiers,
-                &overlay_value.tree,
-                session,
-                app_state,
-                editor,
-                live_resources.runtime_config,
-                live_resources.keybindings,
-                overlay,
-            )) {
-                return;
-            }
-        }
-
-        if (std.meta.activeTag(overlay_value.*) == .extension_dialog) {
-            if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
-                if (action == .tools_expand) {
-                    try handleAppAction(
-                        allocator,
-                        io,
-                        env_map,
-                        action,
-                        session,
-                        current_provider,
-                        session_dir,
-                        options,
-                        live_resources.runtime_config,
-                        app_state,
-                        overlay,
-                        editor,
-                        prompt_worker_active,
-                        tool_items,
-                        subscriber,
-                        should_exit,
-                        app_context,
-                    );
-                    return;
-                }
-            }
-            try extension_dialog.handleDialogKey(
-                allocator,
-                &overlay_value.extension_dialog,
-                key,
-                modifiers,
-                live_resources.keybindings,
-            );
-            return;
-        }
-
-        switch (key) {
-            .escape => {
-                overlay_value.deinit(allocator);
-                overlay.* = null;
-                return;
-            },
-            else => {},
-        }
-
-        const overlay_list = switch (overlay_value.*) {
-            .info => &overlay_value.info.list,
-            .settings => &overlay_value.settings.list,
-            .session => &overlay_value.session.list,
-            .model => &overlay_value.model.list,
-            .scoped_models => &overlay_value.scoped_models.list,
-            .theme => &overlay_value.theme.list,
-            .tree => &overlay_value.tree.list,
-            .fork => &overlay_value.fork.list,
-            .auth => &overlay_value.auth.list,
-            .extension_dialog => unreachable,
-            else => unreachable,
-        };
-        const result = overlay_list.handleKey(key);
-        switch (result) {
-            .handled, .ignored => return,
-            .dismissed => {
-                overlay_value.deinit(allocator);
-                overlay.* = null;
-                return;
-            },
-            .confirmed => |index| {
-                switch (overlay_value.*) {
-                    .info => {},
-                    .session => |session_overlay| {
-                        if (session_overlay.choices[index].path.len == 0) {
-                            try app_state.setStatus("No sessions found");
-                            overlay_value.deinit(allocator);
-                            overlay.* = null;
-                            return;
-                        }
-                        try switchSession(
-                            allocator,
-                            io,
-                            env_map,
-                            session,
-                            current_provider,
-                            session_overlay.choices[index].path,
-                            options,
-                            live_resources.runtime_config,
-                            tool_items,
-                            app_state,
-                            subscriber,
-                        );
-                    },
-                    .model => |model_overlay| {
-                        if (index >= model_overlay.choices.len or
-                            model_overlay.choices[index].provider.len == 0 or
-                            model_overlay.choices[index].model_id.len == 0)
-                        {
-                            try app_state.setStatus("No matching models");
-                            overlay_value.deinit(allocator);
-                            overlay.* = null;
-                            return;
-                        }
-                        try switchModel(
-                            allocator,
-                            env_map,
-                            session,
-                            current_provider,
-                            model_overlay.choices[index].provider,
-                            model_overlay.choices[index].model_id,
-                            options,
-                            live_resources.runtime_config,
-                            app_state,
-                        );
-                    },
-                    .theme => |theme_overlay| {
-                        try applyThemeByName(
-                            allocator,
-                            io,
-                            env_map,
-                            options.cwd,
-                            theme_overlay.choices[index].name,
-                            app_state,
-                            live_resources,
-                        );
-                    },
-                    .tree => |tree_overlay| {
-                        if (tree_overlay.choices[index].entry_id.len == 0) {
-                            try app_state.setStatus("No tree entries available");
-                        } else {
-                            try navigateTree(allocator, session, tree_overlay.choices[index].entry_id, app_state, editor, .{});
-                        }
-                    },
-                    .fork => |fork_overlay| {
-                        if (fork_overlay.choices[index].entry_id.len == 0) {
-                            try app_state.setStatus("No messages to fork from");
-                        } else {
-                            try forkCurrentSessionBeforeUserMessage(
-                                allocator,
-                                io,
-                                session,
-                                current_provider,
-                                session_dir,
-                                tool_items,
-                                fork_overlay.choices[index].entry_id,
-                                app_state,
-                                editor,
-                                subscriber,
-                            );
-                        }
-                    },
-                    .auth => |auth_overlay| switch (auth_overlay.mode) {
-                        .login => try beginLoginFlow(
-                            allocator,
-                            io,
-                            env_map,
-                            auth_overlay.choices[index].provider_id,
-                            auth_overlay.choices[index].auth_type,
-                            app_state,
-                            auth_flow,
-                        ),
-                        .logout => try logoutProviderById(
-                            allocator,
-                            io,
-                            env_map,
-                            session,
-                            current_provider,
-                            auth_overlay.choices[index].provider_id,
-                            options,
-                            app_state,
-                            live_resources,
-                        ),
-                    },
-                    .extension_dialog => unreachable,
-                    else => unreachable,
-                }
-                overlay_value.deinit(allocator);
-                overlay.* = null;
-                return;
-            },
-        }
-    }
-
-    if (auth_flow.* != null) {
-        if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
-            if (action == .exit) {
-                should_exit.* = true;
-                if (prompt_worker_active.*) session.agent.abort();
-                return;
-            }
-        }
-
-        switch (key) {
-            .escape => {
-                cancelAuthFlow(allocator, auth_flow, app_state) catch {};
-                clearEditor(app_state, editor);
-                return;
-            },
-            .enter => {
-                if (editor.isShowingAutocomplete()) {
-                    _ = try editor.handleKey(key);
-                    return;
-                }
-                const expanded_text = try editor.expandedTextAlloc(allocator);
-                defer allocator.free(expanded_text);
-                const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
-                submitAuthFlowInput(
-                    allocator,
-                    io,
-                    env_map,
-                    trimmed,
-                    session,
-                    current_provider,
-                    options,
-                    app_state,
-                    editor,
-                    auth_flow,
-                    live_resources,
-                ) catch |err| {
-                    const auth_message = try auth.formatAuthenticationError(allocator, err);
-                    defer if (auth_message) |formatted| allocator.free(formatted);
-                    const message = try std.fmt.allocPrint(
-                        allocator,
-                        "Authentication failed: {s}",
-                        .{if (auth_message) |formatted| formatted else @errorName(err)},
-                    );
-                    defer allocator.free(message);
-                    try app_state.appendError(message);
-                };
-                return;
-            },
-            else => {},
-        }
-
-        const handled_auth = try editor.handleKey(key);
-        switch (handled_auth) {
-            .exit => {
-                should_exit.* = true;
-                if (prompt_worker_active.*) session.agent.abort();
-            },
-            else => {},
-        }
+    if (overlay.* != null) {
+        try handleOverlayInput(
+            allocator,
+            io,
+            env_map,
+            key,
+            modifiers,
+            session,
+            current_provider,
+            session_dir,
+            options,
+            tool_items,
+            app_state,
+            editor,
+            overlay,
+            auth_flow,
+            prompt_worker_active,
+            subscriber,
+            should_exit,
+            app_context,
+            live_resources,
+        );
         return;
     }
 
+    if (auth_flow.* != null) {
+        try handleAuthFlowInput(
+            allocator,
+            io,
+            env_map,
+            key,
+            modifiers,
+            session,
+            current_provider,
+            options,
+            app_state,
+            editor,
+            auth_flow,
+            prompt_worker_active,
+            should_exit,
+            live_resources,
+        );
+        return;
+    }
+
+    try handleNormalInput(
+        allocator,
+        io,
+        env_map,
+        key,
+        modifiers,
+        session,
+        current_provider,
+        session_dir,
+        options,
+        tool_items,
+        app_state,
+        editor,
+        overlay,
+        auth_flow,
+        prompt_worker,
+        prompt_worker_active,
+        subscriber,
+        should_exit,
+        app_context,
+        live_resources,
+    );
+}
+
+fn handleOverlayInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    app_context: *AppContext,
+    live_resources: *LiveResources,
+) !void {
+    var overlay_value = &overlay.*.?;
+
+    if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
+        if (action == .exit) {
+            should_exit.* = true;
+            if (prompt_worker_active.*) { _ = session.agent.abort(); }
+            return;
+        }
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .settings_editor) {
+        switch (key) {
+            .escape => {
+                overlay_value.deinit(allocator);
+                overlay.* = null;
+                return;
+            },
+            .ctrl => |ctrl| {
+                if (ctrl == 's') {
+                    try saveSettingsEditorOverlay(
+                        allocator,
+                        io,
+                        env_map,
+                        session,
+                        options,
+                        app_state,
+                        editor,
+                        overlay,
+                        live_resources,
+                    );
+                    return;
+                }
+            },
+            else => {},
+        }
+
+        _ = try overlay_value.settings_editor.editor.handleKey(key);
+        return;
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .settings) {
+        try handleSettingsOverlayKey(
+            allocator,
+            io,
+            env_map,
+            key,
+            session,
+            options,
+            app_state,
+            editor,
+            overlay,
+            live_resources,
+        );
+        return;
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .model) {
+        if (try overlay_input.handleModelOverlayInteractiveKey(allocator, key, modifiers, &overlay_value.model, live_resources.keybindings)) {
+            return;
+        }
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .session) {
+        if (try overlay_input.handleSessionOverlayInteractiveKey(
+            allocator,
+            io,
+            key,
+            modifiers,
+            &overlay_value.session,
+            live_resources.keybindings,
+            app_state,
+        )) {
+            return;
+        }
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .scoped_models) {
+        try overlay_input.handleScopedModelsOverlayKey(
+            allocator,
+            io,
+            key,
+            modifiers,
+            &overlay_value.scoped_models,
+            app_state,
+            live_resources.runtime_config,
+            live_resources.keybindings,
+            overlay,
+        );
+        return;
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .tree) {
+        if (try overlay_input.handleTreeOverlayInteractiveKey(
+            allocator,
+            key,
+            modifiers,
+            &overlay_value.tree,
+            session,
+            app_state,
+            editor,
+            live_resources.runtime_config,
+            live_resources.keybindings,
+            overlay,
+        )) {
+            return;
+        }
+    }
+
+    if (std.meta.activeTag(overlay_value.*) == .extension_dialog) {
+        if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
+            if (action == .tools_expand) {
+                try handleAppAction(
+                    allocator,
+                    io,
+                    env_map,
+                    action,
+                    session,
+                    current_provider,
+                    session_dir,
+                    options,
+                    live_resources.runtime_config,
+                    app_state,
+                    overlay,
+                    editor,
+                    prompt_worker_active,
+                    tool_items,
+                    subscriber,
+                    should_exit,
+                    app_context,
+                );
+                return;
+            }
+        }
+        try extension_dialog.handleDialogKey(
+            allocator,
+            &overlay_value.extension_dialog,
+            key,
+            modifiers,
+            live_resources.keybindings,
+        );
+        return;
+    }
+
+    switch (key) {
+        .escape => {
+            overlay_value.deinit(allocator);
+            overlay.* = null;
+            return;
+        },
+        else => {},
+    }
+
+    const overlay_list = switch (overlay_value.*) {
+        .info => &overlay_value.info.list,
+        .settings => &overlay_value.settings.list,
+        .session => &overlay_value.session.list,
+        .model => &overlay_value.model.list,
+        .scoped_models => &overlay_value.scoped_models.list,
+        .theme => &overlay_value.theme.list,
+        .tree => &overlay_value.tree.list,
+        .fork => &overlay_value.fork.list,
+        .auth => &overlay_value.auth.list,
+        .extension_dialog => unreachable,
+        else => unreachable,
+    };
+    const result = overlay_list.handleKey(key);
+    switch (result) {
+        .handled, .ignored => return,
+        .dismissed => {
+            overlay_value.deinit(allocator);
+            overlay.* = null;
+            return;
+        },
+        .confirmed => |index| {
+            switch (overlay_value.*) {
+                .info => {},
+                .session => |session_overlay| {
+                    if (session_overlay.choices[index].path.len == 0) {
+                        try app_state.setStatus("No sessions found");
+                        overlay_value.deinit(allocator);
+                        overlay.* = null;
+                        return;
+                    }
+                    try switchSession(
+                        allocator,
+                        io,
+                        env_map,
+                        session,
+                        current_provider,
+                        session_overlay.choices[index].path,
+                        options,
+                        live_resources.runtime_config,
+                        tool_items,
+                        app_state,
+                        subscriber,
+                    );
+                },
+                .model => |model_overlay| {
+                    if (index >= model_overlay.choices.len or
+                        model_overlay.choices[index].provider.len == 0 or
+                        model_overlay.choices[index].model_id.len == 0)
+                    {
+                        try app_state.setStatus("No matching models");
+                        overlay_value.deinit(allocator);
+                        overlay.* = null;
+                        return;
+                    }
+                    try switchModel(
+                        allocator,
+                        env_map,
+                        session,
+                        current_provider,
+                        model_overlay.choices[index].provider,
+                        model_overlay.choices[index].model_id,
+                        options,
+                        live_resources.runtime_config,
+                        app_state,
+                    );
+                },
+                .theme => |theme_overlay| {
+                    try applyThemeByName(
+                        allocator,
+                        io,
+                        env_map,
+                        options.cwd,
+                        theme_overlay.choices[index].name,
+                        app_state,
+                        live_resources,
+                    );
+                },
+                .tree => |tree_overlay| {
+                    if (tree_overlay.choices[index].entry_id.len == 0) {
+                        try app_state.setStatus("No tree entries available");
+                    } else {
+                        try navigateTree(allocator, session, tree_overlay.choices[index].entry_id, app_state, editor, .{});
+                    }
+                },
+                .fork => |fork_overlay| {
+                    if (fork_overlay.choices[index].entry_id.len == 0) {
+                        try app_state.setStatus("No messages to fork from");
+                    } else {
+                        try forkCurrentSessionBeforeUserMessage(
+                            allocator,
+                            io,
+                            session,
+                            current_provider,
+                            session_dir,
+                            tool_items,
+                            fork_overlay.choices[index].entry_id,
+                            app_state,
+                            editor,
+                            subscriber,
+                        );
+                    }
+                },
+                .auth => |auth_overlay| switch (auth_overlay.mode) {
+                    .login => try beginLoginFlow(
+                        allocator,
+                        io,
+                        env_map,
+                        auth_overlay.choices[index].provider_id,
+                        auth_overlay.choices[index].auth_type,
+                        app_state,
+                        auth_flow,
+                    ),
+                    .logout => try logoutProviderById(
+                        allocator,
+                        io,
+                        env_map,
+                        session,
+                        current_provider,
+                        auth_overlay.choices[index].provider_id,
+                        options,
+                        app_state,
+                        live_resources,
+                    ),
+                },
+                .extension_dialog => unreachable,
+                else => unreachable,
+            }
+            overlay_value.deinit(allocator);
+            overlay.* = null;
+            return;
+        },
+    }
+}
+
+fn handleAuthFlowInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    options: RunInteractiveModeOptions,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    auth_flow: *?AuthFlow,
+    prompt_worker_active: *bool,
+    should_exit: *bool,
+    live_resources: *LiveResources,
+) !void {
+    if (resolveParsedAppAction(live_resources.keybindings, key, modifiers)) |action| {
+        if (action == .exit) {
+            should_exit.* = true;
+            if (prompt_worker_active.*) { _ = session.agent.abort(); }
+            return;
+        }
+    }
+
+    switch (key) {
+        .escape => {
+            cancelAuthFlow(allocator, auth_flow, app_state) catch {};
+            clearEditor(app_state, editor);
+            return;
+        },
+        .enter => {
+            if (editor.isShowingAutocomplete()) {
+                _ = try editor.handleKey(key);
+                return;
+            }
+            const expanded_text = try editor.expandedTextAlloc(allocator);
+            defer allocator.free(expanded_text);
+            const trimmed = std.mem.trim(u8, expanded_text, " \t\r\n");
+            submitAuthFlowInput(
+                allocator,
+                io,
+                env_map,
+                trimmed,
+                session,
+                current_provider,
+                options,
+                app_state,
+                editor,
+                auth_flow,
+                live_resources,
+            ) catch |err| {
+                const auth_message = try auth.formatAuthenticationError(allocator, err);
+                defer if (auth_message) |formatted| allocator.free(formatted);
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "Authentication failed: {s}",
+                    .{if (auth_message) |formatted| formatted else @errorName(err)},
+                );
+                defer allocator.free(message);
+                try app_state.appendError(message);
+            };
+            return;
+        },
+        else => {},
+    }
+
+    const handled_auth = try editor.handleKey(key);
+    switch (handled_auth) {
+        .exit => {
+            should_exit.* = true;
+            if (prompt_worker_active.*) { _ = session.agent.abort(); }
+        },
+        else => {},
+    }
+}
+
+fn handleNormalInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    env_map: *const std.process.Environ.Map,
+    key: tui.Key,
+    modifiers: tui.keys.KeyModifiers,
+    session: *session_mod.AgentSession,
+    current_provider: *provider_config.ResolvedProviderConfig,
+    session_dir: []const u8,
+    options: RunInteractiveModeOptions,
+    tool_items: []const agent.AgentTool,
+    app_state: *AppState,
+    editor: *tui.Editor,
+    overlay: *?SelectorOverlay,
+    auth_flow: *?AuthFlow,
+    prompt_worker: *PromptWorker,
+    prompt_worker_active: *bool,
+    subscriber: agent.AgentSubscriber,
+    should_exit: *bool,
+    app_context: *AppContext,
+    live_resources: *LiveResources,
+) !void {
     if (editor.isShowingAutocomplete()) {
         switch (input_resolution.resolveInputKey(live_resources.keybindings, key, modifiers, .autocomplete)) {
             .editor_action => |editor_action| {
@@ -627,7 +754,7 @@ fn executeResolvedInputKey(
                 ),
                 .exit => {
                     should_exit.* = true;
-                    if (prompt_worker_active.*) session.agent.abort();
+                    if (prompt_worker_active.*) { _ = session.agent.abort(); }
                 },
                 else => {},
             }
@@ -1739,7 +1866,7 @@ fn handleInterruptAction(
         session.abortRetry();
         try app_state.setStatus("retry cancel requested");
     } else if (prompt_worker_active.*) {
-        session.agent.abort();
+        _ = session.agent.abort();
         try app_state.setStatus("interrupt requested");
     } else if (app_state.cancelBashExecution()) {
         try app_state.setStatus("bash cancel requested");
@@ -1786,7 +1913,7 @@ fn handleClearAction(
     if (app_state.takeLastClearActionMs()) |last_ms| {
         if (now_ms - last_ms < CLEAR_DOUBLE_PRESS_WINDOW_MS) {
             should_exit.* = true;
-            if (prompt_worker_active.*) session.agent.abort();
+            if (prompt_worker_active.*) { _ = session.agent.abort(); }
             return;
         }
     }
@@ -2019,7 +2146,7 @@ pub fn handleAppAction(
         .exit => {
             if (editor.text().len == 0) {
                 should_exit.* = true;
-                if (prompt_worker_active.*) session.agent.abort();
+                if (prompt_worker_active.*) { _ = session.agent.abort(); }
                 return;
             }
             _ = try editor.handleKey(.delete);

@@ -167,27 +167,207 @@ const StreamingToolCall = struct {
 
 const ClockNowMsFn = *const fn (?*anyopaque) i64;
 
-pub const AppState = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    mutex: std.Io.Mutex = .init,
-    items: std.ArrayList(ChatItem) = .empty,
-    visible_start_index: usize = 0,
-    chat_scroll_offset: usize = 0,
-    chat_scroll_max_offset: usize = 0,
-    chat_total_rows: usize = 0,
-    chat_visible_rows: usize = 0,
-    chat_width: usize = 1,
-    chat_region: ChatRegion = .{},
-    scroll_indicator_row: ?usize = null,
-    selection_active: bool = false,
-    selection_start_row: usize = 0,
-    selection_start_col: usize = 0,
-    selection_end_row: usize = 0,
-    selection_end_col: usize = 0,
-    all_expanded: bool = false,
-    last_streaming_assistant_index: ?usize = null,
-    last_streaming_thinking_index: ?usize = null,
+pub const TimingState = struct {
+    clock_context: ?*anyopaque = null,
+    clock_now_ms_fn: ClockNowMsFn = systemNowMilliseconds,
+    last_clear_action_ms: ?i64 = null,
+    last_escape_action_ms: ?i64 = null,
+
+    pub fn setClockForTesting(self: *TimingState, context: ?*anyopaque, now_ms_fn: ClockNowMsFn) void {
+        self.timing.clock_context = context;
+        self.timing.clock_now_ms_fn = now_ms_fn;
+    }
+
+    pub fn currentNowMs(self: *TimingState) i64 {
+        return self.timing.clock_now_ms_fn(self.timing.clock_context);
+    }
+
+    pub fn takeLastClearActionMs(self: *TimingState) ?i64 {
+        const result = self.timing.last_clear_action_ms;
+        self.timing.last_clear_action_ms = null;
+        return result;
+    }
+
+    pub fn setLastClearActionMs(self: *TimingState, timestamp_ms: i64) void {
+        self.timing.last_clear_action_ms = timestamp_ms;
+    }
+
+    pub fn takeLastEscapeActionMs(self: *TimingState) ?i64 {
+        const result = self.timing.last_escape_action_ms;
+        self.timing.last_escape_action_ms = null;
+        return result;
+    }
+
+    pub fn setLastEscapeActionMs(self: *TimingState, timestamp_ms: i64) void {
+        self.timing.last_escape_action_ms = timestamp_ms;
+    }
+};
+
+pub const ImageState = struct {
+    pending_editor_images: std.ArrayList(PendingEditorImage) = .empty,
+    retired_kitty_images: std.ArrayList(u32) = .empty,
+    clipboard_paste: clipboard_paste_task.ClipboardPasteTask = undefined,
+
+    pub fn appendPending(self: *ImageState, allocator: std.mem.Allocator, image: ai.ImageContent) !void {
+        try self.pending_editor_images.append(allocator, .{
+            .data = image.data,
+            .mime_type = image.mime_type,
+        });
+    }
+
+    pub fn clearPending(self: *ImageState, allocator: std.mem.Allocator) void {
+        for (self.pending_editor_images.items) |*image| pending_editor_images_mod.deinit(allocator, image);
+        self.pending_editor_images.clearRetainingCapacity();
+    }
+
+    pub fn clonePending(self: *ImageState, allocator: std.mem.Allocator) ![]ai.ImageContent {
+        if (self.pending_editor_images.items.len == 0) return &.{};
+        const cloned = try allocator.alloc(ai.ImageContent, self.pending_editor_images.items.len);
+        errdefer allocator.free(cloned);
+        for (self.pending_editor_images.items, 0..) |image, index| {
+            cloned[index] = .{
+                .data = try allocator.dupe(u8, image.data),
+                .mime_type = try allocator.dupe(u8, image.mime_type),
+            };
+        }
+        return cloned;
+    }
+
+    pub fn flushRetiredTerminalImages(self: *ImageState, terminal_image_context: TerminalImageContext) void {
+        for (self.pending_editor_images.items) |*image| {
+            if (image.kitty_image) |kitty| {
+                if (kitty.id > 0) {
+                    terminal_image_context.delete_image(kitty.id);
+                }
+            }
+        }
+        self.image.pending_editor_images.clearRetainingCapacity();
+        for (self.retired_kitty_images.items) |id| {
+            if (id > 0) terminal_image_context.delete_image(id);
+        }
+        self.image.retired_kitty_images.clearRetainingCapacity();
+    }
+
+    pub fn freeActiveTerminalImages(self: *ImageState, allocator: std.mem.Allocator, terminal_image_context: TerminalImageContext) void {
+        for (self.pending_editor_images.items) |*image| {
+            if (image.kitty_image) |kitty| {
+                if (kitty.id > 0) {
+                    terminal_image_context.delete_image(kitty.id);
+                }
+                allocator.free(kitty.data);
+            }
+            pending_editor_images_mod.deinit(allocator, image);
+        }
+        self.image.pending_editor_images.clearRetainingCapacity();
+        for (self.retired_kitty_images.items) |id| {
+            if (id > 0) terminal_image_context.delete_image(id);
+        }
+        self.image.retired_kitty_images.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *ImageState, allocator: std.mem.Allocator) void {
+        for (self.pending_editor_images.items) |*image| pending_editor_images_mod.deinit(allocator, image);
+        self.pending_editor_images.deinit(allocator);
+        self.retired_kitty_images.deinit(allocator);
+        self.clipboard_paste.deinit();
+    }
+};
+
+pub const QueueState = struct {
+    steering: std.ArrayList([]u8) = .empty,
+    follow_up: std.ArrayList([]u8) = .empty,
+
+    pub fn appendMessage(self: *QueueState, allocator: std.mem.Allocator, mode: QueueDisplayMode, text: []const u8) !void {
+        const owned = try allocator.dupe(u8, text);
+        errdefer allocator.free(owned);
+        switch (mode) {
+            .steering => try self.steering.append(allocator, owned),
+            .follow_up => try self.follow_up.append(allocator, owned),
+        }
+    }
+
+    pub fn clearMessages(self: *QueueState, allocator: std.mem.Allocator) void {
+        for (self.steering.items) |item| allocator.free(item);
+        self.steering.clearRetainingCapacity();
+        for (self.follow_up.items) |item| allocator.free(item);
+        self.follow_up.clearRetainingCapacity();
+    }
+
+    pub fn clearLocked(self: *QueueState, allocator: std.mem.Allocator) void {
+        for (self.steering.items) |item| allocator.free(item);
+        self.steering.clearRetainingCapacity();
+        for (self.follow_up.items) |item| allocator.free(item);
+        self.follow_up.clearRetainingCapacity();
+    }
+
+    pub fn removeMessageLocked(self: *QueueState, allocator: std.mem.Allocator, text: []const u8) void {
+        for (self.steering.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item, text)) {
+                _ = self.steering.orderedRemove(index);
+                allocator.free(item);
+                return;
+            }
+        }
+        for (self.follow_up.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item, text)) {
+                _ = self.follow_up.orderedRemove(index);
+                allocator.free(item);
+                return;
+            }
+        }
+    }
+
+    pub fn deinit(self: *QueueState, allocator: std.mem.Allocator) void {
+        self.clearLocked(allocator);
+        self.steering.deinit(allocator);
+        self.follow_up.deinit(allocator);
+    }
+};
+
+pub const ModelState = struct {
+    scoped_model_override_active: bool = false,
+    scoped_model_patterns: ?[][]u8 = null,
+
+    pub fn currentPatterns(self: *const ModelState) ?[]const []const u8 {
+        if (!self.scoped_model_override_active) return null;
+        return self.scoped_model_patterns;
+    }
+
+    pub fn hasOverride(self: *const ModelState) bool {
+        return self.scoped_model_override_active;
+    }
+
+    pub fn setOverride(self: *ModelState, allocator: std.mem.Allocator, patterns: ?[]const []const u8) !void {
+        self.clearOverride(allocator);
+        self.scoped_model_override_active = true;
+        if (patterns) |source| {
+            if (source.len > 0) {
+                var cloned = try allocator.alloc([]u8, source.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (cloned[0..initialized]) |item| allocator.free(item);
+                    allocator.free(cloned);
+                }
+                for (source, 0..) |item, index| {
+                    cloned[index] = try allocator.dupe(u8, item);
+                    initialized += 1;
+                }
+                self.scoped_model_patterns = cloned;
+            }
+        }
+    }
+
+    pub fn clearOverride(self: *ModelState, allocator: std.mem.Allocator) void {
+        if (self.scoped_model_patterns) |patterns| {
+            for (patterns) |pattern| allocator.free(pattern);
+            allocator.free(patterns);
+        }
+        self.scoped_model_patterns = null;
+        self.scoped_model_override_active = false;
+    }
+};
+
+pub const FooterState = struct {
     status: []u8 = &.{},
     provider_label: []u8 = &.{},
     provider_status: []u8 = &.{},
@@ -199,52 +379,200 @@ pub const AppState = struct {
     context_tokens: ?u32 = null,
     context_percent: ?f64 = null,
     context_unknown: bool = false,
-    queued_steering: std.ArrayList([]u8) = .empty,
-    queued_follow_up: std.ArrayList([]u8) = .empty,
-    pending_editor_images: std.ArrayList(PendingEditorImage) = .empty,
-    retired_kitty_images: std.ArrayList(u32) = .empty,
-    active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
-    streaming_tool_calls: std.ArrayList(StreamingToolCall) = .empty,
-    tool_output_expanded: bool = false,
-    hide_thinking_blocks: bool = false,
-    hidden_thinking_label: []u8 = &.{},
-    extension_header_lines: [][]u8 = &.{},
-    extension_footer_lines: [][]u8 = &.{},
-    extension_editor_label: ?[]u8 = null,
-    extension_widgets: std.ArrayList(ExtensionWidget) = .empty,
-    extension_footer_statuses: std.StringHashMap([]u8),
     working_message: []u8 = &.{},
     working_visible: bool = true,
-    active_operation: ?ActiveOperationState = null,
     recent_activity: []u8 = &.{},
     terminal_progress_active: bool = false,
     terminal_progress_dirty: bool = false,
-    clipboard_paste: clipboard_paste_task.ClipboardPasteTask,
-    user_bash_task: user_bash_task_mod.UserBashTask = .{},
-    scoped_model_override_active: bool = false,
-    scoped_model_patterns: ?[][]u8 = null,
-    clock_context: ?*anyopaque = null,
-    clock_now_ms_fn: ClockNowMsFn = systemNowMilliseconds,
-    last_clear_action_ms: ?i64 = null,
-    last_escape_action_ms: ?i64 = null,
+
+    pub fn deinit(self: *FooterState, allocator: std.mem.Allocator) void {
+        allocator.free(self.footer.status);
+        allocator.free(self.footer.provider_label);
+        allocator.free(self.footer.provider_status);
+        allocator.free(self.footer.model_label);
+        allocator.free(self.footer.session_label);
+        allocator.free(self.footer.git_branch);
+        allocator.free(self.footer.working_message);
+        allocator.free(self.footer.recent_activity);
+    }
+};
+
+
+pub const StreamState = struct {
+    all_expanded: bool = false,
+    last_streaming_assistant_index: ?usize = null,
+    last_streaming_thinking_index: ?usize = null,
+    hide_thinking_blocks: bool = false,
+    hidden_thinking_label: []u8 = &.{},
+    tool_output_expanded: bool = false,
+
+    pub fn toggleAllExpanded(self: *StreamState) void {
+        self.stream.all_expanded = !self.stream.all_expanded;
+        self.stream.tool_output_expanded = self.stream.all_expanded;
+    }
+
+    pub fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
+        allocator.free(self.stream.hidden_thinking_label);
+    }
+};
+
+pub const ToolState = struct {
+    active_tool_updates: std.ArrayList(ActiveToolUpdate) = .empty,
+    streaming_tool_calls: std.ArrayList(StreamingToolCall) = .empty,
+
+    pub fn clearActiveToolUpdates(self: *ToolState, allocator: std.mem.Allocator) void {
+        for (self.tool.active_tool_updates.items) |*update| {
+            allocator.free(update.tool_call_id);
+        }
+        self.tool.active_tool_updates.clearRetainingCapacity();
+    }
+
+    pub fn clearStreamingToolCalls(self: *ToolState, allocator: std.mem.Allocator) void {
+        for (self.tool.streaming_tool_calls.items) |*call| {
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        self.tool.streaming_tool_calls.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *ToolState, allocator: std.mem.Allocator) void {
+        self.clearActiveToolUpdates(allocator);
+        self.tool.active_tool_updates.deinit(allocator);
+        self.clearStreamingToolCalls(allocator);
+        self.tool.streaming_tool_calls.deinit(allocator);
+    }
+};
+
+pub const ExtensionState = struct {
+    header_lines: [][]u8 = &.{},
+    footer_lines: [][]u8 = &.{},
+    editor_label: ?[]u8 = null,
+    widgets: std.ArrayList(ExtensionWidget) = .empty,
+    footer_statuses: std.StringHashMap([]u8),
+
+    pub fn init(allocator: std.mem.Allocator) ExtensionState {
+        return .{
+            .footer_statuses = std.StringHashMap([]u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ExtensionState, allocator: std.mem.Allocator) void {
+        for (self.widgets.items) |*widget| widget.deinit(allocator);
+        self.widgets.deinit(allocator);
+    }
+};
+
+pub const OperationState = struct {
+    active: ?ActiveOperationState = null,
+    bash_task: user_bash_task_mod.UserBashTask = .{},
+
+    pub fn deinit(self: *OperationState, allocator: std.mem.Allocator) void {
+        self.bash_task.deinit(allocator);
+    }
+};
+
+pub const ChatScrollState = struct {
+    items: std.ArrayList(ChatItem) = .empty,
+    visible_start_index: usize = 0,
+    scroll_offset: usize = 0,
+    scroll_max_offset: usize = 0,
+    total_rows: usize = 0,
+    visible_rows: usize = 0,
+    width: usize = 1,
+    region: ChatRegion = .{},
+    scroll_indicator_row: ?usize = null,
+
+    pub fn deinit(self: *ChatScrollState, allocator: std.mem.Allocator) void {
+        for (self.chat.items.items) |*item| chat_items.deinit(allocator, item);
+        self.chat.items.deinit(allocator);
+    }
+};
+
+pub const SelectionState = struct {
+    active: bool = false,
+    start_row: usize = 0,
+    start_col: usize = 0,
+    end_row: usize = 0,
+    end_col: usize = 0,
+
+    pub fn startLocked(self: *SelectionState, region: ChatRegion, row: i16, col: i16) void {
+        if (!region.contains(row, col)) return;
+        const abs_row: usize = @intCast(row);
+        const abs_col: usize = @intCast(col);
+        self.active = true;
+        self.start_row = abs_row;
+        self.start_col = abs_col;
+        self.end_row = abs_row;
+        self.end_col = abs_col;
+    }
+
+    pub fn updateEndLocked(self: *SelectionState, row: i16, col: i16) void {
+        self.end_row = @intCast(row);
+        self.end_col = @intCast(col);
+    }
+
+    pub fn getRange(self: *const SelectionState) ?SelectionRange {
+        if (!self.active) return null;
+        const start_row = @min(self.start_row, self.end_row);
+        const end_row = @max(self.start_row, self.end_row);
+        var start_col = self.start_col;
+        var end_col = self.end_col;
+        if (self.start_row > self.end_row) {
+            start_col = self.end_col;
+            end_col = self.start_col;
+        } else if (self.start_row == self.end_row) {
+            start_col = @min(self.start_col, self.end_col);
+            end_col = @max(self.start_col, self.end_col);
+        }
+        return .{
+            .start_row = start_row,
+            .start_col = start_col,
+            .end_row = end_row,
+            .end_col = end_col,
+        };
+    }
+
+    pub fn has(self: *const SelectionState) bool {
+        return self.active;
+    }
+
+    pub fn clear(self: *SelectionState) void {
+        self.active = false;
+    }
+};
+
+pub const AppState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    chat: ChatScrollState = .{},
+    selection: SelectionState = .{},
+    footer: FooterState = .{},
+    stream: StreamState = .{},
+    queue: QueueState = .{},
+    image: ImageState = .{},
+    tool: ToolState = .{},
+    extension: ExtensionState,
+    operation: OperationState = .{},
+    model: ModelState = .{},
+    timing: TimingState = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !AppState {
         var state = AppState{
             .allocator = allocator,
             .io = io,
-            .extension_footer_statuses = std.StringHashMap([]u8).init(allocator),
-            .clipboard_paste = .{ .io = io },
+            .extension = ExtensionState.init(allocator),
+            .image = .{ .clipboard_paste = .{ .io = io } },
         };
         errdefer state.deinit();
-        state.status = try allocator.dupe(u8, "idle");
-        state.provider_label = try allocator.dupe(u8, "unknown");
-        state.provider_status = try allocator.dupe(u8, "needs auth");
-        state.model_label = try allocator.dupe(u8, "unknown");
-        state.session_label = try allocator.dupe(u8, "new");
-        state.git_branch = try allocator.dupe(u8, "");
-        state.hidden_thinking_label = try allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
-        state.working_message = try allocator.dupe(u8, "Working...");
-        state.recent_activity = try allocator.dupe(u8, "");
+        state.footer.status = try allocator.dupe(u8, "idle");
+        state.footer.provider_label = try allocator.dupe(u8, "unknown");
+        state.footer.provider_status = try allocator.dupe(u8, "needs auth");
+        state.footer.model_label = try allocator.dupe(u8, "unknown");
+        state.footer.session_label = try allocator.dupe(u8, "new");
+        state.footer.git_branch = try allocator.dupe(u8, "");
+        state.stream.hidden_thinking_label = try allocator.dupe(u8, ASSISTANT_THINKING_TEXT);
+        state.footer.working_message = try allocator.dupe(u8, "Working...");
+        state.footer.recent_activity = try allocator.dupe(u8, "");
         try state.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
         return state;
     }
@@ -252,40 +580,35 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         self.clearExtensionUiHooksLocked();
         self.clearActiveOperationLocked();
-        self.extension_widgets.deinit(self.allocator);
-        extension_ui.clearFooterStatuses(self.allocator, &self.extension_footer_statuses);
-        self.extension_footer_statuses.deinit();
-        self.user_bash_task.deinit(self.allocator);
-        self.clearScopedModelOverrideLocked();
-        self.clearPendingEditorImagesLocked();
-        self.pending_editor_images.deinit(self.allocator);
-        self.retired_kitty_images.deinit(self.allocator);
+        self.extension.widgets.deinit(self.allocator);
+        extension_ui.clearFooterStatuses(self.allocator, &self.extension.footer_statuses);
+        self.extension.footer_statuses.deinit();
+        self.operation.bash_task.deinit(self.allocator);
+        self.model.clearOverride(self.allocator);
+        self.image.deinit(self.allocator);
         self.clearActiveToolUpdatesLocked();
-        self.active_tool_updates.deinit(self.allocator);
+        self.tool.active_tool_updates.deinit(self.allocator);
         self.clearStreamingToolCallsLocked();
-        self.streaming_tool_calls.deinit(self.allocator);
-        self.clipboard_paste.deinit();
-        self.clearQueuedMessagesLocked();
-        self.queued_steering.deinit(self.allocator);
-        self.queued_follow_up.deinit(self.allocator);
-        for (self.items.items) |*item| chat_items.deinit(self.allocator, item);
-        self.items.deinit(self.allocator);
-        self.allocator.free(self.status);
-        self.allocator.free(self.provider_label);
-        self.allocator.free(self.provider_status);
-        self.allocator.free(self.model_label);
-        self.allocator.free(self.session_label);
-        self.allocator.free(self.git_branch);
-        self.allocator.free(self.hidden_thinking_label);
-        self.allocator.free(self.working_message);
-        self.allocator.free(self.recent_activity);
+        self.tool.streaming_tool_calls.deinit(self.allocator);
+        self.queue.deinit(self.allocator);
+        for (self.chat.items.items) |*item| chat_items.deinit(self.allocator, item);
+        self.chat.items.deinit(self.allocator);
+        self.allocator.free(self.footer.status);
+        self.allocator.free(self.footer.provider_label);
+        self.allocator.free(self.footer.provider_status);
+        self.allocator.free(self.footer.model_label);
+        self.allocator.free(self.footer.session_label);
+        self.allocator.free(self.footer.git_branch);
+        self.allocator.free(self.stream.hidden_thinking_label);
+        self.allocator.free(self.footer.working_message);
+        self.allocator.free(self.footer.recent_activity);
         self.* = undefined;
     }
 
     pub fn appendPendingEditorImage(self: *AppState, image: ai.ImageContent) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.pending_editor_images.append(self.allocator, .{
+        try self.image.pending_editor_images.append(self.allocator, .{
             .data = image.data,
             .mime_type = image.mime_type,
         });
@@ -298,7 +621,7 @@ pub const AppState = struct {
     }
 
     pub fn startClipboardPaste(self: *AppState, env_map: *const std.process.Environ.Map) !void {
-        if (!(try self.clipboard_paste.start(env_map))) {
+        if (!(try self.image.clipboard_paste.start(env_map))) {
             try self.setStatus("clipboard image paste already in progress");
             return;
         }
@@ -306,7 +629,7 @@ pub const AppState = struct {
     }
 
     pub fn pollClipboardPaste(self: *AppState, terminal_image_context: ?TerminalImageContext) !void {
-        var result = self.clipboard_paste.poll() orelse return;
+        var result = self.image.clipboard_paste.poll() orelse return;
         defer clipboard_paste_task.deinitResult(&result);
 
         switch (result) {
@@ -322,7 +645,7 @@ pub const AppState = struct {
                 {
                     self.mutex.lockUncancelable(self.io);
                     defer self.mutex.unlock(self.io);
-                    try self.pending_editor_images.append(self.allocator, pending);
+                    try self.image.pending_editor_images.append(self.allocator, pending);
                     appended = true;
                 }
                 try self.setStatus("clipboard image pasted");
@@ -335,23 +658,23 @@ pub const AppState = struct {
     }
 
     pub fn clipboardPasteInProgress(self: *const AppState) bool {
-        return self.clipboard_paste.isActive();
+        return self.image.clipboard_paste.isActive();
     }
 
     pub fn scopedModelPatterns(self: *const AppState) ?[]const []const u8 {
-        if (!self.scoped_model_override_active) return null;
-        return self.scoped_model_patterns;
+        if (!self.model.scoped_model_override_active) return null;
+        return self.model.scoped_model_patterns;
     }
 
     pub fn hasScopedModelOverride(self: *const AppState) bool {
-        return self.scoped_model_override_active;
+        return self.model.scoped_model_override_active;
     }
 
     pub fn setScopedModelOverride(self: *AppState, patterns: ?[]const []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.clearScopedModelOverrideLocked();
-        self.scoped_model_override_active = true;
+        self.model.scoped_model_override_active = true;
         if (patterns) |source| {
             if (source.len > 0) {
                 var cloned = try self.allocator.alloc([]u8, source.len);
@@ -364,17 +687,17 @@ pub const AppState = struct {
                     cloned[index] = try self.allocator.dupe(u8, item);
                     initialized += 1;
                 }
-                self.scoped_model_patterns = cloned;
+                self.model.scoped_model_patterns = cloned;
             }
         }
     }
 
     fn clearScopedModelOverrideLocked(self: *AppState) void {
-        if (self.scoped_model_patterns) |patterns| {
+        if (self.model.scoped_model_patterns) |patterns| {
             deinitOwnedStringList(self.allocator, patterns);
-            self.scoped_model_patterns = null;
+            self.model.scoped_model_patterns = null;
         }
-        self.scoped_model_override_active = false;
+        self.model.scoped_model_override_active = false;
     }
 
     pub fn startBashExecution(
@@ -384,35 +707,35 @@ pub const AppState = struct {
         command: []const u8,
         exclude_from_context: bool,
     ) !bool {
-        return try self.user_bash_task.start(allocator, session, bashTaskHooks(self), command, exclude_from_context);
+        return try self.operation.bash_task.start(allocator, session, bashTaskHooks(self), command, exclude_from_context);
     }
 
     pub fn isBashExecutionActive(self: *const AppState) bool {
-        return self.user_bash_task.isActive();
+        return self.operation.bash_task.isActive();
     }
 
     pub fn cancelBashExecution(self: *AppState) bool {
-        return self.user_bash_task.abort();
+        return self.operation.bash_task.abort();
     }
 
     pub fn pollBashExecution(self: *AppState, allocator: std.mem.Allocator) bool {
-        return self.user_bash_task.poll(allocator);
+        return self.operation.bash_task.poll(allocator);
     }
 
     pub fn setClockForTesting(self: *AppState, context: ?*anyopaque, now_ms_fn: ClockNowMsFn) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.clock_context = context;
-        self.clock_now_ms_fn = now_ms_fn;
+        self.timing.clock_context = context;
+        self.timing.clock_now_ms_fn = now_ms_fn;
     }
 
     pub fn clonePendingEditorImages(self: *AppState, allocator: std.mem.Allocator) ![]ai.ImageContent {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.pending_editor_images.items.len == 0) return &.{};
+        if (self.image.pending_editor_images.items.len == 0) return &.{};
 
-        const cloned = try allocator.alloc(ai.ImageContent, self.pending_editor_images.items.len);
+        const cloned = try allocator.alloc(ai.ImageContent, self.image.pending_editor_images.items.len);
         var initialized: usize = 0;
         errdefer {
             for (cloned[0..initialized]) |image| {
@@ -422,7 +745,7 @@ pub const AppState = struct {
             allocator.free(cloned);
         }
 
-        for (self.pending_editor_images.items, 0..) |image, index| {
+        for (self.image.pending_editor_images.items, 0..) |image, index| {
             cloned[index] = .{
                 .data = try allocator.dupe(u8, image.data),
                 .mime_type = try allocator.dupe(u8, image.mime_type),
@@ -443,7 +766,7 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
 
         self.flushRetiredTerminalImagesLocked(terminal_image_context);
-        for (self.pending_editor_images.items) |*image| {
+        for (self.image.pending_editor_images.items) |*image| {
             if (image.kitty_image) |kitty| {
                 terminal_image_context.vx.freeImage(terminal_image_context.tty, kitty.id);
                 image.kitty_image = null;
@@ -451,43 +774,43 @@ pub const AppState = struct {
         }
     }
 
-    pub fn snapshotForRender(self: *const AppState, allocator: std.mem.Allocator) !RenderStateSnapshot {
-        @constCast(&self.mutex).lockUncancelable(self.io);
-        defer @constCast(&self.mutex).unlock(self.io);
+    pub fn snapshotForRender(self: *AppState, allocator: std.mem.Allocator) !RenderStateSnapshot {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         var snapshot = RenderStateSnapshot{
-            .usage_totals = self.usage_totals,
-            .context_window = self.context_window,
-            .context_percent = self.context_percent,
-            .chat_scroll_offset = self.chat_scroll_offset,
-            .chat_visible_rows = self.chat_visible_rows,
-            .chat_width = self.chat_width,
-            .all_expanded = self.all_expanded,
-            .hide_thinking_blocks = self.hide_thinking_blocks,
+            .usage_totals = self.footer.usage_totals,
+            .context_window = self.footer.context_window,
+            .context_percent = self.footer.context_percent,
+            .chat_scroll_offset = self.chat.scroll_offset,
+            .chat_visible_rows = self.chat.visible_rows,
+            .chat_width = self.chat.width,
+            .all_expanded = self.stream.all_expanded,
+            .hide_thinking_blocks = self.stream.hide_thinking_blocks,
         };
         errdefer snapshot.deinit(allocator);
 
-        snapshot.status = try allocator.dupe(u8, self.status);
-        snapshot.provider_label = try allocator.dupe(u8, self.provider_label);
-        snapshot.provider_status = try allocator.dupe(u8, self.provider_status);
-        snapshot.model_label = try allocator.dupe(u8, self.model_label);
-        snapshot.session_label = try allocator.dupe(u8, self.session_label);
-        snapshot.git_branch = try allocator.dupe(u8, self.git_branch);
+        snapshot.status = try allocator.dupe(u8, self.footer.status);
+        snapshot.provider_label = try allocator.dupe(u8, self.footer.provider_label);
+        snapshot.provider_status = try allocator.dupe(u8, self.footer.provider_status);
+        snapshot.model_label = try allocator.dupe(u8, self.footer.model_label);
+        snapshot.session_label = try allocator.dupe(u8, self.footer.session_label);
+        snapshot.git_branch = try allocator.dupe(u8, self.footer.git_branch);
 
-        const start_index = @min(self.visible_start_index, self.items.items.len);
-        snapshot.items = try chat_items.clone(allocator, self.items.items[start_index..]);
-        snapshot.queued_steering = try cloneOwnedStringList(allocator, self.queued_steering.items);
-        snapshot.queued_follow_up = try cloneOwnedStringList(allocator, self.queued_follow_up.items);
-        snapshot.pending_editor_images = try pending_editor_images_mod.cloneForRender(allocator, self.pending_editor_images.items);
-        snapshot.extension_header_lines = try cloneOwnedStringList(allocator, self.extension_header_lines);
-        snapshot.extension_footer_lines = try cloneOwnedStringList(allocator, self.extension_footer_lines);
-        snapshot.extension_editor_label = if (self.extension_editor_label) |label| try allocator.dupe(u8, label) else null;
-        snapshot.extension_widgets = try extension_ui.cloneWidgets(allocator, self.extension_widgets.items);
-        snapshot.extension_footer_statuses = try extension_ui.cloneFooterStatusesSorted(allocator, &self.extension_footer_statuses);
-        snapshot.working_message = if (self.working_message.len > 0) try allocator.dupe(u8, self.working_message) else null;
-        snapshot.working_visible = self.working_visible;
-        snapshot.recent_activity = if (self.recent_activity.len > 0) try allocator.dupe(u8, self.recent_activity) else null;
-        if (self.active_operation) |operation| {
+        const start_index = @min(self.chat.visible_start_index, self.chat.items.items.len);
+        snapshot.items = try chat_items.clone(allocator, self.chat.items.items[start_index..]);
+        snapshot.queued_steering = try cloneOwnedStringList(allocator, self.queue.steering.items);
+        snapshot.queued_follow_up = try cloneOwnedStringList(allocator, self.queue.follow_up.items);
+        snapshot.pending_editor_images = try pending_editor_images_mod.cloneForRender(allocator, self.image.pending_editor_images.items);
+        snapshot.extension_header_lines = try cloneOwnedStringList(allocator, self.extension.header_lines);
+        snapshot.extension_footer_lines = try cloneOwnedStringList(allocator, self.extension.footer_lines);
+        snapshot.extension_editor_label = if (self.extension.editor_label) |label| try allocator.dupe(u8, label) else null;
+        snapshot.extension_widgets = try extension_ui.cloneWidgets(allocator, self.extension.widgets.items);
+        snapshot.extension_footer_statuses = try extension_ui.cloneFooterStatusesSorted(allocator, &self.extension.footer_statuses);
+        snapshot.working_message = if (self.footer.working_message.len > 0) try allocator.dupe(u8, self.footer.working_message) else null;
+        snapshot.working_visible = self.footer.working_visible;
+        snapshot.recent_activity = if (self.footer.recent_activity.len > 0) try allocator.dupe(u8, self.footer.recent_activity) else null;
+        if (self.operation.active) |operation| {
             snapshot.active_operation = .{
                 .kind = operation.kind,
                 .label = try allocator.dupe(u8, operation.label),
@@ -503,29 +826,29 @@ pub const AppState = struct {
     pub fn clearDisplay(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.visible_start_index = self.items.items.len;
-        self.chat_scroll_offset = 0;
-        self.chat_total_rows = 0;
-        self.replaceLabelLocked(&self.status, "display cleared") catch {};
+        self.chat.visible_start_index = self.chat.items.items.len;
+        self.chat.scroll_offset = 0;
+        self.chat.total_rows = 0;
+        self.replaceLabelLocked(&self.footer.status, "display cleared") catch {};
     }
 
     pub fn handleChatMouseWheel(self: *AppState, wheel: tui.keys.MouseWheelInput) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (!self.chat_region.contains(wheel.row, wheel.col)) return;
+        if (!self.chat.region.contains(wheel.row, wheel.col)) return;
         switch (wheel.direction) {
             .up => {
-                if (self.chat_scroll_offset >= self.chat_scroll_max_offset and
+                if (self.chat.scroll_offset >= self.chat.scroll_max_offset and
                     self.revealOlderChatItemsLocked(WHEEL_LINES_PER_NOTCH))
                 {
                     return;
                 }
-                self.chat_scroll_offset = @min(
-                    self.chat_scroll_offset +| WHEEL_LINES_PER_NOTCH,
-                    self.chat_scroll_max_offset,
+                self.chat.scroll_offset = @min(
+                    self.chat.scroll_offset +| WHEEL_LINES_PER_NOTCH,
+                    self.chat.scroll_max_offset,
                 );
             },
-            .down => self.chat_scroll_offset = self.chat_scroll_offset -| WHEEL_LINES_PER_NOTCH,
+            .down => self.chat.scroll_offset = self.chat.scroll_offset -| WHEEL_LINES_PER_NOTCH,
         }
     }
 
@@ -533,92 +856,92 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const page_size = self.chatScrollPageSizeLocked();
-        if (self.chat_scroll_offset >= self.chat_scroll_max_offset and
+        if (self.chat.scroll_offset >= self.chat.scroll_max_offset and
             self.revealOlderChatItemsLocked(page_size))
         {
             return;
         }
-        self.chat_scroll_offset = @min(
-            self.chat_scroll_offset +| page_size,
-            self.chat_scroll_max_offset,
+        self.chat.scroll_offset = @min(
+            self.chat.scroll_offset +| page_size,
+            self.chat.scroll_max_offset,
         );
     }
 
     pub fn chatScrollPageDown(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.chat_scroll_offset = self.chat_scroll_offset -| self.chatScrollPageSizeLocked();
+        self.chat.scroll_offset = self.chat.scroll_offset -| self.chatScrollPageSizeLocked();
     }
 
     pub fn chatScrollToBottom(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.chat_scroll_offset = 0;
+        self.chat.scroll_offset = 0;
     }
 
     pub fn handleMouseClick(self: *AppState, click: tui.keys.MouseClickInput) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.scroll_indicator_row) |indicator_row| {
+        if (self.chat.scroll_indicator_row) |indicator_row| {
             if (click.row == @as(i16, @intCast(indicator_row))) {
-                self.chat_scroll_offset = 0;
+                self.chat.scroll_offset = 0;
                 return;
             }
         }
-        self.startSelectionLocked(click.row, click.col);
+        self.selection.startLocked(self.chat.region, click.row, click.col);
     }
 
     pub fn handleMouseDrag(self: *AppState, drag: tui.keys.MouseDragInput) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (!self.selection_active) return;
-        self.updateSelectionEndLocked(drag.row, drag.col);
+        if (!self.selection.has()) return;
+        self.selection.updateEndLocked(drag.row, drag.col);
     }
 
     pub fn handleMouseRelease(self: *AppState, release: tui.keys.MouseReleaseInput) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (!self.selection_active) return;
-        self.updateSelectionEndLocked(release.row, release.col);
-        self.selection_active = false;
+        if (!self.selection.has()) return;
+        self.selection.updateEndLocked(release.row, release.col);
+        self.selection.clear();
     }
 
     fn startSelectionLocked(self: *AppState, row: i16, col: i16) void {
-        if (!self.chat_region.contains(row, col)) return;
+        if (!self.chat.region.contains(row, col)) return;
         const abs_row: usize = @intCast(row);
         const abs_col: usize = @intCast(col);
-        const rel_row = abs_row - self.chat_region.row_start;
-        const max_offset = self.chat_total_rows -| self.chat_visible_rows;
-        const offset = @min(self.chat_scroll_offset, max_offset);
+        const rel_row = abs_row - self.chat.region.row_start;
+        const max_offset = self.chat.total_rows -| self.chat.visible_rows;
+        const offset = @min(self.chat.scroll_offset, max_offset);
         const src_row = (max_offset -| offset) + rel_row;
-        self.selection_active = true;
-        self.selection_start_row = src_row;
-        self.selection_start_col = abs_col;
-        self.selection_end_row = src_row;
-        self.selection_end_col = abs_col;
+        self.selection.active = true;
+        self.selection.start_row = src_row;
+        self.selection.start_col = abs_col;
+        self.selection.end_row = src_row;
+        self.selection.end_col = abs_col;
     }
 
     fn updateSelectionEndLocked(self: *AppState, row: i16, col: i16) void {
         const abs_row: usize = if (row < 0) 0 else @intCast(row);
         const abs_col: usize = if (col < 0) 0 else @intCast(col);
-        const rel_row = if (abs_row >= self.chat_region.row_start)
-            abs_row - self.chat_region.row_start
+        const rel_row = if (abs_row >= self.chat.region.row_start)
+            abs_row - self.chat.region.row_start
         else
             0;
-        const max_offset = self.chat_total_rows -| self.chat_visible_rows;
-        const offset = @min(self.chat_scroll_offset, max_offset);
+        const max_offset = self.chat.total_rows -| self.chat.visible_rows;
+        const offset = @min(self.chat.scroll_offset, max_offset);
         const src_row = (max_offset -| offset) + rel_row;
-        self.selection_end_row = @min(src_row, self.chat_total_rows -| 1);
-        self.selection_end_col = abs_col;
+        self.selection.end_row = @min(src_row, self.chat.total_rows -| 1);
+        self.selection.end_col = abs_col;
     }
 
     pub fn getSelectionRange(self: *const AppState) ?SelectionRange {
-        if (self.selection_start_row == self.selection_end_row and
-            self.selection_start_col == self.selection_end_col) return null;
-        var start_row = self.selection_start_row;
-        var start_col = self.selection_start_col;
-        var end_row = self.selection_end_row;
-        var end_col = self.selection_end_col;
+        if (self.selection.start_row == self.selection.end_row and
+            self.selection.start_col == self.selection.end_col) return null;
+        var start_row = self.selection.start_row;
+        var start_col = self.selection.start_col;
+        var end_row = self.selection.end_row;
+        var end_col = self.selection.end_col;
         if (end_row < start_row or (end_row == start_row and end_col < start_col)) {
             const tmp_r = start_row;
             const tmp_c = start_col;
@@ -636,79 +959,79 @@ pub const AppState = struct {
     }
 
     pub fn hasSelection(self: *const AppState) bool {
-        return self.selection_start_row != self.selection_end_row or
-            self.selection_start_col != self.selection_end_col;
+        return self.selection.start_row != self.selection.end_row or
+            self.selection.start_col != self.selection.end_col;
     }
 
     pub fn clearSelection(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.selection_active = false;
-        self.selection_start_row = 0;
-        self.selection_start_col = 0;
-        self.selection_end_row = 0;
-        self.selection_end_col = 0;
+        self.selection.active = false;
+        self.selection.start_row = 0;
+        self.selection.start_col = 0;
+        self.selection.end_row = 0;
+        self.selection.end_col = 0;
     }
 
     fn chatScrollPageSizeLocked(self: *const AppState) usize {
-        return @max(self.chat_visible_rows -| 1, 1);
+        return @max(self.chat.visible_rows -| 1, 1);
     }
 
     fn revealOlderChatItemsLocked(self: *AppState, min_rows: usize) bool {
-        const item_count = self.items.items.len;
-        const old_start = @min(self.visible_start_index, item_count);
+        const item_count = self.chat.items.items.len;
+        const old_start = @min(self.chat.visible_start_index, item_count);
         if (old_start == 0) {
-            self.visible_start_index = 0;
+            self.chat.visible_start_index = 0;
             return false;
         }
 
-        const width = @max(self.chat_width, 1);
+        const width = @max(self.chat.width, 1);
         const target_rows = @max(min_rows, 1);
-        const old_total_rows = estimateChatRows(self.items.items[old_start..], width, self.all_expanded);
+        const old_total_rows = estimateChatRows(self.chat.items.items[old_start..], width, self.stream.all_expanded);
 
         var new_start = old_start;
         var revealed_item_rows: usize = 0;
         while (new_start > 0 and revealed_item_rows < target_rows) {
             new_start -= 1;
-            revealed_item_rows +|= estimateChatItemRowsVisible(self.items.items[new_start], width, self.all_expanded);
+            revealed_item_rows +|= estimateChatItemRowsVisible(self.chat.items.items[new_start], width, self.stream.all_expanded);
         }
         if (new_start == old_start) return false;
 
-        const new_total_rows = estimateChatRows(self.items.items[new_start..], width, self.all_expanded);
+        const new_total_rows = estimateChatRows(self.chat.items.items[new_start..], width, self.stream.all_expanded);
         const revealed_rows = new_total_rows -| old_total_rows;
-        self.visible_start_index = new_start;
-        self.chat_total_rows = new_total_rows;
-        self.chat_scroll_max_offset = self.chat_total_rows -| self.chat_visible_rows;
-        self.chat_scroll_offset = @min(self.chat_scroll_offset +| revealed_rows, self.chat_scroll_max_offset);
+        self.chat.visible_start_index = new_start;
+        self.chat.total_rows = new_total_rows;
+        self.chat.scroll_max_offset = self.chat.total_rows -| self.chat.visible_rows;
+        self.chat.scroll_offset = @min(self.chat.scroll_offset +| revealed_rows, self.chat.scroll_max_offset);
         return true;
     }
 
     pub fn chatScrollToTail(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.chat_scroll_offset = 0;
+        self.chat.scroll_offset = 0;
     }
 
     pub fn chatScrollClamp(self: *AppState, max_offset: usize) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
-        self.chat_scroll_max_offset = max_offset;
+        self.chat.scroll_offset = @min(self.chat.scroll_offset, max_offset);
+        self.chat.scroll_max_offset = max_offset;
     }
 
     pub fn toggleAllExpanded(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        const was_at_tail = self.chat_scroll_offset == 0;
-        self.all_expanded = !self.all_expanded;
-        self.tool_output_expanded = self.all_expanded;
-        const start_index = @min(self.visible_start_index, self.items.items.len);
-        const total_rows = estimateChatRows(self.items.items[start_index..], @max(self.chat_width, 1), self.all_expanded);
-        const max_offset = total_rows -| self.chat_visible_rows;
-        self.chat_total_rows = total_rows;
-        self.chat_scroll_max_offset = max_offset;
-        self.chat_scroll_offset = if (was_at_tail) 0 else @min(self.chat_scroll_offset, max_offset);
+        const was_at_tail = self.chat.scroll_offset == 0;
+        self.stream.all_expanded = !self.stream.all_expanded;
+        self.stream.tool_output_expanded = self.stream.all_expanded;
+        const start_index = @min(self.chat.visible_start_index, self.chat.items.items.len);
+        const total_rows = estimateChatRows(self.chat.items.items[start_index..], @max(self.chat.width, 1), self.stream.all_expanded);
+        const max_offset = total_rows -| self.chat.visible_rows;
+        self.chat.total_rows = total_rows;
+        self.chat.scroll_max_offset = max_offset;
+        self.chat.scroll_offset = if (was_at_tail) 0 else @min(self.chat.scroll_offset, max_offset);
     }
 
     pub fn updateChatScrollLayout(
@@ -721,16 +1044,16 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const max_offset = total_chat_rows -| visible_rows;
-        const was_at_tail = self.chat_scroll_offset == 0;
-        if (!was_at_tail and total_chat_rows > self.chat_total_rows) {
-            self.chat_scroll_offset +|= total_chat_rows - self.chat_total_rows;
+        const was_at_tail = self.chat.scroll_offset == 0;
+        if (!was_at_tail and total_chat_rows > self.chat.total_rows) {
+            self.chat.scroll_offset +|= total_chat_rows - self.chat.total_rows;
         }
-        self.chat_total_rows = total_chat_rows;
-        self.chat_scroll_max_offset = max_offset;
-        self.chat_scroll_offset = @min(self.chat_scroll_offset, max_offset);
-        self.chat_visible_rows = visible_rows;
-        self.chat_width = @max(width, 1);
-        self.chat_region = .{
+        self.chat.total_rows = total_chat_rows;
+        self.chat.scroll_max_offset = max_offset;
+        self.chat.scroll_offset = @min(self.chat.scroll_offset, max_offset);
+        self.chat.visible_rows = visible_rows;
+        self.chat.width = @max(width, 1);
+        self.chat.region = .{
             .row_start = row_start,
             .row_end = row_start + visible_rows,
             .col_start = 0,
@@ -741,41 +1064,36 @@ pub const AppState = struct {
     pub fn appendQueuedMessage(self: *AppState, mode: QueueDisplayMode, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        const target = switch (mode) {
-            .steering => &self.queued_steering,
-            .follow_up => &self.queued_follow_up,
-        };
-        try target.append(self.allocator, try self.allocator.dupe(u8, text));
+        try self.queue.appendMessage(self.allocator, mode, text);
     }
 
     pub fn clearQueuedMessages(self: *AppState) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.clearQueuedMessagesLocked();
+        self.queue.clearLocked(self.allocator);
     }
 
     pub fn setToolOutputExpanded(self: *AppState, expanded: bool) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.tool_output_expanded = expanded;
-        self.all_expanded = expanded;
+        self.stream.tool_output_expanded = expanded;
+        self.stream.all_expanded = expanded;
     }
 
     pub fn toggleThinkingBlockVisibility(self: *AppState) !bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        self.hide_thinking_blocks = !self.hide_thinking_blocks;
+        self.stream.hide_thinking_blocks = !self.stream.hide_thinking_blocks;
         try self.applyThinkingBlockVisibilityLocked();
-        return self.hide_thinking_blocks;
+        return self.stream.hide_thinking_blocks;
     }
 
     pub fn setThinkingBlockVisibility(self: *AppState, hidden: bool) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        self.hide_thinking_blocks = hidden;
+        self.stream.hide_thinking_blocks = hidden;
         try self.applyThinkingBlockVisibilityLocked();
     }
 
@@ -783,8 +1101,8 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        try self.replaceLabelLocked(&self.hidden_thinking_label, if (label.len > 0) label else ASSISTANT_THINKING_TEXT);
-        if (self.hide_thinking_blocks) {
+        try self.replaceLabelLocked(&self.stream.hidden_thinking_label, if (label.len > 0) label else ASSISTANT_THINKING_TEXT);
+        if (self.stream.hide_thinking_blocks) {
             try self.applyThinkingBlockVisibilityLocked();
         }
     }
@@ -798,36 +1116,36 @@ pub const AppState = struct {
     pub fn takeLastClearActionMs(self: *AppState) ?i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const value = self.last_clear_action_ms;
-        self.last_clear_action_ms = null;
+        const value = self.timing.last_clear_action_ms;
+        self.timing.last_clear_action_ms = null;
         return value;
     }
 
     pub fn setLastClearActionMs(self: *AppState, timestamp_ms: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.last_clear_action_ms = timestamp_ms;
+        self.timing.last_clear_action_ms = timestamp_ms;
     }
 
     pub fn takeLastEscapeActionMs(self: *AppState) ?i64 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const value = self.last_escape_action_ms;
-        self.last_escape_action_ms = null;
+        const value = self.timing.last_escape_action_ms;
+        self.timing.last_escape_action_ms = null;
         return value;
     }
 
     pub fn setLastEscapeActionMs(self: *AppState, timestamp_ms: i64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.last_escape_action_ms = timestamp_ms;
+        self.timing.last_escape_action_ms = timestamp_ms;
     }
 
     pub fn setFooter(self: *AppState, model_label: []const u8, session_label: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.replaceLabelLocked(&self.model_label, model_label);
-        try self.replaceLabelLocked(&self.session_label, session_label);
+        try self.replaceLabelLocked(&self.footer.model_label, model_label);
+        try self.replaceLabelLocked(&self.footer.session_label, session_label);
     }
 
     pub fn setFooterDetails(
@@ -840,19 +1158,19 @@ pub const AppState = struct {
     ) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.replaceLabelLocked(&self.provider_label, provider_label);
-        try self.replaceLabelLocked(&self.provider_status, provider_status);
-        try self.replaceLabelLocked(&self.model_label, model.id);
-        try self.replaceLabelLocked(&self.session_label, session_label);
-        try self.replaceLabelLocked(&self.git_branch, git_branch orelse "");
-        self.context_window = model.context_window;
+        try self.replaceLabelLocked(&self.footer.provider_label, provider_label);
+        try self.replaceLabelLocked(&self.footer.provider_status, provider_status);
+        try self.replaceLabelLocked(&self.footer.model_label, model.id);
+        try self.replaceLabelLocked(&self.footer.session_label, session_label);
+        try self.replaceLabelLocked(&self.footer.git_branch, git_branch orelse "");
+        self.footer.context_window = model.context_window;
         self.recalculateContextPercentLocked();
     }
 
     pub fn setStatus(self: *AppState, text: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.replaceLabelLocked(&self.status, text);
+        try self.replaceLabelLocked(&self.footer.status, text);
     }
 
     pub fn setExtensionFooterStatus(self: *AppState, key: []const u8, text: ?[]const u8) !void {
@@ -868,16 +1186,16 @@ pub const AppState = struct {
     }
 
     fn setExtensionFooterStatusLocked(self: *AppState, key: []const u8, text: ?[]const u8) !void {
-        return extension_ui.setFooterStatus(self.allocator, &self.extension_footer_statuses, key, text);
+        return extension_ui.setFooterStatus(self.allocator, &self.extension.footer_statuses, key, text);
     }
 
     fn clearExtensionFooterStatusLocked(self: *AppState, key: []const u8) !void {
         if (key.len == 0) return;
-        if (self.extension_footer_statuses.fetchRemove(key)) |removed| {
-            const clears_current_status = std.mem.eql(u8, self.status, removed.value);
+        if (self.extension.footer_statuses.fetchRemove(key)) |removed| {
+            const clears_current_status = std.mem.eql(u8, self.footer.status, removed.value);
             self.allocator.free(removed.key);
             self.allocator.free(removed.value);
-            if (clears_current_status) try self.replaceLabelLocked(&self.status, "idle");
+            if (clears_current_status) try self.replaceLabelLocked(&self.footer.status, "idle");
         }
     }
 
@@ -888,12 +1206,12 @@ pub const AppState = struct {
         options: ActiveOperationOptions,
     ) !void {
         const owned_label = try self.allocator.dupe(u8, label);
-        const start_ms = if (self.active_operation) |operation|
+        const start_ms = if (self.operation.active) |operation|
             if (operation.kind == kind and std.mem.eql(u8, operation.label, label)) operation.start_ms else self.currentNowMsLocked()
         else
             self.currentNowMsLocked();
         self.clearActiveOperationLocked();
-        self.active_operation = .{
+        self.operation.active = .{
             .kind = kind,
             .label = owned_label,
             .start_ms = start_ms,
@@ -905,40 +1223,40 @@ pub const AppState = struct {
 
     fn setRecentActivityLocked(self: *AppState, text: []const u8) !void {
         const owned_text = try self.allocator.dupe(u8, text);
-        self.allocator.free(self.recent_activity);
-        self.recent_activity = owned_text;
+        self.allocator.free(self.footer.recent_activity);
+        self.footer.recent_activity = owned_text;
     }
 
     fn clearRecentActivityLocked(self: *AppState) !void {
-        self.allocator.free(self.recent_activity);
-        self.recent_activity = try self.allocator.dupe(u8, "");
+        self.allocator.free(self.footer.recent_activity);
+        self.footer.recent_activity = try self.allocator.dupe(u8, "");
     }
 
     fn clearActiveOperationLocked(self: *AppState) void {
-        if (self.active_operation) |operation| {
+        if (self.operation.active) |operation| {
             self.allocator.free(operation.label);
-            self.active_operation = null;
+            self.operation.active = null;
         }
     }
 
     pub fn setWorkingMessage(self: *AppState, message: ?[]const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.replaceLabelLocked(&self.working_message, message orelse "Working...");
+        try self.replaceLabelLocked(&self.footer.working_message, message orelse "Working...");
     }
 
     pub fn setWorkingVisible(self: *AppState, visible: bool) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.working_visible = visible;
+        self.footer.working_visible = visible;
     }
 
     pub fn takeTerminalProgressUpdate(self: *AppState) ?bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (!self.terminal_progress_dirty) return null;
-        self.terminal_progress_dirty = false;
-        return self.terminal_progress_active;
+        if (!self.footer.terminal_progress_dirty) return null;
+        self.footer.terminal_progress_dirty = false;
+        return self.footer.terminal_progress_active;
     }
 
     pub fn markTerminalProgress(self: *AppState, active: bool) void {
@@ -961,7 +1279,7 @@ pub const AppState = struct {
                     .{ start.attempt, start.max_attempts, seconds },
                 );
                 defer self.allocator.free(status_text);
-                try self.replaceLabelLocked(&self.status, status_text);
+                try self.replaceLabelLocked(&self.footer.status, status_text);
                 try self.setActiveOperationLocked(.retry, "retry", .{
                     .delay_ms = start.delay_ms,
                     .attempt = start.attempt,
@@ -971,7 +1289,7 @@ pub const AppState = struct {
             .end => |end| {
                 self.clearActiveOperationLocked();
                 if (end.success) {
-                    try self.replaceLabelLocked(&self.status, "retry succeeded");
+                    try self.replaceLabelLocked(&self.footer.status, "retry succeeded");
                 } else {
                     const status_text = try std.fmt.allocPrint(
                         self.allocator,
@@ -979,7 +1297,7 @@ pub const AppState = struct {
                         .{ end.attempt, end.final_error orelse "Unknown error" },
                     );
                     defer self.allocator.free(status_text);
-                    try self.replaceLabelLocked(&self.status, status_text);
+                    try self.replaceLabelLocked(&self.footer.status, status_text);
                 }
             },
         }
@@ -997,7 +1315,7 @@ pub const AppState = struct {
                     .threshold => "Auto-compacting... (Ctrl+C to cancel)",
                     .overflow => "Context overflow detected, auto-compacting... (Ctrl+C to cancel)",
                 };
-                try self.replaceLabelLocked(&self.status, label);
+                try self.replaceLabelLocked(&self.footer.status, label);
                 const active_label = switch (start.reason) {
                     .manual => "Compacting context...",
                     .threshold => "Auto-compacting...",
@@ -1009,9 +1327,9 @@ pub const AppState = struct {
                 self.markTerminalProgressLocked(false);
                 self.clearActiveOperationLocked();
                 if (end.aborted) {
-                    try self.replaceLabelLocked(&self.status, if (end.reason == .manual) "Compaction cancelled" else "Auto-compaction cancelled");
+                    try self.replaceLabelLocked(&self.footer.status, if (end.reason == .manual) "Compaction cancelled" else "Auto-compaction cancelled");
                 } else if (end.error_message) |message| {
-                    try self.replaceLabelLocked(&self.status, message);
+                    try self.replaceLabelLocked(&self.footer.status, message);
                 } else if (end.result) |result| {
                     const status_text = try std.fmt.allocPrint(
                         self.allocator,
@@ -1019,9 +1337,9 @@ pub const AppState = struct {
                         .{result.tokens_before},
                     );
                     defer self.allocator.free(status_text);
-                    try self.replaceLabelLocked(&self.status, status_text);
+                    try self.replaceLabelLocked(&self.footer.status, status_text);
                 } else {
-                    try self.replaceLabelLocked(&self.status, "compaction finished");
+                    try self.replaceLabelLocked(&self.footer.status, "compaction finished");
                 }
             },
         }
@@ -1037,22 +1355,22 @@ pub const AppState = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        try self.replaceExtensionLinesLocked(&self.extension_header_lines, if (registry.header_hook) |hook| hook.lines else &.{});
-        try self.replaceExtensionLinesLocked(&self.extension_footer_lines, if (registry.footer_hook) |hook| hook.lines else &.{});
+        try self.replaceExtensionLinesLocked(&self.extension.header_lines, if (registry.header_hook) |hook| hook.lines else &.{});
+        try self.replaceExtensionLinesLocked(&self.extension.footer_lines, if (registry.footer_hook) |hook| hook.lines else &.{});
 
         const next_editor_label = if (registry.editor_component_hook) |hook| hook.label else null;
-        if (self.extension_editor_label) |old| {
+        if (self.extension.editor_label) |old| {
             self.allocator.free(old);
-            self.extension_editor_label = null;
+            self.extension.editor_label = null;
         }
         if (next_editor_label) |label| {
-            self.extension_editor_label = try self.allocator.dupe(u8, label);
+            self.extension.editor_label = try self.allocator.dupe(u8, label);
         }
 
-        for (self.extension_widgets.items) |*widget| widget.deinit(self.allocator);
-        self.extension_widgets.clearRetainingCapacity();
+        for (self.extension.widgets.items) |*widget| widget.deinit(self.allocator);
+        self.extension.widgets.clearRetainingCapacity();
         for (registry.widgets.items) |widget| {
-            try self.extension_widgets.append(self.allocator, try extension_ui.cloneRegistryWidget(self.allocator, widget));
+            try self.extension.widgets.append(self.allocator, try extension_ui.cloneRegistryWidget(self.allocator, widget));
         }
     }
 
@@ -1090,9 +1408,9 @@ pub const AppState = struct {
         defer self.allocator.free(text);
 
         try self.appendItemWithExpandedTextLocked(.bash_execution, text, null, null, null);
-        try self.replaceLabelLocked(&self.status, "running bash");
+        try self.replaceLabelLocked(&self.footer.status, "running bash");
         try self.setActiveOperationLocked(.bash_execution, command, .{});
-        return self.items.items.len - 1;
+        return self.chat.items.items.len - 1;
     }
 
     fn updateBashExecution(
@@ -1134,7 +1452,7 @@ pub const AppState = struct {
         defer self.allocator.free(expanded);
         const expanded_text: ?[]const u8 = if (std.mem.eql(u8, text, expanded)) null else expanded;
         try self.replaceItemExpandedTextLocked(index, text, expanded_text);
-        try self.replaceLabelLocked(&self.status, "running bash");
+        try self.replaceLabelLocked(&self.footer.status, "running bash");
         try self.setActiveOperationLocked(.bash_execution, command, .{});
     }
 
@@ -1190,7 +1508,7 @@ pub const AppState = struct {
         defer self.allocator.free(activity);
         try self.setRecentActivityLocked(activity);
         self.clearActiveOperationLocked();
-        try self.replaceLabelLocked(&self.status, "idle");
+        try self.replaceLabelLocked(&self.footer.status, "idle");
     }
 
     pub fn appendError(self: *AppState, text: []const u8) !void {
@@ -1198,7 +1516,7 @@ pub const AppState = struct {
         defer self.mutex.unlock(self.io);
         self.removeAssistantThinkingItemLocked();
         try self.appendItemLocked(.@"error", text);
-        try self.replaceLabelLocked(&self.status, text);
+        try self.replaceLabelLocked(&self.footer.status, text);
     }
 
     pub fn rebuildFromSession(
@@ -1212,40 +1530,40 @@ pub const AppState = struct {
         const messages = session.agent.getMessages();
         const stats = session_advanced.getSessionStats(session);
 
-        for (self.items.items) |*item| chat_items.deinit(self.allocator, item);
-        self.items.clearRetainingCapacity();
-        self.visible_start_index = 0;
-        self.chat_scroll_offset = 0;
-        self.chat_scroll_max_offset = 0;
-        self.chat_total_rows = 0;
-        self.chat_visible_rows = 0;
-        self.chat_width = 1;
-        self.chat_region = .{};
-        self.last_streaming_assistant_index = null;
-        self.last_streaming_thinking_index = null;
+        for (self.chat.items.items) |*item| chat_items.deinit(self.allocator, item);
+        self.chat.items.clearRetainingCapacity();
+        self.chat.visible_start_index = 0;
+        self.chat.scroll_offset = 0;
+        self.chat.scroll_max_offset = 0;
+        self.chat.total_rows = 0;
+        self.chat.visible_rows = 0;
+        self.chat.width = 1;
+        self.chat.region = .{};
+        self.stream.last_streaming_assistant_index = null;
+        self.stream.last_streaming_thinking_index = null;
         self.clearPendingEditorImagesLocked();
         self.clearActiveToolUpdatesLocked();
         self.clearStreamingToolCallsLocked();
-        self.clearQueuedMessagesLocked();
+        self.queue.clearLocked(self.allocator);
         self.clearExtensionUiHooksLocked();
         self.clearActiveOperationLocked();
         self.markTerminalProgressLocked(false);
 
-        try self.replaceLabelLocked(&self.status, "idle");
-        try self.replaceLabelLocked(&self.model_label, session.agent.getModel().id);
-        try self.replaceLabelLocked(&self.session_label, currentSessionLabel(session));
-        try self.replaceLabelLocked(&self.git_branch, git_branch orelse "");
-        self.usage_totals = .{
+        try self.replaceLabelLocked(&self.footer.status, "idle");
+        try self.replaceLabelLocked(&self.footer.model_label, session.agent.getModel().id);
+        try self.replaceLabelLocked(&self.footer.session_label, currentSessionLabel(session));
+        try self.replaceLabelLocked(&self.footer.git_branch, git_branch orelse "");
+        self.footer.usage_totals = .{
             .input = stats.tokens.input,
             .output = stats.tokens.output,
             .cache_read = stats.tokens.cache_read,
             .cache_write = stats.tokens.cache_write,
             .cost = stats.cost,
         };
-        self.context_window = session.agent.getModel().context_window;
-        self.context_tokens = if (stats.context_usage) |usage| usage.tokens else null;
-        self.context_percent = if (stats.context_usage) |usage| usage.percent else null;
-        self.context_unknown = if (stats.context_usage) |usage| usage.percent == null else false;
+        self.footer.context_window = session.agent.getModel().context_window;
+        self.footer.context_tokens = if (stats.context_usage) |usage| usage.tokens else null;
+        self.footer.context_percent = if (stats.context_usage) |usage| usage.percent else null;
+        self.footer.context_unknown = if (stats.context_usage) |usage| usage.percent == null else false;
         self.recalculateContextPercentLocked();
         try self.appendItemLocked(.welcome, "Welcome to pi (Zig interactive mode). Type a prompt and press Enter.");
 
@@ -1303,36 +1621,36 @@ pub const AppState = struct {
     fn handleAgentStartLocked(self: *AppState) !void {
         self.markTerminalProgressLocked(true);
         try self.clearRecentActivityLocked();
-        try self.replaceLabelLocked(&self.status, "thinking");
-        try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
+        try self.replaceLabelLocked(&self.footer.status, "thinking");
+        try self.setActiveOperationLocked(.agent_wait, self.footer.working_message, .{});
     }
 
     fn handleAgentEndLocked(self: *AppState) !void {
         self.markTerminalProgressLocked(false);
         self.clearActiveOperationLocked();
-        if (std.mem.eql(u8, self.status, "streaming") or
-            std.mem.eql(u8, self.status, "thinking") or
-            std.mem.eql(u8, self.status, "working") or
-            std.mem.startsWith(u8, self.status, "working: "))
+        if (std.mem.eql(u8, self.footer.status, "streaming") or
+            std.mem.eql(u8, self.footer.status, "thinking") or
+            std.mem.eql(u8, self.footer.status, "working") or
+            std.mem.startsWith(u8, self.footer.status, "working: "))
         {
-            try self.replaceLabelLocked(&self.status, "idle");
+            try self.replaceLabelLocked(&self.footer.status, "idle");
         }
     }
 
     fn handleMessageStartLocked(self: *AppState, event: agent.AgentEvent) !void {
         if (event.message) |message| switch (message) {
             .user => |user_message| {
-                self.removeQueuedMessageLocked(userMessageText(user_message));
+                self.queue.removeMessageLocked(self.allocator, userMessageText(user_message));
                 const rendered = try formatPrefixedBlocks(self.allocator, "You", user_message.content);
                 defer self.allocator.free(rendered);
                 try self.appendItemLocked(.user, rendered);
-                if (std.mem.eql(u8, self.status, "thinking")) {
+                if (std.mem.eql(u8, self.footer.status, "thinking")) {
                     try self.ensureAssistantThinkingItemLocked();
                 }
             },
             .assistant => |assistant_message| {
                 self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
-                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.replaceLabelLocked(&self.footer.status, "thinking");
             },
             else => {},
         };
@@ -1346,27 +1664,27 @@ pub const AppState = struct {
     ) !bool {
         switch (assistant_event.event_type) {
             .thinking_start => {
-                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.replaceLabelLocked(&self.footer.status, "thinking");
                 try self.ensureThinkingItemLocked();
                 return true;
             },
             .thinking_delta => {
-                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.replaceLabelLocked(&self.footer.status, "thinking");
                 try self.appendThinkingDeltaLocked(assistant_event.delta orelse assistant_event.content orelse "");
                 return true;
             },
             .thinking_end => {
-                try self.replaceLabelLocked(&self.status, "thinking");
+                try self.replaceLabelLocked(&self.footer.status, "thinking");
                 self.freezeStreamingThinkingItemLocked();
-                self.last_streaming_thinking_index = null;
+                self.stream.last_streaming_thinking_index = null;
                 return true;
             },
             .text_start, .text_delta, .text_end => {
-                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.replaceLabelLocked(&self.footer.status, "streaming");
                 return false;
             },
             .toolcall_start => {
-                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.replaceLabelLocked(&self.footer.status, "streaming");
                 _ = try self.ensureStreamingToolCallItemLocked(
                     assistant_event.content_index,
                     assistant_event.tool_call,
@@ -1374,7 +1692,7 @@ pub const AppState = struct {
                 return true;
             },
             .toolcall_delta => {
-                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.replaceLabelLocked(&self.footer.status, "streaming");
                 try self.appendStreamingToolCallDeltaLocked(
                     assistant_event.content_index,
                     assistant_event.tool_call,
@@ -1383,7 +1701,7 @@ pub const AppState = struct {
                 return true;
             },
             .toolcall_end => {
-                try self.replaceLabelLocked(&self.status, "streaming");
+                try self.replaceLabelLocked(&self.footer.status, "streaming");
                 try self.finishStreamingToolCallLocked(
                     assistant_event.content_index,
                     assistant_event.tool_call,
@@ -1404,17 +1722,17 @@ pub const AppState = struct {
                 const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                 defer self.allocator.free(rendered);
                 if (rendered.len == 0) {
-                    if (self.last_streaming_assistant_index) |_| return;
+                    if (self.stream.last_streaming_assistant_index) |_| return;
                     try self.ensureAssistantThinkingItemLocked();
                     return;
                 }
                 if (event.assistant_message_event == null) {
-                    try self.replaceLabelLocked(&self.status, "streaming");
+                    try self.replaceLabelLocked(&self.footer.status, "streaming");
                 }
-                const target_index = self.last_streaming_assistant_index orelse blk: {
+                const target_index = self.stream.last_streaming_assistant_index orelse blk: {
                     try self.appendItemLocked(.assistant, rendered);
-                    self.last_streaming_assistant_index = self.items.items.len - 1;
-                    break :blk self.last_streaming_assistant_index.?;
+                    self.stream.last_streaming_assistant_index = self.chat.items.items.len - 1;
+                    break :blk self.stream.last_streaming_assistant_index.?;
                 };
                 try self.replaceItemTextLocked(target_index, rendered);
             },
@@ -1430,7 +1748,7 @@ pub const AppState = struct {
                 self.updateContextUsageLocked(assistantContextTokens(assistant_message.usage));
                 const rendered = try formatAssistantMessage(self.allocator, assistant_message);
                 defer self.allocator.free(rendered);
-                if (self.last_streaming_assistant_index) |index| {
+                if (self.stream.last_streaming_assistant_index) |index| {
                     if (rendered.len == 0) {
                         self.removeItemLocked(index);
                     } else {
@@ -1439,15 +1757,15 @@ pub const AppState = struct {
                 } else if (rendered.len > 0) {
                     try self.appendItemLocked(.assistant, rendered);
                 }
-                self.last_streaming_assistant_index = null;
+                self.stream.last_streaming_assistant_index = null;
                 self.freezeStreamingThinkingItemLocked();
-                self.last_streaming_thinking_index = null;
+                self.stream.last_streaming_thinking_index = null;
 
                 switch (assistant_message.stop_reason) {
                     .stop, .length, .tool_use => {},
-                    .aborted => try self.replaceLabelLocked(&self.status, "interrupted"),
+                    .aborted => try self.replaceLabelLocked(&self.footer.status, "interrupted"),
                     .error_reason => try self.replaceLabelLocked(
-                        &self.status,
+                        &self.footer.status,
                         assistant_message.error_message orelse "error",
                     ),
                 }
@@ -1462,7 +1780,7 @@ pub const AppState = struct {
             if (self.streamingToolCallItemIndexByIdLocked(tool_call_id) != null) {
                 const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
                 defer self.allocator.free(status_text);
-                try self.replaceLabelLocked(&self.status, status_text);
+                try self.replaceLabelLocked(&self.footer.status, status_text);
                 try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
                 return;
             }
@@ -1473,7 +1791,7 @@ pub const AppState = struct {
         try self.appendItemLocked(.tool_call, rendered);
         const status_text = try std.fmt.allocPrint(self.allocator, "working: {s}", .{tool_name});
         defer self.allocator.free(status_text);
-        try self.replaceLabelLocked(&self.status, status_text);
+        try self.replaceLabelLocked(&self.footer.status, status_text);
         try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
     }
 
@@ -1498,11 +1816,11 @@ pub const AppState = struct {
                         false,
                         partial_result.details,
                     );
-                    try self.setActiveToolUpdateLocked(tool_call_id, self.items.items.len - 1);
+                    try self.setActiveToolUpdateLocked(tool_call_id, self.chat.items.items.len - 1);
                 }
             }
         }
-        try self.replaceLabelLocked(&self.status, status_text);
+        try self.replaceLabelLocked(&self.footer.status, status_text);
         try self.setActiveOperationLocked(.tool_execution, tool_name, .{});
     }
 
@@ -1540,8 +1858,8 @@ pub const AppState = struct {
         });
         defer self.allocator.free(activity);
         try self.setRecentActivityLocked(activity);
-        try self.replaceLabelLocked(&self.status, "thinking");
-        try self.setActiveOperationLocked(.agent_wait, self.working_message, .{});
+        try self.replaceLabelLocked(&self.footer.status, "thinking");
+        try self.setActiveOperationLocked(.agent_wait, self.footer.working_message, .{});
     }
 
     fn appendThinkingBlocksLocked(self: *AppState, blocks: []const ai.ContentBlock) !void {
@@ -1555,19 +1873,19 @@ pub const AppState = struct {
 
     pub fn ensureThinkingItemLocked(self: *AppState) !void {
         self.removeAssistantThinkingItemLocked();
-        if (self.last_streaming_thinking_index) |index| {
-            if (index < self.items.items.len and self.items.items[index].kind == .thinking) return;
+        if (self.stream.last_streaming_thinking_index) |index| {
+            if (index < self.chat.items.items.len and self.chat.items.items[index].kind == .thinking) return;
         }
 
         try self.appendStreamingThinkingItemLocked("");
-        self.last_streaming_thinking_index = self.items.items.len - 1;
+        self.stream.last_streaming_thinking_index = self.chat.items.items.len - 1;
     }
 
     fn freezeStreamingThinkingItemLocked(self: *AppState) void {
-        const index = self.last_streaming_thinking_index orelse return;
-        if (index >= self.items.items.len or self.items.items[index].kind != .thinking) return;
-        if (self.items.items[index].frozen_frame_index != null) return;
-        self.items.items[index].frozen_frame_index = thinkingFrameIndex(self.items.items[index], self.currentNowMsLocked());
+        const index = self.stream.last_streaming_thinking_index orelse return;
+        if (index >= self.chat.items.items.len or self.chat.items.items[index].kind != .thinking) return;
+        if (self.chat.items.items[index].frozen_frame_index != null) return;
+        self.chat.items.items[index].frozen_frame_index = thinkingFrameIndex(self.chat.items.items[index], self.currentNowMsLocked());
     }
 
     pub fn appendThinkingDeltaLocked(self: *AppState, delta: []const u8) !void {
@@ -1576,7 +1894,7 @@ pub const AppState = struct {
             return;
         }
         try self.ensureThinkingItemLocked();
-        const index = self.last_streaming_thinking_index orelse return;
+        const index = self.stream.last_streaming_thinking_index orelse return;
         try self.appendToItemTextLocked(index, delta);
     }
 
@@ -1599,8 +1917,8 @@ pub const AppState = struct {
         defer self.allocator.free(initial_text);
 
         try self.appendItemLocked(.tool_call, initial_text);
-        const item_index = self.items.items.len - 1;
-        try self.streaming_tool_calls.append(self.allocator, .{
+        const item_index = self.chat.items.items.len - 1;
+        try self.tool.streaming_tool_calls.append(self.allocator, .{
             .content_index = content_index,
             .tool_call_id = if (tool_call) |call| try self.allocator.dupe(u8, call.id) else null,
             .item_index = item_index,
@@ -1633,32 +1951,32 @@ pub const AppState = struct {
     }
 
     pub fn ensureAssistantThinkingItemLocked(self: *AppState) !void {
-        if (self.last_streaming_assistant_index) |index| {
-            if (index < self.items.items.len and self.items.items[index].kind == .assistant and self.items.items[index].text.len == 0) {
+        if (self.stream.last_streaming_assistant_index) |index| {
+            if (index < self.chat.items.items.len and self.chat.items.items[index].kind == .assistant and self.chat.items.items[index].text.len == 0) {
                 try self.replaceItemTextLocked(index, ASSISTANT_THINKING_TEXT);
             }
             return;
         }
 
         try self.appendItemLocked(.assistant, ASSISTANT_THINKING_TEXT);
-        self.last_streaming_assistant_index = self.items.items.len - 1;
+        self.stream.last_streaming_assistant_index = self.chat.items.items.len - 1;
     }
 
     pub fn removeAssistantThinkingItemLocked(self: *AppState) void {
-        self.last_streaming_assistant_index = null;
+        self.stream.last_streaming_assistant_index = null;
         if (self.findAssistantThinkingItemLocked()) |index| {
             self.removeItemLocked(index);
         }
     }
 
     fn findAssistantThinkingItemLocked(self: *const AppState) ?usize {
-        if (self.last_streaming_assistant_index) |index| {
-            if (index < self.items.items.len) {
-                const item = self.items.items[index];
+        if (self.stream.last_streaming_assistant_index) |index| {
+            if (index < self.chat.items.items.len) {
+                const item = self.chat.items.items[index];
                 if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) return index;
             }
         }
-        for (self.items.items, 0..) |item, index| {
+        for (self.chat.items.items, 0..) |item, index| {
             if (item.kind == .assistant and std.mem.eql(u8, item.text, ASSISTANT_THINKING_TEXT)) return index;
         }
         return null;
@@ -1691,9 +2009,9 @@ pub const AppState = struct {
         start_ms: ?i64,
         frozen_frame_index: ?usize,
     ) !void {
-        const was_at_tail = self.chat_scroll_offset == 0;
-        const display_text = if (kind == .thinking and self.hide_thinking_blocks) self.hidden_thinking_label else text;
-        const stored_expanded_text = if (kind == .thinking and self.hide_thinking_blocks) text else expanded_text;
+        const was_at_tail = self.chat.scroll_offset == 0;
+        const display_text = if (kind == .thinking and self.stream.hide_thinking_blocks) self.stream.hidden_thinking_label else text;
+        const stored_expanded_text = if (kind == .thinking and self.stream.hide_thinking_blocks) text else expanded_text;
         const owned_text = try self.allocator.dupe(u8, display_text);
         errdefer self.allocator.free(owned_text);
         const owned_expanded_text = if (stored_expanded_text) |value|
@@ -1701,14 +2019,14 @@ pub const AppState = struct {
         else
             null;
         errdefer if (owned_expanded_text) |value| self.allocator.free(value);
-        try self.items.append(self.allocator, .{
+        try self.chat.items.append(self.allocator, .{
             .kind = kind,
             .text = owned_text,
             .expanded_text = owned_expanded_text,
             .start_ms = start_ms,
             .frozen_frame_index = frozen_frame_index,
         });
-        if (was_at_tail) self.chat_scroll_offset = 0;
+        if (was_at_tail) self.chat.scroll_offset = 0;
     }
 
     fn appendToolResultItemLocked(
@@ -1741,12 +2059,12 @@ pub const AppState = struct {
     }
 
     fn currentNowMsLocked(self: *const AppState) i64 {
-        return self.clock_now_ms_fn(self.clock_context);
+        return self.timing.clock_now_ms_fn(self.timing.clock_context);
     }
 
     pub fn appendToItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
-        if (index >= self.items.items.len or text.len == 0) return;
-        const item = &self.items.items[index];
+        if (index >= self.chat.items.items.len or text.len == 0) return;
+        const item = &self.chat.items.items[index];
         if (item.kind == .thinking) {
             if (item.expanded_text) |old_hidden_text| {
                 const combined = try self.allocator.alloc(u8, old_hidden_text.len + text.len);
@@ -1766,7 +2084,7 @@ pub const AppState = struct {
     }
 
     pub fn replaceItemTextLocked(self: *AppState, index: usize, text: []const u8) !void {
-        if (index >= self.items.items.len) return;
+        if (index >= self.chat.items.items.len) return;
         try self.replaceItemExpandedTextLocked(index, text, null);
     }
 
@@ -1801,40 +2119,40 @@ pub const AppState = struct {
     }
 
     fn replaceItemExpandedTextLocked(self: *AppState, index: usize, text: []const u8, expanded_text: ?[]const u8) !void {
-        if (index >= self.items.items.len) return;
+        if (index >= self.chat.items.items.len) return;
         const owned_text = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(owned_text);
         const owned_expanded_text = if (expanded_text) |value| try self.allocator.dupe(u8, value) else null;
         errdefer if (owned_expanded_text) |value| self.allocator.free(value);
 
-        self.allocator.free(self.items.items[index].text);
-        if (self.items.items[index].expanded_text) |value| self.allocator.free(value);
-        self.items.items[index].text = owned_text;
-        self.items.items[index].expanded_text = owned_expanded_text;
+        self.allocator.free(self.chat.items.items[index].text);
+        if (self.chat.items.items[index].expanded_text) |value| self.allocator.free(value);
+        self.chat.items.items[index].text = owned_text;
+        self.chat.items.items[index].expanded_text = owned_expanded_text;
     }
 
     pub fn removeItemLocked(self: *AppState, index: usize) void {
-        if (index >= self.items.items.len) return;
-        chat_items.deinit(self.allocator, &self.items.items[index]);
-        _ = self.items.orderedRemove(index);
-        for (self.active_tool_updates.items) |*entry| {
+        if (index >= self.chat.items.items.len) return;
+        chat_items.deinit(self.allocator, &self.chat.items.items[index]);
+        _ = self.chat.items.orderedRemove(index);
+        for (self.tool.active_tool_updates.items) |*entry| {
             if (entry.item_index > index) entry.item_index -= 1;
         }
         var streaming_index: usize = 0;
-        while (streaming_index < self.streaming_tool_calls.items.len) {
-            const entry = &self.streaming_tool_calls.items[streaming_index];
+        while (streaming_index < self.tool.streaming_tool_calls.items.len) {
+            const entry = &self.tool.streaming_tool_calls.items[streaming_index];
             if (entry.item_index == index) {
                 if (entry.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
-                _ = self.streaming_tool_calls.orderedRemove(streaming_index);
+                _ = self.tool.streaming_tool_calls.orderedRemove(streaming_index);
                 continue;
             }
             if (entry.item_index > index) entry.item_index -= 1;
             streaming_index += 1;
         }
-        adjustOptionalIndexAfterRemove(&self.last_streaming_assistant_index, index);
-        adjustOptionalIndexAfterRemove(&self.last_streaming_thinking_index, index);
-        if (self.visible_start_index > self.items.items.len) {
-            self.visible_start_index = self.items.items.len;
+        adjustOptionalIndexAfterRemove(&self.stream.last_streaming_assistant_index, index);
+        adjustOptionalIndexAfterRemove(&self.stream.last_streaming_thinking_index, index);
+        if (self.chat.visible_start_index > self.chat.items.items.len) {
+            self.chat.visible_start_index = self.chat.items.items.len;
         }
     }
 
@@ -1849,30 +2167,30 @@ pub const AppState = struct {
     }
 
     fn clearExtensionUiHooksLocked(self: *AppState) void {
-        deinitOwnedStringList(self.allocator, self.extension_header_lines);
-        self.extension_header_lines = &.{};
-        deinitOwnedStringList(self.allocator, self.extension_footer_lines);
-        self.extension_footer_lines = &.{};
-        if (self.extension_editor_label) |label| self.allocator.free(label);
-        self.extension_editor_label = null;
-        for (self.extension_widgets.items) |*widget| widget.deinit(self.allocator);
-        self.extension_widgets.clearRetainingCapacity();
-        extension_ui.clearFooterStatuses(self.allocator, &self.extension_footer_statuses);
-        self.working_visible = true;
-        self.replaceLabelLocked(&self.working_message, "Working...") catch {};
+        deinitOwnedStringList(self.allocator, self.extension.header_lines);
+        self.extension.header_lines = &.{};
+        deinitOwnedStringList(self.allocator, self.extension.footer_lines);
+        self.extension.footer_lines = &.{};
+        if (self.extension.editor_label) |label| self.allocator.free(label);
+        self.extension.editor_label = null;
+        for (self.extension.widgets.items) |*widget| widget.deinit(self.allocator);
+        self.extension.widgets.clearRetainingCapacity();
+        extension_ui.clearFooterStatuses(self.allocator, &self.extension.footer_statuses);
+        self.footer.working_visible = true;
+        self.replaceLabelLocked(&self.footer.working_message, "Working...") catch {};
     }
 
     fn applyThinkingBlockVisibilityLocked(self: *AppState) !void {
-        for (self.items.items) |*item| {
+        for (self.chat.items.items) |*item| {
             if (item.kind != .thinking) continue;
-            if (self.hide_thinking_blocks) {
+            if (self.stream.hide_thinking_blocks) {
                 if (item.expanded_text != null) {
                     self.allocator.free(item.text);
-                    item.text = try self.allocator.dupe(u8, self.hidden_thinking_label);
+                    item.text = try self.allocator.dupe(u8, self.stream.hidden_thinking_label);
                     continue;
                 }
                 const original = item.text;
-                item.text = try self.allocator.dupe(u8, self.hidden_thinking_label);
+                item.text = try self.allocator.dupe(u8, self.stream.hidden_thinking_label);
                 item.expanded_text = original;
             } else if (item.expanded_text) |original| {
                 self.allocator.free(item.text);
@@ -1883,66 +2201,66 @@ pub const AppState = struct {
     }
 
     pub fn addUsageLocked(self: *AppState, usage: ai.Usage) void {
-        self.usage_totals.input +|= usage.input;
-        self.usage_totals.output +|= usage.output;
-        self.usage_totals.cache_read +|= usage.cache_read;
-        self.usage_totals.cache_write +|= usage.cache_write;
-        self.usage_totals.cost += usage.cost.total;
+        self.footer.usage_totals.input +|= usage.input;
+        self.footer.usage_totals.output +|= usage.output;
+        self.footer.usage_totals.cache_read +|= usage.cache_read;
+        self.footer.usage_totals.cache_write +|= usage.cache_write;
+        self.footer.usage_totals.cost += usage.cost.total;
     }
 
     pub fn updateContextUsageLocked(self: *AppState, tokens: ?u32) void {
         if (tokens == null) {
-            self.context_unknown = true;
+            self.footer.context_unknown = true;
         } else {
-            self.context_unknown = false;
+            self.footer.context_unknown = false;
         }
-        self.context_tokens = tokens;
+        self.footer.context_tokens = tokens;
         self.recalculateContextPercentLocked();
     }
 
     pub fn recalculateContextPercentLocked(self: *AppState) void {
-        if (self.context_window == 0) {
-            self.context_percent = null;
-            self.context_tokens = null;
-            self.context_unknown = false;
+        if (self.footer.context_window == 0) {
+            self.footer.context_percent = null;
+            self.footer.context_tokens = null;
+            self.footer.context_unknown = false;
             return;
         }
 
-        if (self.context_unknown) {
-            self.context_percent = null;
+        if (self.footer.context_unknown) {
+            self.footer.context_percent = null;
             return;
         }
 
-        if (self.context_tokens) |tokens| {
-            self.context_percent =
-                (@as(f64, @floatFromInt(tokens)) / @as(f64, @floatFromInt(self.context_window))) * 100.0;
+        if (self.footer.context_tokens) |tokens| {
+            self.footer.context_percent =
+                (@as(f64, @floatFromInt(tokens)) / @as(f64, @floatFromInt(self.footer.context_window))) * 100.0;
             return;
         }
 
-        self.context_tokens = 0;
-        self.context_percent = 0.0;
+        self.footer.context_tokens = 0;
+        self.footer.context_percent = 0.0;
     }
 
     fn clearPendingEditorImagesLocked(self: *AppState) void {
-        for (self.pending_editor_images.items) |*image| {
+        for (self.image.pending_editor_images.items) |*image| {
             self.retirePendingEditorImageLocked(image);
             pending_editor_images_mod.deinit(self.allocator, image);
         }
-        self.pending_editor_images.clearRetainingCapacity();
+        self.image.pending_editor_images.clearRetainingCapacity();
     }
 
     fn retirePendingEditorImageLocked(self: *AppState, image: *PendingEditorImage) void {
         if (image.kitty_image) |kitty| {
-            self.retired_kitty_images.append(self.allocator, kitty.id) catch {};
+            self.image.retired_kitty_images.append(self.allocator, kitty.id) catch {};
             image.kitty_image = null;
         }
     }
 
     fn flushRetiredTerminalImagesLocked(self: *AppState, terminal_image_context: TerminalImageContext) void {
-        for (self.retired_kitty_images.items) |id| {
+        for (self.image.retired_kitty_images.items) |id| {
             terminal_image_context.vx.freeImage(terminal_image_context.tty, id);
         }
-        self.retired_kitty_images.clearRetainingCapacity();
+        self.image.retired_kitty_images.clearRetainingCapacity();
     }
 
     fn transmitKittyImage(
@@ -1963,19 +2281,19 @@ pub const AppState = struct {
     }
 
     fn clearActiveToolUpdatesLocked(self: *AppState) void {
-        for (self.active_tool_updates.items) |entry| self.allocator.free(entry.tool_call_id);
-        self.active_tool_updates.clearRetainingCapacity();
+        for (self.tool.active_tool_updates.items) |entry| self.allocator.free(entry.tool_call_id);
+        self.tool.active_tool_updates.clearRetainingCapacity();
     }
 
     fn clearStreamingToolCallsLocked(self: *AppState) void {
-        for (self.streaming_tool_calls.items) |entry| {
+        for (self.tool.streaming_tool_calls.items) |entry| {
             if (entry.tool_call_id) |tool_call_id| self.allocator.free(tool_call_id);
         }
-        self.streaming_tool_calls.clearRetainingCapacity();
+        self.tool.streaming_tool_calls.clearRetainingCapacity();
     }
 
     fn streamingToolCallItemIndexByIdLocked(self: *AppState, tool_call_id: []const u8) ?usize {
-        for (self.streaming_tool_calls.items) |entry| {
+        for (self.tool.streaming_tool_calls.items) |entry| {
             const entry_id = entry.tool_call_id orelse continue;
             if (std.mem.eql(u8, entry_id, tool_call_id)) return entry.item_index;
         }
@@ -1983,7 +2301,7 @@ pub const AppState = struct {
     }
 
     fn streamingToolCallItemIndexByContentIndexLocked(self: *AppState, content_index: u32) ?usize {
-        for (self.streaming_tool_calls.items) |entry| {
+        for (self.tool.streaming_tool_calls.items) |entry| {
             if (entry.content_index == content_index) return entry.item_index;
         }
         return null;
@@ -1995,7 +2313,7 @@ pub const AppState = struct {
         tool_call_id: []const u8,
         item_index: usize,
     ) !void {
-        for (self.streaming_tool_calls.items) |*entry| {
+        for (self.tool.streaming_tool_calls.items) |*entry| {
             const content_matches = if (content_index) |value|
                 entry.content_index != null and entry.content_index.? == value
             else
@@ -2018,7 +2336,7 @@ pub const AppState = struct {
             return;
         }
 
-        try self.streaming_tool_calls.append(self.allocator, .{
+        try self.tool.streaming_tool_calls.append(self.allocator, .{
             .content_index = content_index,
             .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
             .item_index = item_index,
@@ -2026,53 +2344,43 @@ pub const AppState = struct {
     }
 
     fn activeToolUpdateIndexLocked(self: *AppState, tool_call_id: []const u8) ?usize {
-        for (self.active_tool_updates.items) |entry| {
+        for (self.tool.active_tool_updates.items) |entry| {
             if (std.mem.eql(u8, entry.tool_call_id, tool_call_id)) return entry.item_index;
         }
         return null;
     }
 
     fn setActiveToolUpdateLocked(self: *AppState, tool_call_id: []const u8, item_index: usize) !void {
-        for (self.active_tool_updates.items) |*entry| {
+        for (self.tool.active_tool_updates.items) |*entry| {
             if (std.mem.eql(u8, entry.tool_call_id, tool_call_id)) {
                 entry.item_index = item_index;
                 return;
             }
         }
-        try self.active_tool_updates.append(self.allocator, .{
+        try self.tool.active_tool_updates.append(self.allocator, .{
             .tool_call_id = try self.allocator.dupe(u8, tool_call_id),
             .item_index = item_index,
         });
     }
 
     fn takeActiveToolUpdateIndexLocked(self: *AppState, tool_call_id: []const u8) ?usize {
-        for (self.active_tool_updates.items, 0..) |entry, index| {
+        for (self.tool.active_tool_updates.items, 0..) |entry, index| {
             if (!std.mem.eql(u8, entry.tool_call_id, tool_call_id)) continue;
             const item_index = entry.item_index;
             self.allocator.free(entry.tool_call_id);
-            _ = self.active_tool_updates.orderedRemove(index);
+            _ = self.tool.active_tool_updates.orderedRemove(index);
             return item_index;
         }
         return null;
     }
 
-    fn clearQueuedMessagesLocked(self: *AppState) void {
-        for (self.queued_steering.items) |text| self.allocator.free(text);
-        self.queued_steering.clearRetainingCapacity();
-        for (self.queued_follow_up.items) |text| self.allocator.free(text);
-        self.queued_follow_up.clearRetainingCapacity();
-    }
 
-    fn removeQueuedMessageLocked(self: *AppState, text: []const u8) void {
-        if (removeQueuedTextFromList(self.allocator, &self.queued_steering, text)) return;
-        _ = removeQueuedTextFromList(self.allocator, &self.queued_follow_up, text);
-    }
 
     fn markTerminalProgressLocked(self: *AppState, active: bool) void {
-        if (self.terminal_progress_active == active and self.terminal_progress_dirty) return;
-        if (self.terminal_progress_active != active or !self.terminal_progress_dirty) {
-            self.terminal_progress_active = active;
-            self.terminal_progress_dirty = true;
+        if (self.footer.terminal_progress_active == active and self.footer.terminal_progress_dirty) return;
+        if (self.footer.terminal_progress_active != active or !self.footer.terminal_progress_dirty) {
+            self.footer.terminal_progress_active = active;
+            self.footer.terminal_progress_dirty = true;
         }
     }
 };
@@ -2263,7 +2571,7 @@ pub const ScreenComponent = struct {
             sel_range,
             if (sel_range != null) &selected_text else null,
         );
-        if (!self.state.selection_active and self.state.hasSelection() and selected_text.items.len > 0) {
+        if (!self.state.selection.active and self.state.hasSelection() and selected_text.items.len > 0) {
             copySelectedText(allocator, self.state.io, selected_text.items);
             self.state.clearSelection();
         }
@@ -2450,11 +2758,11 @@ fn drawScrollIndicatorSection(
     snapshot: *const RenderStateSnapshot,
 ) usize {
     if (snapshot.chat_scroll_offset == 0 or row >= window.height) {
-        screen.state.scroll_indicator_row = null;
+        screen.state.chat.scroll_indicator_row = null;
         return row;
     }
 
-    screen.state.scroll_indicator_row = row;
+    screen.state.chat.scroll_indicator_row = row;
     const indicator_text = " \xe2\x86\x91 scrolled  \xe2\x86\x93 Jump to bottom (Ctrl+End) ";
     const indicator_style = styleForToken(screen.theme, .status);
     const indicator_window = window.child(.{
@@ -3723,7 +4031,7 @@ pub fn renderChatItemIntoAt(
 
 pub fn visibleChatTextAlloc(
     allocator: std.mem.Allocator,
-    app_state: *const AppState,
+    app_state: *AppState,
 ) ![]u8 {
     var snapshot = try app_state.snapshotForRender(allocator);
     defer snapshot.deinit(allocator);

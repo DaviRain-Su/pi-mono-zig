@@ -2453,7 +2453,7 @@ test "fork selector reports empty history without opening overlay" {
 
     try loadForkOverlayOrStatus(allocator, &session, &app_state, &overlay);
     try std.testing.expect(overlay == null);
-    try std.testing.expectEqualStrings("No messages to fork from", app_state.status);
+    try std.testing.expectEqualStrings("No messages to fork from", app_state.footer.status);
 }
 
 fn makeSlashTestTempPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, name: ?[]const u8) ![]u8 {
@@ -2540,9 +2540,9 @@ test "switchModel shows provider-specific setup guidance when auth is missing" {
 
     app_state.mutex.lockUncancelable(app_state.io);
     defer app_state.mutex.unlock(app_state.io);
-    try std.testing.expect(std.mem.indexOf(u8, app_state.status, "OPENAI_API_KEY") != null);
-    try std.testing.expect(app_state.items.items.len > 1);
-    const error_text = app_state.items.items[app_state.items.items.len - 1].text;
+    try std.testing.expect(std.mem.indexOf(u8, app_state.footer.status, "OPENAI_API_KEY") != null);
+    try std.testing.expect(app_state.chat.items.items.len > 1);
+    const error_text = app_state.chat.items.items[app_state.chat.items.items.len - 1].text;
     try std.testing.expect(std.mem.indexOf(u8, error_text, "OPENAI_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, error_text, "/login openai") != null);
 }

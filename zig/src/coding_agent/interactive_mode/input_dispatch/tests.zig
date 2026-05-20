@@ -66,7 +66,7 @@ test "thinking cycle skips xhigh unless the active model supports it" {
     try std.testing.expectEqual(agent.ThinkingLevel.high, session.agent.getThinkingLevel());
     try cycleThinkingLevel(&session, &state);
     try std.testing.expectEqual(agent.ThinkingLevel.off, session.agent.getThinkingLevel());
-    try std.testing.expectEqualStrings("Thinking level: off", state.status);
+    try std.testing.expectEqualStrings("Thinking level: off", state.footer.status);
 
     var xhigh_session = try session_mod.AgentSession.create(allocator, std.testing.io, .{
         .cwd = "/tmp",
@@ -91,7 +91,7 @@ test "thinking cycle reports unsupported model without changing level" {
 
     try cycleThinkingLevel(&session, &state);
     try std.testing.expectEqual(agent.ThinkingLevel.off, session.agent.getThinkingLevel());
-    try std.testing.expectEqualStrings("Current model does not support thinking", state.status);
+    try std.testing.expectEqualStrings("Current model does not support thinking", state.footer.status);
 }
 
 fn ignoreAgentEvent(_: ?*anyopaque, _: agent.AgentEvent) anyerror!void {}
@@ -573,8 +573,8 @@ test "extension dialog keeps tools expand key available through app keybindings"
     harness.overlay = .{ .extension_dialog = try makeExtensionChoiceDialog(allocator, .select) };
 
     try harness.press(.{ .ctrl = '9' }, .{});
-    try std.testing.expect(harness.state.all_expanded);
-    try std.testing.expect(harness.state.tool_output_expanded);
+    try std.testing.expect(harness.state.stream.all_expanded);
+    try std.testing.expect(harness.state.stream.tool_output_expanded);
     try std.testing.expect(harness.overlay != null);
     try std.testing.expectEqual(.extension_dialog, std.meta.activeTag(harness.overlay.?));
     try std.testing.expect(harness.overlay.?.extension_dialog.resolved_payload_json == null);
@@ -641,7 +641,7 @@ test "configured editor keybindings drive movement and submit while old defaults
     try std.testing.expectEqualStrings("/hotkeys", harness.editor.text());
     try harness.press(.{ .ctrl = 'j' }, .{});
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expect(harness.state.items.items.len > 0);
+    try std.testing.expect(harness.state.chat.items.items.len > 0);
 }
 
 test "empty prompt page bindings scroll chat history instead of editor" {
@@ -661,14 +661,14 @@ test "empty prompt page bindings scroll chat history instead of editor" {
 
     harness.state.updateChatScrollLayout(40, 10, 0, 80);
     try harness.press(.page_up, .{});
-    try std.testing.expectEqual(@as(usize, 9), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 9), harness.state.chat.scroll_offset);
     try harness.press(.page_down, .{});
-    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat.scroll_offset);
 
     _ = try harness.editor.handlePaste("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7");
-    harness.state.chat_scroll_offset = 10;
+    harness.state.chat.scroll_offset = 10;
     try harness.press(.page_up, .{});
-    try std.testing.expectEqual(@as(usize, 10), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 10), harness.state.chat.scroll_offset);
     const cursor = harness.editor.cursorPosition();
     try std.testing.expectEqual(@as(usize, 2), cursor.line);
     try std.testing.expectEqual(@as(usize, 2), cursor.column);
@@ -697,12 +697,12 @@ test "chat history page scroll uses configured page bindings" {
 
     harness.state.updateChatScrollLayout(40, 10, 0, 80);
     try harness.press(.page_up, .{});
-    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat.scroll_offset);
 
     try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("u") }, .{ .alt = true });
-    try std.testing.expectEqual(@as(usize, 9), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 9), harness.state.chat.scroll_offset);
     try harness.press(.{ .printable = tui.keys.PrintableKey.fromSlice("d") }, .{ .alt = true });
-    try std.testing.expectEqual(@as(usize, 0), harness.state.chat_scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.chat.scroll_offset);
 }
 
 test "dispatch input event resolves message actions from configured bindings only" {
@@ -731,7 +731,7 @@ test "dispatch input event resolves message actions from configured bindings onl
     var app_context = AppContext.init(cwd, std.testing.io);
 
     _ = try harness.editor.handlePaste("/hotkeys");
-    const items_before_old_default = harness.state.items.items.len;
+    const items_before_old_default = harness.state.chat.items.items.len;
     try dispatchInputEvent(
         allocator,
         std.testing.io,
@@ -755,7 +755,7 @@ test "dispatch input event resolves message actions from configured bindings onl
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("/hotkeys", harness.editor.text());
-    try std.testing.expectEqual(items_before_old_default, harness.state.items.items.len);
+    try std.testing.expectEqual(items_before_old_default, harness.state.chat.items.items.len);
 
     try dispatchInputEvent(
         allocator,
@@ -780,7 +780,7 @@ test "dispatch input event resolves message actions from configured bindings onl
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expect(harness.state.items.items.len > 0);
+    try std.testing.expect(harness.state.chat.items.items.len > 0);
 
     try harness.session.followUp("queued", &.{});
     try harness.state.appendQueuedMessage(.follow_up, "queued");
@@ -809,7 +809,7 @@ test "dispatch input event resolves message actions from configured bindings onl
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("draft", harness.editor.text());
-    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_follow_up.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queue.follow_up.items.len);
 
     try dispatchInputEvent(
         allocator,
@@ -834,7 +834,7 @@ test "dispatch input event resolves message actions from configured bindings onl
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("queued\n\ndraft", harness.editor.text());
-    try std.testing.expectEqual(@as(usize, 0), harness.state.queued_follow_up.items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.state.queue.follow_up.items.len);
 }
 
 test "enter inserts newline after trailing backslash and shift enter inserts newline" {
@@ -982,15 +982,15 @@ test "command pipeline expands skill before prompt template and unknown slash er
 
     try harness.submit("/skill:reviewer focus src");
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "<skill name=\"reviewer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "focus src") != null);
-    try std.testing.expect(std.mem.indexOf(u8, harness.state.queued_steering.items[0], "template fallback") == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queue.steering.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queue.steering.items[0], "<skill name=\"reviewer\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queue.steering.items[0], "focus src") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.queue.steering.items[0], "template fallback") == null);
 
     try harness.submit("/definitely-unknown");
-    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queue.steering.items.len);
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expectEqualStrings("Unknown slash command: /definitely-unknown", harness.state.status);
+    try std.testing.expectEqualStrings("Unknown slash command: /definitely-unknown", harness.state.footer.status);
 }
 
 test "retry countdown preserves command entry queue and interrupt cancels retry" {
@@ -1029,12 +1029,12 @@ test "retry countdown preserves command entry queue and interrupt cancels retry"
     defer harness.session.retry_delay_active.store(false, .seq_cst);
 
     try harness.submit("/fix retry path");
-    try std.testing.expectEqualStrings("queued steering message for after retry", harness.state.status);
-    try std.testing.expectEqual(@as(usize, 1), harness.state.queued_steering.items.len);
-    try std.testing.expectEqualStrings("Fix retry path", harness.state.queued_steering.items[0]);
+    try std.testing.expectEqualStrings("queued steering message for after retry", harness.state.footer.status);
+    try std.testing.expectEqual(@as(usize, 1), harness.state.queue.steering.items.len);
+    try std.testing.expectEqualStrings("Fix retry path", harness.state.queue.steering.items[0]);
 
     try harness.press(.escape, .{});
-    try std.testing.expectEqualStrings("retry cancel requested", harness.state.status);
+    try std.testing.expectEqualStrings("retry cancel requested", harness.state.footer.status);
 }
 
 const InputDispatchFixedClock = struct {
@@ -1208,7 +1208,7 @@ test "idle selector cancellation preserves chat editor and metadata" {
     try harness.state.appendInfo("chat marker before selectors");
     _ = try harness.editor.handlePaste("draft before selector");
 
-    const initial_items_len = harness.state.items.items.len;
+    const initial_items_len = harness.state.chat.items.items.len;
     const initial_model_id = harness.session.agent.getModel().id;
     const initial_provider = harness.session.agent.getModel().provider;
     const initial_session_file = harness.session.session_manager.getSessionFile().?;
@@ -1230,7 +1230,7 @@ test "idle selector cancellation preserves chat editor and metadata" {
         try harness.press(.escape, .{});
         try std.testing.expect(harness.overlay == null);
         try std.testing.expectEqualStrings("draft before selector", harness.editor.text());
-        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
         try std.testing.expectEqualStrings(initial_provider, harness.session.agent.getModel().provider);
         try std.testing.expectEqualStrings(initial_model_id, harness.session.agent.getModel().id);
         try std.testing.expectEqualStrings(initial_session_file, harness.session.session_manager.getSessionFile().?);
@@ -1239,12 +1239,12 @@ test "idle selector cancellation preserves chat editor and metadata" {
     try harness.submit("/settings");
     try std.testing.expect(harness.overlay != null);
     try std.testing.expectEqual(SelectorTag.settings, std.meta.activeTag(harness.overlay.?));
-    const settings_open_items_len = harness.state.items.items.len;
+    const settings_open_items_len = harness.state.chat.items.items.len;
     try harness.press(.escape, .{});
     try std.testing.expect(harness.overlay == null);
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expectEqual(settings_open_items_len, harness.state.items.items.len);
-    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(settings_open_items_len, harness.state.chat.items.items.len);
+    try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
     try std.testing.expectEqualStrings(initial_provider, harness.session.agent.getModel().provider);
     try std.testing.expectEqualStrings(initial_model_id, harness.session.agent.getModel().id);
     try std.testing.expectEqualStrings(initial_session_file, harness.session.session_manager.getSessionFile().?);
@@ -1285,11 +1285,11 @@ test "active selector attempts preserve queued messages editor and chat" {
     try harness.state.appendQueuedMessage(.steering, "queued steering");
     try harness.state.appendQueuedMessage(.follow_up, "queued follow-up");
 
-    const initial_items_len = harness.state.items.items.len;
+    const initial_items_len = harness.state.chat.items.items.len;
     const initial_steering_len = harness.session.agent.steeringQueueLen();
     const initial_follow_up_len = harness.session.agent.followUpQueueLen();
-    const initial_display_steering_len = harness.state.queued_steering.items.len;
-    const initial_display_follow_up_len = harness.state.queued_follow_up.items.len;
+    const initial_display_steering_len = harness.state.queue.steering.items.len;
+    const initial_display_follow_up_len = harness.state.queue.follow_up.items.len;
 
     harness.session.agent.beginRun();
     harness.prompt_worker_active = true;
@@ -1309,12 +1309,12 @@ test "active selector attempts preserve queued messages editor and chat" {
         try harness.press(case.key, case.modifiers);
         try std.testing.expect(harness.overlay == null);
         try std.testing.expectEqualStrings("draft during streaming", harness.editor.text());
-        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
         try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
         try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
-        try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
-        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
-        try std.testing.expectEqualStrings(case.status, harness.state.status);
+        try std.testing.expectEqual(initial_display_steering_len, harness.state.queue.steering.items.len);
+        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queue.follow_up.items.len);
+        try std.testing.expectEqualStrings(case.status, harness.state.footer.status);
     }
 
     const slash_cases = [_]struct {
@@ -1331,12 +1331,12 @@ test "active selector attempts preserve queued messages editor and chat" {
         try harness.submit(case.text);
         try std.testing.expect(harness.overlay == null);
         try std.testing.expectEqualStrings(case.text, harness.editor.text());
-        try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+        try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
         try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
         try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
-        try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
-        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
-        try std.testing.expectEqualStrings(case.status, harness.state.status);
+        try std.testing.expectEqual(initial_display_steering_len, harness.state.queue.steering.items.len);
+        try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queue.follow_up.items.len);
+        try std.testing.expectEqualStrings(case.status, harness.state.footer.status);
     }
 
     harness.session.agent.finishRun();
@@ -1349,22 +1349,22 @@ test "active selector attempts preserve queued messages editor and chat" {
     try harness.press(.{ .ctrl = 'l' }, .{});
     try std.testing.expect(harness.overlay == null);
     try std.testing.expectEqualStrings("draft during compaction", harness.editor.text());
-    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
     try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
     try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
-    try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
-    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
-    try std.testing.expectEqualStrings("wait for the current response to finish before switching models", harness.state.status);
+    try std.testing.expectEqual(initial_display_steering_len, harness.state.queue.steering.items.len);
+    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queue.follow_up.items.len);
+    try std.testing.expectEqualStrings("wait for the current response to finish before switching models", harness.state.footer.status);
 
     try harness.submit("/settings");
     try std.testing.expect(harness.overlay == null);
     try std.testing.expectEqualStrings("/settings", harness.editor.text());
-    try std.testing.expectEqual(initial_items_len, harness.state.items.items.len);
+    try std.testing.expectEqual(initial_items_len, harness.state.chat.items.items.len);
     try std.testing.expectEqual(initial_steering_len, harness.session.agent.steeringQueueLen());
     try std.testing.expectEqual(initial_follow_up_len, harness.session.agent.followUpQueueLen());
-    try std.testing.expectEqual(initial_display_steering_len, harness.state.queued_steering.items.len);
-    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queued_follow_up.items.len);
-    try std.testing.expectEqualStrings("wait for the current response to finish before opening settings", harness.state.status);
+    try std.testing.expectEqual(initial_display_steering_len, harness.state.queue.steering.items.len);
+    try std.testing.expectEqual(initial_display_follow_up_len, harness.state.queue.follow_up.items.len);
+    try std.testing.expectEqualStrings("wait for the current response to finish before opening settings", harness.state.footer.status);
 }
 
 test "external editor action replaces prompt on success and preserves on failure or missing editor" {
@@ -1385,7 +1385,7 @@ test "external editor action replaces prompt on success and preserves on failure
     _ = try harness.editor.handlePaste("draft");
     try harness.press(.{ .ctrl = 'g' }, .{});
     try std.testing.expectEqualStrings("draft", harness.editor.text());
-    try std.testing.expectEqualStrings("No editor configured. Set $VISUAL or $EDITOR environment variable.", harness.state.status);
+    try std.testing.expectEqualStrings("No editor configured. Set $VISUAL or $EDITOR environment variable.", harness.state.footer.status);
 
     const success_script = try makeInputDispatchTestPath(allocator, tmp, "success-editor.sh");
     defer allocator.free(success_script);
@@ -1402,7 +1402,7 @@ test "external editor action replaces prompt on success and preserves on failure
 
     try harness.press(.{ .ctrl = 'g' }, .{});
     try std.testing.expectEqualStrings("edited prompt", harness.editor.text());
-    try std.testing.expectEqualStrings("Updated prompt from external editor", harness.state.status);
+    try std.testing.expectEqualStrings("Updated prompt from external editor", harness.state.footer.status);
 
     const failure_script = try makeInputDispatchTestPath(allocator, tmp, "failure-editor.sh");
     defer allocator.free(failure_script);
@@ -1420,7 +1420,7 @@ test "external editor action replaces prompt on success and preserves on failure
 
     try harness.press(.{ .ctrl = 'g' }, .{});
     try std.testing.expectEqualStrings("edited prompt", harness.editor.text());
-    try std.testing.expectEqualStrings("External editor exited with status 7; prompt unchanged", harness.state.status);
+    try std.testing.expectEqualStrings("External editor exited with status 7; prompt unchanged", harness.state.footer.status);
 }
 
 test "bare bash shortcuts do not submit and Escape clears bash entry" {
@@ -1494,7 +1494,7 @@ test "bare bash shortcuts do not submit and Escape clears bash entry" {
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.status);
+    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.footer.status);
 }
 
 test "configured interrupt clears bash entry and cancels running bash" {
@@ -1567,7 +1567,7 @@ test "configured interrupt clears bash entry and cancels running bash" {
         &harness.live_resources,
     );
     try std.testing.expectEqualStrings("", harness.editor.text());
-    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.status);
+    try std.testing.expectEqualStrings("bash entry cancelled", harness.state.footer.status);
 
     try harness.submit("! printf start; sleep 5; printf end");
     try std.testing.expect(harness.state.isBashExecutionActive());
@@ -1593,7 +1593,7 @@ test "configured interrupt clears bash entry and cancels running bash" {
         &app_context,
         &harness.live_resources,
     );
-    try std.testing.expectEqualStrings("bash cancel requested", harness.state.status);
+    try std.testing.expectEqualStrings("bash cancel requested", harness.state.footer.status);
     try waitForBashCompletion(&harness.state, allocator);
     try std.testing.expect(!harness.state.isBashExecutionActive());
 }
@@ -1639,7 +1639,7 @@ test "bash shortcuts persist included output and exclude double bang from contex
     defer allocator.free(written);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"customType\":\"bashExecution\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"excludeFromContext\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, harness.state.items.items[harness.state.items.items.len - 1].text, "[excluded from context]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.chat.items.items[harness.state.chat.items.items.len - 1].text, "[excluded from context]") != null);
 }
 
 test "concurrent bash shortcut warns and Escape cancels running bash" {
@@ -1661,7 +1661,7 @@ test "concurrent bash shortcut warns and Escape cancels running bash" {
     try std.testing.expect(harness.state.isBashExecutionActive());
 
     try harness.submit("! printf second");
-    try std.testing.expectEqualStrings("A bash command is already running. Press Esc to cancel it first.", harness.state.status);
+    try std.testing.expectEqualStrings("A bash command is already running. Press Esc to cancel it first.", harness.state.footer.status);
     try std.testing.expectEqualStrings("! printf second", harness.editor.text());
 
     var app_context = AppContext.init(cwd, std.testing.io);
@@ -1687,8 +1687,8 @@ test "concurrent bash shortcut warns and Escape cancels running bash" {
         &app_context,
         &harness.live_resources,
     );
-    try std.testing.expectEqualStrings("bash cancel requested", harness.state.status);
+    try std.testing.expectEqualStrings("bash cancel requested", harness.state.footer.status);
     try waitForBashCompletion(&harness.state, allocator);
     try std.testing.expect(!harness.state.isBashExecutionActive());
-    try std.testing.expect(std.mem.indexOf(u8, harness.state.items.items[harness.state.items.items.len - 1].text, "(cancelled)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, harness.state.chat.items.items[harness.state.chat.items.items.len - 1].text, "(cancelled)") != null);
 }

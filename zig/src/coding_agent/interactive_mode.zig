@@ -454,7 +454,7 @@ pub fn runInteractiveMode(
     var prompt_worker: PromptWorker = undefined;
     var prompt_worker_active = false;
     defer if (prompt_worker_active) {
-        bootstrap.session.agent.abort();
+        _ = bootstrap.session.agent.abort();
         prompt_worker.join(allocator);
     };
 
@@ -537,7 +537,7 @@ pub fn runInteractiveMode(
 
         if (should_exit and !prompt_worker_active) break;
 
-        const background_render_active = prompt_worker_active or app_state.user_bash_task.isActive();
+        const background_render_active = prompt_worker_active or app_state.operation.bash_task.isActive();
         if (background_render_active) {
             renderer.markDirty();
         }

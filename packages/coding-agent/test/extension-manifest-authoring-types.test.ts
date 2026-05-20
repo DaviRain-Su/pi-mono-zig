@@ -56,7 +56,7 @@ const javascriptManifest = {
 	version: "0.1.0",
 	runtime: {
 		kind: "javascript",
-		entrypoint: "dist/index.ts",
+		entrypoint: "dist/index.js",
 	},
 } satisfies PiExtensionV1Manifest;
 
@@ -128,7 +128,7 @@ describe("extension manifest authoring types", () => {
 	it("keeps docs fixtures aligned with supported TypeScript and process authoring shapes", () => {
 		expect(manifests.map((manifest) => manifest.runtime.kind)).toEqual(["typescript", "javascript", "process_jsonl"]);
 		expect(typescriptManifest.runtime.entrypoint).toBe("src/index.ts");
-		expect(javascriptManifest.runtime.entrypoint).toBe("dist/index.ts");
+		expect(javascriptManifest.runtime.entrypoint).toBe("dist/index.js");
 		expect(processJsonlManifest.runtime.entrypoint.argv).toEqual(["node", "host.ts"]);
 		expect(normalizedTypeScriptToolMetadata.runtime.adapter).toBe("ts-js-extension-loader");
 		expect(unsupportedWasmRuntime.runtime.entrypoint.artifactPath).toBe("wasm/plugin.wasm");

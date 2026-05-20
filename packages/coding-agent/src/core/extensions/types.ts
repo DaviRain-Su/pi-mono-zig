@@ -45,6 +45,7 @@ import type { BashResult } from "../bash-executor.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { ExtensionPolicy, TypeScriptExtensionIdentity } from "../extension-policy.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
@@ -75,6 +76,7 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type { SubAgentReadinessEnvelope } from "./subagent-readiness.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions } from "../system-prompt.ts";
@@ -324,6 +326,8 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/** Emit a read-only sub-agent readiness observation to subscribers. */
+	emitSubAgentReadiness?(event: Omit<SubAgentReadinessEvent, "type" | "readOnly">): Promise<void>;
 }
 
 /**
@@ -644,6 +648,16 @@ export interface AgentEndEvent {
 	messages: AgentMessage[];
 }
 
+/** Fired when substrate-only sub-agent readiness metadata is recorded or replayed. Observation only; no lifecycle control is delegated. */
+export interface SubAgentReadinessEvent {
+	type: "sub_agent_readiness";
+	envelope: SubAgentReadinessEnvelope;
+	phase: "recorded" | "replayed" | "observed";
+	owner: "agent" | "session";
+	readOnly: true;
+	signal?: AbortSignal;
+}
+
 /** Fired at the start of each turn */
 export interface TurnStartEvent {
 	type: "turn_start";
@@ -956,6 +970,7 @@ export type ExtensionEvent =
 	| BeforeAgentStartEvent
 	| AgentStartEvent
 	| AgentEndEvent
+	| SubAgentReadinessEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -1082,6 +1097,11 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** @internal Returns this extension's canonical policy identity after loader source attribution. */
+	getExtensionIdentity(): TypeScriptExtensionIdentity;
+	/** @internal Returns the effective user/project policy snapshotted for this extension load. */
+	getExtensionPolicy(): ExtensionPolicy | undefined;
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1110,6 +1130,7 @@ export interface ExtensionAPI {
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
+	on(event: "sub_agent_readiness", handler: ExtensionHandler<SubAgentReadinessEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;

@@ -1,7 +1,9 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const event_stream = @import("../event_stream.zig");
 const provider_error = @import("provider_error.zig");
 const types = @import("../types.zig");
+const http_client = @import("../http_client.zig");
 
 pub fn runSetupOrEmit(
     comptime setup_fn: anytype,
@@ -13,6 +15,14 @@ pub fn runSetupOrEmit(
     @call(.auto, setup_fn, setup_args) catch |err| {
         const any_err: anyerror = err;
         if (any_err == error.OutOfMemory) return error.OutOfMemory;
+        if (builtin.mode == .Debug) {
+            std.log.debug("provider setup error (captured as stream event): api={s} provider={s} model={s} err={s}", .{
+                model.api,
+                model.provider,
+                model.id,
+                @errorName(any_err),
+            });
+        }
         emitSetupRuntimeFailure(stream_ptr, model, options, err);
     };
 }
@@ -187,6 +197,36 @@ pub fn invokeOnResponse(
     var response_headers = try normalizedResponseHeaders(allocator, maybe_headers);
     defer deinitOwnedHeaders(allocator, &response_headers);
     try callback(status, response_headers, model);
+}
+
+/// Shared helper that sends a streaming HTTP POST request through the
+/// provided client, invokes the optional `on_response` callback, and
+/// returns the `StreamingResponse`.  The caller owns the returned
+/// response and must call `response.deinit()`; the caller also owns
+/// `client` and must call `client.deinit()` after the response is done.
+pub fn executeStreamingRequest(
+    client: *http_client.HttpClient,
+    url: []const u8,
+    headers: std.StringHashMap([]const u8),
+    body: []const u8,
+    options: ?types.StreamOptions,
+    model: types.Model,
+) !http_client.StreamingResponse {
+    var response = try client.requestStreaming(.{
+        .method = .POST,
+        .url = url,
+        .headers = headers,
+        .body = body,
+        .timeout_ms = if (options) |stream_options| stream_options.timeout_ms orelse 0 else 0,
+        .aborted = if (options) |stream_options| stream_options.signal else null,
+    });
+    errdefer response.deinit();
+    if (options) |stream_options| {
+        if (stream_options.on_response) |callback| {
+            try invokeOnResponse(client.allocator, callback, response.status, response.response_headers, model);
+        }
+    }
+    return response;
 }
 
 /// Type-erased payload-replacement callback. Mirrors
