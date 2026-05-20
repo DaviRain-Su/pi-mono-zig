@@ -10,6 +10,11 @@ const codingAgentDir = join(repoRoot, "packages/coding-agent");
 const rootLockfilePath = join(repoRoot, "package-lock.json");
 const shrinkwrapPath = join(codingAgentDir, "npm-shrinkwrap.json");
 const internalPackagePrefix = "@earendil-works/pi-";
+const allowedInstallScriptPackages = new Map([
+	["@google/genai@1.52.0", "preinstall is a no-op in the published package"],
+	["koffi@2.16.2", "optional native package ships prebuilt modules used without install scripts"],
+	["protobufjs@7.5.9", "postinstall only warns about protobufjs version scheme mismatches"],
+]);
 
 const args = new Set(process.argv.slice(2));
 const checkOnly = args.has("--check");
@@ -221,6 +226,7 @@ function validateShrinkwrap(shrinkwrap, internalNames) {
 	const errors = [];
 	const includedPaths = new Set(Object.keys(shrinkwrap.packages));
 	const includedPackageNames = new Set();
+	const seenAllowedInstallScriptPackages = new Set();
 
 	for (const [lockPath, entry] of Object.entries(shrinkwrap.packages)) {
 		const packageName = packageNameFromLockPath(lockPath);
@@ -232,6 +238,26 @@ function validateShrinkwrap(shrinkwrap, internalNames) {
 		}
 		if (typeof entry.resolved === "string" && /^(file:|link:|workspace:|\.\.?\/|\/)/.test(entry.resolved)) {
 			errors.push(`${lockPath} has a local resolved value: ${entry.resolved}`);
+		}
+		if (entry.hasInstallScript) {
+			if (!packageName || !entry.version) {
+				errors.push(`${lockPath || "root"} has install scripts but no package name/version`);
+			} else {
+				const packageId = `${packageName}@${entry.version}`;
+				if (allowedInstallScriptPackages.has(packageId)) {
+					seenAllowedInstallScriptPackages.add(packageId);
+				} else {
+					errors.push(
+						`${lockPath} has install scripts (${packageId}). Review it and add it to allowedInstallScriptPackages if intentional.`,
+					);
+				}
+			}
+		}
+	}
+
+	for (const packageId of allowedInstallScriptPackages.keys()) {
+		if (!seenAllowedInstallScriptPackages.has(packageId)) {
+			errors.push(`allowed install-script package ${packageId} is no longer present; remove it from the allowlist`);
 		}
 	}
 

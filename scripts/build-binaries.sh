@@ -57,7 +57,7 @@ if [[ -n "$PLATFORM" ]]; then
 fi
 
 echo "==> Installing dependencies..."
-npm ci
+npm ci --ignore-scripts
 
 if [[ "$SKIP_DEPS" == "false" ]]; then
     echo "==> Installing cross-platform native bindings..."

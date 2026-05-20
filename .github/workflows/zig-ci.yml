@@ -263,11 +263,6 @@ jobs:
           choco install ripgrep fd -y
           echo "C:\ProgramData\chocolatey\bin" >> "${GITHUB_PATH}"
 
-      - name: Install tsx (TypeScript loader)
-        shell: bash
-        run: |-
-          npm install --no-save tsx
-
       - name: Verify external tools
         run: |
           rg --version
