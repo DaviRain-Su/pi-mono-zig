@@ -61,6 +61,7 @@ pub const Renderer = struct {
     next_overlay_id: usize = 1,
     last_render_stats: RenderStats = .{},
     dirty: bool = true,
+    measure_screen: ?vaxis.Screen = null,
 
     pub fn init(allocator: std.mem.Allocator, terminal: *terminal_mod.Terminal) Renderer {
         return .{
@@ -79,6 +80,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        if (self.measure_screen) |*ms| ms.deinit(self.allocator);
         self.draw_overlays.deinit(self.allocator);
         self.* = undefined;
     }
@@ -172,15 +174,27 @@ pub const Renderer = struct {
             const max_height = entry.options.max_height orelse size.height;
             const measurement_height = @max(@as(usize, 1), @min(max_height, size.height));
 
-            var measure_screen = try vaxis.Screen.init(frame_allocator, .{
-                .rows = @intCast(measurement_height),
-                .cols = @intCast(@max(width, 1)),
-                .x_pixel = 0,
-                .y_pixel = 0,
-            });
-            defer measure_screen.deinit(frame_allocator);
+            const need_cols: u16 = @intCast(@max(width, 1));
+            const need_rows: u16 = @intCast(measurement_height);
 
-            const measure_window = draw_mod.rootWindow(&measure_screen);
+            const have_cols = if (self.measure_screen) |ms| ms.width else 0;
+            const have_rows = if (self.measure_screen) |ms| ms.height else 0;
+
+            if (need_cols > have_cols or need_rows > have_rows) {
+                if (self.measure_screen) |*ms| ms.deinit(self.allocator);
+                self.measure_screen = try vaxis.Screen.init(self.allocator, .{
+                    .rows = need_rows,
+                    .cols = need_cols,
+                    .x_pixel = 0,
+                    .y_pixel = 0,
+                });
+            }
+
+            const ms = &self.measure_screen.?;
+            const base_cell: vaxis.Cell = .{};
+            @memset(ms.buf, base_cell);
+
+            const measure_window = draw_mod.rootWindow(ms);
             measure_window.clear();
             const measured_size = try entry.component.draw(measure_window, .{
                 .window = measure_window,

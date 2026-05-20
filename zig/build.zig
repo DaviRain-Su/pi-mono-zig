@@ -58,12 +58,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const zigimg_mod = zigimg_dep.module("zigimg");
+    const version = b.option([]const u8, "version", "Application version") orelse "0.16.0";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    mod.addOptions("build_options", build_options);
 
     const shared_mod = b.createModule(.{
         .root_source_file = b.path("src/shared/root.zig"),
@@ -266,6 +271,7 @@ pub fn build(b: *std.Build) void {
     main_test_mod.addImport("shared", shared_mod);
     main_test_mod.addImport("tui", tui_mod);
     main_test_mod.addImport("zigimg", zigimg_mod);
+    main_test_mod.addOptions("build_options", build_options);
 
     const main_tests = b.addTest(.{
         .root_module = main_test_mod,
