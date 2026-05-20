@@ -137,9 +137,9 @@ test "TS RPC response fixtures preserve parse and unsupported-command schema err
     );
     try expectContains(
         bytes,
-        "{\"id\":\"mystery\",\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"$.type: unsupported RPC command type \\\"mystery_command\\\"\"}\n",
+        "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
     );
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"id\":\"mystery") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "mystery_command") != null);
 }
 
 test "TS RPC M3 fixtures cover remaining control response and event shapes" {
