@@ -57,3 +57,4 @@ zig/vendor/zwasm/*
 .pi/*
 !.pi/agents/
 !.pi/agents/**
+.pi

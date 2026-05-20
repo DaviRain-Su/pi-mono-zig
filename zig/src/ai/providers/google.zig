@@ -18,7 +18,6 @@ pub const GoogleProvider = struct {
     pub const stream = BaseProvider.stream;
     pub const streamSimple = BaseProvider.streamSimple;
 
-
     fn streamProduction(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -1016,7 +1015,6 @@ fn deinitCurrentBlock(allocator: std.mem.Allocator, block: *CurrentBlock) void {
         },
     }
 }
-
 
 /// Returns the Gemini major version from a model ID, e.g. "gemini-2.5-pro" → 2,
 /// "gemini-live-3.0-pro" → 3. Returns null for non-Gemini models.

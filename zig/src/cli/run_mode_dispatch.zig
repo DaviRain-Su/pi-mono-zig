@@ -141,7 +141,6 @@ pub fn dispatchRunMode(
     );
 }
 
-
 fn dispatchNonInteractiveMode(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -291,7 +290,6 @@ fn dispatchNonInteractiveMode(
         stderr,
     );
 }
-
 
 fn resolveProviderRuntime(
     allocator: std.mem.Allocator,

@@ -1250,8 +1250,8 @@ fn copyCorrelationFields(
 ) !void {
     if (invocation != .object) return;
     const fields = [_][]const u8{
-        "agentId",         "runId",         "taskId",       "sessionId",
-        "toolCallId",      "parentAgentId", "parentRunId",  "parentTaskId",
+        "agentId",         "runId",         "taskId",      "sessionId",
+        "toolCallId",      "parentAgentId", "parentRunId", "parentTaskId",
         "parentSessionId", "parentId",
     };
     for (fields) |field| {

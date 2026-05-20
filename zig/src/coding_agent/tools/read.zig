@@ -253,8 +253,6 @@ fn formatSize(allocator: std.mem.Allocator, bytes: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "{d:.1}MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)});
 }
 
-
-
 test "read tool returns full file contents" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

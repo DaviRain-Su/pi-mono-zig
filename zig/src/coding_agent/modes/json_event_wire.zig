@@ -366,7 +366,7 @@ fn validateContentArray(
             _ = try requireStringField(allocator, object, item_path, "mimeType");
             continue;
         }
-if (std.mem.eql(u8, item_type, "thinking")) {
+        if (std.mem.eql(u8, item_type, "thinking")) {
             // Allow thinking in all modes - it's valid for tool results to include thinking content
             _ = try requireStringField(allocator, object, item_path, "thinking");
             if (object.get("thinkingSignature")) |signature| {
@@ -1536,22 +1536,26 @@ test "VAL-REFACTOR-009 deterministic JSON event wire fuzz smoke" {
     }{
         .{
             .label = "malformed-top-level-type",
-            .json = \\{"type":123}
+            .json =
+            \\{"type":123}
             ,
         },
         .{
             .label = "malformed-assistant-content-index",
-            .json = \\{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10},"assistantMessageEvent":{"type":"text_delta","contentIndex":"zero","delta":"hello","partial":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}}
+            .json =
+            \\{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10},"assistantMessageEvent":{"type":"text_delta","contentIndex":"zero","delta":"hello","partial":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}}
             ,
         },
         .{
             .label = "malformed-stop-reason",
-            .json = \\{"type":"done","reason":"toolUse","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}
+            .json =
+            \\{"type":"done","reason":"toolUse","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":10}}
             ,
         },
         .{
             .label = "truncated-json",
-            .json = \\{"type":"turn_start"
+            .json =
+            \\{"type":"turn_start"
             ,
         },
     };

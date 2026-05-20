@@ -1152,7 +1152,6 @@ test "session html export preserves user content block order after stripped skil
     try std.testing.expect(std.mem.indexOf(u8, html, "&lt;skill name") == null);
 }
 
-
 fn makeUserMessage(text: []const u8, timestamp: i64) !agent.AgentMessage {
     const blocks = try std.testing.allocator.alloc(ai.ContentBlock, 1);
     blocks[0] = .{ .text = .{ .text = try std.testing.allocator.dupe(u8, text) } };

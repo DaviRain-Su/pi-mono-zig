@@ -82,10 +82,19 @@ pub fn drawViewport(
         if (draw_start < entry_rows and available > 0) {
             const slice_height = @min(entry_rows - draw_start, available);
             try renderItemSlice(
-                dst, allocator, keybindings, theme,
-                items[item_index], dst_row, slice_height,
-                draw_start, now_ms, all_expanded, width,
-                selection, src_start,
+                dst,
+                allocator,
+                keybindings,
+                theme,
+                items[item_index],
+                dst_row,
+                slice_height,
+                draw_start,
+                now_ms,
+                all_expanded,
+                width,
+                selection,
+                src_start,
             );
             dst_row += slice_height;
         }
@@ -96,9 +105,16 @@ pub fn drawViewport(
     if (selected_text_out) |text_out| {
         if (selection) |sel| {
             try extractSelectedTextFromItems(
-                allocator, keybindings, theme,
-                items, layout, width,
-                now_ms, all_expanded, sel, text_out,
+                allocator,
+                keybindings,
+                theme,
+                items,
+                layout,
+                width,
+                now_ms,
+                all_expanded,
+                sel,
+                text_out,
             );
         }
     }

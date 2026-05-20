@@ -6,7 +6,6 @@ const std = @import("std");
 /// These were originally added in `tools/common.zig`; they are promoted here so
 /// non-tool modules (extensions, sessions, auth, modes) can use them without
 /// importing tools/common and creating a cross-layer dependency.
-
 /// `object` may be `*std.json.ObjectMap` or `**std.json.ObjectMap`
 /// (callers freely write `&map` even when `map` is already a pointer).
 inline fn mapPtr(object: anytype) *std.json.ObjectMap {

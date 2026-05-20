@@ -79,8 +79,6 @@ pub fn parseArguments(args: std.json.Value) !WriteArgs {
     return args_parser.parseArgsFromJson(WriteArgs, std.heap.page_allocator, args);
 }
 
-
-
 const QueuedWriteThreadContext = struct {
     path: []const u8,
     content: []const u8,

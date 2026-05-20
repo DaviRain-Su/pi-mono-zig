@@ -392,7 +392,6 @@ test "tool selection distinguishes no-tools and no-builtin-tools in prompt" {
     try std.testing.expect(std.mem.indexOf(u8, colliding_allowlist_prompt, "- read: Read file contents") == null);
 }
 
-
 test "system prompt appends project context files and skills when read is available" {
     const allocator = std.testing.allocator;
 

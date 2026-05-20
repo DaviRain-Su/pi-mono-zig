@@ -206,7 +206,6 @@ pub const PreparedExtensionCli = struct {
             return true;
         }
         return false;
-
     }
 
     pub fn parsedCliFlagValues(self: *const PreparedExtensionCli) []const extension_registry.ParsedCliFlag {
@@ -367,7 +366,6 @@ fn snapshotWithRejectedFlagDiagnostics(
     }
     try writer.writer.writeAll("]}");
     return try allocator.dupe(u8, writer.writer.buffered());
-
 }
 
 fn isEnabledValue(value: []const u8) bool {

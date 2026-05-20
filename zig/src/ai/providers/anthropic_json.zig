@@ -460,4 +460,3 @@ fn buildToolObject(
     }
     return .{ .object = object };
 }
-

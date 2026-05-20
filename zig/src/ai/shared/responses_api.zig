@@ -313,8 +313,6 @@ fn initObject(allocator: std.mem.Allocator) !std.json.ObjectMap {
     return provider_json.initObject(allocator);
 }
 
-
-
 fn freeToolCallOwned(allocator: std.mem.Allocator, tool_call: types.ToolCall) void {
     allocator.free(tool_call.id);
     allocator.free(tool_call.name);

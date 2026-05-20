@@ -174,7 +174,6 @@ pub const OpenAIResponsesProvider = struct {
     }
 };
 
-
 pub fn buildRequestPayload(
     allocator: std.mem.Allocator,
     model: types.Model,
@@ -1631,7 +1630,6 @@ pub fn buildPayloadJsonBytes(
     });
 }
 
-
 fn modelSupportsImages(model: types.Model) bool {
     for (model.input_types) |input_type| {
         if (std.mem.eql(u8, input_type, "image")) return true;
@@ -2182,7 +2180,6 @@ fn compatBoolField(compat: ?std.json.Value, key: []const u8) ?bool {
     if (field != .bool) return null;
     return field.bool;
 }
-
 
 fn modelThinkingLevel(level: types.ThinkingLevel) types.ModelThinkingLevel {
     return switch (level) {

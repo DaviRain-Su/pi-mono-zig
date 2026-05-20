@@ -1926,7 +1926,6 @@ fn handleOutputItemAdded(
     }
 }
 
-
 fn stripBearerPrefix(token: []const u8) []const u8 {
     if (std.mem.startsWith(u8, token, "Bearer ")) {
         return std.mem.trim(u8, token["Bearer ".len..], " \t\r\n");

@@ -358,8 +358,6 @@ fn editSchemaEntry(allocator: std.mem.Allocator) !std.json.Value {
 
 const schemaArrayProperty = common.schemaArrayProperty;
 
-
-
 const QueuedEditThreadContext = struct {
     path: []const u8,
     success: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

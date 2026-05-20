@@ -27,7 +27,6 @@ pub const KimiProvider = struct {
     pub const stream = BaseProvider.stream;
     pub const streamSimple = BaseProvider.streamSimple;
 
-
     fn streamProduction(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -109,7 +108,6 @@ pub const KimiProvider = struct {
 
         try parseSseStreamLines(allocator, stream_instance, &streaming, model, options);
     }
-
 };
 
 const ActiveTextBlock = struct {

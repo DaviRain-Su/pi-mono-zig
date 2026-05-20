@@ -98,7 +98,6 @@ pub const MistralProvider = struct {
     pub const stream = BaseProvider.stream;
     pub const streamSimple = BaseProvider.streamSimple;
 
-
     fn streamProduction(
         allocator: std.mem.Allocator,
         io: std.Io,

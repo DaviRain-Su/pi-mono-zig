@@ -17,7 +17,6 @@ fn mapThinkingLevel(level: types.ThinkingLevel) ?ai.types.ThinkingLevel {
     };
 }
 
-
 fn streamSimpleForAgentLoop(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -28,7 +27,6 @@ fn streamSimpleForAgentLoop(
 ) !ai.event_stream.AssistantMessageEventStream {
     return try ai.streamSimple(allocator, io, model, context, options);
 }
-
 
 pub fn streamAssistantResponse(
     allocator: std.mem.Allocator,
@@ -189,7 +187,6 @@ pub fn streamAssistantResponse(
     return final_message;
 }
 
-
 fn emitPartialMessageUpdate(
     allocator: std.mem.Allocator,
     emit_context: ?*anyopaque,
@@ -230,7 +227,6 @@ fn emitPartialMessageUpdate(
     });
 }
 
-
 fn convertToolsToLlm(
     allocator: std.mem.Allocator,
     tools: []const types.AgentTool,
@@ -245,5 +241,3 @@ fn convertToolsToLlm(
     }
     return converted;
 }
-
-

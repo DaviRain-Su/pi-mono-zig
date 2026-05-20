@@ -64,7 +64,6 @@ pub const cloneJsonValue = provider_json.cloneValue;
 pub const deinitJsonValue = provider_json.freeValue;
 
 /// Schema helpers — shared across all built-in tools.
-
 pub fn schemaProperty(
     allocator: std.mem.Allocator,
     type_name: []const u8,

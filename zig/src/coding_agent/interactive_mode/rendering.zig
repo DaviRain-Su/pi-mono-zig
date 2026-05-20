@@ -3399,7 +3399,7 @@ pub const OverlayPanelComponent = struct {
                             .auth => |*auth_overlay| &auth_overlay.list,
                             else => unreachable,
                         };
-                        
+
                         overlay_list.max_visible = @max(@as(usize, 1), @min(self.max_height, @as(usize, content_window.height) - row));
                         const size = try overlay_list.draw(list_window, .{
                             .window = list_window,

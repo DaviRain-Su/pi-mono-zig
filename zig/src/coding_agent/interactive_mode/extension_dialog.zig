@@ -154,4 +154,3 @@ fn matchesEditorAction(
     }
     return keybindings_mod.defaultEditorActionForKeyWithModifiers(key, modifiers) == action;
 }
-
