@@ -265,7 +265,8 @@ jobs:
 
       - name: Install tsx (TypeScript loader)
         shell: bash
-        run: npm install -g tsx
+        run: |-
+          npm install --no-save tsx
 
       - name: Verify external tools
         run: |
