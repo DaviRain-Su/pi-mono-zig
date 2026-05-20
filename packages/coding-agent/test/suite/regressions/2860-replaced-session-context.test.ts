@@ -3,17 +3,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentSession } from "../../../src/core/agent-session.js";
+import type { AgentSession } from "../../../src/core/agent-session.ts";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
-} from "../../../src/core/agent-session-runtime.js";
-import { AuthStorage } from "../../../src/core/auth-storage.js";
-import { SessionManager } from "../../../src/core/session-manager.js";
-import { SettingsManager } from "../../../src/core/settings-manager.js";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from "../../../src/index.js";
+} from "../../../src/core/agent-session-runtime.ts";
+import { AuthStorage } from "../../../src/core/auth-storage.ts";
+import { SessionManager } from "../../../src/core/session-manager.ts";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionFactory } from "../../../src/index.ts";
 
 function getText(message: AgentSession["messages"][number]): string {
 	if (!("content" in message)) {
@@ -47,17 +46,12 @@ describe("regression #2860: replaced session callbacks", () => {
 
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		settingsManager.setExtensionPolicy("typescript:inline:inline:<inline:1>", {
-			approvedGrants: ["model.call", "session.write"],
-		});
 
 		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
 			const services = await createAgentSessionServices({
 				cwd,
 				agentDir: tempDir,
 				authStorage,
-				settingsManager,
 				resourceLoaderOptions: {
 					extensionFactories: [
 						(pi: ExtensionAPI) => {

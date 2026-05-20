@@ -1,4 +1,4 @@
-// NEVER convert to top-level imports - breaks browser/Vite builds (web-ui)
+// NEVER convert to top-level imports - breaks browser/Vite builds
 let _existsSync: typeof import("node:fs").existsSync | null = null;
 let _homedir: typeof import("node:os").homedir | null = null;
 let _join: typeof import("node:path").join | null = null;
@@ -23,7 +23,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 	});
 }
 
-import type { KnownProvider } from "./types.js";
+import type { KnownProvider } from "./types.ts";
 
 let _procEnvCache: Map<string, string> | null = null;
 
@@ -121,7 +121,6 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 		opencode: "OPENCODE_API_KEY",
 		"opencode-go": "OPENCODE_API_KEY",
 		"kimi-coding": "KIMI_API_KEY",
-		"kimi-code-openai": "KIMI_API_KEY",
 		"cloudflare-workers-ai": "CLOUDFLARE_API_KEY",
 		"cloudflare-ai-gateway": "CLOUDFLARE_API_KEY",
 		xiaomi: "XIAOMI_API_KEY",

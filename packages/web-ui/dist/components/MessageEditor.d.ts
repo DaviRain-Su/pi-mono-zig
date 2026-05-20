@@ -1,0 +1,44 @@
+import type { Model } from "@earendil-works/pi-ai";
+import { LitElement } from "lit";
+import { type Attachment } from "../utils/attachment-utils.js";
+import "./AttachmentTile.js";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+export declare class MessageEditor extends LitElement {
+    private _value;
+    private textareaRef;
+    get value(): string;
+    set value(val: string);
+    isStreaming: boolean;
+    currentModel?: Model<any>;
+    thinkingLevel: ThinkingLevel;
+    showAttachmentButton: boolean;
+    showModelSelector: boolean;
+    showThinkingSelector: boolean;
+    onInput?: (value: string) => void;
+    onSend?: (input: string, attachments: Attachment[]) => void;
+    onAbort?: () => void;
+    onModelSelect?: () => void;
+    onThinkingChange?: (level: "off" | "minimal" | "low" | "medium" | "high") => void;
+    onFilesChange?: (files: Attachment[]) => void;
+    attachments: Attachment[];
+    maxFiles: number;
+    maxFileSize: number;
+    acceptedTypes: string;
+    processingFiles: boolean;
+    isDragging: boolean;
+    private fileInputRef;
+    protected createRenderRoot(): HTMLElement | DocumentFragment;
+    private handleTextareaInput;
+    private handleKeyDown;
+    private handlePaste;
+    private handleSend;
+    private handleAttachmentClick;
+    private handleFilesSelected;
+    private removeFile;
+    private handleDragOver;
+    private handleDragLeave;
+    private handleDrop;
+    firstUpdated(): void;
+    render(): import("lit-html").TemplateResult<1>;
+}
+//# sourceMappingURL=MessageEditor.d.ts.map

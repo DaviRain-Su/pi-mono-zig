@@ -1,15 +1,14 @@
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { getAgentDir } from "../config.js";
-import { AuthStorage } from "./auth-storage.js";
-import { attachDiagnosticEnvelope, createDiagnosticEnvelope, type DiagnosticEnvelopeV0 } from "./diagnostics.js";
-import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
-import { ModelRegistry } from "./model-registry.js";
-import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
-import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
-import type { SessionManager } from "./session-manager.js";
-import { SettingsManager } from "./settings-manager.js";
+import { getAgentDir } from "../config.ts";
+import { AuthStorage } from "./auth-storage.ts";
+import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
+import { ModelRegistry } from "./model-registry.ts";
+import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.ts";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
+import type { SessionManager } from "./session-manager.ts";
+import { SettingsManager } from "./settings-manager.ts";
 
 /**
  * Non-fatal issues collected while creating services or sessions.
@@ -21,7 +20,6 @@ import { SettingsManager } from "./settings-manager.js";
 export interface AgentSessionRuntimeDiagnostic {
 	type: "info" | "warning" | "error";
 	message: string;
-	envelope?: DiagnosticEnvelopeV0;
 }
 
 /**
@@ -107,41 +105,17 @@ function applyExtensionFlagValues(
 			extensionsResult.runtime.flagValues.set(name, value);
 			continue;
 		}
-		const message = `Extension flag "--${name}" requires a value`;
-		diagnostics.push(
-			attachDiagnosticEnvelope(
-				{ type: "error", message },
-				createDiagnosticEnvelope({
-					severity: "error",
-					phase: "load",
-					runtimeKind: "typescript",
-					category: "extension_flag_invalid",
-					message,
-					recoveryHint: "Provide a value for the string extension flag or remove the option.",
-					operation: "extension.flag",
-					target: { flag: name },
-				}),
-			),
-		);
+		diagnostics.push({
+			type: "error",
+			message: `Extension flag "--${name}" requires a value`,
+		});
 	}
 
 	if (unknownFlags.length > 0) {
-		const message = `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`;
-		diagnostics.push(
-			attachDiagnosticEnvelope(
-				{ type: "error", message },
-				createDiagnosticEnvelope({
-					severity: "error",
-					phase: "load",
-					runtimeKind: "typescript",
-					category: "extension_flag_unknown",
-					message,
-					recoveryHint: "Remove unknown extension flags or enable the extension that registers them.",
-					operation: "extension.flag",
-					target: { flags: unknownFlags },
-				}),
-			),
-		);
+		diagnostics.push({
+			type: "error",
+			message: `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`,
+		});
 	}
 
 	return diagnostics;
@@ -175,26 +149,10 @@ export async function createAgentSessionServices(
 			modelRegistry.registerProvider(name, config);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			const diagnosticMessage = `Extension "${extensionPath}" error: ${message}`;
-			diagnostics.push(
-				attachDiagnosticEnvelope(
-					{
-						type: "error",
-						message: diagnosticMessage,
-					},
-					createDiagnosticEnvelope({
-						severity: "error",
-						phase: "load",
-						runtimeKind: "typescript",
-						category: "provider_registration_failed",
-						message: diagnosticMessage,
-						recoveryHint:
-							"Fix the extension provider registration or disable the extension, then reload extensions.",
-						source: { path: extensionPath },
-						operation: "provider.register",
-					}),
-				),
-			);
+			diagnostics.push({
+				type: "error",
+				message: `Extension "${extensionPath}" error: ${message}`,
+			});
 		}
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];

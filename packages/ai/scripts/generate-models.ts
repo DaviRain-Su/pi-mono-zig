@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 
 import { writeFileSync } from "fs";
 import { join, dirname } from "path";
@@ -8,15 +8,8 @@ import {
 	CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
 	CLOUDFLARE_AI_GATEWAY_OPENAI_BASE_URL,
 	CLOUDFLARE_WORKERS_AI_BASE_URL,
-} from "../src/providers/cloudflare.js";
-import {
-	Api,
-	type AnthropicMessagesCompat,
-	KnownProvider,
-	Model,
-	type OpenAICompletionsCompat,
-	type OpenAIResponsesCompat,
-} from "../src/types.js";
+} from "../src/providers/cloudflare.ts";
+import type { AnthropicMessagesCompat, Api, KnownProvider, Model, OpenAICompletionsCompat } from "../src/types.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -64,6 +57,10 @@ const COPILOT_STATIC_HEADERS = {
 	"Editor-Version": "vscode/1.107.0",
 	"Editor-Plugin-Version": "copilot-chat/0.35.0",
 	"Copilot-Integration-Id": "vscode-chat",
+} as const;
+
+const KIMI_STATIC_HEADERS = {
+	"User-Agent": "KimiCLI/1.5",
 } as const;
 
 const TOGETHER_BASE_URL = "https://api.together.ai/v1";
@@ -120,7 +117,6 @@ const TOGETHER_TOGGLE_REASONING_LEVEL_MAP = {
 
 const AI_GATEWAY_MODELS_URL = "https://ai-gateway.vercel.sh/v1";
 const AI_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh";
-const XAI_OAUTH_BASE_URL = "https://api.x.ai/v1";
 const ZAI_TOOL_STREAM_UNSUPPORTED_MODELS = new Set(["glm-4.5", "glm-4.5-air", "glm-4.5-flash", "glm-4.5v"]);
 const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-haiku-4.5",
@@ -135,157 +131,6 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	high: "high",
 	xhigh: "max",
 } as const;
-
-const ZIG_DEFAULT_MODEL_PER_PROVIDER: Record<string, string> = {
-	"amazon-bedrock": "us.anthropic.claude-opus-4-6-v1",
-	anthropic: "claude-opus-4-7",
-	openai: "gpt-5.4",
-	"azure-openai-responses": "gpt-5.4",
-	"openai-codex": "gpt-5.5",
-	deepseek: "deepseek-v4-pro",
-	google: "gemini-3.1-pro-preview",
-	"google-vertex": "gemini-3.1-pro-preview",
-	"github-copilot": "gpt-5.4",
-	openrouter: "moonshotai/kimi-k2.6",
-	"vercel-ai-gateway": "zai/glm-5.1",
-	xai: "grok-4.20-0309-reasoning",
-	"xai-oauth": "grok-4.3",
-	groq: "openai/gpt-oss-120b",
-	cerebras: "zai-glm-4.7",
-	zai: "glm-4.7",
-	mistral: "devstral-medium-latest",
-	minimax: "MiniMax-M2.7",
-	"minimax-cn": "MiniMax-M2.7",
-	moonshotai: "kimi-k2.6",
-	"moonshotai-cn": "kimi-k2.6",
-	huggingface: "moonshotai/Kimi-K2.6",
-	fireworks: "accounts/fireworks/models/kimi-k2p6",
-	together: "moonshotai/Kimi-K2.6",
-	opencode: "kimi-k2.6",
-	"opencode-go": "kimi-k2.6",
-	"kimi-coding": "kimi-for-coding",
-	"kimi-code-openai": "kimi-for-coding",
-	"cloudflare-workers-ai": "@cf/moonshotai/kimi-k2.6",
-	"cloudflare-ai-gateway": "workers-ai/@cf/moonshotai/kimi-k2.6",
-	xiaomi: "mimo-v2.5-pro",
-	"xiaomi-token-plan-cn": "mimo-v2.5-pro",
-	"xiaomi-token-plan-ams": "mimo-v2.5-pro",
-	"xiaomi-token-plan-sgp": "mimo-v2.5-pro",
-};
-
-const ZIG_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
-
-function zigString(value: string): string {
-	return `"${value
-		.replace(/\\/g, "\\\\")
-		.replace(/"/g, '\\"')
-		.replace(/\n/g, "\\n")
-		.replace(/\r/g, "\\r")
-		.replace(/\t/g, "\\t")}"`;
-}
-
-function zigNumber(value: number): string {
-	if (!Number.isFinite(value)) return "0";
-	return Object.is(value, -0) ? "0" : `${value}`;
-}
-
-function generateZigThinkingLevelMap(model: Model<any>): string | undefined {
-	if (!model.thinkingLevelMap) return undefined;
-
-	const fields: string[] = [];
-	for (const level of ZIG_THINKING_LEVELS) {
-		const value = model.thinkingLevelMap[level];
-		if (value === undefined) continue;
-		if (value === null) {
-			fields.push(`.${level} = .unsupported`);
-		} else {
-			fields.push(`.${level} = .{ .mapped = ${zigString(value)} }`);
-		}
-	}
-	if (fields.length === 0) return undefined;
-	return `.{ ${fields.join(", ")} }`;
-}
-
-function generateZigHeaders(model: Model<any>): string | undefined {
-	if (!model.headers || Object.keys(model.headers).length === 0) return undefined;
-	const entries = Object.entries(model.headers)
-		.sort(([left], [right]) => left.localeCompare(right))
-		.map(([name, value]) => `.{ .name = ${zigString(name)}, .value = ${zigString(String(value))} }`);
-	return `&[_]model_registry.HeaderPair{ ${entries.join(", ")} }`;
-}
-
-function generateZigInputTypes(inputTypes: readonly string[]): string {
-	const values = inputTypes.map((input) => zigString(input)).join(", ");
-	return inputTypes.length === 1 ? `&[_][]const u8{${values}}` : `&[_][]const u8{ ${values} }`;
-}
-
-function generateZigModelDefinition(model: Model<any>): string {
-	const fields = [
-		`.provider = ${zigString(model.provider)}`,
-		`.id = ${zigString(model.id)}`,
-		`.name = ${zigString(model.name)}`,
-		`.api = ${zigString(model.api)}`,
-		...(model.baseUrl !== undefined ? [`.base_url = ${zigString(model.baseUrl)}`] : []),
-		`.reasoning = ${model.reasoning}`,
-	];
-
-	const thinkingLevelMap = generateZigThinkingLevelMap(model);
-	if (thinkingLevelMap) fields.push(`.thinking_level_map = ${thinkingLevelMap}`);
-
-	fields.push(`.input_types = ${generateZigInputTypes(model.input)}`);
-	fields.push(
-		`.cost = .{ .input = ${zigNumber(model.cost.input)}, .output = ${zigNumber(model.cost.output)}, .cache_read = ${zigNumber(model.cost.cacheRead)}, .cache_write = ${zigNumber(model.cost.cacheWrite)} }`,
-	);
-	fields.push(`.context_window = ${Math.trunc(model.contextWindow)}`);
-	fields.push(`.max_tokens = ${Math.trunc(model.maxTokens)}`);
-
-	const headers = generateZigHeaders(model);
-	if (headers) fields.push(`.headers_pairs = ${headers}`);
-	if (model.compat) fields.push(`.compat_json = ${zigString(JSON.stringify(model.compat))}`);
-
-	return `    .{ ${fields.join(", ")} },\n`;
-}
-
-function generateZigModels(providers: Record<string, Record<string, Model<any>>>): string {
-	let output = `// This file is auto-generated by packages/ai/scripts/generate-models.ts
-// Do not edit manually - run 'npm run generate-models' from packages/ai.
-
-const model_registry = @import("model_registry.zig");
-
-pub const provider_count = ${Object.keys(providers).length};
-pub const model_count = ${Object.values(providers).reduce((sum, models) => sum + Object.keys(models).length, 0)};
-
-pub const provider_configs = [_]model_registry.ProviderConfig{
-`;
-
-	const sortedProviderIds = Object.keys(providers).sort();
-	for (const providerId of sortedProviderIds) {
-		const models = providers[providerId];
-		const sortedModelIds = Object.keys(models).sort();
-		const configuredDefault = ZIG_DEFAULT_MODEL_PER_PROVIDER[providerId];
-		const defaultModelId = configuredDefault && models[configuredDefault] ? configuredDefault : sortedModelIds[0];
-		const defaultModel = models[defaultModelId];
-		output += `    .{ .provider = ${zigString(providerId)}, .api = ${zigString(defaultModel.api)}, .base_url = ${zigString(defaultModel.baseUrl ?? "")}, .default_model_id = ${zigString(defaultModelId)} },\n`;
-	}
-
-	output += `};
-
-pub const models = [_]model_registry.ModelDefinition{
-`;
-
-	for (const providerId of sortedProviderIds) {
-		const models = providers[providerId];
-		const sortedModelIds = Object.keys(models).sort();
-		for (const modelId of sortedModelIds) {
-			output += generateZigModelDefinition(models[modelId]);
-		}
-	}
-
-	output += `};
-`;
-
-	return output;
-}
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.1",
@@ -352,6 +197,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	) {
 		mergeThinkingLevelMap(model, { off: null });
 	}
+	if (model.provider === "github-copilot" && model.id.startsWith("gpt-5")) {
+		mergeThinkingLevelMap(model, { minimal: "low" });
+	}
 	if (
 		model.api === "openai-responses" &&
 		model.provider === "openai" &&
@@ -385,9 +233,6 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { minimal: "low" });
-	}
-	if (model.provider === "openai-codex" && model.id === "gpt-5.1-codex-mini") {
-		mergeThinkingLevelMap(model, { minimal: "medium", low: "medium", medium: "medium", high: "high" });
 	}
 	if (model.provider === "openrouter" && model.id.startsWith("inception/mercury-2")) {
 		// Mercury 2 in instant mode (reasoning_effort: "none") disables tool calling.
@@ -822,7 +667,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					name: m.name || modelId,
 					api: "openai-completions",
 					provider: "zai",
-					baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+					baseUrl: "https://api.z.ai/api/coding/paas/v4",
 					reasoning: m.reasoning === true,
 					input: supportsImage ? ["text", "image"] : ["text"],
 					cost: {
@@ -1138,58 +983,41 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
-		// Process Kimi Code models
+		// Process Kimi For Coding models
 		if (data["kimi-for-coding"]?.models) {
 			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
-			// Kimi Code docs require the fixed model id `kimi-for-coding` for
-			// both Anthropic-compatible and OpenAI-compatible APIs. models.dev
-			// can include transient backend ids; keep only the public alias.
-			const canonicalModel = kimiModels["kimi-for-coding"] ?? kimiModels.k2p6 ?? kimiModels.k2p5;
+			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
 
-			if (canonicalModel?.tool_call === true) {
-				const input: ("text" | "image")[] = canonicalModel.modalities?.input?.includes("image")
-					? ["text", "image"]
-					: ["text"];
-				const cost = {
-					input: canonicalModel.cost?.input || 0,
-					output: canonicalModel.cost?.output || 0,
-					cacheRead: canonicalModel.cost?.cache_read || 0,
-					cacheWrite: canonicalModel.cost?.cache_write || 0,
-				};
-				const contextWindow = canonicalModel.limit?.context || 4096;
-				const maxTokens = canonicalModel.limit?.output || 4096;
+			const kimiAliases = new Set(["k2p5", "k2p6"]);
+
+			for (const [modelId, model] of Object.entries(kimiModels)) {
+				const m = model as ModelsDevModel;
+				if (m.tool_call !== true) continue;
+				// models.dev may expose versioned aliases (e.g. k2p5/k2p6).
+				// Normalize aliases to the canonical model id and drop duplicates when canonical exists.
+				if (kimiAliases.has(modelId) && hasCanonicalModel) continue;
+
+				const normalizedId = kimiAliases.has(modelId) ? "kimi-for-coding" : modelId;
+				const normalizedName = kimiAliases.has(modelId) ? "Kimi For Coding" : m.name || normalizedId;
 
 				models.push({
-					id: "kimi-for-coding",
-					name: "Kimi For Coding",
+					id: normalizedId,
+					name: normalizedName,
 					api: "anthropic-messages",
 					provider: "kimi-coding",
-					// Kimi Code's Anthropic-compatible API - SDK appends /v1/messages
+					// Kimi For Coding's Anthropic-compatible API - SDK appends /v1/messages
 					baseUrl: "https://api.kimi.com/coding",
-					reasoning: canonicalModel.reasoning === true,
-					input,
-					cost,
-					contextWindow,
-					maxTokens,
-				});
-				models.push({
-					id: "kimi-for-coding",
-					name: "Kimi For Coding",
-					api: "openai-completions",
-					provider: "kimi-code-openai",
-					baseUrl: "https://api.kimi.com/coding/v1",
-					compat: {
-						supportsStore: false,
-						supportsDeveloperRole: false,
-						supportsReasoningEffort: false,
-						maxTokensField: "max_tokens",
-						supportsStrictMode: false,
+					headers: { ...KIMI_STATIC_HEADERS },
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
 					},
-					reasoning: canonicalModel.reasoning === true,
-					input,
-					cost,
-					contextWindow,
-					maxTokens,
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
 				});
 			}
 		}
@@ -1239,11 +1067,15 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		// Built-in `xiaomi` targets the API billing endpoint (single stable URL,
 		// keys from platform.xiaomimimo.com). The three `xiaomi-token-plan-*`
 		// providers cover prepaid Token Plan endpoints in cn / ams / sgp.
+		const xiaomiCompat: OpenAICompletionsCompat = {
+			requiresReasoningContentOnAssistantMessages: true,
+			thinkingFormat: "deepseek",
+		};
 		const xiaomiVariants = [
-			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/anthropic" },
-			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/anthropic" },
+			{ provider: "xiaomi", baseUrl: "https://api.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-cn", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-ams", baseUrl: "https://token-plan-ams.xiaomimimo.com/v1" },
+			{ provider: "xiaomi-token-plan-sgp", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1" },
 		] as const;
 
 		if (data.xiaomi?.models) {
@@ -1255,9 +1087,10 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					models.push({
 						id: modelId,
 						name: m.name || modelId,
-						api: "anthropic-messages",
+						api: "openai-completions",
 						provider,
 						baseUrl,
+						compat: xiaomiCompat,
 						reasoning: m.reasoning === true,
 						input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 						cost: {
@@ -1664,56 +1497,8 @@ async function generateModels() {
 	const CODEX_MAX_TOKENS = 128000;
 	const codexModels: Model<"openai-codex-responses">[] = [
 		{
-			id: "gpt-5.1",
-			name: "GPT-5.1",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.1-codex-max",
-			name: "GPT-5.1 Codex Max",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.1-codex-mini",
-			name: "GPT-5.1 Codex Mini",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
 			id: "gpt-5.2",
 			name: "GPT-5.2",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.2-codex",
-			name: "GPT-5.2 Codex",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: CODEX_BASE_URL,
@@ -1736,6 +1521,18 @@ async function generateModels() {
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 		{
+			id: "gpt-5.3-codex-spark",
+			name: "GPT-5.3 Codex Spark",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1.75, output: 14, cacheRead: 0.175, cacheWrite: 0 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
 			id: "gpt-5.4",
 			name: "GPT-5.4",
 			api: "openai-codex-responses",
@@ -1744,6 +1541,18 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.4-mini",
+			name: "GPT-5.4 mini",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
@@ -1759,35 +1568,11 @@ async function generateModels() {
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
-		{
-			id: "gpt-5.4-mini",
-			name: "GPT-5.4 Mini",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-			contextWindow: CODEX_CONTEXT,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
-		{
-			id: "gpt-5.3-codex-spark",
-			name: "GPT-5.3 Codex Spark",
-			api: "openai-codex-responses",
-			provider: "openai-codex",
-			baseUrl: CODEX_BASE_URL,
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128000,
-			maxTokens: CODEX_MAX_TOKENS,
-		},
 	];
 	allModels.push(...codexModels);
 
 	// Add missing Grok models
-	const missingGrokModels: Model[] = [
+	const missingGrokModels: Model<"openai-completions">[] = [
 		{
 			id: "grok-3",
 			name: "Grok 3",
@@ -1835,66 +1620,6 @@ async function generateModels() {
 			allModels.push(model);
 		}
 	}
-
-	const xaiOAuthResponsesCompat: OpenAIResponsesCompat = {
-		sendSessionIdHeader: false,
-		supportsLongCacheRetention: false,
-	};
-	const xaiOAuthModels: Model<"openai-responses">[] = [
-		{
-			id: "grok-4.3",
-			name: "Grok 4.3",
-			api: "openai-responses",
-			baseUrl: XAI_OAUTH_BASE_URL,
-			provider: "xai-oauth",
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
-			contextWindow: 1000000,
-			maxTokens: 30000,
-			compat: xaiOAuthResponsesCompat,
-		},
-		{
-			id: "grok-4.20-0309-reasoning",
-			name: "Grok 4.20 (Reasoning)",
-			api: "openai-responses",
-			baseUrl: XAI_OAUTH_BASE_URL,
-			provider: "xai-oauth",
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
-			contextWindow: 2000000,
-			maxTokens: 30000,
-			compat: xaiOAuthResponsesCompat,
-		},
-		{
-			id: "grok-4.20-0309-non-reasoning",
-			name: "Grok 4.20 (Non-Reasoning)",
-			api: "openai-responses",
-			baseUrl: XAI_OAUTH_BASE_URL,
-			provider: "xai-oauth",
-			reasoning: false,
-			input: ["text", "image"],
-			cost: { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
-			contextWindow: 2000000,
-			maxTokens: 30000,
-			compat: xaiOAuthResponsesCompat,
-		},
-		{
-			id: "grok-4.20-multi-agent-0309",
-			name: "Grok 4.20 Multi-Agent",
-			api: "openai-responses",
-			baseUrl: XAI_OAUTH_BASE_URL,
-			provider: "xai-oauth",
-			reasoning: true,
-			input: ["text", "image"],
-			cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
-			contextWindow: 2000000,
-			maxTokens: 30000,
-			compat: xaiOAuthResponsesCompat,
-		},
-	];
-	allModels.push(...xaiOAuthModels);
 
 	// Add missing Mistral Medium 3.5 model until models.dev includes it
 	if (!allModels.some(m => m.provider === "mistral" && m.id === "mistral-medium-3.5")) {
@@ -2132,7 +1857,7 @@ async function generateModels() {
 	let output = `// This file is auto-generated by scripts/generate-models.ts
 // Do not edit manually - run 'npm run generate-models' to update
 
-import type { Model } from "./types.js";
+import type { Model } from "./types.ts";
 
 export const MODELS = {
 `;
@@ -2186,9 +1911,6 @@ export const MODELS = {
 	// Write file
 	writeFileSync(join(packageRoot, "src/models.generated.ts"), output);
 	console.log("Generated src/models.generated.ts");
-
-	writeFileSync(join(packageRoot, "../../zig/src/ai/models_generated.zig"), generateZigModels(providers));
-	console.log("Generated ../../zig/src/ai/models_generated.zig");
 
 	// Print statistics
 	const totalModels = allModels.length;

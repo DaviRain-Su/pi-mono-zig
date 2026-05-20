@@ -5,17 +5,17 @@ import { Type } from "typebox";
 import {
 	streamAzureOpenAIResponses,
 	type AzureOpenAIResponsesOptions,
-} from "../../packages/ai/src/providers/azure-openai-responses.js";
+} from "../../packages/ai/src/providers/azure-openai-responses.ts";
 import {
 	streamOpenAICodexResponses,
 	type OpenAICodexResponsesOptions,
-} from "../../packages/ai/src/providers/openai-codex-responses.js";
+} from "../../packages/ai/src/providers/openai-codex-responses.ts";
 import {
 	streamOpenAIResponses,
 	streamSimpleOpenAIResponses,
 	type OpenAIResponsesOptions,
-} from "../../packages/ai/src/providers/openai-responses.js";
-import type { AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions } from "../../packages/ai/src/types.js";
+} from "../../packages/ai/src/providers/openai-responses.ts";
+import type { AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions } from "../../packages/ai/src/types.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);

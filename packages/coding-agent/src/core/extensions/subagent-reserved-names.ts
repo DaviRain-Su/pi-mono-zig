@@ -1,4 +1,4 @@
-import type { ExtensionFactory } from "./types.js";
+import type { ExtensionFactory } from "./types.ts";
 
 const SUB_AGENT_RESERVED_PREFIX = "sub_agent.";
 const SUB_AGENT_RESERVED_NAMES = new Set([

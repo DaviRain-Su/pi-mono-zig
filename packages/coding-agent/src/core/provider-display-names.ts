@@ -12,7 +12,6 @@ export const BUILT_IN_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
 	groq: "Groq",
 	huggingface: "Hugging Face",
 	"kimi-coding": "Kimi For Coding",
-	"kimi-code-openai": "Kimi Code (OpenAI Compatible)",
 	mistral: "Mistral",
 	minimax: "MiniMax",
 	"minimax-cn": "MiniMax (China)",

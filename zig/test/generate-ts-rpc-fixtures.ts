@@ -6,16 +6,16 @@ import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
-import type { AgentSessionEvent } from "../../packages/coding-agent/src/core/agent-session.js";
-import type { AgentSessionRuntime } from "../../packages/coding-agent/src/core/agent-session-runtime.js";
-import { runRpcMode } from "../../packages/coding-agent/src/modes/rpc/rpc-mode.js";
-import { attachJsonlLineReader, serializeJsonLine } from "../../packages/coding-agent/src/modes/rpc/jsonl.js";
+import type { AgentSessionEvent } from "../../packages/coding-agent/src/core/agent-session.ts";
+import type { AgentSessionRuntime } from "../../packages/coding-agent/src/core/agent-session-runtime.ts";
+import { runRpcMode } from "../../packages/coding-agent/src/modes/rpc/rpc-mode.ts";
+import { attachJsonlLineReader, serializeJsonLine } from "../../packages/coding-agent/src/modes/rpc/jsonl.ts";
 import type {
 	RpcCommand,
 	RpcExtensionUIResponse,
 	RpcSessionState,
 	RpcSlashCommand,
-} from "../../packages/coding-agent/src/modes/rpc/rpc-types.js";
+} from "../../packages/coding-agent/src/modes/rpc/rpc-types.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);

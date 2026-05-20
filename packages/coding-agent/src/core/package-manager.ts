@@ -1,15 +1,6 @@
-import { type ChildProcess, type ChildProcessByStdio, spawn, spawnSync } from "node:child_process";
+import type { ChildProcess, ChildProcessByStdio } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 
 function getEnv(): NodeJS.ProcessEnv {
@@ -36,43 +27,12 @@ import type { Readable } from "node:stream";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
-import { CONFIG_DIR_NAME } from "../config.js";
-import { shouldUseWindowsShell } from "../utils/child-process.js";
-import { type GitSource, parseGitUrl } from "../utils/git.js";
-import { canonicalizePath, isLocalPath } from "../utils/paths.js";
-import { adaptProvenanceDiagnosticToEnvelope, attachDiagnosticEnvelope } from "./diagnostics.js";
-import {
-	createWasmExtensionIdentity,
-	createWasmExtensionLegacyPolicyKey,
-	createWasmExtensionPolicyPrefix,
-	type ExtensionPolicy,
-	type WasmExtensionIdentity,
-} from "./extension-policy.js";
-import {
-	createExtensionProvenanceLockEntry,
-	createMissingLockEntryDiagnostic,
-	createMissingLockfileDiagnostic,
-	createWasmArtifactIdentity,
-	type ExtensionProvenanceDiagnostic,
-	type ExtensionProvenanceLockEntry,
-	type ExtensionProvenanceScope,
-	type ExtensionProvenanceSourceIdentity,
-	getExtensionProvenanceLockfilePath,
-	makeExtensionProvenanceEntryKey,
-	readExtensionProvenanceLockfile,
-	removeExtensionProvenanceLockEntry,
-	writeExtensionProvenanceLockEntry,
-} from "./extension-provenance-lockfile.js";
-import { isStdoutTakenOver } from "./output-guard.js";
-import type { PackageSource, SettingsManager, SettingsScope } from "./settings-manager.js";
-import { createSourceInfo, type SourceProvenanceBinding } from "./source-info.js";
-import {
-	hasWasmExtensionManifest,
-	validateWasmExtensionPackage,
-	WASM_CANONICAL_SECURITY_GRANTS,
-	type WasmExtensionPackageManifest,
-	type WasmExtensionPackagePolicyRequest,
-} from "./wasm-extension-package.js";
+import { CONFIG_DIR_NAME } from "../config.ts";
+import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
+import { type GitSource, parseGitUrl } from "../utils/git.ts";
+import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync } from "../utils/paths.ts";
+import { isStdoutTakenOver } from "./output-guard.ts";
+import type { PackageSource, SettingsManager } from "./settings-manager.ts";
 
 const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
@@ -89,7 +49,6 @@ export interface PathMetadata {
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
-	provenance?: SourceProvenanceBinding;
 }
 
 export interface ResolvedResource {
@@ -98,21 +57,11 @@ export interface ResolvedResource {
 	metadata: PathMetadata;
 }
 
-export interface ResolvedWasmExtensionPackage extends WasmExtensionPackageManifest {
-	path: string;
-	enabled: boolean;
-	metadata: PathMetadata;
-	identity: WasmExtensionIdentity;
-	effectivePolicy?: ExtensionPolicy;
-}
-
 export interface ResolvedPaths {
 	extensions: ResolvedResource[];
-	wasmExtensions: ResolvedWasmExtensionPackage[];
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
-	diagnostics: ExtensionProvenanceDiagnostic[];
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
@@ -187,12 +136,6 @@ interface ConfiguredUpdateSource {
 	scope: InstalledSourceScope;
 }
 
-interface FileSnapshot {
-	path: string;
-	existed: boolean;
-	bytes?: string;
-}
-
 interface NpmUpdateTarget extends ConfiguredUpdateSource {
 	parsed: NpmSource;
 }
@@ -208,19 +151,11 @@ interface PiManifest {
 	themes?: string[];
 }
 
-interface PackageJsonIdentity {
-	name?: string;
-	version?: string;
-	pi?: PiManifest;
-}
-
 interface ResourceAccumulator {
 	extensions: Map<string, { metadata: PathMetadata; enabled: boolean }>;
-	wasmExtensions: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>;
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
-	diagnostics: ExtensionProvenanceDiagnostic[];
 }
 
 /**
@@ -251,17 +186,6 @@ interface PackageFilter {
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 
 const RESOURCE_TYPES: ResourceType[] = ["extensions", "skills", "prompts", "themes"];
-const PROVENANCE_SOURCE_FIELDS: Array<keyof ExtensionProvenanceSourceIdentity> = ["type", "identity", "specifier"];
-const PROVENANCE_MANIFEST_FIELDS: Array<keyof ExtensionProvenanceLockEntry["manifest"]> = [
-	"kind",
-	"packageName",
-	"packageVersion",
-	"schemaVersion",
-	"id",
-	"name",
-	"version",
-	"toolId",
-];
 
 const FILE_PATTERNS: Record<ResourceType, RegExp> = {
 	extensions: /\.(ts|js)$/,
@@ -601,10 +525,6 @@ function readPiManifestFile(packageJsonPath: string): PiManifest | null {
 }
 
 function resolveExtensionEntries(dir: string): string[] | null {
-	if (hasWasmExtensionManifest(dir)) {
-		return null;
-	}
-
 	const packageJsonPath = join(dir, "package.json");
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifestFile(packageJsonPath);
@@ -907,537 +827,6 @@ export class DefaultPackageManager implements PackageManager {
 		return undefined;
 	}
 
-	private getProvenanceLockfilePath(scope: ExtensionProvenanceScope): string {
-		return getExtensionProvenanceLockfilePath({
-			scope,
-			agentDir: this.agentDir,
-			cwd: this.cwd,
-			configDirName: CONFIG_DIR_NAME,
-		});
-	}
-
-	private getSettingsPath(scope: InstalledSourceScope): string {
-		return scope === "user" ? join(this.agentDir, "settings.json") : join(this.cwd, CONFIG_DIR_NAME, "settings.json");
-	}
-
-	private getSettingsScope(scope: InstalledSourceScope): SettingsScope {
-		return scope === "user" ? "global" : "project";
-	}
-
-	private captureFileSnapshot(path: string): FileSnapshot {
-		if (!existsSync(path)) {
-			return { path, existed: false };
-		}
-		const stats = statSync(path);
-		return stats.isFile() ? { path, existed: true, bytes: readFileSync(path, "utf-8") } : { path, existed: true };
-	}
-
-	private restoreFileSnapshot(snapshot: FileSnapshot): void {
-		if (!snapshot.existed) {
-			rmSync(snapshot.path, { force: true });
-			return;
-		}
-		if (snapshot.bytes === undefined) {
-			return;
-		}
-		mkdirSync(dirname(snapshot.path), { recursive: true });
-		writeFileSync(snapshot.path, snapshot.bytes, "utf-8");
-	}
-
-	private restoreFileSnapshots(snapshots: FileSnapshot[]): void {
-		for (const snapshot of snapshots) {
-			this.restoreFileSnapshot(snapshot);
-		}
-	}
-
-	private async flushSettingsOrThrow(scope: InstalledSourceScope, action: string): Promise<void> {
-		await this.settingsManager.flush();
-		const settingsScope = this.getSettingsScope(scope);
-		const errors = this.settingsManager.drainErrors();
-		const scopedErrors = errors.filter((entry) => entry.scope === settingsScope);
-		if (scopedErrors.length === 0) {
-			return;
-		}
-		throw new Error(
-			`Failed to persist ${scope} package settings while ${action}: ${scopedErrors
-				.map((entry) => entry.error.message)
-				.join("; ")}`,
-		);
-	}
-
-	private restorePackageSettingsInMemory(scope: InstalledSourceScope, packages: PackageSource[]): void {
-		if (scope === "project") {
-			this.settingsManager.setProjectPackages(packages);
-		} else {
-			this.settingsManager.setPackages(packages);
-		}
-	}
-
-	private async restorePackageSettingsAfterFailedTransaction(
-		scope: InstalledSourceScope,
-		packages: PackageSource[],
-	): Promise<void> {
-		this.restorePackageSettingsInMemory(scope, packages);
-		await this.settingsManager.flush();
-		this.settingsManager.drainErrors();
-	}
-
-	private getNormalizedSourceIdentityForParsedSource(
-		_source: string,
-		parsed: ParsedSource,
-		scope: SourceScope,
-		mode: "input" | "settings",
-	): ExtensionProvenanceSourceIdentity {
-		if (parsed.type === "npm") {
-			return { type: "npm", identity: parsed.name };
-		}
-		if (parsed.type === "git") {
-			return { type: "git", identity: `${parsed.host}/${parsed.path}` };
-		}
-		const resolved =
-			mode === "settings"
-				? this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope))
-				: this.resolvePath(parsed.path);
-		const identity = existsSync(resolved) ? realpathSync(resolved) : resolved;
-		return { type: "local", identity };
-	}
-
-	private getTrustedLockEntryForSource(
-		source: string,
-		parsed: ParsedSource,
-		scope: InstalledSourceScope,
-		accumulator: ResourceAccumulator,
-	): ExtensionProvenanceLockEntry | undefined {
-		const lockfilePath = this.getProvenanceLockfilePath(scope);
-		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, "settings");
-		const key = makeExtensionProvenanceEntryKey(sourceIdentity);
-		const loaded = readExtensionProvenanceLockfile({ scope, lockfilePath, phase: "resolve" });
-		if (loaded.diagnostic) {
-			accumulator.diagnostics.push(loaded.diagnostic);
-			return undefined;
-		}
-		if (!existsSync(lockfilePath)) {
-			accumulator.diagnostics.push(createMissingLockfileDiagnostic({ scope, source, lockfilePath }));
-			return undefined;
-		}
-		const entry = loaded.entries.get(key);
-		if (!entry) {
-			accumulator.diagnostics.push(createMissingLockEntryDiagnostic({ scope, source, lockfilePath }));
-			return undefined;
-		}
-		return entry;
-	}
-
-	private verifyTrustedLockEntryForSource(
-		source: string,
-		parsed: ParsedSource,
-		scope: InstalledSourceScope,
-		lockEntry: ExtensionProvenanceLockEntry,
-		accumulator: ResourceAccumulator,
-	): boolean {
-		let currentEntry: ExtensionProvenanceLockEntry | undefined;
-		try {
-			currentEntry = this.createProvenanceLockEntryForSource(source, parsed, scope, "settings");
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "package_validation_failed",
-					scope,
-					source,
-					lockEntry,
-					message: `Unable to validate package provenance for ${scope} package source ${source}: ${message}`,
-					expected: "valid package provenance",
-					actual: message,
-					path: "$",
-				}),
-			);
-			return false;
-		}
-
-		if (!currentEntry) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "package_root_mismatch",
-					scope,
-					source,
-					lockEntry,
-					message: `Package root drift for ${scope} package source ${source}: configured package root is missing`,
-					expected: lockEntry.packageRoot,
-					actual: "missing",
-				}),
-			);
-			return false;
-		}
-
-		if (lockEntry.key !== currentEntry.key) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "source_identity_mismatch",
-					scope,
-					source,
-					lockEntry,
-					currentEntry,
-					message: `Source identity drift for ${scope} package source ${source}: lock entry key changed`,
-					expected: lockEntry.key,
-					actual: currentEntry.key,
-					field: "key",
-				}),
-			);
-			return false;
-		}
-
-		if (lockEntry.scope !== currentEntry.scope) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "source_identity_mismatch",
-					scope,
-					source,
-					lockEntry,
-					currentEntry,
-					message: `Source identity drift for ${scope} package source ${source}: scope changed`,
-					expected: lockEntry.scope,
-					actual: currentEntry.scope,
-					field: "scope",
-				}),
-			);
-			return false;
-		}
-
-		for (const field of PROVENANCE_SOURCE_FIELDS) {
-			const expected = lockEntry.source[field];
-			const actual = currentEntry.source[field];
-			if (expected !== actual) {
-				accumulator.diagnostics.push(
-					this.createProvenanceDriftDiagnostic({
-						category: "source_identity_mismatch",
-						scope,
-						source,
-						lockEntry,
-						currentEntry,
-						message: `Source identity drift for ${scope} package source ${source}: source.${field} changed`,
-						expected,
-						actual,
-						field: `source.${field}`,
-					}),
-				);
-				return false;
-			}
-		}
-
-		if (lockEntry.packageRoot !== currentEntry.packageRoot) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "package_root_mismatch",
-					scope,
-					source,
-					lockEntry,
-					currentEntry,
-					message: `Package root drift for ${scope} package source ${source}`,
-					expected: lockEntry.packageRoot,
-					actual: currentEntry.packageRoot,
-					field: "packageRoot",
-				}),
-			);
-			return false;
-		}
-
-		if (lockEntry.manifestPath !== currentEntry.manifestPath) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "manifest_provenance_mismatch",
-					scope,
-					source,
-					lockEntry,
-					currentEntry,
-					message: `Manifest provenance drift for ${scope} package source ${source}: manifestPath changed`,
-					expected: lockEntry.manifestPath,
-					actual: currentEntry.manifestPath,
-					field: "manifestPath",
-				}),
-			);
-			return false;
-		}
-
-		for (const field of PROVENANCE_MANIFEST_FIELDS) {
-			const expected = lockEntry.manifest[field];
-			const actual = currentEntry.manifest[field];
-			if (expected !== actual) {
-				accumulator.diagnostics.push(
-					this.createProvenanceDriftDiagnostic({
-						category: "manifest_provenance_mismatch",
-						scope,
-						source,
-						lockEntry,
-						currentEntry,
-						message: `Manifest provenance drift for ${scope} package source ${source}: manifest.${field} changed`,
-						expected,
-						actual,
-						field: `manifest.${field}`,
-					}),
-				);
-				return false;
-			}
-		}
-
-		const artifactDiagnostic = this.verifyTrustedArtifactProvenance(source, scope, lockEntry, currentEntry);
-		if (artifactDiagnostic) {
-			accumulator.diagnostics.push(artifactDiagnostic);
-			return false;
-		}
-
-		if (lockEntry.digests.packageRootSha256 !== currentEntry.digests.packageRootSha256) {
-			accumulator.diagnostics.push(
-				this.createProvenanceDriftDiagnostic({
-					category: "package_root_digest_mismatch",
-					scope,
-					source,
-					lockEntry,
-					currentEntry,
-					message: `Package-root digest drift for ${scope} package source ${source}`,
-					expected: lockEntry.digests.packageRootSha256,
-					actual: currentEntry.digests.packageRootSha256,
-					field: "digests.packageRootSha256",
-				}),
-			);
-			return false;
-		}
-
-		return true;
-	}
-
-	private createSourceProvenanceBinding(lockEntry: ExtensionProvenanceLockEntry): SourceProvenanceBinding {
-		return {
-			lockEntryKey: lockEntry.key,
-			sourceIdentity: lockEntry.source.identity,
-			packageRoot: lockEntry.packageRoot,
-			packageRootSha256: lockEntry.digests.packageRootSha256,
-			artifactSha256: lockEntry.artifact?.sha256,
-		};
-	}
-
-	private verifyTrustedArtifactProvenance(
-		source: string,
-		scope: InstalledSourceScope,
-		lockEntry: ExtensionProvenanceLockEntry,
-		currentEntry: ExtensionProvenanceLockEntry,
-	): ExtensionProvenanceDiagnostic | undefined {
-		if (!lockEntry.artifact && !currentEntry.artifact) {
-			return undefined;
-		}
-		if (!lockEntry.artifact || !currentEntry.artifact) {
-			return this.createProvenanceDriftDiagnostic({
-				category: "artifact_path_mismatch",
-				scope,
-				source,
-				lockEntry,
-				currentEntry,
-				message: `Artifact provenance drift for ${scope} package source ${source}: artifact presence changed`,
-				expected: lockEntry.artifact?.path,
-				actual: currentEntry.artifact?.path,
-				field: "artifact",
-			});
-		}
-		if (lockEntry.artifact.path !== currentEntry.artifact.path) {
-			return this.createProvenanceDriftDiagnostic({
-				category: "artifact_path_mismatch",
-				scope,
-				source,
-				lockEntry,
-				currentEntry,
-				message: `Artifact path drift for ${scope} package source ${source}`,
-				expected: lockEntry.artifact.path,
-				actual: currentEntry.artifact.path,
-				field: "artifact.path",
-			});
-		}
-		if (lockEntry.artifact.absolutePath !== currentEntry.artifact.absolutePath) {
-			return this.createProvenanceDriftDiagnostic({
-				category: "artifact_path_mismatch",
-				scope,
-				source,
-				lockEntry,
-				currentEntry,
-				message: `Artifact resolved path drift for ${scope} package source ${source}`,
-				expected: lockEntry.artifact.absolutePath,
-				actual: currentEntry.artifact.absolutePath,
-				field: "artifact.absolutePath",
-			});
-		}
-		if (lockEntry.artifact.sha256 !== currentEntry.artifact.sha256) {
-			return this.createProvenanceDriftDiagnostic({
-				category: "artifact_digest_mismatch",
-				scope,
-				source,
-				lockEntry,
-				currentEntry,
-				message: `Artifact digest drift for ${scope} package source ${source}`,
-				expected: lockEntry.artifact.sha256,
-				actual: currentEntry.artifact.sha256,
-				field: "artifact.sha256",
-			});
-		}
-		return undefined;
-	}
-
-	private createProvenanceDriftDiagnostic(options: {
-		category: ExtensionProvenanceDiagnostic["category"];
-		scope: InstalledSourceScope;
-		source: string;
-		lockEntry: ExtensionProvenanceLockEntry;
-		currentEntry?: ExtensionProvenanceLockEntry;
-		message: string;
-		expected?: string;
-		actual?: string;
-		field?: string;
-		path?: string;
-	}): ExtensionProvenanceDiagnostic {
-		const diagnostic: ExtensionProvenanceDiagnostic = {
-			category: options.category,
-			scope: options.scope,
-			lockfilePath: this.getProvenanceLockfilePath(options.scope),
-			phase: "resolve",
-			source: options.source,
-			message: options.message,
-			recoveryHint: "Run install or update for the package to refresh trusted extension provenance.",
-		};
-		const packageRoot = options.currentEntry?.packageRoot ?? options.lockEntry.packageRoot;
-		const manifestPath = options.currentEntry?.manifestPath ?? options.lockEntry.manifestPath;
-		const artifactPath = options.currentEntry?.artifact?.path ?? options.lockEntry.artifact?.path;
-		if (options.expected !== undefined) diagnostic.expected = options.expected;
-		if (options.actual !== undefined) diagnostic.actual = options.actual;
-		if (options.field !== undefined) diagnostic.field = options.field;
-		if (options.path !== undefined) diagnostic.path = options.path;
-		if (packageRoot !== undefined) diagnostic.packageRoot = packageRoot;
-		if (manifestPath !== undefined) diagnostic.manifestPath = manifestPath;
-		if (artifactPath !== undefined) diagnostic.artifactPath = artifactPath;
-		return attachDiagnosticEnvelope(diagnostic, adaptProvenanceDiagnosticToEnvelope(diagnostic));
-	}
-
-	private writeProvenanceLockForSource(
-		source: string,
-		scope: InstalledSourceScope,
-		mode: "input" | "settings" = "input",
-	): void {
-		const parsed = this.parseSource(source);
-		const entry = this.createProvenanceLockEntryForSource(source, parsed, scope, mode);
-		if (!entry) {
-			throw new Error(`Unable to compute extension provenance for ${scope} package source ${source}`);
-		}
-		writeExtensionProvenanceLockEntry({
-			scope,
-			lockfilePath: this.getProvenanceLockfilePath(scope),
-			entry,
-		});
-	}
-
-	private removeProvenanceLockForSource(
-		source: string,
-		scope: InstalledSourceScope,
-		mode: "input" | "settings",
-		removedKeys: Set<string>,
-	): void {
-		const parsed = this.parseSource(source);
-		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, mode);
-		const key = makeExtensionProvenanceEntryKey(sourceIdentity);
-		if (removedKeys.has(key)) {
-			return;
-		}
-		removedKeys.add(key);
-		removeExtensionProvenanceLockEntry({
-			scope,
-			lockfilePath: this.getProvenanceLockfilePath(scope),
-			key,
-		});
-	}
-
-	private getConfiguredPackageSourcesMatching(source: string, scope: InstalledSourceScope): string[] {
-		const currentSettings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-		return (currentSettings.packages ?? [])
-			.filter((existing) => this.packageSourcesMatch(existing, source, scope))
-			.map((existing) => this.getPackageSourceString(existing));
-	}
-
-	private createProvenanceLockEntryForSource(
-		source: string,
-		parsed: ParsedSource,
-		scope: InstalledSourceScope,
-		mode: "input" | "settings" = "input",
-	): ExtensionProvenanceLockEntry | undefined {
-		const packageRoot = this.getPackageRootForInstalledSource(parsed, scope, mode);
-		if (!packageRoot || !existsSync(packageRoot) || !statSync(packageRoot).isDirectory()) {
-			return undefined;
-		}
-		const sourceIdentity = this.getNormalizedSourceIdentityForParsedSource(source, parsed, scope, mode);
-		const wasmManifest = hasWasmExtensionManifest(packageRoot)
-			? validateWasmExtensionPackage(packageRoot, { approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS })
-			: undefined;
-		if (wasmManifest) {
-			return createExtensionProvenanceLockEntry({
-				scope,
-				source: sourceIdentity,
-				packageRoot,
-				manifestPath: wasmManifest.manifestPath,
-				manifest: {
-					kind: "wasm-extension",
-					schemaVersion: wasmManifest.schemaVersion,
-					id: wasmManifest.id,
-					name: wasmManifest.name,
-					version: wasmManifest.version,
-					toolId: wasmManifest.toolId,
-				},
-				artifact: createWasmArtifactIdentity(wasmManifest),
-			});
-		}
-		const packageJsonPath = join(packageRoot, "package.json");
-		const packageJson = this.readPackageJsonIdentity(packageJsonPath);
-		const hasPiManifest = Boolean(packageJson?.pi);
-		return createExtensionProvenanceLockEntry({
-			scope,
-			source: sourceIdentity,
-			packageRoot,
-			manifestPath: existsSync(packageJsonPath) ? packageJsonPath : packageRoot,
-			manifest: {
-				kind: hasPiManifest ? "typescript-package" : "resource-package",
-				packageName: packageJson?.name,
-				packageVersion: packageJson?.version,
-			},
-		});
-	}
-
-	private getPackageRootForInstalledSource(
-		parsed: ParsedSource,
-		scope: InstalledSourceScope,
-		mode: "input" | "settings" = "input",
-	): string | undefined {
-		if (parsed.type === "npm") {
-			return this.getNpmInstallPath(parsed, scope);
-		}
-		if (parsed.type === "git") {
-			return this.getGitInstallPath(parsed, scope);
-		}
-		const resolved =
-			mode === "settings"
-				? this.resolvePathFromBase(parsed.path, this.getBaseDirForScope(scope))
-				: this.resolvePath(parsed.path);
-		if (!existsSync(resolved)) {
-			return undefined;
-		}
-		return statSync(resolved).isDirectory() ? resolved : dirname(resolved);
-	}
-
-	private readPackageJsonIdentity(packageJsonPath: string): PackageJsonIdentity | undefined {
-		if (!existsSync(packageJsonPath)) {
-			return undefined;
-		}
-		try {
-			return JSON.parse(readFileSync(packageJsonPath, "utf-8")) as PackageJsonIdentity;
-		} catch {
-			return undefined;
-		}
-	}
-
 	private emitProgress(event: ProgressEvent): void {
 		this.progressCallback?.(event);
 	}
@@ -1475,7 +864,7 @@ export class DefaultPackageManager implements PackageManager {
 
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		await this.resolvePackageSources(packageSources, accumulator, onMissing, true);
+		await this.resolvePackageSources(packageSources, accumulator, onMissing);
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -1520,7 +909,7 @@ export class DefaultPackageManager implements PackageManager {
 		const accumulator = this.createAccumulator();
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		const packageSources = sources.map((source) => ({ pkg: source as PackageSource, scope }));
-		await this.resolvePackageSources(packageSources, accumulator, undefined, false);
+		await this.resolvePackageSources(packageSources, accumulator);
 		return this.toResolvedPaths(accumulator);
 	}
 
@@ -1569,12 +958,6 @@ export class DefaultPackageManager implements PackageManager {
 				if (!existsSync(resolved)) {
 					throw new Error(`Path does not exist: ${resolved}`);
 				}
-				if (statSync(resolved).isDirectory() && hasWasmExtensionManifest(resolved)) {
-					const metadata: PathMetadata = { source, scope, origin: "package", baseDir: resolved };
-					validateWasmExtensionPackage(resolved, {
-						resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
-					});
-				}
 				return;
 			}
 			throw new Error(`Unsupported install source: ${source}`);
@@ -1583,25 +966,7 @@ export class DefaultPackageManager implements PackageManager {
 
 	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
 		await this.install(source, options);
-		const scope: InstalledSourceScope = options?.local ? "project" : "user";
-		const currentSettings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-		const previousPackages = currentSettings.packages ?? [];
-		const snapshots = [
-			this.captureFileSnapshot(this.getProvenanceLockfilePath(scope)),
-			this.captureFileSnapshot(this.getSettingsPath(scope)),
-		];
-		try {
-			this.writeProvenanceLockForSource(source, scope);
-			const changed = this.addSourceToSettings(source, options);
-			if (changed) {
-				await this.flushSettingsOrThrow(scope, "installing package");
-			}
-		} catch (error) {
-			await this.restorePackageSettingsAfterFailedTransaction(scope, previousPackages);
-			this.restoreFileSnapshots(snapshots);
-			throw error;
-		}
+		this.addSourceToSettings(source, options);
 	}
 
 	async remove(source: string, options?: { local?: boolean }): Promise<void> {
@@ -1624,18 +989,8 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	async removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean> {
-		const scope: InstalledSourceScope = options?.local ? "project" : "user";
-		const matchingConfiguredSources = this.getConfiguredPackageSourcesMatching(source, scope);
 		await this.remove(source, options);
-		const removed = this.removeSourceFromSettings(source, options);
-		if (removed) {
-			const removedKeys = new Set<string>();
-			this.removeProvenanceLockForSource(source, scope, "input", removedKeys);
-			for (const matchingSource of matchingConfiguredSources) {
-				this.removeProvenanceLockForSource(matchingSource, scope, "settings", removedKeys);
-			}
-		}
-		return removed;
+		return this.removeSourceFromSettings(source, options);
 	}
 
 	async update(source?: string): Promise<void> {
@@ -1668,38 +1023,6 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		await this.updateConfiguredSources(updateSources);
-		const entriesToWrite = updateSources
-			.map((entry) => {
-				const parsed = this.parseSource(entry.source);
-				const lockEntry = this.createProvenanceLockEntryForSource(entry.source, parsed, entry.scope, "settings");
-				if (!lockEntry) {
-					if (parsed.type !== "local") {
-						return undefined;
-					}
-					throw new Error(
-						`Unable to compute extension provenance for ${entry.scope} package source ${entry.source}`,
-					);
-				}
-				return { scope: entry.scope, lockEntry };
-			})
-			.filter((entry): entry is { scope: InstalledSourceScope; lockEntry: ExtensionProvenanceLockEntry } =>
-				Boolean(entry),
-			);
-		const lockSnapshots = Array.from(new Set(entriesToWrite.map((entry) => entry.scope))).map((scope) =>
-			this.captureFileSnapshot(this.getProvenanceLockfilePath(scope)),
-		);
-		try {
-			for (const entry of entriesToWrite) {
-				writeExtensionProvenanceLockEntry({
-					scope: entry.scope,
-					lockfilePath: this.getProvenanceLockfilePath(entry.scope),
-					entry: entry.lockEntry,
-				});
-			}
-		} catch (error) {
-			this.restoreFileSnapshots(lockSnapshots);
-			throw error;
-		}
 	}
 
 	private async updateConfiguredSources(sources: ConfiguredUpdateSource[]): Promise<void> {
@@ -1761,7 +1084,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async shouldUpdateNpmSource(source: NpmSource, scope: InstalledSourceScope): Promise<boolean> {
-		const installedPath = this.getNpmInstallPath(source, scope);
+		const installedPath = this.getManagedNpmInstallPath(source, scope);
 		const installedVersion = existsSync(installedPath) ? this.getInstalledNpmVersion(installedPath) : undefined;
 		if (!installedVersion) {
 			return true;
@@ -1791,13 +1114,9 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installNpmBatch(specs: string[], scope: InstalledSourceScope): Promise<void> {
-		if (scope === "user") {
-			await this.runNpmCommand(["install", "-g", ...specs]);
-			return;
-		}
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(["install", ...specs, "--prefix", installRoot]);
+		await this.runNpmCommand(this.getNpmInstallArgs(specs, installRoot));
 	}
 
 	async checkForAvailableUpdates(): Promise<PackageUpdate[]> {
@@ -1869,23 +1188,12 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
-		enforceProvenance = false,
 	): Promise<void> {
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
 			const parsed = this.parseSource(sourceStr);
 			const metadata: PathMetadata = { source: sourceStr, scope, origin: "package" };
-			if (enforceProvenance && scope !== "temporary") {
-				const lockEntry = this.getTrustedLockEntryForSource(sourceStr, parsed, scope, accumulator);
-				if (!lockEntry) {
-					continue;
-				}
-				if (!this.verifyTrustedLockEntryForSource(sourceStr, parsed, scope, lockEntry, accumulator)) {
-					continue;
-				}
-				metadata.provenance = this.createSourceProvenanceBinding(lockEntry);
-			}
 
 			if (parsed.type === "local") {
 				const baseDir = this.getBaseDirForScope(scope);
@@ -1958,7 +1266,10 @@ export class DefaultPackageManager implements PackageManager {
 			}
 			if (stats.isDirectory()) {
 				metadata.baseDir = resolved;
-				this.collectPackageResources(resolved, accumulator, filter, metadata);
+				const resources = this.collectPackageResources(resolved, accumulator, filter, metadata);
+				if (!resources) {
+					this.addResource(accumulator.extensions, resolved, metadata, true);
+				}
 			}
 		} catch {
 			return;
@@ -2354,6 +1665,14 @@ export class DefaultPackageManager implements PackageManager {
 		return { command, args };
 	}
 
+	private getPackageManagerName(): string {
+		const npmCommand = this.getNpmCommand();
+		const commandParts = [npmCommand.command, ...npmCommand.args];
+		const separatorIndex = commandParts.lastIndexOf("--");
+		const packageManagerCommand = separatorIndex >= 0 ? commandParts[separatorIndex + 1] : npmCommand.command;
+		return packageManagerCommand ? basename(packageManagerCommand).replace(/\.(cmd|exe)$/i, "") : "";
+	}
+
 	private async runNpmCommand(args: string[], options?: { cwd?: string }): Promise<void> {
 		const npmCommand = this.getNpmCommand();
 		await this.runCommand(npmCommand.command, [...npmCommand.args, ...args], options);
@@ -2372,23 +1691,30 @@ export class DefaultPackageManager implements PackageManager {
 		return this.runCommandSync(npmCommand.command, [...npmCommand.args, ...args]);
 	}
 
-	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
-		if (scope === "user" && !temporary) {
-			await this.runNpmCommand(["install", "-g", source.spec]);
-			return;
+	private getNpmInstallArgs(specs: string[], installRoot: string): string[] {
+		const packageManagerName = this.getPackageManagerName();
+		if (packageManagerName === "bun") {
+			return ["install", ...specs, "--cwd", installRoot];
 		}
+		if (packageManagerName === "pnpm") {
+			return ["install", ...specs, "--prefix", installRoot, "--config.strict-dep-builds=false"];
+		}
+		return ["install", ...specs, "--prefix", installRoot];
+	}
+
+	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(["install", source.spec, "--prefix", installRoot]);
+		await this.runNpmCommand(this.getNpmInstallArgs([source.spec], installRoot));
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
-		if (scope === "user") {
-			await this.runNpmCommand(["uninstall", "-g", source.name]);
-			return;
-		}
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		if (!existsSync(installRoot)) {
+			return;
+		}
+		if (this.getPackageManagerName() === "bun") {
+			await this.runNpmCommand(["uninstall", source.name, "--cwd", installRoot]);
 			return;
 		}
 		await this.runNpmCommand(["uninstall", source.name, "--prefix", installRoot]);
@@ -2496,6 +1822,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (!existsSync(installRoot)) {
 			mkdirSync(installRoot, { recursive: true });
 		}
+		markPathIgnoredByCloudSync(installRoot);
 		this.ensureGitIgnore(installRoot);
 		const packageJsonPath = join(installRoot, "package.json");
 		if (!existsSync(packageJsonPath)) {
@@ -2521,7 +1848,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (scope === "project") {
 			return join(this.cwd, CONFIG_DIR_NAME, "npm");
 		}
-		return join(this.getGlobalNpmRoot(), "..");
+		return join(this.agentDir, "npm");
 	}
 
 	private getGlobalNpmRoot(): string {
@@ -2530,8 +1857,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (this.globalNpmRoot && this.globalNpmRootCommandKey === commandKey) {
 			return this.globalNpmRoot;
 		}
-		const isBunPackageManager = npmCommand.command === "bun";
-		if (isBunPackageManager) {
+		if (this.getPackageManagerName() === "bun") {
 			const binDir = this.runNpmCommandSync(["pm", "bin", "-g"]).trim();
 			this.globalNpmRoot = join(dirname(binDir), "install", "global", "node_modules");
 		} else {
@@ -2542,14 +1868,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private getPnpmGlobalPackagePath(packageName: string): string | undefined {
-		const npmCommand = this.getNpmCommand();
-		const commandParts = [npmCommand.command, ...npmCommand.args];
-		const separatorIndex = commandParts.lastIndexOf("--");
-		const packageManagerCommand = separatorIndex >= 0 ? commandParts[separatorIndex + 1] : npmCommand.command;
-		const packageManagerName = packageManagerCommand
-			? basename(packageManagerCommand).replace(/\.(cmd|exe)$/i, "")
-			: "";
-		if (packageManagerName !== "pnpm") {
+		if (this.getPackageManagerName() !== "pnpm") {
 			return undefined;
 		}
 
@@ -2562,14 +1881,31 @@ export class DefaultPackageManager implements PackageManager {
 		return undefined;
 	}
 
-	private getNpmInstallPath(source: NpmSource, scope: SourceScope): string {
+	private getManagedNpmInstallPath(source: NpmSource, scope: SourceScope): string {
 		if (scope === "temporary") {
 			return join(this.getTemporaryDir("npm"), "node_modules", source.name);
 		}
 		if (scope === "project") {
 			return join(this.cwd, CONFIG_DIR_NAME, "npm", "node_modules", source.name);
 		}
-		return this.getPnpmGlobalPackagePath(source.name) ?? join(this.getGlobalNpmRoot(), source.name);
+		return join(this.agentDir, "npm", "node_modules", source.name);
+	}
+
+	private getLegacyGlobalNpmInstallPath(source: NpmSource): string | undefined {
+		try {
+			return this.getPnpmGlobalPackagePath(source.name) ?? join(this.getGlobalNpmRoot(), source.name);
+		} catch {
+			return undefined;
+		}
+	}
+
+	private getNpmInstallPath(source: NpmSource, scope: SourceScope): string {
+		const managedPath = this.getManagedNpmInstallPath(source, scope);
+		if (scope !== "user" || existsSync(managedPath)) {
+			return managedPath;
+		}
+		const legacyPath = this.getLegacyGlobalNpmInstallPath(source);
+		return legacyPath && existsSync(legacyPath) ? legacyPath : managedPath;
 	}
 
 	private getGitInstallPath(source: GitSource, scope: SourceScope): string {
@@ -2632,11 +1968,6 @@ export class DefaultPackageManager implements PackageManager {
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
 	): boolean {
-		const hasWasmExtension = this.collectWasmExtensionPackage(packageRoot, accumulator, metadata);
-		if (hasWasmExtension) {
-			return true;
-		}
-
 		if (filter) {
 			for (const resourceType of RESOURCE_TYPES) {
 				const patterns = filter[resourceType as keyof PackageFilter];
@@ -2678,144 +2009,6 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		}
 		return hasAnyDir;
-	}
-
-	private collectWasmExtensionPackage(
-		packageRoot: string,
-		accumulator: ResourceAccumulator,
-		metadata: PathMetadata,
-	): boolean {
-		if (!hasWasmExtensionManifest(packageRoot)) {
-			return false;
-		}
-		let manifest: WasmExtensionPackageManifest;
-		try {
-			manifest = validateWasmExtensionPackage(packageRoot, {
-				resolveApprovedCapabilities: (request) => this.resolveApprovedWasmCapabilities(request, metadata),
-			});
-		} catch (error) {
-			if (!metadata.provenance) {
-				throw error;
-			}
-			const trustedManifest = validateWasmExtensionPackage(packageRoot, {
-				approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS,
-			});
-			const sourceInfo = createSourceInfo(trustedManifest.manifestPath, metadata);
-			const identity = createWasmExtensionIdentity(trustedManifest, sourceInfo);
-			const mismatchedPolicyKey = this.findMismatchedWasmPolicyKey(identity, trustedManifest);
-			if (mismatchedPolicyKey) {
-				accumulator.diagnostics.push(
-					this.createPolicyDigestMismatchDiagnostic(identity, metadata, mismatchedPolicyKey),
-				);
-				return true;
-			}
-			throw error;
-		}
-		this.addWasmExtensionPackage(accumulator.wasmExtensions, manifest, metadata, true);
-		return true;
-	}
-
-	private resolveApprovedWasmCapabilities(
-		request: WasmExtensionPackagePolicyRequest,
-		metadata: PathMetadata,
-	): readonly string[] {
-		const policy = this.resolveWasmPolicyForRequest(request, metadata);
-		return policy?.approvedGrants ?? [];
-	}
-
-	private resolveWasmPolicyForRequest(
-		request: WasmExtensionPackagePolicyRequest,
-		metadata: PathMetadata,
-	): ExtensionPolicy | undefined {
-		const finalIdentityPolicy = this.resolveFinalWasmIdentityPolicy(request, metadata);
-		if (finalIdentityPolicy) {
-			return finalIdentityPolicy;
-		}
-		if (metadata.provenance) {
-			return undefined;
-		}
-		return this.settingsManager.getExtensionPolicy(request.policyLookupKey);
-	}
-
-	private resolveFinalWasmIdentityPolicy(
-		request: WasmExtensionPackagePolicyRequest,
-		metadata: PathMetadata,
-	): ExtensionPolicy | undefined {
-		try {
-			const manifest = validateWasmExtensionPackage(request.packageRoot, {
-				approvedCapabilities: WASM_CANONICAL_SECURITY_GRANTS,
-			});
-			const identity = createWasmExtensionIdentity(manifest, createSourceInfo(manifest.manifestPath, metadata));
-			return this.settingsManager.getExtensionPolicy(identity.key);
-		} catch {
-			return undefined;
-		}
-	}
-
-	private resolveWasmPolicyForIdentity(
-		identity: WasmExtensionIdentity,
-		manifest: WasmExtensionPackageManifest,
-		metadata: PathMetadata,
-		diagnostics: ExtensionProvenanceDiagnostic[],
-	): ExtensionPolicy | undefined {
-		const policy = this.settingsManager.getExtensionPolicy(identity.key);
-		if (policy) {
-			return policy;
-		}
-		if (!metadata.provenance) {
-			return this.settingsManager.getExtensionPolicy(manifest.policyLookupKey);
-		}
-		const mismatchedPolicyKey = this.findMismatchedWasmPolicyKey(identity, manifest);
-		if (mismatchedPolicyKey) {
-			diagnostics.push(this.createPolicyDigestMismatchDiagnostic(identity, metadata, mismatchedPolicyKey));
-		}
-		return undefined;
-	}
-
-	private findMismatchedWasmPolicyKey(
-		identity: WasmExtensionIdentity,
-		manifest: WasmExtensionPackageManifest,
-	): string | undefined {
-		const policies = this.settingsManager.getExtensionPolicies();
-		if (policies[manifest.policyLookupKey]) {
-			return manifest.policyLookupKey;
-		}
-		const legacyIdentityKey = createWasmExtensionLegacyPolicyKey(manifest);
-		if (policies[legacyIdentityKey]) {
-			return legacyIdentityKey;
-		}
-		const digestBoundPrefix = createWasmExtensionPolicyPrefix({
-			schemaVersion: manifest.schemaVersion,
-			id: manifest.id,
-			version: manifest.version,
-		});
-		return Object.keys(policies).find((key) => key !== identity.key && key.startsWith(digestBoundPrefix));
-	}
-
-	private createPolicyDigestMismatchDiagnostic(
-		identity: WasmExtensionIdentity,
-		metadata: PathMetadata,
-		policyKey: string,
-	): ExtensionProvenanceDiagnostic {
-		const diagnostic: ExtensionProvenanceDiagnostic = {
-			category: "policy_digest_mismatch",
-			scope: metadata.scope === "project" ? "project" : "user",
-			lockfilePath: this.getProvenanceLockfilePath(metadata.scope === "project" ? "project" : "user"),
-			phase: "resolve",
-			source: metadata.source,
-			message: `Extension policy digest mismatch for ${metadata.scope} package source ${metadata.source}`,
-			recoveryHint: "Update the extension policy after installing or updating the package provenance.",
-			field: "extensionPolicies",
-			expected: identity.key,
-			actual: policyKey,
-			packageRoot: identity.packageRoot,
-			manifestPath: identity.manifestPath,
-			artifactPath: identity.artifactPath,
-		};
-		return attachDiagnosticEnvelope(
-			diagnostic,
-			adaptProvenanceDiagnosticToEnvelope(diagnostic, identity.runtimeKind),
-		);
 	}
 
 	private collectDefaultResources(
@@ -3178,25 +2371,12 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	private addWasmExtensionPackage(
-		map: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
-		manifest: WasmExtensionPackageManifest,
-		metadata: PathMetadata,
-		enabled: boolean,
-	): void {
-		if (!map.has(manifest.manifestPath)) {
-			map.set(manifest.manifestPath, { metadata, manifest, enabled });
-		}
-	}
-
 	private createAccumulator(): ResourceAccumulator {
 		return {
 			extensions: new Map(),
-			wasmExtensions: new Map(),
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
-			diagnostics: [],
 		};
 	}
 
@@ -3222,48 +2402,18 @@ export class DefaultPackageManager implements PackageManager {
 
 		return {
 			extensions: mapToResolved(accumulator.extensions),
-			wasmExtensions: this.mapWasmExtensionsToResolved(accumulator.wasmExtensions, accumulator.diagnostics),
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
-			diagnostics: [...accumulator.diagnostics],
 		};
 	}
 
-	private mapWasmExtensionsToResolved(
-		entries: Map<string, { metadata: PathMetadata; manifest: WasmExtensionPackageManifest; enabled: boolean }>,
-		diagnostics: ExtensionProvenanceDiagnostic[],
-	): ResolvedWasmExtensionPackage[] {
-		const resolved = Array.from(entries.values()).map(({ metadata, manifest, enabled }) => {
-			const sourceInfo = createSourceInfo(manifest.manifestPath, metadata);
-			const identity = createWasmExtensionIdentity(manifest, sourceInfo);
-			const effectivePolicy = this.resolveWasmPolicyForIdentity(identity, manifest, metadata, diagnostics);
-			return {
-				...manifest,
-				path: manifest.manifestPath,
-				enabled,
-				metadata,
-				identity,
-				effectivePolicy,
-			};
-		});
-		resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
-
-		const seen = new Set<string>();
-		return resolved.filter((entry) => {
-			const canonicalPath = canonicalizePath(entry.manifestPath);
-			if (seen.has(canonicalPath)) return false;
-			seen.add(canonicalPath);
-			return true;
-		});
-	}
-
 	private spawnCommand(command: string, args: string[], options?: { cwd?: string }): ChildProcess {
-		return spawn(command, args, {
+		const env = getEnv();
+		return spawnProcess(command, args, {
 			cwd: options?.cwd,
 			stdio: isStdoutTakenOver() ? ["ignore", 2, 2] : "inherit",
-			shell: shouldUseWindowsShell(command),
-			env: getEnv(),
+			env,
 		});
 	}
 
@@ -3273,11 +2423,11 @@ export class DefaultPackageManager implements PackageManager {
 		options?: { cwd?: string; env?: Record<string, string> },
 	): ChildProcessByStdio<null, Readable, Readable> {
 		const baseEnv = getEnv();
-		return spawn(command, args, {
+		const env = options?.env ? { ...baseEnv, ...options.env } : baseEnv;
+		return spawnProcess(command, args, {
 			cwd: options?.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			shell: shouldUseWindowsShell(command),
-			env: options?.env ? { ...baseEnv, ...options.env } : baseEnv,
+			env,
 		});
 	}
 
@@ -3340,11 +2490,11 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private runCommandSync(command: string, args: string[]): string {
-		const result = spawnSync(command, args, {
+		const env = getEnv();
+		const result = spawnProcessSync(command, args, {
 			stdio: ["ignore", "pipe", "pipe"],
 			encoding: "utf-8",
-			shell: shouldUseWindowsShell(command),
-			env: getEnv(),
+			env,
 		});
 		if (result.error || result.status !== 0) {
 			throw new Error(

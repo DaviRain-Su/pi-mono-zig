@@ -2,35 +2,23 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import chalk from "chalk";
-import { CONFIG_DIR_NAME } from "../config.js";
-import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
-import {
-	attachDiagnosticEnvelope,
-	attachResourceDiagnosticEnvelope,
-	createDiagnosticEnvelope,
-	type ResourceDiagnostic,
-} from "./diagnostics.js";
+import { CONFIG_DIR_NAME } from "../config.ts";
+import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.ts";
+import type { ResourceDiagnostic } from "./diagnostics.ts";
 
-export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
+export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
-import { canonicalizePath, isLocalPath } from "../utils/paths.js";
-import { createEventBus, type EventBus } from "./event-bus.js";
-import { createTypeScriptExtensionIdentity } from "./extension-policy.js";
-import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
-import type {
-	Extension,
-	ExtensionFactory,
-	ExtensionRuntime,
-	LoadExtensionError,
-	LoadExtensionsResult,
-} from "./extensions/types.js";
-import { DefaultPackageManager, type PathMetadata, type ResolvedWasmExtensionPackage } from "./package-manager.js";
-import type { PromptTemplate } from "./prompt-templates.js";
-import { loadPromptTemplates } from "./prompt-templates.js";
-import { SettingsManager } from "./settings-manager.js";
-import type { Skill } from "./skills.js";
-import { loadSkills } from "./skills.js";
-import { createSourceInfo, type SourceInfo } from "./source-info.js";
+import { canonicalizePath, isLocalPath } from "../utils/paths.ts";
+import { createEventBus, type EventBus } from "./event-bus.ts";
+import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.ts";
+import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.ts";
+import { DefaultPackageManager, type PathMetadata } from "./package-manager.ts";
+import type { PromptTemplate } from "./prompt-templates.ts";
+import { loadPromptTemplates } from "./prompt-templates.ts";
+import { SettingsManager } from "./settings-manager.ts";
+import type { Skill } from "./skills.ts";
+import { loadSkills } from "./skills.ts";
+import { createSourceInfo, type SourceInfo } from "./source-info.ts";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -40,7 +28,6 @@ export interface ResourceExtensionPaths {
 
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
-	getWasmExtensions(): ResolvedWasmExtensionPackage[];
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
@@ -201,7 +188,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
 	private extensionsResult: LoadExtensionsResult;
-	private wasmExtensions: ResolvedWasmExtensionPackage[];
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -249,7 +235,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.appendSystemPromptOverride = options.appendSystemPromptOverride;
 
 		this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
-		this.wasmExtensions = [];
 		this.skills = [];
 		this.skillDiagnostics = [];
 		this.prompts = [];
@@ -270,29 +255,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return this.extensionsResult;
 	}
 
-	getWasmExtensions(): ResolvedWasmExtensionPackage[] {
-		return [...this.wasmExtensions];
-	}
-
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
-		return {
-			skills: this.skills,
-			diagnostics: this.skillDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
-		};
+		return { skills: this.skills, diagnostics: this.skillDiagnostics };
 	}
 
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } {
-		return {
-			prompts: this.prompts,
-			diagnostics: this.promptDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
-		};
+		return { prompts: this.prompts, diagnostics: this.promptDiagnostics };
 	}
 
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] } {
-		return {
-			themes: this.themes,
-			diagnostics: this.themeDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic)),
-		};
+		return { themes: this.themes, diagnostics: this.themeDiagnostics };
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -348,9 +320,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	async reload(): Promise<void> {
-		this.extensionsResult.runtime.invalidate(
-			"This extension runtime is stale after extension reload, disable, or removal.",
-		);
 		await this.settingsManager.reload();
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
@@ -378,7 +347,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 			resources: Array<{ path: string; enabled: boolean; metadata: PathMetadata }>,
 		): string[] => getEnabledResources(resources).map((r) => r.path);
 		const enabledExtensions = getEnabledPaths(resolvedPaths.extensions);
-		this.wasmExtensions = resolvedPaths.wasmExtensions.filter((extension) => extension.enabled);
 		const enabledSkillResources = getEnabledResources(resolvedPaths.skills);
 		const enabledPrompts = getEnabledPaths(resolvedPaths.prompts);
 		const enabledThemes = getEnabledPaths(resolvedPaths.themes);
@@ -428,12 +396,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
 
-		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus, {
-			resolveSourceInfo: ({ configuredPath, resolvedPath }) =>
-				this.findSourceInfoForPath(resolvedPath, undefined, metadataByPath) ??
-				this.findSourceInfoForPath(configuredPath, undefined, metadataByPath),
-			resolveEffectivePolicy: (identity) => this.settingsManager.getExtensionPolicy(identity.key),
-		});
+		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus);
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
 		extensionsResult.extensions.push(...inlineExtensions.extensions);
 		extensionsResult.errors.push(...inlineExtensions.errors);
@@ -595,12 +558,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 			extension.sourceInfo =
 				this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ??
 				this.getDefaultSourceInfoForPath(extension.path);
-			extension.identity = createTypeScriptExtensionIdentity({
-				configuredPath: extension.path,
-				resolvedPath: extension.resolvedPath,
-				sourceInfo: extension.sourceInfo,
-			});
-			extension.effectivePolicy = this.settingsManager.getExtensionPolicy(extension.identity.key);
 			for (const command of extension.commands.values()) {
 				command.sourceInfo = extension.sourceInfo;
 			}
@@ -812,41 +769,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private async loadExtensionFactories(runtime: ExtensionRuntime): Promise<{
 		extensions: Extension[];
-		errors: LoadExtensionError[];
+		errors: Array<{ path: string; error: string }>;
 	}> {
 		const extensions: Extension[] = [];
-		const errors: LoadExtensionError[] = [];
+		const errors: Array<{ path: string; error: string }> = [];
 
 		for (const [index, factory] of this.extensionFactories.entries()) {
 			const extensionPath = `<inline:${index + 1}>`;
 			try {
-				const identity = createTypeScriptExtensionIdentity({
-					configuredPath: extensionPath,
-					resolvedPath: extensionPath,
-					sourceInfo: this.getDefaultSourceInfoForPath(extensionPath),
-				});
-				const extension = await loadExtensionFromFactory(
-					factory,
-					this.cwd,
-					this.eventBus,
-					runtime,
-					extensionPath,
-					this.settingsManager.getExtensionPolicy(identity.key),
-				);
+				const extension = await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath);
 				extensions.push(extension);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "failed to load extension";
-				const envelope = createDiagnosticEnvelope({
-					severity: "error",
-					phase: "load",
-					runtimeKind: "typescript",
-					category: "extension_load_failed",
-					message,
-					recoveryHint: "Fix or remove the inline extension factory, then reload extensions.",
-					source: { path: extensionPath },
-					path: extensionPath,
-				});
-				errors.push(attachDiagnosticEnvelope({ path: extensionPath, error: envelope.message }, envelope));
+				errors.push({ path: extensionPath, error: message });
 			}
 		}
 

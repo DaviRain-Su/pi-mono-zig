@@ -17,8 +17,8 @@ import {
 	streamBedrock,
 	type BedrockOptions,
 	streamSimpleBedrock,
-} from "../../packages/ai/src/providers/amazon-bedrock.js";
-import { streamSimple } from "../../packages/ai/src/stream.js";
+} from "../../packages/ai/src/providers/amazon-bedrock.ts";
+import { streamSimple } from "../../packages/ai/src/stream.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -27,7 +27,7 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	ToolCall,
-} from "../../packages/ai/src/types.js";
+} from "../../packages/ai/src/types.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);

@@ -15,8 +15,8 @@ import {
 	adaptProvenanceDiagnosticToEnvelope,
 	attachDiagnosticEnvelope,
 	type DiagnosticEnvelopeV0,
-} from "./diagnostics.js";
-import type { WasmExtensionPackageManifest } from "./wasm-extension-package.js";
+} from "./diagnostics.ts";
+import type { WasmExtensionPackageManifest } from "./wasm-extension-package.ts";
 
 export const EXTENSION_PROVENANCE_LOCKFILE_NAME = "extensions.lock.json";
 export const EXTENSION_PROVENANCE_LOCK_SCHEMA_VERSION = "pi-extension-lock.v0";

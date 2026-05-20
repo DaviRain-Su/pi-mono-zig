@@ -4,7 +4,7 @@ import {
 	adaptResourceDiagnosticToEnvelope,
 	createDiagnosticEnvelope,
 	redactDiagnosticValue,
-} from "../src/core/diagnostics.js";
+} from "../src/core/diagnostics.ts";
 
 function joinSensitiveParts(parts: readonly string[]): string {
 	return parts.join("");

@@ -22,7 +22,7 @@ import {
 } from "@aws-sdk/client-bedrock-runtime";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { DocumentType } from "@smithy/types";
-import { calculateCost } from "../models.js";
+import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
@@ -40,13 +40,13 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
-} from "../types.js";
-import { AssistantMessageEventStream } from "../utils/event-stream.js";
-import { parseStreamingJson } from "../utils/json-parse.js";
-import { createHttpProxyAgentsForTarget } from "../utils/node-http-proxy.js";
-import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
-import { transformMessages } from "./transform-messages.js";
+} from "../types.ts";
+import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { parseStreamingJson } from "../utils/json-parse.ts";
+import { createHttpProxyAgentsForTarget } from "../utils/node-http-proxy.ts";
+import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
+import { transformMessages } from "./transform-messages.ts";
 
 export type BedrockThinkingDisplay = "summarized" | "omitted";
 
@@ -180,7 +180,6 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
-		let observedResponseMetadata = false;
 		try {
 			const client = new BedrockRuntimeClient(config);
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
@@ -209,7 +208,6 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 					responseHeaders["x-amzn-requestid"] = response.$metadata.requestId;
 				}
 				await options?.onResponse?.({ status: response.$metadata.httpStatusCode, headers: responseHeaders }, model);
-				observedResponseMetadata = true;
 			}
 
 			for await (const item of response.stream!) {
@@ -252,23 +250,13 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			let finalError = error;
-			if (!observedResponseMetadata) {
-				try {
-					if (await emitBedrockErrorResponseMetadata(error, options, model)) {
-						observedResponseMetadata = true;
-					}
-				} catch (metadataError) {
-					finalError = metadataError;
-				}
-			}
 			for (const block of output.content) {
 				delete (block as Block).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as Block).partialJson;
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(finalError);
+			output.errorMessage = formatBedrockError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -276,23 +264,6 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 
 	return stream;
 };
-
-async function emitBedrockErrorResponseMetadata(
-	error: unknown,
-	options: BedrockOptions | undefined,
-	model: Model<"bedrock-converse-stream">,
-): Promise<boolean> {
-	if (!(error instanceof BedrockRuntimeServiceException)) return false;
-	const status = error.$metadata?.httpStatusCode;
-	if (status === undefined) return false;
-	const headers: Record<string, string> = {};
-	const requestId = error.$metadata?.requestId;
-	if (requestId) {
-		headers["x-amzn-requestid"] = requestId;
-	}
-	await options?.onResponse?.({ status, headers }, model);
-	return true;
-}
 
 /**
  * Human-readable prefixes for Bedrock SDK exception names.
@@ -343,8 +314,10 @@ export const streamSimpleBedrock: StreamFunction<"bedrock-converse-stream", Simp
 			} satisfies BedrockOptions);
 		}
 
+		// Undefined means the caller did not request an output cap; let the helper use the model cap.
+		// Do not coerce to 0 here, or the thinking budget would become the entire maxTokens value.
 		const adjusted = adjustMaxTokensForThinking(
-			base.maxTokens || 0,
+			base.maxTokens,
 			model.maxTokens,
 			options.reasoning,
 			options.thinkingBudgets,
@@ -647,24 +620,31 @@ function convertMessages(
 		const m = transformedMessages[i];
 
 		switch (m.role) {
-			case "user":
+			case "user": {
+				const content: ContentBlock[] = [];
+				if (typeof m.content === "string") {
+					content.push({ text: sanitizeSurrogates(m.content) });
+				} else {
+					for (const c of m.content) {
+						switch (c.type) {
+							case "text":
+								content.push({ text: sanitizeSurrogates(c.text) });
+								break;
+							case "image":
+								content.push({ image: createImageBlock(c.mimeType, c.data) });
+								break;
+							default:
+								continue;
+						}
+					}
+				}
+				if (content.length === 0) continue;
 				result.push({
 					role: ConversationRole.USER,
-					content:
-						typeof m.content === "string"
-							? [{ text: sanitizeSurrogates(m.content) }]
-							: m.content.map((c) => {
-									switch (c.type) {
-										case "text":
-											return { text: sanitizeSurrogates(c.text) };
-										case "image":
-											return { image: createImageBlock(c.mimeType, c.data) };
-										default:
-											throw new Error("Unknown user content type");
-									}
-								}),
+					content,
 				});
 				break;
+			}
 			case "assistant": {
 				// Skip assistant messages with empty content (e.g., from aborted requests)
 				// Bedrock rejects messages with empty content arrays
@@ -715,7 +695,7 @@ function convertMessages(
 							}
 							break;
 						default:
-							throw new Error("Unknown assistant content type");
+							continue;
 					}
 				}
 				// Skip if all content blocks were filtered out
@@ -774,7 +754,7 @@ function convertMessages(
 				break;
 			}
 			default:
-				throw new Error("Unknown message role");
+				continue;
 		}
 	}
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExtensionAPI } from "../../../src/index.js";
-import { createHarness, type Harness } from "../harness.js";
+import type { ExtensionAPI } from "../../../src/index.ts";
+import { createHarness, type Harness } from "../harness.ts";
 
 describe("regression #3686: session name changes emit an event", () => {
 	const harnesses: Harness[] = [];
@@ -25,11 +25,8 @@ describe("regression #3686: session name changes emit an event", () => {
 		let api: ExtensionAPI | undefined;
 		const harness = await createHarness({
 			extensionFactories: [
-				{
-					factory: (pi) => {
-						api = pi;
-					},
-					effectivePolicy: { approvedGrants: ["session.write"] },
+				(pi) => {
+					api = pi;
 				},
 			],
 		});

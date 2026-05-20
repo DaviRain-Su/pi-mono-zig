@@ -8,22 +8,21 @@ import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AgentSession } from "../src/core/agent-session.js";
-import { AuthStorage } from "../src/core/auth-storage.js";
-import { createTypeScriptExtensionIdentity } from "../src/core/extension-policy.js";
+import { AgentSession } from "../src/core/agent-session.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
 import {
 	createExtensionRuntime,
 	type Extension,
 	type SessionBeforeCompactEvent,
 	type SessionCompactEvent,
 	type SessionEvent,
-} from "../src/core/extensions/index.js";
-import { ModelRegistry } from "../src/core/model-registry.js";
-import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
-import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import { createCodingTools } from "../src/index.js";
-import { createTestResourceLoader } from "./utilities.js";
+} from "../src/core/extensions/index.ts";
+import { ModelRegistry } from "../src/core/model-registry.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
+import { createCodingTools } from "../src/index.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 const API_KEY = process.env.ANTHROPIC_OAUTH_TOKEN || process.env.ANTHROPIC_API_KEY;
 
@@ -73,16 +72,10 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			},
 		]);
 
-		const sourceInfo = createSyntheticSourceInfo("<test:test-extension>", { source: "test" });
 		return {
 			path: "test-extension",
 			resolvedPath: "/test/test-extension.ts",
-			sourceInfo,
-			identity: createTypeScriptExtensionIdentity({
-				configuredPath: "test-extension",
-				resolvedPath: "/test/test-extension.ts",
-				sourceInfo,
-			}),
+			sourceInfo: createSyntheticSourceInfo("<test:test-extension>", { source: "test" }),
 			handlers,
 			tools: new Map(),
 			messageRenderers: new Map(),
@@ -234,16 +227,10 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 	}, 120000);
 
 	it("should continue with default compaction if extension throws error", async () => {
-		const sourceInfo = createSyntheticSourceInfo("<test:throwing-extension>", { source: "test" });
 		const throwingExtension: Extension = {
 			path: "throwing-extension",
 			resolvedPath: "/test/throwing-extension.ts",
-			sourceInfo,
-			identity: createTypeScriptExtensionIdentity({
-				configuredPath: "throwing-extension",
-				resolvedPath: "/test/throwing-extension.ts",
-				sourceInfo,
-			}),
+			sourceInfo: createSyntheticSourceInfo("<test:throwing-extension>", { source: "test" }),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",
@@ -289,16 +276,10 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 	it("should call multiple extensions in order", async () => {
 		const callOrder: string[] = [];
 
-		const sourceInfo1 = createSyntheticSourceInfo("<test:extension1>", { source: "test" });
 		const extension1: Extension = {
 			path: "extension1",
 			resolvedPath: "/test/extension1.ts",
-			sourceInfo: sourceInfo1,
-			identity: createTypeScriptExtensionIdentity({
-				configuredPath: "extension1",
-				resolvedPath: "/test/extension1.ts",
-				sourceInfo: sourceInfo1,
-			}),
+			sourceInfo: createSyntheticSourceInfo("<test:extension1>", { source: "test" }),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",
@@ -326,16 +307,10 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 			shortcuts: new Map(),
 		};
 
-		const sourceInfo2 = createSyntheticSourceInfo("<test:extension2>", { source: "test" });
 		const extension2: Extension = {
 			path: "extension2",
 			resolvedPath: "/test/extension2.ts",
-			sourceInfo: sourceInfo2,
-			identity: createTypeScriptExtensionIdentity({
-				configuredPath: "extension2",
-				resolvedPath: "/test/extension2.ts",
-				sourceInfo: sourceInfo2,
-			}),
+			sourceInfo: createSyntheticSourceInfo("<test:extension2>", { source: "test" }),
 			handlers: new Map<string, ((event: any, ctx: any) => Promise<any>)[]>([
 				[
 					"session_before_compact",

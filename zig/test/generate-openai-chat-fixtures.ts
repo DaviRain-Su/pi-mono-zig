@@ -6,7 +6,7 @@ import {
 	getOpenAICompletionsCompatForTesting,
 	streamOpenAICompletions,
 	type OpenAICompletionsOptions,
-} from "../../packages/ai/src/providers/openai-completions.js";
+} from "../../packages/ai/src/providers/openai-completions.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -15,7 +15,7 @@ import type {
 	Model,
 	OpenAICompletionsCompat,
 	ToolCall,
-} from "../../packages/ai/src/types.js";
+} from "../../packages/ai/src/types.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);

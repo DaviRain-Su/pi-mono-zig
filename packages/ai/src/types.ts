@@ -1,7 +1,7 @@
-import type { AssistantMessageDiagnostic } from "./utils/diagnostics.js";
-import type { AssistantMessageEventStream } from "./utils/event-stream.js";
+import type { AssistantMessageDiagnostic } from "./utils/diagnostics.ts";
+import type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
-export type { AssistantMessageEventStream } from "./utils/event-stream.js";
+export type { AssistantMessageEventStream } from "./utils/event-stream.ts";
 
 export type KnownApi =
 	| "openai-completions"
@@ -47,7 +47,6 @@ export type KnownProvider =
 	| "opencode"
 	| "opencode-go"
 	| "kimi-coding"
-	| "kimi-code-openai"
 	| "cloudflare-workers-ai"
 	| "cloudflare-ai-gateway"
 	| "xiaomi"

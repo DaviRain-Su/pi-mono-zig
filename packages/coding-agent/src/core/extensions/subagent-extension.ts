@@ -1,12 +1,12 @@
 import { type Static, Type } from "typebox";
-import type { ExtensionPolicy, ExtensionResourceLimits, TypeScriptExtensionIdentity } from "../extension-policy.js";
-import type { CustomEntry } from "../session-manager.js";
-import type { SourceInfo } from "../source-info.js";
+import type { ExtensionPolicy, ExtensionResourceLimits, TypeScriptExtensionIdentity } from "../extension-policy.ts";
+import type { CustomEntry } from "../session-manager.ts";
+import type { SourceInfo } from "../source-info.ts";
 import {
 	type BoundedSubAgentExecutor,
 	defaultBoundedSubAgentExecutor,
 	executeBoundedSubAgentTask,
-} from "./bounded-subagent-execution.js";
+} from "./bounded-subagent-execution.ts";
 import {
 	type SubAgentCancellationMetadata,
 	type SubAgentResourceLimits,
@@ -14,9 +14,9 @@ import {
 	type SubAgentTaskResultEnvelope,
 	validateSubAgentTaskInvocationEnvelope,
 	validateSubAgentTaskResultEnvelope,
-} from "./subagent-readiness.js";
-import { markSubAgentExtensionFactory } from "./subagent-reserved-names.js";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionFactory } from "./types.js";
+} from "./subagent-readiness.ts";
+import { markSubAgentExtensionFactory } from "./subagent-reserved-names.ts";
+import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionFactory } from "./types.ts";
 
 export const SUB_AGENT_READINESS_ENTRY = "sub_agent.readiness";
 export const SUB_AGENT_DELEGATION_RESULT_ENTRY = "sub_agent.delegation.result";

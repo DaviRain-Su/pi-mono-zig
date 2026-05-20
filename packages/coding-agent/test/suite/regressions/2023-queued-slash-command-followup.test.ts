@@ -3,7 +3,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.js";
+import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "../harness.ts";
 
 describe("issue #2023 queued slash-command follow-up", () => {
 	const harnesses: Harness[] = [];
@@ -37,17 +37,14 @@ describe("issue #2023 queued slash-command follow-up", () => {
 		const harness = await createHarness({
 			tools: [waitTool],
 			extensionFactories: [
-				{
-					factory: (pi) => {
-						extensionApi = pi;
-						pi.registerCommand("testcmd", {
-							description: "Test command",
-							handler: async (args) => {
-								commandRuns.push(args);
-							},
-						});
-					},
-					effectivePolicy: { approvedGrants: ["session.write"] },
+				(pi) => {
+					extensionApi = pi;
+					pi.registerCommand("testcmd", {
+						description: "Test command",
+						handler: async (args) => {
+							commandRuns.push(args);
+						},
+					});
 				},
 			],
 		});

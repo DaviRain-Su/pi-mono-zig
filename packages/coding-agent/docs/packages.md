@@ -36,7 +36,9 @@ pi update npm:@foo/bar      # update one package
 pi update --extension npm:@foo/bar
 ```
 
-By default, `install` and `remove` write to global settings (`~/.pi/agent/settings.json`). Use `-l` to write to project settings (`.pi/settings.json`) instead. Project settings can be shared with your team, and pi installs any missing packages automatically on startup.
+These commands manage pi packages, not the pi CLI installation. To uninstall pi itself, see [Quickstart](quickstart.md#uninstall).
+
+By default, `install` and `remove` write to user settings (`~/.pi/agent/settings.json`). Use `-l` to write to project settings (`.pi/settings.json`) instead. Project settings can be shared with your team, and pi installs any missing packages automatically on startup.
 
 To try a package without installing it, use `--extension` or `-e`. This installs to a temporary directory for the current run only:
 
@@ -57,7 +59,7 @@ npm:pkg
 ```
 
 - Versioned specs are pinned and skipped by package updates (`pi update`, `pi update --extensions`).
-- Global installs use `npm install -g`.
+- User installs go under `~/.pi/agent/npm/`.
 - Project installs go under `.pi/npm/`.
 - Set `npmCommand` in `settings.json` to pin npm package lookup and install operations to a specific wrapper command such as `mise` or `asdf`.
 
@@ -149,16 +151,6 @@ The [package gallery](https://pi.dev/packages) displays packages tagged with `pi
 If both are set, video takes precedence.
 
 ## Package Structure
-
-### `pi-extension.json` authoring manifests
-
-TypeScript and process-backed extensions may use `pi-extension.json` manifests.
-The TypeScript-facing docs, types, and schema are parity references for the Zig
-validators; they do not add separate TypeScript production runtime behavior.
-
-See [Extension Manifest Authoring](extension-manifest-authoring.md) for the
-supported `pi-extension.v1` TypeScript, JavaScript, and `process_jsonl` authoring
-shapes.
 
 ### Convention Directories
 

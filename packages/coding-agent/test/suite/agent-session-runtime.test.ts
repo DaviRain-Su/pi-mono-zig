@@ -1,23 +1,16 @@
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
-} from "../../src/core/agent-session-runtime.js";
-import { AuthStorage } from "../../src/core/auth-storage.js";
-import {
-	createSubAgentExtension,
-	SUB_AGENT_DELEGATION_RESULT_ENTRY,
-	SUB_AGENT_READINESS_ENTRY,
-	SUB_AGENT_STATUS_MESSAGE,
-} from "../../src/core/extensions/subagent-extension.js";
-import { convertToLlm } from "../../src/core/messages.js";
-import { SessionManager } from "../../src/core/session-manager.js";
+} from "../../src/core/agent-session-runtime.ts";
+import { AuthStorage } from "../../src/core/auth-storage.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
 	ExtensionFactory,
@@ -25,8 +18,7 @@ import type {
 	SessionBeforeSwitchEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
-} from "../../src/index.js";
-import { createHarness, type Harness } from "./harness.js";
+} from "../../src/index.ts";
 
 type RecordedSessionEvent =
 	| SessionBeforeSwitchEvent
@@ -61,21 +53,6 @@ describe("AgentSessionRuntime characterization", () => {
 
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-		const fauxProviderConfig = {
-			baseUrl: faux.getModel().baseUrl,
-			apiKey: "faux-key",
-			api: faux.api,
-			models: faux.models.map((registeredModel) => ({
-				id: registeredModel.id,
-				name: registeredModel.name,
-				api: registeredModel.api,
-				reasoning: registeredModel.reasoning,
-				input: registeredModel.input,
-				cost: registeredModel.cost,
-				contextWindow: registeredModel.contextWindow,
-				maxTokens: registeredModel.maxTokens,
-			})),
-		};
 
 		const runtimeOptions = {
 			agentDir: tempDir,
@@ -83,7 +60,26 @@ describe("AgentSessionRuntime characterization", () => {
 			model: options?.bootstrapModel === false ? undefined : faux.getModel(),
 			thinkingLevel: options?.bootstrapThinkingLevel === false ? undefined : undefined,
 			resourceLoaderOptions: {
-				extensionFactories: [extensionFactory],
+				extensionFactories: [
+					(pi: ExtensionAPI) => {
+						pi.registerProvider(faux.getModel().provider, {
+							baseUrl: faux.getModel().baseUrl,
+							apiKey: "faux-key",
+							api: faux.api,
+							models: faux.models.map((registeredModel) => ({
+								id: registeredModel.id,
+								name: registeredModel.name,
+								api: registeredModel.api,
+								reasoning: registeredModel.reasoning,
+								input: registeredModel.input,
+								cost: registeredModel.cost,
+								contextWindow: registeredModel.contextWindow,
+								maxTokens: registeredModel.maxTokens,
+							})),
+						});
+						extensionFactory(pi);
+					},
+				],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
@@ -94,7 +90,6 @@ describe("AgentSessionRuntime characterization", () => {
 				...runtimeOptions,
 				cwd,
 			});
-			services.modelRegistry.registerProvider(faux.getModel().provider, fauxProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,
@@ -462,25 +457,29 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			authStorage: otherAuthStorage,
 			resourceLoaderOptions: {
+				extensionFactories: [
+					(pi: ExtensionAPI) => {
+						pi.registerProvider(faux.getModel().provider, {
+							baseUrl: faux.getModel().baseUrl,
+							apiKey: "faux-key",
+							api: faux.api,
+							models: faux.models.map((registeredModel) => ({
+								id: registeredModel.id,
+								name: registeredModel.name,
+								api: registeredModel.api,
+								reasoning: registeredModel.reasoning,
+								input: registeredModel.input,
+								cost: registeredModel.cost,
+								contextWindow: registeredModel.contextWindow,
+								maxTokens: registeredModel.maxTokens,
+							})),
+						});
+					},
+				],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
 			},
-		};
-		const otherProviderConfig = {
-			baseUrl: faux.getModel().baseUrl,
-			apiKey: "faux-key",
-			api: faux.api,
-			models: faux.models.map((registeredModel) => ({
-				id: registeredModel.id,
-				name: registeredModel.name,
-				api: registeredModel.api,
-				reasoning: registeredModel.reasoning,
-				input: registeredModel.input,
-				cost: registeredModel.cost,
-				contextWindow: registeredModel.contextWindow,
-				maxTokens: registeredModel.maxTokens,
-			})),
 		};
 		const createOtherRuntime: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
@@ -491,7 +490,6 @@ describe("AgentSessionRuntime characterization", () => {
 				...otherRuntimeOptions,
 				cwd,
 			});
-			services.modelRegistry.registerProvider(faux.getModel().provider, otherProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,
@@ -532,25 +530,29 @@ describe("AgentSessionRuntime characterization", () => {
 			agentDir: tempDir,
 			authStorage: otherAuthStorage,
 			resourceLoaderOptions: {
+				extensionFactories: [
+					(pi: ExtensionAPI) => {
+						pi.registerProvider(faux.getModel().provider, {
+							baseUrl: faux.getModel().baseUrl,
+							apiKey: "faux-key",
+							api: faux.api,
+							models: faux.models.map((registeredModel) => ({
+								id: registeredModel.id,
+								name: registeredModel.name,
+								api: registeredModel.api,
+								reasoning: registeredModel.reasoning,
+								input: registeredModel.input,
+								cost: registeredModel.cost,
+								contextWindow: registeredModel.contextWindow,
+								maxTokens: registeredModel.maxTokens,
+							})),
+						});
+					},
+				],
 				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
 			},
-		};
-		const otherProviderConfig = {
-			baseUrl: faux.getModel().baseUrl,
-			apiKey: "faux-key",
-			api: faux.api,
-			models: faux.models.map((registeredModel) => ({
-				id: registeredModel.id,
-				name: registeredModel.name,
-				api: registeredModel.api,
-				reasoning: registeredModel.reasoning,
-				input: registeredModel.input,
-				cost: registeredModel.cost,
-				contextWindow: registeredModel.contextWindow,
-				maxTokens: registeredModel.maxTokens,
-			})),
 		};
 		const createOtherRuntime: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
@@ -561,7 +563,6 @@ describe("AgentSessionRuntime characterization", () => {
 				...otherRuntimeOptions,
 				cwd,
 			});
-			services.modelRegistry.registerProvider(faux.getModel().provider, otherProviderConfig);
 			return {
 				...(await createAgentSessionFromServices({
 					services,
@@ -589,210 +590,5 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(runtime.session.model?.id).toBe("faux-2");
 		expect(runtime.session.thinkingLevel).toBe("off");
-	});
-
-	it("keeps sub-agent replay records and status details outside model-visible context", async () => {
-		let delegateCalls = 0;
-		const harness: Harness = await createHarness({
-			extensionFactories: [
-				createSubAgentExtension({
-					approvedCapabilities: ["agent.delegate"],
-					delegate: (invocation) => {
-						delegateCalls++;
-						return {
-							type: "sub_agent_task_result",
-							agentId: invocation.agentId,
-							runId: invocation.runId,
-							taskId: invocation.taskId,
-							sessionId: invocation.sessionId,
-							parentAgentId: invocation.parentAgentId,
-							status: "completed",
-							content: [{ type: "text", text: "agent-session delegated" }],
-							startedAt: 10,
-							completedAt: 20,
-							resourceSummary: {
-								turns: 1,
-								outputBytes: 23,
-								outputLines: 1,
-								childrenStarted: 1,
-							},
-						};
-					},
-				}),
-			],
-		});
-		cleanups.push(() => harness.cleanup());
-
-		const payload = {
-			agentId: "agent-runtime",
-			runId: "run-runtime",
-			taskId: "task-runtime",
-			sessionId: "session-runtime",
-			parentAgentId: "parent-runtime",
-			route: "runtime-route",
-			input: { prompt: "delegate from runtime" },
-			limits: { maxChildren: 1, depth: 1, turns: 1, outputBytes: 256, outputLines: 5 },
-		};
-
-		await harness.session.prompt(`/sub-agent ${JSON.stringify(payload)}`);
-
-		expect(delegateCalls).toBe(1);
-		expect(harness.getPendingResponseCount()).toBe(0);
-		const entries = harness.sessionManager.getEntries();
-		const customTypes = entries.filter((entry) => entry.type === "custom").map((entry) => entry.customType);
-		expect(customTypes).toEqual([SUB_AGENT_READINESS_ENTRY, SUB_AGENT_DELEGATION_RESULT_ENTRY]);
-		const statusEntry = entries.find(
-			(entry) => entry.type === "custom_message" && entry.customType === SUB_AGENT_STATUS_MESSAGE,
-		);
-		expect(statusEntry).toMatchObject({
-			type: "custom_message",
-			customType: SUB_AGENT_STATUS_MESSAGE,
-			content: "completed",
-			details: { type: "sub_agent_task_result", taskId: "task-runtime", status: "completed" },
-		});
-
-		const context = harness.sessionManager.buildSessionContext();
-		expect(context.messages).toHaveLength(1);
-		expect(context.messages[0]).toMatchObject({
-			role: "custom",
-			customType: SUB_AGENT_STATUS_MESSAGE,
-			content: "completed",
-		});
-		const modelVisibleStatus = JSON.stringify(convertToLlm(context.messages));
-		expect(modelVisibleStatus).toContain("completed");
-		expect(modelVisibleStatus).not.toContain("sub_agent_task_invocation");
-		expect(modelVisibleStatus).not.toContain("sub_agent_task_result");
-		expect(modelVisibleStatus).not.toContain("agent-session delegated");
-
-		harness.setResponses([
-			(providerRequest) => {
-				const modelVisibleMessages = JSON.stringify(providerRequest.messages);
-				expect(modelVisibleMessages).toContain("completed");
-				expect(modelVisibleMessages).not.toContain("sub_agent_task_invocation");
-				expect(modelVisibleMessages).not.toContain("sub_agent_task_result");
-				expect(modelVisibleMessages).not.toContain("agent-session delegated");
-				return fauxAssistantMessage("after status boundary");
-			},
-		]);
-
-		await harness.session.prompt("continue after sub-agent status");
-
-		expect(delegateCalls).toBe(1);
-	});
-
-	it("routes assistant sub-agent tool calls through bounded delegation with read-only observations", async () => {
-		let delegateCalls = 0;
-		const observed: Array<{ type: string; taskId: string; phase: string; readOnly: true }> = [];
-		const payload = {
-			agentId: "agent-toolcall",
-			runId: "run-toolcall",
-			taskId: "task-toolcall",
-			sessionId: "session-toolcall",
-			toolCallId: "tool-call-toolcall",
-			parentAgentId: "parent-toolcall",
-			route: "assistant-tool-call",
-			input: { prompt: "delegate from assistant tool call" },
-			limits: { maxChildren: 1, depth: 1, turns: 1, outputBytes: 256, outputLines: 5 },
-		};
-		const harness: Harness = await createHarness({
-			extensionFactories: [
-				createSubAgentExtension({
-					approvedCapabilities: ["agent.delegate"],
-					delegate: (invocation) => {
-						delegateCalls++;
-						return {
-							type: "sub_agent_task_result",
-							agentId: invocation.agentId,
-							runId: invocation.runId,
-							taskId: invocation.taskId,
-							sessionId: invocation.sessionId,
-							toolCallId: invocation.toolCallId,
-							parentAgentId: invocation.parentAgentId,
-							status: "completed",
-							content: [{ type: "text", text: "assistant tool-call delegated" }],
-							startedAt: 100,
-							completedAt: 200,
-							resourceSummary: {
-								turns: 1,
-								outputBytes: 29,
-								outputLines: 1,
-								childrenStarted: 1,
-							},
-						};
-					},
-				}),
-				(pi) => {
-					pi.on("sub_agent_readiness", (event) => {
-						observed.push({
-							type: event.envelope.type,
-							taskId: event.envelope.taskId,
-							phase: event.phase,
-							readOnly: event.readOnly,
-						});
-						return { cancel: true, automaticSpawn: true } as unknown as undefined;
-					});
-				},
-			],
-		});
-		cleanups.push(() => harness.cleanup());
-
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("sub_agent.delegate", payload, { id: "tool-call-toolcall" }), {
-				stopReason: "toolUse",
-			}),
-			(providerRequest) => {
-				const toolResult = providerRequest.messages.find((message) => message.role === "toolResult");
-				const toolText =
-					toolResult?.role === "toolResult"
-						? toolResult.content
-								.filter((part): part is { type: "text"; text: string } => part.type === "text")
-								.map((part) => part.text)
-								.join("\n")
-						: "";
-				expect(toolText).toContain("assistant tool-call delegated");
-				expect(toolText).toContain('"type":"sub_agent_task_result"');
-				return fauxAssistantMessage("after assistant tool-call");
-			},
-		]);
-
-		await harness.session.prompt("delegate using the sub-agent tool");
-
-		expect(delegateCalls).toBe(1);
-		expect(observed).toEqual([
-			{ type: "sub_agent_task_invocation", taskId: "task-toolcall", phase: "recorded", readOnly: true },
-			{ type: "sub_agent_task_result", taskId: "task-toolcall", phase: "recorded", readOnly: true },
-		]);
-		const entries = harness.sessionManager.getEntries();
-		expect(entries.filter((entry) => entry.type === "custom").map((entry) => entry.customType)).toEqual([
-			SUB_AGENT_READINESS_ENTRY,
-			SUB_AGENT_DELEGATION_RESULT_ENTRY,
-		]);
-		const toolResult = harness.session.messages.find(
-			(message) => message.role === "toolResult" && message.toolName === "sub_agent.delegate",
-		);
-		expect(toolResult).toMatchObject({
-			role: "toolResult",
-			toolCallId: "tool-call-toolcall",
-			isError: false,
-		});
-		expect(JSON.stringify(toolResult)).toContain("assistant tool-call delegated");
-
-		harness.setResponses([
-			fauxAssistantMessage(fauxToolCall("sub_agent.delegate", payload, { id: "tool-call-toolcall-replay" }), {
-				stopReason: "toolUse",
-			}),
-			fauxAssistantMessage("after replay"),
-		]);
-
-		await harness.session.prompt("delegate using the sub-agent tool again");
-
-		expect(delegateCalls).toBe(1);
-		expect(observed.at(-1)).toEqual({
-			type: "sub_agent_task_result",
-			taskId: "task-toolcall",
-			phase: "replayed",
-			readOnly: true,
-		});
-		expect(entries.filter((entry) => entry.type === "custom")).toHaveLength(2);
 	});
 });

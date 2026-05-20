@@ -2,24 +2,15 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import { existsSync, realpathSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
-import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
-import { attachResourceDiagnosticEnvelope, type ResourceDiagnostic, sanitizeExtensionError } from "../diagnostics.js";
-import {
-	type CanonicalExtensionGrant,
-	createExtensionPolicyDenialError,
-	ExtensionPolicyDeniedError,
-	hasExtensionGrant,
-} from "../extension-policy.js";
-import type { KeybindingsConfig } from "../keybindings.js";
-import type { ModelRegistry } from "../model-registry.js";
-import type { PathMetadata, ResolvedWasmExtensionPackage } from "../package-manager.js";
-import type { SessionManager } from "../session-manager.js";
-import type { BuildSystemPromptOptions } from "../system-prompt.js";
+import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import type { ResourceDiagnostic } from "../diagnostics.ts";
+import type { KeybindingsConfig } from "../keybindings.ts";
+import type { ModelRegistry } from "../model-registry.ts";
+import type { SessionManager } from "../session-manager.ts";
+import type { BuildSystemPromptOptions } from "../system-prompt.ts";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -64,8 +55,7 @@ import type {
 	ToolResultEventResult,
 	UserBashEvent,
 	UserBashEventResult,
-} from "./types.js";
-import { DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS } from "./types.js";
+} from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
 // Only editor-global shortcuts are reserved here. Picker-specific bindings are not.
@@ -90,13 +80,6 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 ] as const;
 
 type BuiltInKeyBindings = Partial<Record<KeyId, { keybinding: string; restrictOverride: boolean }>>;
-type ProviderActions = {
-	registerProvider?: (name: string, config: ProviderConfig) => void;
-	unregisterProvider?: (name: string) => void;
-};
-type FacadeFunction = (...args: unknown[]) => unknown;
-type ExtensionResourcePath = { path: string; extensionPath: string; metadata: PathMetadata };
-type Validation<T> = { ok: true; value: T } | { ok: false; path: string; message: string };
 
 const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
 	const builtinKeybindings = {} as BuiltInKeyBindings;
@@ -118,208 +101,6 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 	}
 	return builtinKeybindings;
 };
-
-function cloneForExtensionHandler<T>(value: T, seen = new WeakMap<object, unknown>()): T {
-	if (value === null || typeof value !== "object") {
-		return value;
-	}
-
-	if (Array.isArray(value)) {
-		const existing = seen.get(value);
-		if (existing) return existing as T;
-		const clone: unknown[] = [];
-		seen.set(value, clone);
-		for (const item of value) {
-			clone.push(cloneForExtensionHandler(item, seen));
-		}
-		return clone as T;
-	}
-
-	const source = value as object;
-	const existing = seen.get(source);
-	if (existing) return existing as T;
-
-	const prototype = Object.getPrototypeOf(source);
-	if (prototype !== Object.prototype && prototype !== null) {
-		return value;
-	}
-
-	const clone = Object.create(prototype) as Record<PropertyKey, unknown>;
-	seen.set(source, clone);
-	for (const key of Reflect.ownKeys(source)) {
-		const descriptor = Object.getOwnPropertyDescriptor(source, key);
-		if (!descriptor) continue;
-		const clonedDescriptor = { ...descriptor };
-		if ("value" in clonedDescriptor) {
-			clonedDescriptor.value = cloneForExtensionHandler(clonedDescriptor.value, seen);
-		}
-		Object.defineProperty(clone, key, clonedDescriptor);
-	}
-	return clone as T;
-}
-
-function createRevocableFacade<T extends object>(
-	getTarget: () => T,
-	assertActive: () => void,
-	options: { readOnly?: boolean; deniedMethods?: readonly string[] } = {},
-): T {
-	const functionCache = new Map<PropertyKey, FacadeFunction>();
-	const deniedMethods = new Set<PropertyKey>(options.deniedMethods ?? []);
-	const denyMutation = (property: PropertyKey): never => {
-		throw new Error(`read-only extension facade denied method ${String(property)}`);
-	};
-
-	return new Proxy({} as T, {
-		get(_target, property) {
-			assertActive();
-			if (deniedMethods.has(property)) {
-				return () => denyMutation(property);
-			}
-			const target = getTarget();
-			const value = Reflect.get(target, property, target) as unknown;
-			if (typeof value !== "function") {
-				return value;
-			}
-
-			const cached = functionCache.get(property);
-			if (cached) {
-				return cached;
-			}
-
-			const wrapper: FacadeFunction = (...args) => {
-				assertActive();
-				const activeTarget = getTarget();
-				const activeValue = Reflect.get(activeTarget, property, activeTarget) as unknown;
-				if (typeof activeValue !== "function") {
-					throw new TypeError(`Revoked extension facade property ${String(property)} is not callable`);
-				}
-				return Reflect.apply(activeValue as FacadeFunction, activeTarget, args);
-			};
-			functionCache.set(property, wrapper);
-			return wrapper;
-		},
-		set(_target, property, value) {
-			assertActive();
-			if (options.readOnly) {
-				denyMutation(property);
-			}
-			return Reflect.set(getTarget(), property, value);
-		},
-		has(_target, property) {
-			assertActive();
-			return property in getTarget();
-		},
-		ownKeys() {
-			assertActive();
-			return Reflect.ownKeys(getTarget()).filter((property) => !deniedMethods.has(property));
-		},
-		getOwnPropertyDescriptor(_target, property) {
-			assertActive();
-			if (deniedMethods.has(property)) return undefined;
-			const descriptor = Reflect.getOwnPropertyDescriptor(getTarget(), property);
-			if (!descriptor) return undefined;
-			return { ...descriptor, configurable: true };
-		},
-	});
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function invalid<T>(path: string, message: string): Validation<T> {
-	return { ok: false, path, message };
-}
-
-function valid<T>(value: T): Validation<T> {
-	return { ok: true, value };
-}
-
-function validateResultObject(value: unknown, eventType: string): Validation<Record<string, unknown> | undefined> {
-	if (value === undefined) return valid(undefined);
-	if (!isRecord(value)) {
-		return invalid("$", `${eventType} handlers must return an object or undefined`);
-	}
-	return valid(value);
-}
-
-function validateOptionalBoolean(record: Record<string, unknown>, field: string): Validation<void> {
-	const value = record[field];
-	if (value !== undefined && typeof value !== "boolean") {
-		return invalid(`$.${field}`, "expected boolean");
-	}
-	return valid(undefined);
-}
-
-function validateOptionalString(record: Record<string, unknown>, field: string): Validation<void> {
-	const value = record[field];
-	if (value !== undefined && typeof value !== "string") {
-		return invalid(`$.${field}`, "expected string");
-	}
-	return valid(undefined);
-}
-
-function validateOptionalNumber(record: Record<string, unknown>, field: string): Validation<void> {
-	const value = record[field];
-	if (value !== undefined && typeof value !== "number") {
-		return invalid(`$.${field}`, "expected number");
-	}
-	return valid(undefined);
-}
-
-function validateStringArray(value: unknown, path: string): Validation<string[] | undefined> {
-	if (value === undefined) return valid(undefined);
-	if (!Array.isArray(value)) {
-		return invalid(path, "expected string array");
-	}
-	for (const [index, item] of value.entries()) {
-		if (typeof item !== "string") {
-			return invalid(`${path}[${index}]`, "expected string");
-		}
-	}
-	return valid(value);
-}
-
-function validateContentBlock(value: unknown, path: string): Validation<void> {
-	if (!isRecord(value)) {
-		return invalid(path, "expected content block object");
-	}
-	if (value.type === "text") {
-		if (typeof value.text !== "string") return invalid(`${path}.text`, "expected string");
-		return valid(undefined);
-	}
-	if (value.type === "image") {
-		if (typeof value.data !== "string") return invalid(`${path}.data`, "expected string");
-		if (typeof value.mimeType !== "string") return invalid(`${path}.mimeType`, "expected string");
-		return valid(undefined);
-	}
-	return invalid(`${path}.type`, 'expected "text" or "image"');
-}
-
-function validateContentBlocks(value: unknown, path: string): Validation<(TextContent | ImageContent)[] | undefined> {
-	if (value === undefined) return valid(undefined);
-	if (!Array.isArray(value)) {
-		return invalid(path, "expected content block array");
-	}
-	for (const [index, item] of value.entries()) {
-		const result = validateContentBlock(item, `${path}[${index}]`);
-		if (!result.ok) return result;
-	}
-	return valid(value as (TextContent | ImageContent)[]);
-}
-
-function validateOptionalImageArray(value: unknown, path: string): Validation<ImageContent[] | undefined> {
-	if (value === undefined) return valid(undefined);
-	if (!Array.isArray(value)) {
-		return invalid(path, "expected image array");
-	}
-	for (const [index, item] of value.entries()) {
-		if (!isRecord(item) || item.type !== "image") return invalid(`${path}[${index}]`, "expected image block");
-		const block = validateContentBlock(item, `${path}[${index}]`);
-		if (!block.ok) return block;
-	}
-	return valid(value as ImageContent[]);
-}
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -392,17 +173,6 @@ export type ReloadHandler = () => Promise<void>;
 
 export type ShutdownHandler = () => void;
 
-export interface ExtensionRunnerOptions {
-	/**
-	 * Per-subscriber handler timeout in milliseconds. Defaults to
-	 * DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS. Set to 0 to disable bounding.
-	 */
-	handlerTimeoutMs?: number;
-}
-
-const HANDLER_TIMEOUT = Symbol("extension-handler-timeout");
-const GENERATED_HANDLER_SIGNAL = Symbol("generated-extension-handler-signal");
-
 /**
  * Helper function to emit session_shutdown event to extensions.
  * Returns true if the event was emitted, false if there were no handlers.
@@ -451,27 +221,8 @@ const noOpUIContext: ExtensionUIContext = {
 	setToolsExpanded: () => {},
 };
 
-const SESSION_MANAGER_MUTATING_METHODS = [
-	"setSessionFile",
-	"newSession",
-	"_persist",
-	"appendMessage",
-	"appendThinkingLevelChange",
-	"appendModelChange",
-	"appendCustomEntry",
-	"appendSessionInfo",
-	"appendLabelChange",
-	"branch",
-	"resetLeaf",
-	"branchWithSummary",
-	"createBranchedSession",
-] as const;
-
-const MODEL_REGISTRY_MUTATING_METHODS = ["refresh", "registerProvider", "unregisterProvider"] as const;
-
 export class ExtensionRunner {
 	private extensions: Extension[];
-	private wasmExtensions: ResolvedWasmExtensionPackage[];
 	private runtime: ExtensionRuntime;
 	private uiContext: ExtensionUIContext;
 	private cwd: string;
@@ -496,9 +247,6 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
-	private handlerTimeoutMs: number;
-	private providerActions: ProviderActions | undefined;
-	private registeredProviderNames: Set<string> = new Set();
 
 	constructor(
 		extensions: Extension[],
@@ -506,26 +254,23 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
-		wasmExtensions: ResolvedWasmExtensionPackage[] = [],
-		options: ExtensionRunnerOptions = {},
 	) {
 		this.extensions = extensions;
-		this.wasmExtensions = [...wasmExtensions];
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
-		this.handlerTimeoutMs = options.handlerTimeoutMs ?? DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS;
 	}
 
 	bindCore(
 		actions: ExtensionActions,
 		contextActions: ExtensionContextActions,
-		providerActions?: ProviderActions,
+		providerActions?: {
+			registerProvider?: (name: string, config: ProviderConfig) => void;
+			unregisterProvider?: (name: string) => void;
+		},
 	): void {
-		this.assertActive();
-		this.providerActions = providerActions;
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
@@ -556,7 +301,11 @@ export class ExtensionRunner {
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
 			try {
-				this.registerOwnedProvider(name, config);
+				if (providerActions?.registerProvider) {
+					providerActions.registerProvider(name, config);
+				} else {
+					this.modelRegistry.registerProvider(name, config);
+				}
 			} catch (err) {
 				this.emitError({
 					extensionPath,
@@ -571,56 +320,19 @@ export class ExtensionRunner {
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
 		this.runtime.registerProvider = (name, config) => {
-			this.assertActive();
-			this.runtime.assertActive();
-			this.registerOwnedProvider(name, config);
+			if (providerActions?.registerProvider) {
+				providerActions.registerProvider(name, config);
+				return;
+			}
+			this.modelRegistry.registerProvider(name, config);
 		};
 		this.runtime.unregisterProvider = (name) => {
-			this.assertActive();
-			this.runtime.assertActive();
-			this.unregisterOwnedProvider(name);
-		};
-	}
-
-	private registerOwnedProvider(name: string, config: ProviderConfig): void {
-		if (this.providerActions?.registerProvider) {
-			this.providerActions.registerProvider(name, config);
-		} else {
-			this.modelRegistry.registerProvider(name, config);
-		}
-		this.registeredProviderNames.add(name);
-	}
-
-	private unregisterOwnedProvider(name: string): void {
-		if (this.providerActions?.unregisterProvider) {
-			this.providerActions.unregisterProvider(name);
-		} else {
-			this.modelRegistry.unregisterProvider(name);
-		}
-		this.registeredProviderNames.delete(name);
-	}
-
-	private cleanupOwnedProviders(): void {
-		const providerNames = [...this.registeredProviderNames];
-		this.registeredProviderNames.clear();
-		for (const name of providerNames) {
-			try {
-				if (this.providerActions?.unregisterProvider) {
-					this.providerActions.unregisterProvider(name);
-				} else {
-					this.modelRegistry.unregisterProvider(name);
-				}
-			} catch (err) {
-				this.emitError({
-					extensionPath: "<runtime>",
-					event: "unregister_provider",
-					error: err instanceof Error ? err.message : String(err),
-					stack: err instanceof Error ? err.stack : undefined,
-					phase: "unload",
-					runtimeKind: "typescript",
-				});
+			if (providerActions?.unregisterProvider) {
+				providerActions.unregisterProvider(name);
+				return;
 			}
-		}
+			this.modelRegistry.unregisterProvider(name);
+		};
 	}
 
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
@@ -656,10 +368,6 @@ export class ExtensionRunner {
 
 	getExtensionPaths(): string[] {
 		return this.extensions.map((e) => e.path);
-	}
-
-	getWasmExtensions(): ResolvedWasmExtensionPackage[] {
-		return [...this.wasmExtensions];
 	}
 
 	/** Get all registered tools from all extensions (first registration per name wins). */
@@ -752,7 +460,7 @@ export class ExtensionRunner {
 	}
 
 	getShortcutDiagnostics(): ResourceDiagnostic[] {
-		return this.shortcutDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic));
+		return this.shortcutDiagnostics;
 	}
 
 	invalidate(
@@ -761,8 +469,6 @@ export class ExtensionRunner {
 		if (!this.staleMessage) {
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
-			this.runtime.pendingProviderRegistrations = [];
-			this.cleanupOwnedProviders();
 		}
 	}
 
@@ -778,9 +484,8 @@ export class ExtensionRunner {
 	}
 
 	emitError(error: ExtensionError): void {
-		const sanitized = sanitizeExtensionError(error);
 		for (const listener of this.errorListeners) {
-			listener(sanitized);
+			listener(error);
 		}
 	}
 
@@ -846,7 +551,7 @@ export class ExtensionRunner {
 	}
 
 	getCommandDiagnostics(): ResourceDiagnostic[] {
-		return this.commandDiagnostics.map((diagnostic) => attachResourceDiagnosticEnvelope(diagnostic));
+		return this.commandDiagnostics;
 	}
 
 	getCommand(name: string): ResolvedCommand | undefined {
@@ -868,20 +573,10 @@ export class ExtensionRunner {
 	createContext(): ExtensionContext {
 		const runner = this;
 		const getModel = this.getModel;
-		const assertActive = () => runner.assertActive();
-		const uiFacade = createRevocableFacade(() => runner.uiContext, assertActive);
-		const sessionManagerFacade = createRevocableFacade(() => runner.sessionManager, assertActive, {
-			readOnly: true,
-			deniedMethods: SESSION_MANAGER_MUTATING_METHODS,
-		});
-		const modelRegistryFacade = createRevocableFacade(() => runner.modelRegistry, assertActive, {
-			readOnly: true,
-			deniedMethods: MODEL_REGISTRY_MUTATING_METHODS,
-		});
 		return {
 			get ui() {
 				runner.assertActive();
-				return uiFacade;
+				return runner.uiContext;
 			},
 			get hasUI() {
 				runner.assertActive();
@@ -893,11 +588,11 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return sessionManagerFacade;
+				return runner.sessionManager;
 			},
 			get modelRegistry() {
 				runner.assertActive();
-				return modelRegistryFacade;
+				return runner.modelRegistry;
 			},
 			get model() {
 				runner.assertActive();
@@ -934,17 +629,6 @@ export class ExtensionRunner {
 			getSystemPrompt: () => {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
-			},
-			emitSubAgentReadiness: async (event) => {
-				runner.assertActive();
-				await runner.emit({
-					type: "sub_agent_readiness",
-					envelope: event.envelope,
-					phase: event.phase,
-					owner: event.owner,
-					readOnly: true,
-					signal: event.signal,
-				});
 			},
 		};
 	}
@@ -993,360 +677,6 @@ export class ExtensionRunner {
 		);
 	}
 
-	private eventWithHandlerSignal(event: unknown, signal: AbortSignal): unknown {
-		if (event === null || typeof event !== "object" || Array.isArray(event)) {
-			return event;
-		}
-
-		const record = event as Record<PropertyKey, unknown>;
-		const hasCallerSignal = Object.hasOwn(record, "signal") && !record[GENERATED_HANDLER_SIGNAL];
-		if (hasCallerSignal || !Object.isExtensible(event)) {
-			return event;
-		}
-
-		Object.defineProperty(event, "signal", {
-			value: signal,
-			configurable: true,
-			enumerable: false,
-		});
-		Object.defineProperty(event, GENERATED_HANDLER_SIGNAL, {
-			value: true,
-			configurable: true,
-			enumerable: false,
-		});
-		return event;
-	}
-
-	private async invokeHandler(
-		ext: Extension,
-		eventType: string,
-		handler: (...args: unknown[]) => Promise<unknown>,
-		event: unknown,
-		ctx: ExtensionContext,
-	): Promise<unknown | undefined> {
-		const timeoutMs = this.handlerTimeoutMs;
-		const controller = new AbortController();
-		const handlerEvent = this.eventWithHandlerSignal(event, controller.signal);
-		const handlerPromise = Promise.resolve().then(() => handler(handlerEvent, ctx));
-		let timeoutId: ReturnType<typeof setTimeout> | undefined;
-		const timeoutPromise =
-			timeoutMs > 0
-				? new Promise<typeof HANDLER_TIMEOUT>((resolve) => {
-						timeoutId = setTimeout(() => {
-							controller.abort(`timeout:${timeoutMs}`);
-							resolve(HANDLER_TIMEOUT);
-						}, timeoutMs);
-					})
-				: undefined;
-
-		try {
-			const result =
-				timeoutPromise === undefined ? await handlerPromise : await Promise.race([handlerPromise, timeoutPromise]);
-			if (result === HANDLER_TIMEOUT) {
-				void handlerPromise.catch(() => undefined);
-				this.emitError({
-					extensionPath: ext.path,
-					event: eventType,
-					error: `Extension handler timed out after ${timeoutMs}ms`,
-					phase: "event",
-					runtimeKind: "typescript",
-					extensionIdentity: ext.identity.key,
-				});
-				return undefined;
-			}
-			return result;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			const stack = err instanceof Error ? err.stack : undefined;
-			if (err instanceof ExtensionPolicyDeniedError) {
-				this.emitError({
-					extensionPath: ext.path,
-					event: eventType,
-					error: message,
-					stack,
-					phase: err.details.phase,
-					runtimeKind: err.details.runtimeKind,
-					category: err.details.category,
-					capability: err.details.capability,
-					operation: err.details.operation,
-					target: err.details.target,
-					principal: err.details.principal,
-					extensionIdentity: err.details.extensionIdentity,
-				});
-				return undefined;
-			}
-			this.emitError({
-				extensionPath: ext.path,
-				event: eventType,
-				error: message,
-				stack,
-				phase: "event",
-				runtimeKind: "typescript",
-				extensionIdentity: ext.identity.key,
-			});
-			return undefined;
-		} finally {
-			if (timeoutId) {
-				clearTimeout(timeoutId);
-			}
-		}
-	}
-
-	private invalidSubscriberResult<T>(
-		ext: Extension,
-		eventType: string,
-		result: Validation<T>,
-	): result is { ok: false; path: string; message: string } {
-		if (result.ok) {
-			return false;
-		}
-		this.emitError({
-			extensionPath: ext.path,
-			event: eventType,
-			error: `Invalid subscriber result for ${eventType} at ${result.path}: ${result.message}`,
-			phase: "event",
-			runtimeKind: "typescript",
-			extensionIdentity: ext.identity.key,
-		});
-		return true;
-	}
-
-	private validateSessionBeforeResult(
-		ext: Extension,
-		eventType: string,
-		handlerResult: unknown,
-	): SessionBeforeEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, eventType);
-		if (this.invalidSubscriberResult(ext, eventType, recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-
-		for (const field of ["cancel", "skipConversationRestore", "replaceInstructions"] as const) {
-			const boolResult = validateOptionalBoolean(record, field);
-			if (this.invalidSubscriberResult(ext, eventType, boolResult)) return undefined;
-		}
-		for (const field of ["customInstructions", "label"] as const) {
-			const stringResult = validateOptionalString(record, field);
-			if (this.invalidSubscriberResult(ext, eventType, stringResult)) return undefined;
-		}
-		if (record.compaction !== undefined && !isRecord(record.compaction)) {
-			this.invalidSubscriberResult(ext, eventType, invalid("$.compaction", "expected object"));
-			return undefined;
-		}
-		if (record.compaction !== undefined) {
-			const compaction = record.compaction;
-			for (const field of ["summary", "firstKeptEntryId"] as const) {
-				const stringResult = validateOptionalString(compaction, field);
-				if (this.invalidSubscriberResult(ext, eventType, stringResult)) return undefined;
-			}
-			const numberResult = validateOptionalNumber(compaction, "tokensBefore");
-			if (this.invalidSubscriberResult(ext, eventType, numberResult)) return undefined;
-		}
-		if (record.summary !== undefined && !isRecord(record.summary)) {
-			this.invalidSubscriberResult(ext, eventType, invalid("$.summary", "expected object"));
-			return undefined;
-		}
-		if (record.summary !== undefined) {
-			const summaryResult = validateOptionalString(record.summary, "summary");
-			if (this.invalidSubscriberResult(ext, eventType, summaryResult)) return undefined;
-		}
-		return record as SessionBeforeEventResult;
-	}
-
-	private validateResourcesDiscoverResult(
-		ext: Extension,
-		handlerResult: unknown,
-	): ResourcesDiscoverResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "resources_discover");
-		if (this.invalidSubscriberResult(ext, "resources_discover", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		for (const field of ["skillPaths", "promptPaths", "themePaths"] as const) {
-			const arrayResult = validateStringArray(record[field], `$.${field}`);
-			if (this.invalidSubscriberResult(ext, "resources_discover", arrayResult)) return undefined;
-		}
-		return record as ResourcesDiscoverResult;
-	}
-
-	private validateInputResult(ext: Extension, handlerResult: unknown): InputEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "input");
-		if (this.invalidSubscriberResult(ext, "input", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		if (record.action !== "continue" && record.action !== "transform" && record.action !== "handled") {
-			this.invalidSubscriberResult(
-				ext,
-				"input",
-				invalid("$.action", 'expected "continue", "transform", or "handled"'),
-			);
-			return undefined;
-		}
-		if (record.action === "transform" && typeof record.text !== "string") {
-			this.invalidSubscriberResult(ext, "input", invalid("$.text", "expected string"));
-			return undefined;
-		}
-		const imagesResult = validateOptionalImageArray(record.images, "$.images");
-		if (this.invalidSubscriberResult(ext, "input", imagesResult)) return undefined;
-		return record as InputEventResult;
-	}
-
-	private validateToolResultPatch(ext: Extension, handlerResult: unknown): ToolResultEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "tool_result");
-		if (this.invalidSubscriberResult(ext, "tool_result", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		const contentResult = validateContentBlocks(record.content, "$.content");
-		if (this.invalidSubscriberResult(ext, "tool_result", contentResult)) return undefined;
-		const isErrorResult = validateOptionalBoolean(record, "isError");
-		if (this.invalidSubscriberResult(ext, "tool_result", isErrorResult)) return undefined;
-		return record as ToolResultEventResult;
-	}
-
-	private validateToolCallResult(ext: Extension, handlerResult: unknown): ToolCallEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "tool_call");
-		if (this.invalidSubscriberResult(ext, "tool_call", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		const blockResult = validateOptionalBoolean(record, "block");
-		if (this.invalidSubscriberResult(ext, "tool_call", blockResult)) return undefined;
-		const reasonResult = validateOptionalString(record, "reason");
-		if (this.invalidSubscriberResult(ext, "tool_call", reasonResult)) return undefined;
-		return record as ToolCallEventResult;
-	}
-
-	private validateMessageEndResult(ext: Extension, handlerResult: unknown): MessageEndEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "message_end");
-		if (this.invalidSubscriberResult(ext, "message_end", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		if (record.message !== undefined) {
-			if (!isRecord(record.message)) {
-				this.invalidSubscriberResult(ext, "message_end", invalid("$.message", "expected object"));
-				return undefined;
-			}
-			if (typeof record.message.role !== "string") {
-				this.invalidSubscriberResult(ext, "message_end", invalid("$.message.role", "expected string"));
-				return undefined;
-			}
-		}
-		return record as MessageEndEventResult;
-	}
-
-	private validateContextResult(ext: Extension, handlerResult: unknown): ContextEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "context");
-		if (this.invalidSubscriberResult(ext, "context", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		if (record.messages !== undefined && !Array.isArray(record.messages)) {
-			this.invalidSubscriberResult(ext, "context", invalid("$.messages", "expected array"));
-			return undefined;
-		}
-		return record as ContextEventResult;
-	}
-
-	private validateBeforeAgentStartResult(
-		ext: Extension,
-		handlerResult: unknown,
-	): BeforeAgentStartEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "before_agent_start");
-		if (this.invalidSubscriberResult(ext, "before_agent_start", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		const systemPromptResult = validateOptionalString(record, "systemPrompt");
-		if (this.invalidSubscriberResult(ext, "before_agent_start", systemPromptResult)) return undefined;
-		if (record.message !== undefined && !isRecord(record.message)) {
-			this.invalidSubscriberResult(ext, "before_agent_start", invalid("$.message", "expected object"));
-			return undefined;
-		}
-		if (isRecord(record.message) && typeof record.message.customType !== "string") {
-			this.invalidSubscriberResult(ext, "before_agent_start", invalid("$.message.customType", "expected string"));
-			return undefined;
-		}
-		return record as BeforeAgentStartEventResult;
-	}
-
-	private validateUserBashResult(ext: Extension, handlerResult: unknown): UserBashEventResult | undefined {
-		const recordResult = validateResultObject(handlerResult, "user_bash");
-		if (this.invalidSubscriberResult(ext, "user_bash", recordResult)) return undefined;
-		const record = recordResult.value;
-		if (!record) return undefined;
-		if (record.operations !== undefined && !isRecord(record.operations)) {
-			this.invalidSubscriberResult(ext, "user_bash", invalid("$.operations", "expected object"));
-			return undefined;
-		}
-		if (record.result !== undefined && !isRecord(record.result)) {
-			this.invalidSubscriberResult(ext, "user_bash", invalid("$.result", "expected object"));
-			return undefined;
-		}
-		return record as UserBashEventResult;
-	}
-
-	private metadataForExtension(ext: Extension): PathMetadata {
-		const source =
-			ext.sourceInfo.origin === "package" ? ext.sourceInfo.source : this.getExtensionSourceLabel(ext.path);
-		return {
-			source,
-			scope: ext.sourceInfo.scope,
-			origin: ext.sourceInfo.origin,
-			baseDir: ext.sourceInfo.baseDir,
-			provenance: ext.sourceInfo.provenance,
-		};
-	}
-
-	private isPathInsideBase(pathValue: string, baseDir: string): boolean {
-		const resolvedBase = existsSync(baseDir) ? realpathSync(baseDir) : resolve(baseDir);
-		const absolutePath = isAbsolute(pathValue) ? pathValue : resolve(resolvedBase, pathValue);
-		const resolvedPath = existsSync(absolutePath) ? realpathSync(absolutePath) : resolve(absolutePath);
-		const relativePath = relative(resolvedBase, resolvedPath);
-		return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
-	}
-
-	private filterResourcePathsByPolicy(
-		ext: Extension,
-		paths: readonly string[],
-		capability: CanonicalExtensionGrant,
-		operation: string,
-	): string[] {
-		const baseDir = ext.sourceInfo.provenance?.packageRoot ?? ext.sourceInfo.baseDir;
-		if (!baseDir || hasExtensionGrant(ext.effectivePolicy, capability)) {
-			return [...paths];
-		}
-
-		const allowedPaths: string[] = [];
-		for (const pathValue of paths) {
-			const absolutePath = isAbsolute(pathValue) ? pathValue : resolve(baseDir, pathValue);
-			if (!existsSync(absolutePath) || this.isPathInsideBase(pathValue, baseDir)) {
-				allowedPaths.push(pathValue);
-				continue;
-			}
-
-			const denial = createExtensionPolicyDenialError(ext.identity, capability, operation, { path: pathValue });
-			this.emitError({
-				extensionPath: ext.path,
-				event: operation,
-				error: denial.message,
-				phase: denial.details.phase,
-				runtimeKind: denial.details.runtimeKind,
-				category: denial.details.category,
-				capability: denial.details.capability,
-				operation: denial.details.operation,
-				target: denial.details.target,
-				principal: denial.details.principal,
-				extensionIdentity: denial.details.extensionIdentity,
-			});
-		}
-		return allowedPaths;
-	}
-
-	private getExtensionSourceLabel(extensionPath: string): string {
-		if (extensionPath.startsWith("<")) {
-			return `extension:${extensionPath.replace(/[<>]/g, "")}`;
-		}
-		const base = basename(extensionPath);
-		const name = base.replace(/\.(ts|js)$/, "");
-		return `extension:${name}`;
-	}
-
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
@@ -1356,17 +686,24 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerEvent = cloneForExtensionHandler(event);
-				const handlerResult = await this.invokeHandler(ext, event.type, handler, handlerEvent, ctx);
+				try {
+					const handlerResult = await handler(event, ctx);
 
-				if (this.isSessionBeforeEvent(event) && handlerResult !== undefined) {
-					result = this.validateSessionBeforeResult(ext, event.type, handlerResult);
-					if (!result) {
-						continue;
+					if (this.isSessionBeforeEvent(event) && handlerResult) {
+						result = handlerResult as SessionBeforeEventResult;
+						if (result.cancel) {
+							return result as RunnerEmitResult<TEvent>;
+						}
 					}
-					if (result.cancel) {
-						return result as RunnerEmitResult<TEvent>;
-					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: event.type,
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1384,27 +721,32 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const currentEvent: MessageEndEvent = { ...event, message: cloneForExtensionHandler(currentMessage) };
-				const handlerResult = this.validateMessageEndResult(
-					ext,
-					await this.invokeHandler(ext, "message_end", handler, currentEvent, ctx),
-				);
-				if (!handlerResult?.message) continue;
+				try {
+					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
+					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
+					if (!handlerResult?.message) continue;
 
-				if (handlerResult.message.role !== currentMessage.role) {
+					if (handlerResult.message.role !== currentMessage.role) {
+						this.emitError({
+							extensionPath: ext.path,
+							event: "message_end",
+							error: "message_end handlers must return a message with the same role",
+						});
+						continue;
+					}
+
+					currentMessage = handlerResult.message;
+					modified = true;
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
 						extensionPath: ext.path,
 						event: "message_end",
-						error: "message_end handlers must return a message with the same role",
-						phase: "event",
-						runtimeKind: "typescript",
-						extensionIdentity: ext.identity.key,
+						error: message,
+						stack,
 					});
-					continue;
 				}
-
-				currentMessage = cloneForExtensionHandler(handlerResult.message);
-				modified = true;
 			}
 		}
 
@@ -1421,24 +763,31 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerEvent = cloneForExtensionHandler(currentEvent);
-				const handlerResult = this.validateToolResultPatch(
-					ext,
-					await this.invokeHandler(ext, "tool_result", handler, handlerEvent, ctx),
-				);
-				if (!handlerResult) continue;
+				try {
+					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					if (!handlerResult) continue;
 
-				if (handlerResult.content !== undefined) {
-					currentEvent.content = handlerResult.content;
-					modified = true;
-				}
-				if (handlerResult.details !== undefined) {
-					currentEvent.details = handlerResult.details;
-					modified = true;
-				}
-				if (handlerResult.isError !== undefined) {
-					currentEvent.isError = handlerResult.isError;
-					modified = true;
+					if (handlerResult.content !== undefined) {
+						currentEvent.content = handlerResult.content;
+						modified = true;
+					}
+					if (handlerResult.details !== undefined) {
+						currentEvent.details = handlerResult.details;
+						modified = true;
+					}
+					if (handlerResult.isError !== undefined) {
+						currentEvent.isError = handlerResult.isError;
+						modified = true;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "tool_result",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1463,13 +812,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerResult = this.validateToolCallResult(
-					ext,
-					await this.invokeHandler(ext, "tool_call", handler, event, ctx),
-				);
+				const handlerResult = await handler(event, ctx);
 
 				if (handlerResult) {
-					result = handlerResult;
+					result = handlerResult as ToolCallEventResult;
 					if (result.block) {
 						return result;
 					}
@@ -1488,13 +834,20 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerEvent = cloneForExtensionHandler(event);
-				const handlerResult = this.validateUserBashResult(
-					ext,
-					await this.invokeHandler(ext, "user_bash", handler, handlerEvent, ctx),
-				);
-				if (handlerResult) {
-					return handlerResult;
+				try {
+					const handlerResult = await handler(event, ctx);
+					if (handlerResult) {
+						return handlerResult as UserBashEventResult;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "user_bash",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1511,14 +864,22 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const event: ContextEvent = { type: "context", messages: cloneForExtensionHandler(currentMessages) };
-				const handlerResult = this.validateContextResult(
-					ext,
-					await this.invokeHandler(ext, "context", handler, event, ctx),
-				);
+				try {
+					const event: ContextEvent = { type: "context", messages: currentMessages };
+					const handlerResult = await handler(event, ctx);
 
-				if (handlerResult?.messages) {
-					currentMessages = cloneForExtensionHandler(handlerResult.messages);
+					if (handlerResult && (handlerResult as ContextEventResult).messages) {
+						currentMessages = (handlerResult as ContextEventResult).messages!;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "context",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1535,13 +896,24 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const event: BeforeProviderRequestEvent = {
-					type: "before_provider_request",
-					payload: cloneForExtensionHandler(currentPayload),
-				};
-				const handlerResult = await this.invokeHandler(ext, "before_provider_request", handler, event, ctx);
-				if (handlerResult !== undefined) {
-					currentPayload = cloneForExtensionHandler(handlerResult);
+				try {
+					const event: BeforeProviderRequestEvent = {
+						type: "before_provider_request",
+						payload: currentPayload,
+					};
+					const handlerResult = await handler(event, ctx);
+					if (handlerResult !== undefined) {
+						currentPayload = handlerResult;
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "before_provider_request",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1572,26 +944,35 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const event: BeforeAgentStartEvent = {
-					type: "before_agent_start",
-					prompt,
-					images: cloneForExtensionHandler(images),
-					systemPrompt: currentSystemPrompt,
-					systemPromptOptions: cloneForExtensionHandler(systemPromptOptions),
-				};
-				const result = this.validateBeforeAgentStartResult(
-					ext,
-					await this.invokeHandler(ext, "before_agent_start", handler, event, ctx),
-				);
+				try {
+					const event: BeforeAgentStartEvent = {
+						type: "before_agent_start",
+						prompt,
+						images,
+						systemPrompt: currentSystemPrompt,
+						systemPromptOptions,
+					};
+					const handlerResult = await handler(event, ctx);
 
-				if (result) {
-					if (result.message) {
-						messages.push(cloneForExtensionHandler(result.message));
+					if (handlerResult) {
+						const result = handlerResult as BeforeAgentStartEventResult;
+						if (result.message) {
+							messages.push(result.message);
+						}
+						if (result.systemPrompt !== undefined) {
+							currentSystemPrompt = result.systemPrompt;
+							systemPromptModified = true;
+						}
 					}
-					if (result.systemPrompt !== undefined) {
-						currentSystemPrompt = result.systemPrompt;
-						systemPromptModified = true;
-					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "before_agent_start",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1610,44 +991,43 @@ export class ExtensionRunner {
 		cwd: string,
 		reason: ResourcesDiscoverEvent["reason"],
 	): Promise<{
-		skillPaths: ExtensionResourcePath[];
-		promptPaths: ExtensionResourcePath[];
-		themePaths: ExtensionResourcePath[];
+		skillPaths: Array<{ path: string; extensionPath: string }>;
+		promptPaths: Array<{ path: string; extensionPath: string }>;
+		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
 		const ctx = this.createContext();
-		const skillPaths: ExtensionResourcePath[] = [];
-		const promptPaths: ExtensionResourcePath[] = [];
-		const themePaths: ExtensionResourcePath[] = [];
+		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
+		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
+		const themePaths: Array<{ path: string; extensionPath: string }> = [];
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("resources_discover");
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-				const result = this.validateResourcesDiscoverResult(
-					ext,
-					await this.invokeHandler(ext, "resources_discover", handler, event, ctx),
-				);
-				const metadata = this.metadataForExtension(ext);
-				const allowedSkillPaths = result?.skillPaths
-					? this.filterResourcePathsByPolicy(ext, result.skillPaths, "file.read", "resources_discover")
-					: undefined;
-				const allowedPromptPaths = result?.promptPaths
-					? this.filterResourcePathsByPolicy(ext, result.promptPaths, "file.read", "resources_discover")
-					: undefined;
-				const allowedThemePaths = result?.themePaths
-					? this.filterResourcePathsByPolicy(ext, result.themePaths, "file.read", "resources_discover")
-					: undefined;
+				try {
+					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
+					const handlerResult = await handler(event, ctx);
+					const result = handlerResult as ResourcesDiscoverResult | undefined;
 
-				if (allowedSkillPaths?.length) {
-					skillPaths.push(...allowedSkillPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
-				}
-				if (allowedPromptPaths?.length) {
-					promptPaths.push(...allowedPromptPaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
-				}
-				if (allowedThemePaths?.length) {
-					themePaths.push(...allowedThemePaths.map((path) => ({ path, extensionPath: ext.path, metadata })));
+					if (result?.skillPaths?.length) {
+						skillPaths.push(...result.skillPaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+					if (result?.promptPaths?.length) {
+						promptPaths.push(...result.promptPaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+					if (result?.themePaths?.length) {
+						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "resources_discover",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}
@@ -1663,17 +1043,21 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const handler of ext.handlers.get("input") ?? []) {
-				const event: InputEvent = {
-					type: "input",
-					text: currentText,
-					images: cloneForExtensionHandler(currentImages),
-					source,
-				};
-				const result = this.validateInputResult(ext, await this.invokeHandler(ext, "input", handler, event, ctx));
-				if (result?.action === "handled") return result;
-				if (result?.action === "transform") {
-					currentText = result.text;
-					currentImages = result.images ?? currentImages;
+				try {
+					const event: InputEvent = { type: "input", text: currentText, images: currentImages, source };
+					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					if (result?.action === "handled") return result;
+					if (result?.action === "transform") {
+						currentText = result.text;
+						currentImages = result.images ?? currentImages;
+					}
+				} catch (err) {
+					this.emitError({
+						extensionPath: ext.path,
+						event: "input",
+						error: err instanceof Error ? err.message : String(err),
+						stack: err instanceof Error ? err.stack : undefined,
+					});
 				}
 			}
 		}

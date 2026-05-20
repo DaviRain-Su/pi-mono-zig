@@ -1,10 +1,15 @@
-import { type AssistantMessage, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	type Model,
+} from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, type Harness } from "./harness.js";
+import { createHarness, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
-	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
+	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
 };
 
 function createUsage(totalTokens: number) {
@@ -39,6 +44,43 @@ function createAssistant(
 		model: model.id,
 		usage: createUsage(options.totalTokens ?? 0),
 	};
+}
+
+function useSummaryStreamFn(harness: Harness, summary: string): () => number {
+	let callCount = 0;
+	harness.session.agent.streamFn = (model) => {
+		callCount++;
+		const stream = createAssistantMessageEventStream();
+		queueMicrotask(() => {
+			const message: AssistantMessage = {
+				...fauxAssistantMessage(summary),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: createUsage(10),
+			};
+			stream.push({ type: "done", reason: "stop", message });
+		});
+		return stream;
+	};
+	return () => callCount;
+}
+
+function seedCompactableSession(harness: Harness): void {
+	const now = Date.now();
+	harness.sessionManager.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "message to compact" }],
+		timestamp: now - 1000,
+	});
+	harness.sessionManager.appendMessage(
+		createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 100,
+			timestamp: now - 500,
+		}),
+	);
+	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
 describe("AgentSession compaction characterization", () => {
@@ -95,6 +137,32 @@ describe("AgentSession compaction characterization", () => {
 		await expect(harness.session.compact()).rejects.toThrow(`No API key found for ${harness.getModel().provider}.`);
 	});
 
+	it("manually compacts with a custom streamFn when registry auth is absent", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const getStreamCallCount = useSummaryStreamFn(harness, "summary from custom stream");
+
+		const result = await harness.session.compact();
+
+		expect(result.summary).toBe("summary from custom stream");
+		expect(getStreamCallCount()).toBe(1);
+	});
+
+	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const getStreamCallCount = useSummaryStreamFn(harness, "auto summary from custom stream");
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+
+		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(compactionEntries).toHaveLength(1);
+		expect(getStreamCallCount()).toBe(1);
+	});
+
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
 		const harness = await createHarness({
 			extensionFactories: [
@@ -149,13 +217,9 @@ describe("AgentSession compaction characterization", () => {
 			timestamp: Date.now(),
 		});
 
-		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await sessionInternals._runAutoCompaction("threshold", false);
-		await vi.advanceTimersByTimeAsync(100);
-
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(true);
 	});
 
 	it("does not retry overflow recovery more than once", async () => {
@@ -167,7 +231,7 @@ describe("AgentSession compaction characterization", () => {
 			errorMessage: "prompt is too long",
 			timestamp: Date.now(),
 		});
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 		const compactionErrors: string[] = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "compaction_end" && event.errorMessage) {
@@ -215,7 +279,7 @@ describe("AgentSession compaction characterization", () => {
 			timestamp: Date.now(),
 		});
 
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await sessionInternals._checkCompaction(staleAssistant, false);
 
@@ -243,7 +307,7 @@ describe("AgentSession compaction characterization", () => {
 			errorAssistant,
 		];
 
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await sessionInternals._checkCompaction(errorAssistant);
 
@@ -264,7 +328,7 @@ describe("AgentSession compaction characterization", () => {
 			errorAssistant,
 		];
 
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await sessionInternals._checkCompaction(errorAssistant);
 
@@ -309,7 +373,7 @@ describe("AgentSession compaction characterization", () => {
 			errorAssistant,
 		];
 
-		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await sessionInternals._checkCompaction(errorAssistant);
 
@@ -327,8 +391,8 @@ describe("AgentSession compaction characterization", () => {
 
 		const belowThresholdInternals = belowThresholdHarness.session as unknown as SessionWithCompactionInternals;
 		const disabledInternals = disabledHarness.session as unknown as SessionWithCompactionInternals;
-		const belowThresholdSpy = vi.spyOn(belowThresholdInternals, "_runAutoCompaction").mockResolvedValue();
-		const disabledSpy = vi.spyOn(disabledInternals, "_runAutoCompaction").mockResolvedValue();
+		const belowThresholdSpy = vi.spyOn(belowThresholdInternals, "_runAutoCompaction").mockResolvedValue(false);
+		const disabledSpy = vi.spyOn(disabledInternals, "_runAutoCompaction").mockResolvedValue(false);
 
 		await belowThresholdInternals._checkCompaction(
 			createAssistant(belowThresholdHarness, { stopReason: "stop", totalTokens: 1_000, timestamp: Date.now() }),

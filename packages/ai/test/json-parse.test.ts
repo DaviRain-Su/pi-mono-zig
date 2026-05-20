@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseStreamingJson } from "../src/utils/json-parse.js";
+import { parseStreamingJson } from "../src/utils/json-parse.ts";
 
 describe("parseStreamingJson", () => {
 	it("parses complete JSON", () => {

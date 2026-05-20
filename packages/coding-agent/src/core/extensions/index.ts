@@ -2,27 +2,14 @@
  * Extension system for lifecycle events and custom tools.
  */
 
-export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.js";
-export type { SourceInfo } from "../source-info.js";
-export type {
-	BoundedSubAgentAdmissionDenial,
-	BoundedSubAgentExecutionContext,
-	BoundedSubAgentExecutionOptions,
-	BoundedSubAgentExecutionStore,
-	BoundedSubAgentExecutor,
-	BoundedSubAgentToolHandler,
-	BoundedSubAgentToolResult,
-} from "./bounded-subagent-execution.js";
-export {
-	defaultBoundedSubAgentExecutor,
-	executeBoundedSubAgentTask,
-} from "./bounded-subagent-execution.js";
+export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.ts";
+export type { SourceInfo } from "../source-info.ts";
 export {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,
 	loadExtensionFromFactory,
 	loadExtensions,
-} from "./loader.js";
+} from "./loader.ts";
 export type {
 	ExtensionErrorListener,
 	ForkHandler,
@@ -30,46 +17,8 @@ export type {
 	NewSessionHandler,
 	ShutdownHandler,
 	SwitchSessionHandler,
-} from "./runner.js";
-export { ExtensionRunner } from "./runner.js";
-export type {
-	SubAgentDelegationCapability,
-	SubAgentDelegationHost,
-	SubAgentDelegationHostContext,
-	SubAgentDelegationInput,
-	SubAgentExtensionOptions,
-} from "./subagent-extension.js";
-export {
-	createSubAgentExtension,
-	SUB_AGENT_DELEGATION_COMMAND,
-	SUB_AGENT_DELEGATION_RESULT_ENTRY,
-	SUB_AGENT_DELEGATION_TOOL,
-	SUB_AGENT_READINESS_ENTRY,
-	SUB_AGENT_STATUS_MESSAGE,
-	subAgentDelegationInputSchema,
-} from "./subagent-extension.js";
-export type {
-	SubAgentCancellationMetadata,
-	SubAgentCancellationState,
-	SubAgentCorrelationIds,
-	SubAgentLineage,
-	SubAgentNumericResourceLimit,
-	SubAgentReadinessEnvelope,
-	SubAgentResourceLimitDetail,
-	SubAgentResourceLimitDetails,
-	SubAgentResourceLimits,
-	SubAgentResourceSummary,
-	SubAgentTaskError,
-	SubAgentTaskInvocationEnvelope,
-	SubAgentTaskResultEnvelope,
-	SubAgentTaskStatus,
-	SubAgentUsageSummary,
-} from "./subagent-readiness.js";
-export {
-	validateSubAgentReadinessEnvelope,
-	validateSubAgentTaskInvocationEnvelope,
-	validateSubAgentTaskResultEnvelope,
-} from "./subagent-readiness.js";
+} from "./runner.ts";
+export { ExtensionRunner } from "./runner.ts";
 export type {
 	AfterProviderResponseEvent,
 	AgentEndEvent,
@@ -117,7 +66,6 @@ export type {
 	ExtensionFactory,
 	ExtensionFlag,
 	ExtensionHandler,
-	ExtensionLifecycleReason,
 	// Runtime
 	ExtensionRuntime,
 	ExtensionShortcut,
@@ -182,7 +130,6 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
-	SubAgentReadinessEvent,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,
@@ -209,12 +156,10 @@ export type {
 	WorkingIndicatorOptions,
 	WriteToolCallEvent,
 	WriteToolResultEvent,
-} from "./types.js";
+} from "./types.ts";
 // Type guards
 export {
-	DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
 	defineTool,
-	EXTENSION_LIFECYCLE_SUPPORT_MATRIX,
 	isBashToolResult,
 	isEditToolResult,
 	isFindToolResult,
@@ -223,5 +168,5 @@ export {
 	isReadToolResult,
 	isToolCallEventType,
 	isWriteToolResult,
-} from "./types.js";
-export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.js";
+} from "./types.ts";
+export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.ts";

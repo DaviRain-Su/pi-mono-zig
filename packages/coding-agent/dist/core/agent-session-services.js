@@ -1,0 +1,142 @@
+import { join } from "node:path";
+import { getAgentDir } from "../config.js";
+import { AuthStorage } from "./auth-storage.js";
+import { attachDiagnosticEnvelope, createDiagnosticEnvelope } from "./diagnostics.js";
+import { ModelRegistry } from "./model-registry.js";
+import { DefaultResourceLoader } from "./resource-loader.js";
+import { createAgentSession } from "./sdk.js";
+import { SettingsManager } from "./settings-manager.js";
+function applyExtensionFlagValues(resourceLoader, extensionFlagValues) {
+    if (!extensionFlagValues) {
+        return [];
+    }
+    const diagnostics = [];
+    const extensionsResult = resourceLoader.getExtensions();
+    const registeredFlags = new Map();
+    for (const extension of extensionsResult.extensions) {
+        for (const [name, flag] of extension.flags) {
+            registeredFlags.set(name, { type: flag.type });
+        }
+    }
+    const unknownFlags = [];
+    for (const [name, value] of extensionFlagValues) {
+        const flag = registeredFlags.get(name);
+        if (!flag) {
+            unknownFlags.push(name);
+            continue;
+        }
+        if (flag.type === "boolean") {
+            extensionsResult.runtime.flagValues.set(name, true);
+            continue;
+        }
+        if (typeof value === "string") {
+            extensionsResult.runtime.flagValues.set(name, value);
+            continue;
+        }
+        const message = `Extension flag "--${name}" requires a value`;
+        diagnostics.push(attachDiagnosticEnvelope({ type: "error", message }, createDiagnosticEnvelope({
+            severity: "error",
+            phase: "load",
+            runtimeKind: "typescript",
+            category: "extension_flag_invalid",
+            message,
+            recoveryHint: "Provide a value for the string extension flag or remove the option.",
+            operation: "extension.flag",
+            target: { flag: name },
+        })));
+    }
+    if (unknownFlags.length > 0) {
+        const message = `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`;
+        diagnostics.push(attachDiagnosticEnvelope({ type: "error", message }, createDiagnosticEnvelope({
+            severity: "error",
+            phase: "load",
+            runtimeKind: "typescript",
+            category: "extension_flag_unknown",
+            message,
+            recoveryHint: "Remove unknown extension flags or enable the extension that registers them.",
+            operation: "extension.flag",
+            target: { flags: unknownFlags },
+        })));
+    }
+    return diagnostics;
+}
+/**
+ * Create cwd-bound runtime services.
+ *
+ * Returns services plus diagnostics. It does not create an AgentSession.
+ */
+export async function createAgentSessionServices(options) {
+    const cwd = options.cwd;
+    const agentDir = options.agentDir ?? getAgentDir();
+    const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
+    const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+    const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
+    const resourceLoader = new DefaultResourceLoader({
+        ...(options.resourceLoaderOptions ?? {}),
+        cwd,
+        agentDir,
+        settingsManager,
+    });
+    await resourceLoader.reload();
+    const diagnostics = [];
+    const extensionsResult = resourceLoader.getExtensions();
+    for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
+        try {
+            modelRegistry.registerProvider(name, config);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            const diagnosticMessage = `Extension "${extensionPath}" error: ${message}`;
+            diagnostics.push(attachDiagnosticEnvelope({
+                type: "error",
+                message: diagnosticMessage,
+            }, createDiagnosticEnvelope({
+                severity: "error",
+                phase: "load",
+                runtimeKind: "typescript",
+                category: "provider_registration_failed",
+                message: diagnosticMessage,
+                recoveryHint: "Fix the extension provider registration or disable the extension, then reload extensions.",
+                source: { path: extensionPath },
+                operation: "provider.register",
+            })));
+        }
+    }
+    extensionsResult.runtime.pendingProviderRegistrations = [];
+    diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
+    return {
+        cwd,
+        agentDir,
+        authStorage,
+        settingsManager,
+        modelRegistry,
+        resourceLoader,
+        diagnostics,
+    };
+}
+/**
+ * Create an AgentSession from previously created services.
+ *
+ * This keeps session creation separate from service creation so callers can
+ * resolve model, thinking, tools, and other session inputs against the target
+ * cwd before constructing the session.
+ */
+export async function createAgentSessionFromServices(options) {
+    return createAgentSession({
+        cwd: options.services.cwd,
+        agentDir: options.services.agentDir,
+        authStorage: options.services.authStorage,
+        settingsManager: options.services.settingsManager,
+        modelRegistry: options.services.modelRegistry,
+        resourceLoader: options.services.resourceLoader,
+        sessionManager: options.sessionManager,
+        model: options.model,
+        thinkingLevel: options.thinkingLevel,
+        scopedModels: options.scopedModels,
+        tools: options.tools,
+        noTools: options.noTools,
+        customTools: options.customTools,
+        sessionStartEvent: options.sessionStartEvent,
+    });
+}
+//# sourceMappingURL=agent-session-services.js.map

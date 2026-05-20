@@ -1,10 +1,10 @@
 import { relative, resolve, sep } from "node:path";
-import type { SourceInfo } from "./source-info.js";
+import type { SourceInfo } from "./source-info.ts";
 import {
 	WASM_CANONICAL_SECURITY_GRANTS,
 	type WasmExtensionPackageManifest,
 	type WasmExtensionResourceLimits,
-} from "./wasm-extension-package.js";
+} from "./wasm-extension-package.ts";
 
 export const CANONICAL_EXTENSION_GRANTS = WASM_CANONICAL_SECURITY_GRANTS;
 

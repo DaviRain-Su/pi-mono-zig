@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
-import { complete, stream } from "../src/stream.js";
-import type { Api, Context, Model, StreamOptions } from "../src/types.js";
+import { getModel } from "../src/models.ts";
+import { complete, stream } from "../src/stream.ts";
+import type { Api, Context, Model, StreamOptions } from "../src/types.ts";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
-import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.js";
-import { hasBedrockCredentials } from "./bedrock-utils.js";
-import { resolveApiKey } from "./oauth.js";
+import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.ts";
+import { hasBedrockCredentials } from "./bedrock-utils.ts";
+import { resolveApiKey } from "./oauth.ts";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
 const [openaiCodexToken] = await Promise.all([resolveApiKey("openai-codex")]);
@@ -251,7 +251,7 @@ describe("AI Providers Abort Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider Abort", () => {
-		const llm = getModel("kimi-coding", "kimi-for-coding");
+		const llm = getModel("kimi-coding", "kimi-k2-thinking");
 
 		it("should abort mid-stream", { retry: 3 }, async () => {
 			await testAbortSignal(llm);
@@ -276,12 +276,12 @@ describe("AI Providers Abort Tests", () => {
 
 	describe("OpenAI Codex Provider Abort", () => {
 		it.skipIf(!openaiCodexToken)("should abort mid-stream", { retry: 3 }, async () => {
-			const llm = getModel("openai-codex", "gpt-5.2-codex");
+			const llm = getModel("openai-codex", "gpt-5.5");
 			await testAbortSignal(llm, { apiKey: openaiCodexToken });
 		});
 
 		it.skipIf(!openaiCodexToken)("should handle immediate abort", { retry: 3 }, async () => {
-			const llm = getModel("openai-codex", "gpt-5.2-codex");
+			const llm = getModel("openai-codex", "gpt-5.5");
 			await testImmediateAbort(llm, { apiKey: openaiCodexToken });
 		});
 	});

@@ -2,31 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const bedrockMock = vi.hoisted(() => ({
 	constructorCalls: [] as Array<Record<string, unknown>>,
-	send: () => Promise.reject(new Error("mock send")) as Promise<unknown>,
 }));
 
 vi.mock("@aws-sdk/client-bedrock-runtime", () => {
-	class BedrockRuntimeServiceException extends Error {
-		readonly $metadata: { httpStatusCode?: number; requestId?: string };
-
-		constructor(options: {
-			name?: string;
-			message: string;
-			$metadata?: { httpStatusCode?: number; requestId?: string };
-		}) {
-			super(options.message);
-			this.name = options.name ?? "BedrockRuntimeServiceException";
-			this.$metadata = options.$metadata ?? {};
-		}
-	}
+	class BedrockRuntimeServiceException extends Error {}
 
 	class BedrockRuntimeClient {
 		constructor(config: Record<string, unknown>) {
 			bedrockMock.constructorCalls.push(config);
 		}
 
-		send(): Promise<unknown> {
-			return bedrockMock.send();
+		send(): Promise<never> {
+			return Promise.reject(new Error("mock send"));
 		}
 	}
 
@@ -57,10 +44,9 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 	};
 });
 
-import { BedrockRuntimeServiceException } from "@aws-sdk/client-bedrock-runtime";
-import { getModel } from "../src/models.js";
-import { streamBedrock } from "../src/providers/amazon-bedrock.js";
-import type { Context, Model } from "../src/types.js";
+import { getModel } from "../src/models.ts";
+import { streamBedrock } from "../src/providers/amazon-bedrock.ts";
+import type { Context, Model } from "../src/types.ts";
 
 const context: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
@@ -69,17 +55,12 @@ const context: Context = {
 const originalAwsRegion = process.env.AWS_REGION;
 const originalAwsDefaultRegion = process.env.AWS_DEFAULT_REGION;
 const originalAwsProfile = process.env.AWS_PROFILE;
-const originalAwsBearerTokenBedrock = process.env.AWS_BEARER_TOKEN_BEDROCK;
-const originalAwsBedrockSkipAuth = process.env.AWS_BEDROCK_SKIP_AUTH;
 
 beforeEach(() => {
 	bedrockMock.constructorCalls.length = 0;
-	bedrockMock.send = () => Promise.reject(new Error("mock send")) as Promise<unknown>;
 	delete process.env.AWS_REGION;
 	delete process.env.AWS_DEFAULT_REGION;
 	delete process.env.AWS_PROFILE;
-	delete process.env.AWS_BEARER_TOKEN_BEDROCK;
-	delete process.env.AWS_BEDROCK_SKIP_AUTH;
 });
 
 afterEach(() => {
@@ -100,25 +81,10 @@ afterEach(() => {
 	} else {
 		process.env.AWS_PROFILE = originalAwsProfile;
 	}
-
-	if (originalAwsBearerTokenBedrock === undefined) {
-		delete process.env.AWS_BEARER_TOKEN_BEDROCK;
-	} else {
-		process.env.AWS_BEARER_TOKEN_BEDROCK = originalAwsBearerTokenBedrock;
-	}
-
-	if (originalAwsBedrockSkipAuth === undefined) {
-		delete process.env.AWS_BEDROCK_SKIP_AUTH;
-	} else {
-		process.env.AWS_BEDROCK_SKIP_AUTH = originalAwsBedrockSkipAuth;
-	}
 });
 
-async function captureClientConfig(
-	model: Model<"bedrock-converse-stream">,
-	options: Parameters<typeof streamBedrock>[2] = {},
-): Promise<Record<string, unknown>> {
-	await streamBedrock(model, context, { cacheRetention: "none", ...options }).result();
+async function captureClientConfig(model: Model<"bedrock-converse-stream">): Promise<Record<string, unknown>> {
+	await streamBedrock(model, context, { cacheRetention: "none" }).result();
 	expect(bedrockMock.constructorCalls).toHaveLength(1);
 	return bedrockMock.constructorCalls[0];
 }
@@ -161,75 +127,5 @@ describe("bedrock endpoint resolution", () => {
 
 		expect(config.endpoint).toBe("https://bedrock-vpc.example.com");
 		expect(config.region).toBe("us-west-2");
-	});
-
-	it("leaves region to SDK profile resolution when AWS_PROFILE is configured", async () => {
-		process.env.AWS_PROFILE = "fixture-env-profile";
-		const model = getModel("amazon-bedrock", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0");
-
-		const config = await captureClientConfig(model);
-
-		expect(config.endpoint).toBeUndefined();
-		expect(config.region).toBeUndefined();
-		expect(config.profile).toBeUndefined();
-	});
-
-	it("passes options.profile without treating it like AWS_PROFILE", async () => {
-		const model = getModel("amazon-bedrock", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0");
-
-		const config = await captureClientConfig(model, { profile: "fixture-option-profile" });
-
-		expect(config.profile).toBe("fixture-option-profile");
-		expect(config.endpoint).toBe("https://bedrock-runtime.eu-central-1.amazonaws.com");
-		expect(config.region).toBe("eu-central-1");
-	});
-
-	it("prefers bearer token options over bearer token environment auth", async () => {
-		process.env.AWS_BEARER_TOKEN_BEDROCK = "fixture-env-bearer";
-		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
-
-		const config = await captureClientConfig(model, { bearerToken: "fixture-option-bearer" });
-
-		expect(config.token).toEqual({ token: "fixture-option-bearer" });
-		expect(config.authSchemePreference).toEqual(["httpBearerAuth"]);
-	});
-
-	it("suppresses bearer auth and uses dummy credentials when skip auth is enabled", async () => {
-		process.env.AWS_BEARER_TOKEN_BEDROCK = "fixture-env-bearer";
-		process.env.AWS_BEDROCK_SKIP_AUTH = "1";
-		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
-
-		const config = await captureClientConfig(model);
-
-		expect(config.token).toBeUndefined();
-		expect(config.authSchemePreference).toBeUndefined();
-		expect(config.credentials).toEqual({
-			accessKeyId: "dummy-access-key",
-			secretAccessKey: "dummy-secret-key",
-		});
-	});
-
-	it("emits non-200 SDK exception response metadata before sanitized stream error", async () => {
-		const observedResponses: Array<{ status?: number; headers?: Record<string, string> }> = [];
-		bedrockMock.send = () =>
-			Promise.reject(
-				new BedrockRuntimeServiceException({
-					$fault: "server",
-					name: "ServiceUnavailableException",
-					message: "service unavailable fixture",
-					$metadata: { httpStatusCode: 503, requestId: "fixture-request-id" },
-				}),
-			);
-		const model = getModel("amazon-bedrock", "us.anthropic.claude-opus-4-7");
-
-		const result = await streamBedrock(model, context, {
-			cacheRetention: "none",
-			onResponse: (response) => {
-				observedResponses.push(response);
-			},
-		}).result();
-
-		expect(observedResponses).toEqual([{ status: 503, headers: { "x-amzn-requestid": "fixture-request-id" } }]);
-		expect(result.errorMessage).toBe("Service unavailable: service unavailable fixture");
 	});
 });

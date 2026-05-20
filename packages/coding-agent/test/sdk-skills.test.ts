@@ -2,11 +2,11 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createExtensionRuntime } from "../src/core/extensions/loader.js";
-import type { ResourceLoader } from "../src/core/resource-loader.js";
-import { createAgentSession } from "../src/core/sdk.js";
-import { SessionManager } from "../src/core/session-manager.js";
-import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { createExtensionRuntime } from "../src/core/extensions/loader.ts";
+import type { ResourceLoader } from "../src/core/resource-loader.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 
 describe("createAgentSession skills option", () => {
 	let tempDir: string;
@@ -53,7 +53,6 @@ This is a test skill.
 	it("should have empty skills when resource loader returns none (--no-skills)", async () => {
 		const resourceLoader: ResourceLoader = {
 			getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-			getWasmExtensions: () => [],
 			getSkills: () => ({ skills: [], diagnostics: [] }),
 			getPrompts: () => ({ prompts: [], diagnostics: [] }),
 			getThemes: () => ({ themes: [], diagnostics: [] }),
@@ -87,7 +86,6 @@ This is a test skill.
 
 		const resourceLoader: ResourceLoader = {
 			getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-			getWasmExtensions: () => [],
 			getSkills: () => ({ skills: [customSkill], diagnostics: [] }),
 			getPrompts: () => ({ prompts: [], diagnostics: [] }),
 			getThemes: () => ({ themes: [], diagnostics: [] }),

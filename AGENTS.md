@@ -16,6 +16,7 @@
 - Check node_modules for external API type definitions instead of guessing
 - **NEVER use inline imports** - no `await import("./foo.js")`, no `import("pkg").Type` in type positions, no dynamic imports for types. Always use standard top-level imports.
 - NEVER remove or downgrade code to fix type errors from outdated dependencies; upgrade the dependency instead
+- Use only erasable TypeScript syntax compatible with Node strip-only mode in TypeScript checked by the root config (`packages/*/src`, `packages/*/test`, and `packages/coding-agent/examples`). Do not use constructor parameter properties, `enum`, `namespace`/`module`, `import =`, `export =`, or other TypeScript constructs that require JavaScript emit. Use explicit fields and constructor assignments instead of parameter properties.
 - Always ask before removing functionality or code that appears to be intentional
 - Do not preserve backward compatibility unless the user explicitly asks for it
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
@@ -25,14 +26,14 @@
 
 - After code changes (not documentation changes): `npm run check` (get full output, no tail). Fix all errors, warnings, and infos before committing.
 - Note: `npm run check` does not run tests.
-- NEVER run: `npm run dev`, `npm run build`, `npm test`
-- **verificationSteps**: Run every step in `feature.verificationSteps` verbatim. If you substitute a step (e.g., a different test command), declare the substitution explicitly in your handoff `verification.commandsRun` with a note explaining why.
+- NEVER run: `npm run build`, `npm test`
 - Only run specific tests if user instructs: `npx tsx ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`
 - Run tests from the package root, not the repo root.
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
+- For ad-hoc scripts, write the script to a temporary file (for example under `/tmp`) using `write`, run that file, edit it if needed, and remove it when it is no longer needed. Do not embed multi-line scripts directly in `bash` commands.
 - NEVER commit unless user asks
 
 ## Contribution Gate
@@ -48,7 +49,7 @@
 When creating issues:
 
 - Add `pkg:*` labels to indicate which package(s) the issue affects
-  - Available labels: `pkg:agent`, `pkg:ai`, `pkg:coding-agent`, `pkg:tui`, `pkg:web-ui`
+  - Available labels: `pkg:agent`, `pkg:ai`, `pkg:coding-agent`, `pkg:tui`
 - If an issue spans multiple packages, add all relevant labels
 
 When posting issue/PR comments:
@@ -189,13 +190,23 @@ Create provider file exporting:
 
 1. **Update CHANGELOGs**: Ensure all changes since last release are documented in the `[Unreleased]` section of each affected package's CHANGELOG.md
 
-2. **Run release script**:
+2. **Soft gate: local release smoke test**: Before running the real release script, build an unpublished local release and manually smoke test it from outside the repository so it cannot accidentally resolve workspace files:
+   ```bash
+   npm run release:local -- --out /tmp/pi-local-release --force
+   cd /tmp
+   /tmp/pi-local-release/bin/pi --help
+   /tmp/pi-local-release/bin/pi --version
+   /tmp/pi-local-release/bin/pi
+   ```
+   In the interactive smoke test, verify startup, model/account listing, and at least one real prompt with the intended default provider. Treat failures as release blockers unless the user explicitly accepts the risk.
+
+3. **Run release script**:
    ```bash
    npm run release:patch    # Fixes and additions
    npm run release:minor    # API breaking changes
    ```
 
-The script handles: version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
+The release script handles: version bump, CHANGELOG finalization, commit, tag, publish, and adding new `[Unreleased]` sections.
 
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
@@ -245,74 +256,6 @@ git pull --rebase && git push
 - If conflict is in a file you didn't modify, abort and ask the user
 - NEVER force push
 
-### Restore-then-recheck Pattern for Revert Features
-
-When a feature's goal is to revert or undo a previous change:
-
-1. `git restore <specific-files>` to revert only those files
-2. `git diff HEAD` to confirm exactly what changed
-3. Re-run all relevant tests and checks to confirm the revert is clean
-4. Include a diff summary in the handoff so the orchestrator can verify no unrelated lines were reverted
-
-Perform this check at hand-off time, not just at the time of revert.
-
 ### User override
 
 If the user instructions conflict with rules set out here, ask for confirmation that they want to override the rules. Only then execute their instructions.
-
----
-
-## Zig Implementation Notes
-
-### Provider Helper Integration Checklist
-
-When porting a helper module from `packages/ai/src/providers/` to Zig (e.g., `github-copilot-headers.ts`, `cloudflare.ts`), verify integration at every call site after implementation:
-
-- `zig/src/ai/providers/openai.zig` line 78 — `cloudflare` base-URL resolution call
-- `zig/src/ai/providers/openai.zig` line 1604 — `copilot` dynamic header construction call
-- `zig/src/ai/providers/anthropic.zig` line 1480 — `cloudflare` base-URL resolution call
-- `zig/src/ai/providers/anthropic.zig` line 2213 — `copilot` dynamic header construction call
-
-These are the canonical wire-up sites. Any new leaf helper must be wired into the provider `stream()` path at these sites AND accompanied by a stream-level smoke test (pass an invalid base_url/token and assert the stream contains an error event rather than throwing).
-
-### Stream Contract Pattern
-
-The reference implementation for Zig provider stream contracts is `zig/src/ai/providers/anthropic.zig`.
-
-All provider `stream()` functions must return an `AssistantMessageEventStream` and never throw (except `error.OutOfMemory`). The canonical pattern:
-
-1. Extract setup into `streamProduction()` returning `!void`
-2. In `stream()`: create stream, call `streamProduction(...)` with `catch |err| switch (err) { error.OutOfMemory => return err, else => emitSetupRuntimeFailure(...) }`, return stream
-
-**Canonical setup-failure regression test template:**
-
-```zig
-test "<provider> stream returns error_event on setup failure" {
-    const allocator = std.testing.allocator;
-    var stream = try <provider>.stream(allocator, .{
-        .base_url = "http://127.0.0.1:1",  // unreachable — forces connection error
-        .api_key = "placeholder",
-        .model = "<any-valid-model-id>",
-        .messages = &.{},
-    });
-    defer stream.deinit();
-
-    const event = (try stream.next()).?;
-    try std.testing.expectEqual(.error_event, event);
-    try std.testing.expect(event.error_event.message.len > 0);
-    try std.testing.expectEqual(.error_reason, event.error_event.stop_reason);
-    // api / provider / model fields must match what was passed in
-    const null_event = try stream.next();
-    try std.testing.expectEqual(null, null_event);
-}
-```
-
-### Keybinding Implementation Notes
-
-- Adding or removing `Action` enum variants in `keybindings.zig` requires corresponding call-site updates across: `input_dispatch.zig`, overlay files (tree/session/model overlays), `interactive_mode.zig`, and any rendering code that switch-dispatches on `Action`.
-- The contract shorthand `.{ .char = 'l' }` used in tests is a `KeySpec` literal, NOT a `tui.Key` union value. Real key matching goes through `Keybindings.actionForKey()` which converts `tui.Key` → `KeySpec` before comparing.
-- Keybinding declaration order in `DEFINITIONS` matters: the first matching definition wins when two bindings share a default key. Check for collisions before adding new defaults. Cross-reference the "Never hardcode key checks" rule above.
-
-### Environmental Dependencies for Standalone Parity Tests
-
-`zig build test-ts-rpc-parity` requires `libsimdjson` installed on the host (e.g., `brew install simdjson` on macOS). Without it the linker will fail. The same test scenarios are covered inside `zig build test` which links a bundled copy, so CI failures in `test-ts-rpc-parity` on clean machines are an environment issue, not a code bug.

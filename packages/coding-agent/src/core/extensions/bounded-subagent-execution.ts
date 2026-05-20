@@ -6,8 +6,8 @@ import type {
 	SubAgentResourceSummary,
 	SubAgentTaskInvocationEnvelope,
 	SubAgentTaskResultEnvelope,
-} from "./subagent-readiness.js";
-import { validateSubAgentTaskInvocationEnvelope, validateSubAgentTaskResultEnvelope } from "./subagent-readiness.js";
+} from "./subagent-readiness.ts";
+import { validateSubAgentTaskInvocationEnvelope, validateSubAgentTaskResultEnvelope } from "./subagent-readiness.ts";
 
 export interface BoundedSubAgentToolResult {
 	ok: boolean;

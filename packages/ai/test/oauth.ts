@@ -8,8 +8,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { getOAuthApiKey } from "../src/utils/oauth/index.js";
-import type { OAuthCredentials, OAuthProvider } from "../src/utils/oauth/types.js";
+import { getOAuthApiKey } from "../src/utils/oauth/index.ts";
+import type { OAuthCredentials, OAuthProvider } from "../src/utils/oauth/types.ts";
 
 const AUTH_PATH = join(homedir(), ".pi", "agent", "auth.json");
 
@@ -74,7 +74,12 @@ export async function resolveApiKey(provider: string): Promise<string | undefine
 			}
 		}
 
-		const result = await getOAuthApiKey(provider as OAuthProvider, oauthCredentials);
+		let result: { newCredentials: OAuthCredentials; apiKey: string } | null = null;
+		try {
+			result = await getOAuthApiKey(provider as OAuthProvider, oauthCredentials);
+		} catch (e) {
+			console.log(JSON.stringify(e));
+		}
 		if (!result) return undefined;
 
 		// Save refreshed credentials back to auth.json

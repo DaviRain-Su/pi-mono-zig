@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.js";
-import { getModel, getModels } from "../src/models.js";
-import { streamSimple } from "../src/stream.js";
+import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
+import { getModel, getModels } from "../src/models.ts";
+import { streamSimple } from "../src/stream.ts";
 
 interface FakeOpenAIClientOptions {
 	apiKey: string;

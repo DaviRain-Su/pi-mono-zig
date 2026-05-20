@@ -8,17 +8,16 @@ import { dirname, join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { getModel, type OAuthCredentials, type OAuthProvider } from "@earendil-works/pi-ai";
 import { getOAuthApiKey } from "@earendil-works/pi-ai/oauth";
-import { AgentSession } from "../src/core/agent-session.js";
-import { AuthStorage } from "../src/core/auth-storage.js";
-import { createEventBus } from "../src/core/event-bus.js";
-import type { ExtensionPolicy } from "../src/core/extension-policy.js";
-import type { Extension, ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.js";
-import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.js";
-import { ModelRegistry } from "../src/core/model-registry.js";
-import type { ResourceLoader } from "../src/core/resource-loader.js";
-import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
-import { createCodingTools } from "../src/index.js";
+import { AgentSession } from "../src/core/agent-session.ts";
+import { AuthStorage } from "../src/core/auth-storage.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import type { Extension, ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.ts";
+import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import { ModelRegistry } from "../src/core/model-registry.ts";
+import type { ResourceLoader } from "../src/core/resource-loader.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createCodingTools } from "../src/index.ts";
 
 /**
  * API key for authenticated tests. Tests using this should be wrapped in
@@ -180,7 +179,6 @@ export interface TestSessionContext {
 export interface CreateTestExtensionsResultInput {
 	factory: ExtensionFactory;
 	path?: string;
-	effectivePolicy?: ExtensionPolicy;
 }
 
 export async function createTestExtensionsResult(
@@ -195,8 +193,7 @@ export async function createTestExtensionsResult(
 		const factory = typeof input === "function" ? input : input.factory;
 		const extensionPath =
 			typeof input === "function" ? `<inline:${index + 1}>` : (input.path ?? `<inline:${index + 1}>`);
-		const effectivePolicy = typeof input === "function" ? undefined : input.effectivePolicy;
-		extensions.push(await loadExtensionFromFactory(factory, cwd, eventBus, runtime, extensionPath, effectivePolicy));
+		extensions.push(await loadExtensionFromFactory(factory, cwd, eventBus, runtime, extensionPath));
 	}
 
 	return {
@@ -219,7 +216,6 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 
 	return {
 		getExtensions: () => extensionsResult,
-		getWasmExtensions: () => [],
 		getSkills: () => ({ skills: [], diagnostics: [] }),
 		getPrompts: () => ({ prompts: [], diagnostics: [] }),
 		getThemes: () => ({ themes: [], diagnostics: [] }),

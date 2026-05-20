@@ -15,12 +15,12 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { CONFIG_DIR_NAME } from "../../../config.js";
-import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.js";
-import type { PackageSource, SettingsManager } from "../../../core/settings-manager.js";
-import { theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
-import { rawKeyHint } from "./keybinding-hints.js";
+import { CONFIG_DIR_NAME } from "../../../config.ts";
+import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
+import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
+import { theme } from "../theme/theme.ts";
+import { DynamicBorder } from "./dynamic-border.ts";
+import { rawKeyHint } from "./keybinding-hints.ts";
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 
@@ -201,7 +201,7 @@ class ResourceList implements Component, Focusable {
 	private filteredItems: FlatEntry[] = [];
 	private selectedIndex = 0;
 	private searchInput: Input;
-	private maxVisible = 15;
+	private maxVisible: number;
 	private settingsManager: SettingsManager;
 	private cwd: string;
 	private agentDir: string;
@@ -219,12 +219,21 @@ class ResourceList implements Component, Focusable {
 		this.searchInput.focused = value;
 	}
 
-	constructor(groups: ResourceGroup[], settingsManager: SettingsManager, cwd: string, agentDir: string) {
+	constructor(
+		groups: ResourceGroup[],
+		settingsManager: SettingsManager,
+		cwd: string,
+		agentDir: string,
+		terminalHeight?: number,
+	) {
 		this.groups = groups;
 		this.settingsManager = settingsManager;
 		this.cwd = cwd;
 		this.agentDir = agentDir;
 		this.searchInput = new Input();
+		// 8 lines of chrome: top spacer + top border + spacer + header (2 lines) + spacer + bottom spacer + bottom border
+		const chrome = 8;
+		this.maxVisible = Math.max(5, (terminalHeight ?? 24) - chrome);
 		this.buildFlatList();
 		this.filteredItems = [...this.flatItems];
 	}
@@ -588,6 +597,7 @@ export class ConfigSelectorComponent extends Container implements Focusable {
 		onClose: () => void,
 		onExit: () => void,
 		requestRender: () => void,
+		terminalHeight?: number,
 	) {
 		super();
 
@@ -601,7 +611,7 @@ export class ConfigSelectorComponent extends Container implements Focusable {
 		this.addChild(new Spacer(1));
 
 		// Resource list
-		this.resourceList = new ResourceList(groups, settingsManager, cwd, agentDir);
+		this.resourceList = new ResourceList(groups, settingsManager, cwd, agentDir, terminalHeight);
 		this.resourceList.onCancel = onClose;
 		this.resourceList.onExit = onExit;
 		this.resourceList.onToggle = () => requestRender();

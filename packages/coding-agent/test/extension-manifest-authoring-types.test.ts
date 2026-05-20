@@ -3,7 +3,7 @@ import type {
 	PiExtensionManifest,
 	PiExtensionNormalizedDeclarationMetadata,
 	PiExtensionV1Manifest,
-} from "../docs/extension-manifest-authoring.types.js";
+} from "../docs/extension-manifest-authoring.types.ts";
 
 const typescriptManifest = {
 	schemaVersion: "pi-extension.v1",
@@ -56,7 +56,7 @@ const javascriptManifest = {
 	version: "0.1.0",
 	runtime: {
 		kind: "javascript",
-		entrypoint: "dist/index.js",
+		entrypoint: "dist/index.ts",
 	},
 } satisfies PiExtensionV1Manifest;
 
@@ -68,7 +68,7 @@ const processJsonlManifest = {
 	runtime: {
 		kind: "process_jsonl",
 		entrypoint: {
-			argv: ["node", "host.js"],
+			argv: ["node", "host.ts"],
 		},
 	},
 } satisfies PiExtensionV1Manifest;
@@ -128,8 +128,8 @@ describe("extension manifest authoring types", () => {
 	it("keeps docs fixtures aligned with supported TypeScript and process authoring shapes", () => {
 		expect(manifests.map((manifest) => manifest.runtime.kind)).toEqual(["typescript", "javascript", "process_jsonl"]);
 		expect(typescriptManifest.runtime.entrypoint).toBe("src/index.ts");
-		expect(javascriptManifest.runtime.entrypoint).toBe("dist/index.js");
-		expect(processJsonlManifest.runtime.entrypoint.argv).toEqual(["node", "host.js"]);
+		expect(javascriptManifest.runtime.entrypoint).toBe("dist/index.ts");
+		expect(processJsonlManifest.runtime.entrypoint.argv).toEqual(["node", "host.ts"]);
 		expect(normalizedTypeScriptToolMetadata.runtime.adapter).toBe("ts-js-extension-loader");
 		expect(unsupportedWasmRuntime.runtime.entrypoint.artifactPath).toBe("wasm/plugin.wasm");
 		expect(unsupportedNativeRuntime.runtime.entrypoint.descriptor).toBe("native://static/example");

@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { discoverAndLoadExtensions } from "../src/core/extensions/loader.js";
+import { discoverAndLoadExtensions } from "../src/core/extensions/loader.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -195,95 +195,6 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(path.join(subdir, "utils.ts"), extensionCode);
 
 		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(0);
-	});
-
-	it("ignores pi-extension.json Wasm package directories in Bun extension discovery", async () => {
-		const subdir = path.join(extensionsDir, "wasm-package");
-		fs.mkdirSync(path.join(subdir, "wasm"), { recursive: true });
-		fs.writeFileSync(path.join(subdir, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d]));
-		fs.writeFileSync(path.join(subdir, "index.ts"), "throw new Error('index.ts must not load for Wasm packages');");
-		fs.writeFileSync(
-			path.join(subdir, "custom.ts"),
-			"throw new Error('package.json pi.extensions must not load for Wasm packages');",
-		);
-		fs.writeFileSync(
-			path.join(subdir, "package.json"),
-			JSON.stringify({
-				name: "wasm-package",
-				pi: {
-					extensions: ["./custom.ts"],
-				},
-			}),
-		);
-		fs.writeFileSync(
-			path.join(subdir, "pi-extension.json"),
-			JSON.stringify({
-				schemaVersion: "pi-extension.v0",
-				id: "com.example.discovery-wasm",
-				name: "Discovery Wasm Fixture",
-				version: "0.1.0",
-				description: "A Wasm package fixture that should not be loaded through the Bun path.",
-				artifact: {
-					kind: "wasm-component",
-					path: "wasm/plugin.wasm",
-				},
-				tool: {
-					id: "fixture.discovery",
-					description: "Discovery fixture",
-					inputSchema: {},
-					outputSchema: {},
-				},
-				capabilities: [],
-			}),
-		);
-
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(0);
-	});
-
-	it("ignores configured pi-extension.json Wasm package directories in Bun extension loading", async () => {
-		const subdir = path.join(tempDir, "configured-wasm-package");
-		fs.mkdirSync(path.join(subdir, "wasm"), { recursive: true });
-		fs.writeFileSync(path.join(subdir, "wasm", "plugin.wasm"), Buffer.from([0x00, 0x61, 0x73, 0x6d]));
-		fs.writeFileSync(path.join(subdir, "index.ts"), "throw new Error('configured index.ts must not load');");
-		fs.writeFileSync(path.join(subdir, "custom.ts"), "throw new Error('configured custom.ts must not load');");
-		fs.writeFileSync(
-			path.join(subdir, "package.json"),
-			JSON.stringify({
-				name: "configured-wasm-package",
-				pi: {
-					extensions: ["./custom.ts"],
-				},
-			}),
-		);
-		fs.writeFileSync(
-			path.join(subdir, "pi-extension.json"),
-			JSON.stringify({
-				schemaVersion: "pi-extension.v0",
-				id: "com.example.configured-discovery-wasm",
-				name: "Configured Discovery Wasm Fixture",
-				version: "0.1.0",
-				description: "A configured Wasm package fixture that should not be loaded through the Bun path.",
-				artifact: {
-					kind: "wasm-component",
-					path: "wasm/plugin.wasm",
-				},
-				tool: {
-					id: "fixture.configuredDiscovery",
-					description: "Configured discovery fixture",
-					inputSchema: {},
-					outputSchema: {},
-				},
-				capabilities: [],
-			}),
-		);
-
-		const result = await discoverAndLoadExtensions([subdir], tempDir, tempDir);
 
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(0);
@@ -529,7 +440,7 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(explicitPath, extensionCodeWithTool("explicit"));
 
 		// Use loadExtensions directly to skip discovery
-		const { loadExtensions } = await import("../src/core/extensions/loader.js");
+		const { loadExtensions } = await import("../src/core/extensions/loader.ts");
 		const result = await loadExtensions([explicitPath], tempDir);
 
 		expect(result.errors).toHaveLength(0);
@@ -543,7 +454,7 @@ describe("extensions discovery", () => {
 		fs.writeFileSync(path.join(extensionsDir, "discovered.ts"), extensionCode);
 
 		// Use loadExtensions directly with empty paths
-		const { loadExtensions } = await import("../src/core/extensions/loader.js");
+		const { loadExtensions } = await import("../src/core/extensions/loader.ts");
 		const result = await loadExtensions([], tempDir);
 
 		expect(result.errors).toHaveLength(0);

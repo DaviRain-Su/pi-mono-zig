@@ -1,0 +1,1 @@
+{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../src/index.ts"],"names":[],"mappings":"AACA,cAAc,YAAY,CAAC","sourcesContent":["// Main library exports\nexport * from \"./types.js\";\n"]}

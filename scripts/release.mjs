@@ -10,10 +10,11 @@
  * 1. Check for uncommitted changes
  * 2. Bump version via npm run version:xxx or set an explicit version
  * 3. Update CHANGELOG.md files: [Unreleased] -> [version] - date
- * 4. Commit and tag
- * 5. Publish to npm
- * 6. Add new [Unreleased] section to changelogs
- * 7. Commit
+ * 4. Generate the coding-agent npm-shrinkwrap.json
+ * 5. Commit and tag
+ * 6. Publish to npm
+ * 7. Add new [Unreleased] section to changelogs
+ * 8. Commit
  */
 
 import { execSync } from "child_process";
@@ -90,9 +91,7 @@ function bumpOrSetVersion(target) {
 	}
 
 	console.log(`Setting explicit version (${target})...`);
-	run(
-		`npm version ${target} -ws --no-git-tag-version && node scripts/sync-versions.js && npx shx rm -rf node_modules packages/*/node_modules package-lock.json && npm install`,
-	);
+	run(`npm version ${target} -ws --no-git-tag-version && node scripts/sync-versions.js && npm install --package-lock-only`);
 	return getVersion();
 }
 
@@ -164,30 +163,35 @@ console.log("Updating CHANGELOG.md files...");
 updateChangelogsForRelease(version);
 console.log();
 
-// 4. Commit and tag
+// 4. Generate publish shrinkwrap
+console.log("Generating coding-agent shrinkwrap...");
+run("npm run shrinkwrap:coding-agent");
+console.log();
+
+// 5. Commit and tag
 console.log("Committing and tagging...");
 stageChangedFiles();
 run(`git commit -m "Release v${version}"`);
 run(`git tag v${version}`);
 console.log();
 
-// 5. Publish
+// 6. Publish
 console.log("Publishing to npm...");
 run("npm run publish");
 console.log();
 
-// 6. Add new [Unreleased] sections
+// 7. Add new [Unreleased] sections
 console.log("Adding [Unreleased] sections for next cycle...");
 addUnreleasedSection();
 console.log();
 
-// 7. Commit
+// 8. Commit
 console.log("Committing changelog updates...");
 stageChangedFiles();
 run(`git commit -m "Add [Unreleased] section for next cycle"`);
 console.log();
 
-// 8. Push
+// 9. Push
 console.log("Pushing to remote...");
 run("git push origin main");
 run(`git push origin v${version}`);

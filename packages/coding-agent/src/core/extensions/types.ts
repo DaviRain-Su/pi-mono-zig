@@ -40,29 +40,27 @@ import type {
 	TUI,
 } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
-import type { Theme } from "../../modes/interactive/theme/theme.js";
-import type { BashResult } from "../bash-executor.js";
-import type { CompactionPreparation, CompactionResult } from "../compaction/index.js";
-import type { DiagnosticEnvelopeV0 } from "../diagnostics.js";
-import type { EventBus } from "../event-bus.js";
-import type { ExecOptions, ExecResult } from "../exec.js";
-import type { ExtensionPolicy, TypeScriptExtensionIdentity } from "../extension-policy.js";
-import type { ReadonlyFooterDataProvider } from "../footer-data-provider.js";
-import type { KeybindingsManager } from "../keybindings.js";
-import type { CustomMessage } from "../messages.js";
-import type { ModelRegistry } from "../model-registry.js";
+import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import type { BashResult } from "../bash-executor.ts";
+import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
+import type { EventBus } from "../event-bus.ts";
+import type { ExecOptions, ExecResult } from "../exec.ts";
+import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
+import type { KeybindingsManager } from "../keybindings.ts";
+import type { CustomMessage } from "../messages.ts";
+import type { ModelRegistry } from "../model-registry.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
 	ReadonlySessionManager,
 	SessionEntry,
 	SessionManager,
-} from "../session-manager.js";
-import type { SlashCommandInfo } from "../slash-commands.js";
-import type { SourceInfo } from "../source-info.js";
-import type { BuildSystemPromptOptions } from "../system-prompt.js";
-import type { BashOperations } from "../tools/bash.js";
-import type { EditToolDetails } from "../tools/edit.js";
+} from "../session-manager.ts";
+import type { SlashCommandInfo } from "../slash-commands.ts";
+import type { SourceInfo } from "../source-info.ts";
+import type { BuildSystemPromptOptions } from "../system-prompt.ts";
+import type { BashOperations } from "../tools/bash.ts";
+import type { EditToolDetails } from "../tools/edit.ts";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -76,13 +74,12 @@ import type {
 	ReadToolDetails,
 	ReadToolInput,
 	WriteToolInput,
-} from "../tools/index.js";
-import type { SubAgentReadinessEnvelope } from "./subagent-readiness.js";
+} from "../tools/index.ts";
 
-export type { ExecOptions, ExecResult } from "../exec.js";
-export type { BuildSystemPromptOptions } from "../system-prompt.js";
+export type { ExecOptions, ExecResult } from "../exec.ts";
+export type { BuildSystemPromptOptions } from "../system-prompt.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
-export type { AppKeybinding, KeybindingsManager } from "../keybindings.js";
+export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
 // ============================================================================
 // UI Context
@@ -327,8 +324,6 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
-	/** Emit a read-only sub-agent readiness observation to subscribers. */
-	emitSubAgentReadiness?(event: Omit<SubAgentReadinessEvent, "type" | "readOnly">): Promise<void>;
 }
 
 /**
@@ -496,24 +491,11 @@ export function defineTool<TParams extends TSchema, TDetails = unknown, TState =
 // Resource Events
 // ============================================================================
 
-export type ExtensionLifecycleReason = "startup" | "reload" | "new" | "resume" | "fork";
-
-/**
- * Default bounded wait for one extension subscriber handler.
- *
- * Source/override: ExtensionRunnerOptions.handlerTimeoutMs. A timeout aborts the
- * handler-local signal when the JavaScript runtime supports AbortController and
- * ignores any late result from the timed-out handler.
- */
-export const DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS = 5000;
-
 /** Fired after session_start to allow extensions to provide additional resource paths. */
 export interface ResourcesDiscoverEvent {
 	type: "resources_discover";
 	cwd: string;
-	reason: ExtensionLifecycleReason;
-	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
-	signal?: AbortSignal;
+	reason: "startup" | "reload";
 }
 
 /** Result from resources_discover event handler */
@@ -531,11 +513,9 @@ export interface ResourcesDiscoverResult {
 export interface SessionStartEvent {
 	type: "session_start";
 	/** Why this session start happened. */
-	reason: ExtensionLifecycleReason;
+	reason: "startup" | "reload" | "new" | "resume" | "fork";
 	/** Previously active session file. Present for "new", "resume", and "fork". */
 	previousSessionFile?: string;
-	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
-	signal?: AbortSignal;
 }
 
 /** Fired before switching to another session (can be cancelled) */
@@ -543,8 +523,6 @@ export interface SessionBeforeSwitchEvent {
 	type: "session_before_switch";
 	reason: "new" | "resume";
 	targetSessionFile?: string;
-	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
-	signal?: AbortSignal;
 }
 
 /** Fired before forking a session (can be cancelled) */
@@ -552,8 +530,6 @@ export interface SessionBeforeForkEvent {
 	type: "session_before_fork";
 	entryId: string;
 	position: "before" | "at";
-	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
-	signal?: AbortSignal;
 }
 
 /** Fired before context compaction (can be cancelled or customized) */
@@ -578,8 +554,6 @@ export interface SessionShutdownEvent {
 	reason: "quit" | "reload" | "new" | "resume" | "fork";
 	/** Destination session file when shutting down due to session replacement. */
 	targetSessionFile?: string;
-	/** Handler-local abort signal. Aborted when the subscriber timeout expires. */
-	signal?: AbortSignal;
 }
 
 /** Preparation data for tree navigation */
@@ -668,16 +642,6 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
-}
-
-/** Fired when substrate-only sub-agent readiness metadata is recorded or replayed. Observation only; no lifecycle control is delegated. */
-export interface SubAgentReadinessEvent {
-	type: "sub_agent_readiness";
-	envelope: SubAgentReadinessEnvelope;
-	phase: "recorded" | "replayed" | "observed";
-	owner: "agent" | "session";
-	readOnly: true;
-	signal?: AbortSignal;
 }
 
 /** Fired at the start of each turn */
@@ -992,7 +956,6 @@ export type ExtensionEvent =
 	| BeforeAgentStartEvent
 	| AgentStartEvent
 	| AgentEndEvent
-	| SubAgentReadinessEvent
 	| TurnStartEvent
 	| TurnEndEvent
 	| MessageStartEvent
@@ -1007,132 +970,6 @@ export type ExtensionEvent =
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent;
-
-export const EXTENSION_EVENT_NAMES = [
-	"resources_discover",
-	"session_start",
-	"session_before_switch",
-	"session_before_fork",
-	"session_before_compact",
-	"session_compact",
-	"session_shutdown",
-	"session_before_tree",
-	"session_tree",
-	"before_agent_start",
-	"agent_start",
-	"agent_end",
-	"sub_agent_readiness",
-	"turn_start",
-	"turn_end",
-	"message_start",
-	"message_update",
-	"message_end",
-	"tool_execution_start",
-	"tool_execution_update",
-	"tool_execution_end",
-	"tool_call",
-	"tool_result",
-	"user_bash",
-	"context",
-	"before_provider_request",
-	"after_provider_response",
-	"model_select",
-	"thinking_level_select",
-	"input",
-] as const satisfies readonly ExtensionEvent["type"][];
-
-export type ExtensionEventName = (typeof EXTENSION_EVENT_NAMES)[number];
-
-export function isExtensionEventName(event: string): event is ExtensionEventName {
-	return (EXTENSION_EVENT_NAMES as readonly string[]).includes(event);
-}
-
-type AssertNoExtensionEventDrift<T extends never> = T;
-type ExtensionEventNameMissing = Exclude<ExtensionEvent["type"], ExtensionEventName>;
-type ExtensionEventNameExtra = Exclude<ExtensionEventName, ExtensionEvent["type"]>;
-type _ExtensionEventNamesCoverAllEvents = AssertNoExtensionEventDrift<ExtensionEventNameMissing>;
-type _ExtensionEventNamesContainOnlyEvents = AssertNoExtensionEventDrift<ExtensionEventNameExtra>;
-
-export const EXTENSION_LIFECYCLE_SUPPORT_MATRIX = {
-	typescript: {
-		events: EXTENSION_EVENT_NAMES,
-		payloadFields: {
-			session_start: ["type", "reason", "previousSessionFile", "signal"],
-			session_shutdown: ["type", "reason", "targetSessionFile", "signal"],
-			resources_discover: ["type", "cwd", "reason", "signal"],
-			session_before_switch: ["type", "reason", "targetSessionFile", "signal"],
-			session_before_fork: ["type", "entryId", "position", "signal"],
-		},
-		reasons: ["startup", "reload", "new", "resume", "fork"],
-		results: ["none", "cancellable", "resources"],
-		timeout: {
-			source: "ExtensionRunnerOptions.handlerTimeoutMs",
-			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
-			override: "per-runner",
-			abortSignal: true,
-			lateResults: "ignored",
-		},
-		shutdown: { supported: true, timeout: "same-handler-timeout", exactlyOnce: true },
-		unsupportedDiagnostics: true,
-	},
-	process_jsonl: {
-		events: EXTENSION_EVENT_NAMES,
-		payloadFields: {
-			session_start: ["type", "reason", "previousSessionFile"],
-			session_shutdown: ["type", "reason", "targetSessionFile"],
-			resources_discover: ["type", "cwd", "reason"],
-		},
-		reasons: ["startup", "reload", "new", "resume", "fork"],
-		results: ["none", "cancellable", "resources"],
-		timeout: {
-			source: "lifecycle-handler-timeout-ms",
-			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
-			override: "runtime-host",
-			abortSignal: false,
-			lateResults: "ignored",
-		},
-		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
-		unsupportedDiagnostics: true,
-	},
-	wasm: {
-		events: ["session_start", "session_shutdown", "resources_discover"],
-		payloadFields: {
-			session_start: ["type", "reason", "previousSessionFile"],
-			session_shutdown: ["type", "reason", "targetSessionFile"],
-			resources_discover: ["type", "cwd", "reason"],
-		},
-		reasons: ["startup", "reload", "new", "resume", "fork"],
-		results: ["none", "resources"],
-		timeout: {
-			source: "lifecycle-handler-timeout-ms",
-			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
-			override: "runtime-host",
-			abortSignal: false,
-			lateResults: "ignored",
-		},
-		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
-		unsupportedDiagnostics: false,
-	},
-	native: {
-		events: ["session_start", "session_shutdown", "resources_discover"],
-		payloadFields: {
-			session_start: ["type", "reason", "previousSessionFile"],
-			session_shutdown: ["type", "reason", "targetSessionFile"],
-			resources_discover: ["type", "cwd", "reason"],
-		},
-		reasons: ["startup", "reload", "new", "resume", "fork"],
-		results: ["none", "resources"],
-		timeout: {
-			source: "lifecycle-handler-timeout-ms",
-			defaultMs: DEFAULT_EXTENSION_HANDLER_TIMEOUT_MS,
-			override: "runtime-host",
-			abortSignal: false,
-			lateResults: "ignored",
-		},
-		shutdown: { supported: true, timeout: "runtime-shutdown-timeout", exactlyOnce: true },
-		unsupportedDiagnostics: false,
-	},
-} as const;
 
 // ============================================================================
 // Event Results
@@ -1245,10 +1082,6 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
-	/** @internal Returns this extension's canonical policy identity after loader source attribution. */
-	getExtensionIdentity(): TypeScriptExtensionIdentity;
-	/** @internal Returns the effective user/project policy snapshotted for this extension load. */
-	getExtensionPolicy(): ExtensionPolicy | undefined;
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1277,7 +1110,6 @@ export interface ExtensionAPI {
 	on(event: "before_agent_start", handler: ExtensionHandler<BeforeAgentStartEvent, BeforeAgentStartEventResult>): void;
 	on(event: "agent_start", handler: ExtensionHandler<AgentStartEvent>): void;
 	on(event: "agent_end", handler: ExtensionHandler<AgentEndEvent>): void;
-	on(event: "sub_agent_readiness", handler: ExtensionHandler<SubAgentReadinessEvent>): void;
 	on(event: "turn_start", handler: ExtensionHandler<TurnStartEvent>): void;
 	on(event: "turn_end", handler: ExtensionHandler<TurnEndEvent>): void;
 	on(event: "message_start", handler: ExtensionHandler<MessageStartEvent>): void;
@@ -1707,9 +1539,6 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	sourceInfo: SourceInfo;
-	identity: TypeScriptExtensionIdentity;
-	effectivePolicy?: ExtensionPolicy;
-	ownsSubAgentReservedNames?: boolean;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
@@ -1719,15 +1548,9 @@ export interface Extension {
 }
 
 /** Result of loading extensions. */
-export interface LoadExtensionError {
-	path: string;
-	error: string;
-	envelope?: DiagnosticEnvelopeV0;
-}
-
 export interface LoadExtensionsResult {
 	extensions: Extension[];
-	errors: LoadExtensionError[];
+	errors: Array<{ path: string; error: string }>;
 	/** Shared runtime - actions are throwing stubs until runner.initialize() */
 	runtime: ExtensionRuntime;
 }
@@ -1741,13 +1564,4 @@ export interface ExtensionError {
 	event: string;
 	error: string;
 	stack?: string;
-	phase?: string;
-	runtimeKind?: "typescript" | "process_jsonl" | "wasm" | "native" | "remote";
-	category?: string;
-	capability?: string;
-	operation?: string;
-	target?: unknown;
-	principal?: unknown;
-	extensionIdentity?: string;
-	envelope?: DiagnosticEnvelopeV0;
 }

@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseStreamingJson } from "../../packages/ai/src/utils/json-parse.js";
+import { parseStreamingJson } from "../../packages/ai/src/utils/json-parse.ts";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = dirname(scriptPath);

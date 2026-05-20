@@ -25,12 +25,12 @@
 import { writeFileSync } from "fs";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
-import { completeSimple, getEnvApiKey } from "../src/stream.js";
-import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.js";
-import { hasAzureOpenAICredentials } from "./azure-utils.js";
-import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.js";
-import { resolveApiKey } from "./oauth.js";
+import { getModel } from "../src/models.ts";
+import { completeSimple, getEnvApiKey } from "../src/stream.ts";
+import type { Api, AssistantMessage, Message, Model, Tool, ToolResultMessage } from "../src/types.ts";
+import { hasAzureOpenAICredentials } from "./azure-utils.ts";
+import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.ts";
+import { resolveApiKey } from "./oauth.ts";
 
 // Simple tool for testing
 const testToolSchema = Type.Object({
@@ -67,7 +67,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	{ provider: "openai", model: "gpt-5-mini", label: "openai-responses-gpt-5-mini" },
 	{ provider: "azure-openai-responses", model: "gpt-4o-mini", label: "azure-openai-responses-gpt-4o-mini" },
 	// OpenAI Codex
-	{ provider: "openai-codex", model: "gpt-5.2-codex", label: "openai-codex-gpt-5.2-codex" },
+	{ provider: "openai-codex", model: "gpt-5.5", label: "openai-codex-gpt-5.5" },
 	// GitHub Copilot
 	{ provider: "github-copilot", model: "claude-sonnet-4.5", label: "copilot-claude-sonnet-4.5" },
 	{ provider: "github-copilot", model: "gpt-5.1-codex", label: "copilot-gpt-5.1-codex" },
@@ -110,7 +110,7 @@ const PROVIDER_MODEL_PAIRS: ProviderModelPair[] = [
 	// Together AI
 	{ provider: "together", model: "moonshotai/Kimi-K2.6", label: "together-kimi-k2.6" },
 	// Kimi For Coding
-	{ provider: "kimi-coding", model: "kimi-for-coding", label: "kimi-coding-kimi-for-coding" },
+	{ provider: "kimi-coding", model: "kimi-k2-thinking", label: "kimi-coding-k2-thinking" },
 	// Mistral
 	{ provider: "mistral", model: "devstral-medium-latest", label: "mistral-devstral-medium" },
 	// MiniMax

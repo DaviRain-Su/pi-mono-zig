@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
-import { complete } from "../src/stream.js";
-import type { Api, Context, Model, StreamOptions } from "../src/types.js";
-import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.js";
-import { resolveApiKey } from "./oauth.js";
+import { getModel } from "../src/models.ts";
+import { complete } from "../src/stream.ts";
+import type { Api, Context, Model, StreamOptions } from "../src/types.ts";
+import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.ts";
+import { resolveApiKey } from "./oauth.ts";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -114,7 +114,7 @@ describe("responseId E2E Tests", () => {
 
 	describe("OpenAI Codex Provider", () => {
 		it.skipIf(!openaiCodexToken)("should expose responseId", { retry: 3, timeout: 30000 }, async () => {
-			const llm = getModel("openai-codex", "gpt-5.2-codex");
+			const llm = getModel("openai-codex", "gpt-5.5");
 			await expectResponseId(llm, { apiKey: openaiCodexToken });
 		});
 	});

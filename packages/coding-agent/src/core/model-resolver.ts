@@ -6,9 +6,9 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { type Api, type KnownProvider, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { minimatch } from "minimatch";
-import { isValidThinkingLevel } from "../cli/args.js";
-import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
-import type { ModelRegistry } from "./model-registry.js";
+import { isValidThinkingLevel } from "../cli/args.ts";
+import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
+import type { ModelRegistry } from "./model-registry.ts";
 
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
@@ -26,7 +26,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	xai: "grok-4.20-0309-reasoning",
 	groq: "openai/gpt-oss-120b",
 	cerebras: "zai-glm-4.7",
-	zai: "glm-4.7",
+	zai: "glm-5.1",
 	mistral: "devstral-medium-latest",
 	minimax: "MiniMax-M2.7",
 	"minimax-cn": "MiniMax-M2.7",
@@ -38,7 +38,6 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	opencode: "kimi-k2.6",
 	"opencode-go": "kimi-k2.6",
 	"kimi-coding": "kimi-for-coding",
-	"kimi-code-openai": "kimi-for-coding",
 	"cloudflare-workers-ai": "@cf/moonshotai/kimi-k2.6",
 	"cloudflare-ai-gateway": "workers-ai/@cf/moonshotai/kimi-k2.6",
 	xiaomi: "mimo-v2.5-pro",

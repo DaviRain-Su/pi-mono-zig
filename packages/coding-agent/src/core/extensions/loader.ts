@@ -13,48 +13,32 @@ import * as _bundledPiAi from "@earendil-works/pi-ai";
 import * as _bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
 import type { KeyId } from "@earendil-works/pi-tui";
 import * as _bundledPiTui from "@earendil-works/pi-tui";
-import { createJiti } from "jiti";
+import { createJiti } from "jiti/static";
 // Static imports of packages that extensions may use.
 // These MUST be static so Bun bundles them into the compiled binary.
 // The virtualModules option then makes them available to extensions.
 import * as _bundledTypebox from "typebox";
 import * as _bundledTypeboxCompile from "typebox/compile";
 import * as _bundledTypeboxValue from "typebox/value";
-import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.js";
+import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
-import * as _bundledPiCodingAgent from "../../index.js";
-import { attachDiagnosticEnvelope, createDiagnosticEnvelope } from "../diagnostics.js";
-import { createEventBus, type EventBus } from "../event-bus.js";
-import type { ExecOptions } from "../exec.js";
-import { execCommand } from "../exec.js";
-import {
-	assertExtensionGrant,
-	createTypeScriptExtensionIdentity,
-	type ExtensionPolicy,
-	type TypeScriptExtensionIdentity,
-} from "../extension-policy.js";
-import { createSyntheticSourceInfo, type SourceInfo } from "../source-info.js";
-import { hasWasmExtensionManifest } from "../wasm-extension-package.js";
-import {
-	assertSubAgentReservedNameAllowed,
-	isSubAgentExtensionFactory,
-	isSubAgentReservedName,
-} from "./subagent-reserved-names.js";
+import * as _bundledPiCodingAgent from "../../index.ts";
+import { createEventBus, type EventBus } from "../event-bus.ts";
+import type { ExecOptions } from "../exec.ts";
+import { execCommand } from "../exec.ts";
+import { createSyntheticSourceInfo } from "../source-info.ts";
 import type {
 	Extension,
 	ExtensionAPI,
-	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
-	LoadExtensionError,
 	LoadExtensionsResult,
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
-} from "./types.js";
-import { isExtensionEventName } from "./types.js";
+} from "./types.ts";
 
 /** Modules available to extensions via virtualModules (for compiled Bun binary) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
@@ -79,8 +63,8 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 const require = createRequire(import.meta.url);
 
 /**
- * Get aliases for jiti so extensions can import workspace packages and
- * typebox-compatible specifiers consistently.
+ * Get aliases for jiti (used in Node.js/development mode).
+ * In Bun binary mode, virtualModules is used instead.
  */
 let _aliases: Record<string, string> | null = null;
 
@@ -88,36 +72,26 @@ function getAliases(): Record<string, string> {
 	if (_aliases) return _aliases;
 
 	const __dirname = path.dirname(fileURLToPath(import.meta.url));
+	const packageIndex = path.resolve(__dirname, "../..", "index.js");
 
 	const typeboxEntry = require.resolve("typebox");
 	const typeboxCompileEntry = require.resolve("typebox/compile");
 	const typeboxValueEntry = require.resolve("typebox/value");
 
 	const packagesRoot = path.resolve(__dirname, "../../../../");
-	const resolveWorkspaceOrImport = (workspaceRelativePaths: string[], specifier: string): string => {
-		for (const workspaceRelativePath of workspaceRelativePaths) {
-			const workspacePath = path.join(packagesRoot, workspaceRelativePath);
-			if (fs.existsSync(workspacePath)) {
-				return workspacePath;
-			}
+	const resolveWorkspaceOrImport = (workspaceRelativePath: string, specifier: string): string => {
+		const workspacePath = path.join(packagesRoot, workspaceRelativePath);
+		if (fs.existsSync(workspacePath)) {
+			return workspacePath;
 		}
-		return require.resolve(specifier);
+		return fileURLToPath(import.meta.resolve(specifier));
 	};
 
-	const piCodingAgentEntry = resolveWorkspaceOrImport(
-		["coding-agent/dist/index.js", "coding-agent/src/index.ts"],
-		"@earendil-works/pi-coding-agent",
-	);
-	const piAgentCoreEntry = resolveWorkspaceOrImport(
-		["agent/dist/index.js", "agent/src/index.ts"],
-		"@earendil-works/pi-agent-core",
-	);
-	const piTuiEntry = resolveWorkspaceOrImport(["tui/dist/index.js", "tui/src/index.ts"], "@earendil-works/pi-tui");
-	const piAiEntry = resolveWorkspaceOrImport(["ai/dist/index.js", "ai/src/index.ts"], "@earendil-works/pi-ai");
-	const piAiOauthEntry = resolveWorkspaceOrImport(
-		["ai/dist/oauth.js", "ai/src/oauth.ts"],
-		"@earendil-works/pi-ai/oauth",
-	);
+	const piCodingAgentEntry = packageIndex;
+	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
+	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
+	const piAiEntry = resolveWorkspaceOrImport("ai/dist/index.js", "@earendil-works/pi-ai");
+	const piAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/pi-ai/oauth");
 
 	_aliases = {
 		"@earendil-works/pi-coding-agent": piCodingAgentEntry,
@@ -167,11 +141,6 @@ function resolvePath(extPath: string, cwd: string): string {
 }
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
-
-export interface LoadExtensionOptions {
-	resolveSourceInfo?: (request: { configuredPath: string; resolvedPath: string }) => SourceInfo | undefined;
-	resolveEffectivePolicy?: (identity: TypeScriptExtensionIdentity) => ExtensionPolicy | undefined;
-}
 
 /**
  * Create a runtime with throwing stubs for action methods.
@@ -225,33 +194,6 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	return runtime;
 }
 
-function createRevocableEventBus(eventBus: EventBus, assertActive: () => void): EventBus {
-	return {
-		emit(channel, data) {
-			assertActive();
-			eventBus.emit(channel, data);
-		},
-		on(channel, handler) {
-			assertActive();
-			let subscribed = true;
-			const unsubscribe = eventBus.on(channel, (data) => {
-				if (!subscribed) return;
-				try {
-					assertActive();
-				} catch {
-					return;
-				}
-				return handler(data);
-			});
-			return () => {
-				assertActive();
-				subscribed = false;
-				unsubscribe();
-			};
-		},
-	};
-}
-
 /**
  * Create the ExtensionAPI for an extension.
  * Registration methods write to the extension object.
@@ -263,25 +205,10 @@ function createExtensionAPI(
 	cwd: string,
 	eventBus: EventBus,
 ): ExtensionAPI {
-	const assertGrant = (capability: Parameters<typeof assertExtensionGrant>[2], operation: string, target?: unknown) =>
-		assertExtensionGrant(extension.identity, extension.effectivePolicy, capability, operation, target);
 	const api = {
-		getExtensionIdentity() {
-			runtime.assertActive();
-			return extension.identity;
-		},
-
-		getExtensionPolicy() {
-			runtime.assertActive();
-			return extension.effectivePolicy;
-		},
-
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
 			runtime.assertActive();
-			if (typeof event !== "string" || !isExtensionEventName(event)) {
-				throw new Error(`Unknown extension event "${String(event)}". Supported events: use ExtensionEventName.`);
-			}
 			const list = extension.handlers.get(event) ?? [];
 			list.push(handler);
 			extension.handlers.set(event, list);
@@ -289,7 +216,6 @@ function createExtensionAPI(
 
 		registerTool(tool: ToolDefinition): void {
 			runtime.assertActive();
-			assertSubAgentReservedNameAllowed(tool.name, extension.ownsSubAgentReservedNames, "register");
 			extension.tools.set(tool.name, {
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
@@ -299,7 +225,6 @@ function createExtensionAPI(
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
 			runtime.assertActive();
-			assertSubAgentReservedNameAllowed(name, extension.ownsSubAgentReservedNames, "register");
 			extension.commands.set(name, {
 				name,
 				sourceInfo: extension.sourceInfo,
@@ -311,7 +236,7 @@ function createExtensionAPI(
 			shortcut: KeyId,
 			options: {
 				description?: string;
-				handler: (ctx: ExtensionContext) => Promise<void> | void;
+				handler: (ctx: import("./types.ts").ExtensionContext) => Promise<void> | void;
 			},
 		): void {
 			runtime.assertActive();
@@ -331,7 +256,6 @@ function createExtensionAPI(
 
 		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
 			runtime.assertActive();
-			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "register");
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
 		},
 
@@ -345,34 +269,21 @@ function createExtensionAPI(
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			runtime.assertActive();
-			const customType = String(message.customType);
-			const isSubAgentReserved = isSubAgentReservedName(customType);
-			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "write");
-			if (!isSubAgentReserved) {
-				assertGrant("session.write", "send_message");
-			}
 			runtime.sendMessage(message, options);
 		},
 
 		sendUserMessage(content, options): void {
 			runtime.assertActive();
-			assertGrant("session.write", "send_user_message");
 			runtime.sendUserMessage(content, options);
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
 			runtime.assertActive();
-			const isSubAgentReserved = isSubAgentReservedName(customType);
-			assertSubAgentReservedNameAllowed(customType, extension.ownsSubAgentReservedNames, "write");
-			if (!isSubAgentReserved) {
-				assertGrant("session.write", "append_entry", { customType });
-			}
 			runtime.appendEntry(customType, data);
 		},
 
 		setSessionName(name: string): void {
 			runtime.assertActive();
-			assertGrant("session.write", "set_session_name");
 			runtime.setSessionName(name);
 		},
 
@@ -383,19 +294,11 @@ function createExtensionAPI(
 
 		setLabel(entryId: string, label: string | undefined): void {
 			runtime.assertActive();
-			assertGrant("session.write", "set_label", { entryId });
 			runtime.setLabel(entryId, label);
 		},
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			runtime.assertActive();
-			assertGrant("shell.run", "exec", { command });
-			if (typeof command !== "string" || command.length === 0) {
-				throw new Error("exec command must be a non-empty string");
-			}
-			if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
-				throw new Error("exec args must be a string array");
-			}
 			return execCommand(command, args, options?.cwd ?? cwd, options);
 		},
 
@@ -411,7 +314,6 @@ function createExtensionAPI(
 
 		setActiveTools(toolNames: string[]): void {
 			runtime.assertActive();
-			assertGrant("tool.use", "set_active_tools");
 			runtime.setActiveTools(toolNames);
 		},
 
@@ -422,7 +324,6 @@ function createExtensionAPI(
 
 		setModel(model) {
 			runtime.assertActive();
-			assertGrant("model.call", "set_model", { provider: model.provider, id: model.id });
 			return runtime.setModel(model);
 		},
 
@@ -433,23 +334,20 @@ function createExtensionAPI(
 
 		setThinkingLevel(level) {
 			runtime.assertActive();
-			assertGrant("model.call", "set_thinking_level");
 			runtime.setThinkingLevel(level);
 		},
 
 		registerProvider(name: string, config: ProviderConfig) {
 			runtime.assertActive();
-			assertGrant("model.call", "register_provider", { provider: name });
 			runtime.registerProvider(name, config, extension.path);
 		},
 
 		unregisterProvider(name: string) {
 			runtime.assertActive();
-			assertGrant("model.call", "unregister_provider", { provider: name });
 			runtime.unregisterProvider(name, extension.path);
 		},
 
-		events: createRevocableEventBus(eventBus, () => runtime.assertActive()),
+		events: eventBus,
 	} as ExtensionAPI;
 
 	return api;
@@ -458,9 +356,9 @@ function createExtensionAPI(
 async function loadExtensionModule(extensionPath: string) {
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false,
-		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution).
-		// Also disable tryNative so jiti handles all imports, not just the entry point.
-		// In Node.js/dev: use aliases to resolve to workspace or node_modules paths.
+		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
+		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
+		// In Node.js/dev: use aliases to resolve to node_modules paths
 		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
 	});
 
@@ -472,25 +370,17 @@ async function loadExtensionModule(extensionPath: string) {
 /**
  * Create an Extension object with empty collections.
  */
-function createExtension(
-	extensionPath: string,
-	resolvedPath: string,
-	options?: { sourceInfo?: SourceInfo; effectivePolicy?: ExtensionPolicy; ownsSubAgentReservedNames?: boolean },
-): Extension {
+function createExtension(extensionPath: string, resolvedPath: string): Extension {
 	const source =
 		extensionPath.startsWith("<") && extensionPath.endsWith(">")
 			? extensionPath.slice(1, -1).split(":")[0] || "temporary"
 			: "local";
 	const baseDir = extensionPath.startsWith("<") ? undefined : path.dirname(resolvedPath);
 
-	const sourceInfo = options?.sourceInfo ?? createSyntheticSourceInfo(extensionPath, { source, baseDir });
 	return {
 		path: extensionPath,
 		resolvedPath,
-		sourceInfo,
-		identity: createTypeScriptExtensionIdentity({ configuredPath: extensionPath, resolvedPath, sourceInfo }),
-		effectivePolicy: options?.effectivePolicy,
-		ownsSubAgentReservedNames: options?.ownsSubAgentReservedNames,
+		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
 		tools: new Map(),
 		messageRenderers: new Map(),
@@ -505,53 +395,24 @@ async function loadExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
-	options?: LoadExtensionOptions,
-): Promise<{ extension: Extension | null; error: LoadExtensionError | null }> {
+): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 
 	try {
-		const sourceInfo = options?.resolveSourceInfo?.({ configuredPath: extensionPath, resolvedPath });
 		const factory = await loadExtensionModule(resolvedPath);
 		if (!factory) {
-			return {
-				extension: null,
-				error: createLoadExtensionError(
-					extensionPath,
-					`Extension does not export a valid factory function: ${extensionPath}`,
-				),
-			};
+			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
-		const extension = createExtension(extensionPath, resolvedPath, {
-			sourceInfo,
-			ownsSubAgentReservedNames: isSubAgentExtensionFactory(factory),
-		});
-		extension.effectivePolicy = options?.resolveEffectivePolicy?.(extension.identity);
 
+		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 		await factory(api);
 
 		return { extension, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return {
-			extension: null,
-			error: createLoadExtensionError(extensionPath, `Failed to load extension: ${message}`),
-		};
+		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
-}
-
-function createLoadExtensionError(extensionPath: string, message: string): LoadExtensionError {
-	const envelope = createDiagnosticEnvelope({
-		severity: "error",
-		phase: "load",
-		runtimeKind: "typescript",
-		category: "extension_load_failed",
-		message,
-		recoveryHint: "Fix or remove the extension, then reload extensions.",
-		source: { path: extensionPath },
-		path: extensionPath,
-	});
-	return attachDiagnosticEnvelope({ path: extensionPath, error: envelope.message }, envelope);
 }
 
 /**
@@ -563,12 +424,8 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	extensionPath = "<inline>",
-	effectivePolicy?: ExtensionPolicy,
 ): Promise<Extension> {
-	const extension = createExtension(extensionPath, extensionPath, {
-		effectivePolicy,
-		ownsSubAgentReservedNames: isSubAgentExtensionFactory(factory),
-	});
+	const extension = createExtension(extensionPath, extensionPath);
 	const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 	await factory(api);
 	return extension;
@@ -577,22 +434,17 @@ export async function loadExtensionFromFactory(
 /**
  * Load extensions from paths.
  */
-export async function loadExtensions(
-	paths: string[],
-	cwd: string,
-	eventBus?: EventBus,
-	options?: LoadExtensionOptions,
-): Promise<LoadExtensionsResult> {
+export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
-	const errors: LoadExtensionError[] = [];
+	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
 
 	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime, options);
+		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push(error);
+			errors.push({ path: extPath, error });
 			continue;
 		}
 
@@ -642,10 +494,6 @@ function isExtensionFile(name: string): boolean {
  * Returns resolved paths or null if no entry points found.
  */
 function resolveExtensionEntries(dir: string): string[] | null {
-	if (hasWasmExtensionManifest(dir)) {
-		return null;
-	}
-
 	// Check for package.json with "pi" field first
 	const packageJsonPath = path.join(dir, "package.json");
 	if (fs.existsSync(packageJsonPath)) {
@@ -689,9 +537,6 @@ function resolveExtensionEntries(dir: string): string[] | null {
  */
 function discoverExtensionsInDir(dir: string): string[] {
 	if (!fs.existsSync(dir)) {
-		return [];
-	}
-	if (hasWasmExtensionManifest(dir)) {
 		return [];
 	}
 
@@ -758,9 +603,6 @@ export async function discoverAndLoadExtensions(
 	for (const p of configuredPaths) {
 		const resolved = resolvePath(p, cwd);
 		if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-			if (hasWasmExtensionManifest(resolved)) {
-				continue;
-			}
 			// Check for package.json with pi manifest or index.ts
 			const entries = resolveExtensionEntries(resolved);
 			if (entries) {

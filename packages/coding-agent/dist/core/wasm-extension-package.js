@@ -1,0 +1,409 @@
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
+export const WASM_EXTENSION_MANIFEST_NAME = "pi-extension.json";
+export const WASM_EXTENSION_SCHEMA_VERSION = "pi-extension.v0";
+export const WASM_DENIED_CAPABILITY_CATEGORY = "denied_capability";
+export const WASM_CANONICAL_SECURITY_GRANTS = [
+    "file.read",
+    "file.write",
+    "network.request",
+    "shell.run",
+    "env.read",
+    "model.call",
+    "session.read",
+    "session.write",
+    "ui.notify",
+    "tool.use",
+    "agent.spawn",
+    "agent.delegate",
+];
+export const WASM_CANONICAL_CAPABILITIES = WASM_CANONICAL_SECURITY_GRANTS;
+const SECURITY_GRANTS = new Set(WASM_CANONICAL_SECURITY_GRANTS);
+const RESOURCE_LIMIT_FIELDS = new Set([
+    "maxChildren",
+    "depth",
+    "turns",
+    "timeoutMs",
+    "outputBytes",
+    "outputLines",
+    "toolScopes",
+]);
+const UNSUPPORTED_SURFACE_FIELDS = [
+    "commands",
+    "widgets",
+    "providers",
+    "editorHooks",
+    "extensions",
+    "shortcuts",
+    "themes",
+    "prompts",
+    "skills",
+];
+const UNSUPPORTED_TRUST_PRODUCT_FIELDS = new Set([
+    "signature",
+    "signing",
+    "publisher",
+    "marketplace",
+    "approvalUi",
+    "approvalPolicy",
+    "remoteUrl",
+    "remoteWasmUrl",
+    "workflow",
+    "workflowPreset",
+    "wiki",
+    "wikiPreset",
+    "qa",
+    "qaPreset",
+    "review",
+    "reviewPreset",
+    "spawn",
+    "spawnPolicy",
+    "automaticSpawn",
+    "orchestrationPolicy",
+    "modelSelectionUi",
+    "ui",
+    "ux",
+    "slashCommand",
+]);
+export class WasmExtensionCapabilityDenialError extends Error {
+    details;
+    constructor(message, details) {
+        super(message);
+        this.name = "WasmExtensionCapabilityDenialError";
+        this.details = details;
+    }
+}
+function toPolicyPath(value) {
+    return value.replace(/\\/g, "/");
+}
+export function hasWasmExtensionManifest(packageRoot) {
+    return existsSync(join(packageRoot, WASM_EXTENSION_MANIFEST_NAME));
+}
+export function validateWasmExtensionPackage(packageRoot, options = {}) {
+    const request = readWasmExtensionPackagePolicyRequest(packageRoot);
+    const approvedCapabilities = options.resolveApprovedCapabilities?.(request) ?? options.approvedCapabilities ?? [];
+    denyRequestedCapabilities(request, approvedCapabilities);
+    const artifactAbsolutePath = validateArtifactPath(packageRoot, request.artifactPath);
+    const artifactSha256 = createHash("sha256").update(readFileSync(artifactAbsolutePath)).digest("hex");
+    return {
+        kind: "wasm-extension",
+        packageRoot: realpathSync(packageRoot),
+        manifestPath: request.manifestPath,
+        policyLookupKey: createManifestPolicyLookupKey(request),
+        schemaVersion: request.schemaVersion,
+        id: request.id,
+        name: request.name,
+        version: request.version,
+        description: request.description,
+        artifactKind: "wasm-component",
+        artifactPath: request.artifactPath,
+        artifactAbsolutePath,
+        artifactSha256,
+        toolId: request.toolId,
+        toolDescription: request.toolDescription,
+        capabilities: request.capabilities,
+        resourceLimits: request.resourceLimits,
+    };
+}
+export function readWasmExtensionPackagePolicyRequest(packageRoot) {
+    const manifestPath = join(packageRoot, WASM_EXTENSION_MANIFEST_NAME);
+    let parsed;
+    try {
+        parsed = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    }
+    catch (error) {
+        if (!existsSync(manifestPath)) {
+            throw new Error("discover: pi-extension.json was not found");
+        }
+        throw new Error(`$: malformed JSON${messageSuffix(error)}`);
+    }
+    const root = expectObject(parsed, "$");
+    const schemaVersion = requiredString(root, "$", "schemaVersion");
+    if (schemaVersion !== WASM_EXTENSION_SCHEMA_VERSION) {
+        throw new Error(`$.schemaVersion: unsupported schema version "${schemaVersion}"; expected ${WASM_EXTENSION_SCHEMA_VERSION}`);
+    }
+    const unsupportedTrustProductPath = scanUnsupportedTrustProductSurface(root, "$");
+    if (unsupportedTrustProductPath) {
+        throw new Error(`${unsupportedTrustProductPath}: unsupported v0 trust/product surface`);
+    }
+    const id = requiredString(root, "$", "id");
+    const name = requiredString(root, "$", "name");
+    const version = requiredString(root, "$", "version");
+    const description = requiredString(root, "$", "description");
+    const artifact = requiredObject(root, "$", "artifact");
+    const artifactKind = requiredString(artifact, "$.artifact", "kind");
+    if (artifactKind !== "wasm-component") {
+        throw new Error(`$.artifact.kind: unsupported artifact kind "${artifactKind}"; expected wasm-component`);
+    }
+    const artifactPath = requiredString(artifact, "$.artifact", "path");
+    if (Object.hasOwn(root, "tools")) {
+        throw new Error("$.tools: v0 manifests must declare exactly one tool in $.tool");
+    }
+    const tool = requiredObject(root, "$", "tool");
+    const toolId = requiredString(tool, "$.tool", "id");
+    const toolDescription = requiredString(tool, "$.tool", "description");
+    requiredObject(tool, "$.tool", "inputSchema");
+    requiredObject(tool, "$.tool", "outputSchema");
+    for (const field of UNSUPPORTED_SURFACE_FIELDS) {
+        if (Object.hasOwn(root, field)) {
+            throw new Error(`$.${field}: unsupported v0 surface; only $.tool is supported`);
+        }
+    }
+    const capabilities = readCapabilities(root);
+    const resourceLimits = readResourceLimits(root);
+    return {
+        manifestPath,
+        policyLookupKey: createManifestPolicyLookupKey({
+            packageRoot,
+            manifestPath,
+            schemaVersion,
+            id,
+            version,
+            artifactPath,
+        }),
+        schemaVersion,
+        id,
+        name,
+        version,
+        description,
+        artifactPath,
+        toolId,
+        toolDescription,
+        capabilities,
+        resourceLimits,
+        packageRoot,
+    };
+}
+function createManifestPolicyLookupKey(request) {
+    return `wasm:manifest:${request.schemaVersion}:${request.id}:${request.version}:${toPolicyPath(request.packageRoot)}:${toPolicyPath(request.manifestPath)}:${toPolicyPath(request.artifactPath)}`;
+}
+function messageSuffix(error) {
+    return error instanceof Error && error.message ? `: ${error.message}` : "";
+}
+function expectObject(value, path) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(`${path}: expected object`);
+    }
+    return value;
+}
+function requiredValue(object, parentPath, field) {
+    if (!Object.hasOwn(object, field)) {
+        throw new Error(`${parentPath}.${field}: missing required field`);
+    }
+    return object[field];
+}
+function requiredString(object, parentPath, field) {
+    const value = requiredValue(object, parentPath, field);
+    if (typeof value !== "string") {
+        throw new Error(`${parentPath}.${field}: expected string`);
+    }
+    return value;
+}
+function requiredObject(object, parentPath, field) {
+    return expectObject(requiredValue(object, parentPath, field), `${parentPath}.${field}`);
+}
+function scanUnsupportedTrustProductSurface(value, path) {
+    if (value === null || typeof value !== "object") {
+        return undefined;
+    }
+    if (Array.isArray(value)) {
+        for (const [index, entry] of value.entries()) {
+            const nested = scanUnsupportedTrustProductSurface(entry, `${path}[${index}]`);
+            if (nested)
+                return nested;
+        }
+        return undefined;
+    }
+    for (const [key, entry] of Object.entries(value)) {
+        const fieldPath = `${path}.${key}`;
+        if (UNSUPPORTED_TRUST_PRODUCT_FIELDS.has(key)) {
+            return fieldPath;
+        }
+        const nested = scanUnsupportedTrustProductSurface(entry, fieldPath);
+        if (nested)
+            return nested;
+    }
+    return undefined;
+}
+function readCapabilities(root) {
+    const value = root.capabilities;
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value)) {
+        throw new Error("$.capabilities: expected array");
+    }
+    return value.map((capability, index) => {
+        if (typeof capability !== "string") {
+            throw new Error(`$.capabilities[${index}]: expected string`);
+        }
+        if (!SECURITY_GRANTS.has(capability)) {
+            throw new Error(`$.capabilities[${index}]: unknown capability "${capability}"`);
+        }
+        return capability;
+    });
+}
+function readResourceLimits(root) {
+    const value = root.resourceLimits;
+    if (value === undefined)
+        return { toolScopes: [] };
+    const limits = expectObject(value, "$.resourceLimits");
+    for (const field of Object.keys(limits)) {
+        if (!RESOURCE_LIMIT_FIELDS.has(field)) {
+            throw new Error(`$.resourceLimits.${field}: unsupported resource limit`);
+        }
+    }
+    return {
+        maxChildren: optionalResourceLimitInteger(limits, "$.resourceLimits", "maxChildren"),
+        depth: optionalResourceLimitInteger(limits, "$.resourceLimits", "depth"),
+        turns: optionalResourceLimitInteger(limits, "$.resourceLimits", "turns"),
+        timeoutMs: optionalResourceLimitInteger(limits, "$.resourceLimits", "timeoutMs"),
+        outputBytes: optionalResourceLimitInteger(limits, "$.resourceLimits", "outputBytes"),
+        outputLines: optionalResourceLimitInteger(limits, "$.resourceLimits", "outputLines"),
+        toolScopes: readToolScopes(limits),
+    };
+}
+function optionalResourceLimitInteger(object, parentPath, field) {
+    const value = object[field];
+    if (value === undefined)
+        return undefined;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`${parentPath}.${field}: expected non-negative integer`);
+    }
+    return value;
+}
+function readToolScopes(limits) {
+    const value = limits.toolScopes;
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value)) {
+        throw new Error("$.resourceLimits.toolScopes: expected array");
+    }
+    return value.map((scope, index) => {
+        if (typeof scope !== "string") {
+            throw new Error(`$.resourceLimits.toolScopes[${index}]: expected string`);
+        }
+        if (scope.length === 0) {
+            throw new Error(`$.resourceLimits.toolScopes[${index}]: must not be empty`);
+        }
+        return scope;
+    });
+}
+function denyRequestedCapabilities(request, approvedCapabilities) {
+    const approved = new Set(approvedCapabilities);
+    for (const [index, capability] of request.capabilities.entries()) {
+        if (approved.has(capability)) {
+            continue;
+        }
+        const path = `$.capabilities[${index}]`;
+        const message = `${path}: ${WASM_DENIED_CAPABILITY_CATEGORY}: capability "${capability}" is not approved for manifest-request`;
+        throw new WasmExtensionCapabilityDenialError(message, {
+            category: WASM_DENIED_CAPABILITY_CATEGORY,
+            capability,
+            operation: capability,
+            branch: wasmCapabilityBranch(capability),
+            phase: "validate",
+            mode: "manifest-request",
+            reason: "grant is not approved",
+            path,
+            principal: {
+                runtimeKind: "wasm",
+                extensionId: request.id,
+                policyLookupKey: request.policyLookupKey,
+                toolId: request.toolId,
+            },
+            source: {
+                manifestPath: request.manifestPath,
+                packageRoot: request.packageRoot,
+                artifactPath: request.artifactPath,
+            },
+        });
+    }
+}
+function wasmCapabilityBranch(capability) {
+    switch (capability) {
+        case "file.read":
+            return "filesystem.read";
+        case "file.write":
+            return "filesystem.write";
+        case "network.request":
+            return "network.request";
+        case "shell.run":
+            return "shell.process";
+        case "env.read":
+            return "environment.variable";
+        case "model.call":
+            return "model.call";
+        case "session.read":
+            return "session.read";
+        case "session.write":
+            return "session.write";
+        case "ui.notify":
+            return "ui.notification";
+        case "tool.use":
+            return "tool.execution";
+        case "agent.spawn":
+            return "agent.spawn";
+        case "agent.delegate":
+            return "agent.delegate";
+        default:
+            return capability;
+    }
+}
+function validateArtifactPath(packageRoot, artifactPath) {
+    if (artifactPath.length === 0) {
+        throw new Error("$.artifact.path: artifact path must not be empty");
+    }
+    if (isAbsolute(artifactPath)) {
+        throw new Error("$.artifact.path: artifact path must be package-relative");
+    }
+    if (artifactPath.includes("\\")) {
+        throw new Error("$.artifact.path: artifact path must use '/' separators");
+    }
+    if (!artifactPath.endsWith(".wasm")) {
+        throw new Error("$.artifact.path: artifact path must point to a .wasm file");
+    }
+    for (const component of artifactPath.split("/")) {
+        if (!component || component === ".") {
+            throw new Error("$.artifact.path: artifact path must be normalized");
+        }
+        if (component === "..") {
+            throw new Error("$.artifact.path: artifact path escapes package root");
+        }
+    }
+    let rootReal;
+    try {
+        rootReal = realpathSync(packageRoot);
+    }
+    catch {
+        throw new Error("$: package root was not found");
+    }
+    const candidate = resolve(rootReal, artifactPath);
+    if (!isWithin(rootReal, candidate)) {
+        throw new Error("$.artifact.path: artifact path escapes package root");
+    }
+    let artifactReal;
+    try {
+        artifactReal = realpathSync(candidate);
+    }
+    catch {
+        throw new Error("$.artifact.path: artifact file was not found");
+    }
+    if (!isWithin(rootReal, artifactReal)) {
+        throw new Error("$.artifact.path: artifact path resolves outside package root");
+    }
+    if (!statSync(artifactReal).isFile()) {
+        throw new Error("$.artifact.path: artifact path must point to a file");
+    }
+    const bytes = readFileSync(artifactReal);
+    if (bytes.length < 4 || bytes[0] !== 0x00 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) {
+        throw new Error("$.artifact.path: artifact file is not a valid Wasm binary");
+    }
+    return artifactReal;
+}
+function isWithin(root, candidate) {
+    const rel = relative(root, candidate);
+    const firstComponent = rel.split(/[\\/]/)[0];
+    return rel === "" || (firstComponent !== ".." && !isAbsolute(rel));
+}
+//# sourceMappingURL=wasm-extension-package.js.map

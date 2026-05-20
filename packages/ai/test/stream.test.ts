@@ -4,17 +4,17 @@ import { dirname, join } from "path";
 import { Type } from "typebox";
 import { fileURLToPath } from "url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
-import { complete, stream } from "../src/stream.js";
-import type { Api, Context, ImageContent, Model, StreamOptions, Tool, ToolResultMessage } from "../src/types.js";
+import { getModel } from "../src/models.ts";
+import { complete, stream } from "../src/stream.ts";
+import type { Api, Context, ImageContent, Model, StreamOptions, Tool, ToolResultMessage } from "../src/types.ts";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
-import { StringEnum } from "../src/utils/typebox-helpers.js";
-import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.js";
-import { hasBedrockCredentials } from "./bedrock-utils.js";
-import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.js";
-import { resolveApiKey } from "./oauth.js";
+import { StringEnum } from "../src/utils/typebox-helpers.ts";
+import { hasAzureOpenAICredentials, resolveAzureDeploymentName } from "./azure-utils.ts";
+import { hasBedrockCredentials } from "./bedrock-utils.ts";
+import { hasCloudflareAiGatewayCredentials, hasCloudflareWorkersAICredentials } from "./cloudflare-utils.ts";
+import { resolveApiKey } from "./oauth.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -995,9 +995,9 @@ describe("Generate E2E Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)(
-		"Kimi For Coding Provider (kimi-for-coding via Anthropic Messages)",
+		"Kimi For Coding Provider (kimi-k2-thinking via Anthropic Messages)",
 		() => {
-			const llm = getModel("kimi-coding", "kimi-for-coding");
+			const llm = getModel("kimi-coding", "kimi-k2-thinking");
 
 			it("should complete basic text generation", { retry: 3 }, async () => {
 				await basicTextGeneration(llm);
