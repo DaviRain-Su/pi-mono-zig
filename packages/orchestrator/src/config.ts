@@ -14,6 +14,10 @@ export function getOrchestratorDir(): string {
 	return join(piDir, "orchestrator");
 }
 
+export function getAuthPath(): string {
+	return join(getOrchestratorDir(), "auth.json");
+}
+
 export function getMachinePath(): string {
 	return join(getOrchestratorDir(), "machine.json");
 }
