@@ -1312,11 +1312,41 @@ fn updateUsage(usage: *types.Usage, usage_value: std.json.Value) void {
     const ct = getJsonU32(usage_value.object.get("completion_tokens"));
     const tt = getJsonU32(usage_value.object.get("total_tokens"));
 
-    usage.input = pt;
+    // Extract cached prompt tokens from various possible field locations.
+    const cached = getMistralCachedPromptTokens(usage_value, pt);
+
+    usage.input = if (pt > cached) pt - cached else 0;
     usage.output = ct;
-    usage.cache_read = 0;
+    usage.cache_read = cached;
     usage.cache_write = 0;
-    usage.total_tokens = if (tt > 0) tt else pt + ct;
+    usage.total_tokens = if (tt > 0) tt else usage.input + ct + cached;
+}
+
+fn getMistralCachedPromptTokens(usage_value: std.json.Value, prompt_tokens: u32) u32 {
+    // Try nested objects: promptTokensDetails.cachedTokens, prompt_tokens_details.cached_tokens, etc.
+    const candidates = [_]struct { outer: []const u8, inner: []const u8 }{
+        .{ .outer = "promptTokensDetails", .inner = "cachedTokens" },
+        .{ .outer = "prompt_tokens_details", .inner = "cached_tokens" },
+        .{ .outer = "promptTokenDetails", .inner = "cachedTokens" },
+        .{ .outer = "prompt_token_details", .inner = "cached_tokens" },
+    };
+    for (candidates) |c| {
+        if (usage_value.object.get(c.outer)) |outer| {
+            if (outer == .object) {
+                if (outer.object.get(c.inner)) |val| {
+                    if (val == .integer) return @min(prompt_tokens, @as(u32, @intCast(val.integer)));
+                }
+            }
+        }
+    }
+    // Try flat fields: numCachedTokens, num_cached_tokens.
+    if (usage_value.object.get("numCachedTokens")) |val| {
+        if (val == .integer) return @min(prompt_tokens, @as(u32, @intCast(val.integer)));
+    }
+    if (usage_value.object.get("num_cached_tokens")) |val| {
+        if (val == .integer) return @min(prompt_tokens, @as(u32, @intCast(val.integer)));
+    }
+    return 0;
 }
 
 fn modelSupportsImages(model: types.Model) bool {

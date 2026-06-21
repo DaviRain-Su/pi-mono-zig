@@ -258,6 +258,7 @@ pub fn buildAssistantMessageValue(
     allocator: std.mem.Allocator,
     assistant: types.AssistantMessage,
     is_oauth: bool,
+    allow_empty_signature: bool,
 ) !std.json.Value {
     var content = std.json.Array.init(allocator);
     errdefer deinitJsonArrayItems(allocator, &content);
@@ -276,6 +277,8 @@ pub fn buildAssistantMessageValue(
                 }
                 if (signature) |value| {
                     try content.append(try buildThinkingBlockObject(allocator, thinking.thinking, value));
+                } else if (allow_empty_signature) {
+                    try content.append(try buildThinkingBlockObject(allocator, thinking.thinking, ""));
                 } else {
                     try content.append(try buildTextBlockObject(allocator, thinking.thinking, null));
                 }
@@ -371,6 +374,7 @@ pub fn buildMessagesValue(
     tools: ?[]const types.Tool,
     is_oauth: bool,
     cache_control: ?std.json.Value,
+    allow_empty_signature: bool,
 ) !std.json.Value {
     var array = std.json.Array.init(allocator);
     errdefer deinitJsonArrayItems(allocator, &array);
@@ -381,7 +385,7 @@ pub fn buildMessagesValue(
             .user => |user| try array.append(try buildUserMessageValue(allocator, user)),
             .assistant => |assistant| {
                 if (types.shouldReplayAssistantInProviderContext(assistant)) {
-                    try array.append(try buildAssistantMessageValue(allocator, assistant, is_oauth));
+                    try array.append(try buildAssistantMessageValue(allocator, assistant, is_oauth, allow_empty_signature));
                 }
             },
             .tool_result => {

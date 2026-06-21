@@ -301,7 +301,7 @@ fn buildOwnedAnthropic(
         system_owned = v;
     }
 
-    const messages_value = try buildMessagesValue(allocator, context.messages, context.tools, is_oauth, cache_control);
+    const messages_value = try buildMessagesValue(allocator, context.messages, context.tools, is_oauth, cache_control, compat.allow_empty_signature);
     try owned_values_list.append(allocator, messages_value);
 
     var tools_owned: ?std.json.Value = null;
@@ -3143,8 +3143,9 @@ fn buildMessagesValue(
     tools: ?[]const types.Tool,
     is_oauth: bool,
     cache_control: ?std.json.Value,
+    allow_empty_signature: bool,
 ) !std.json.Value {
-    return anthropic_json.buildMessagesValue(allocator, messages, tools, is_oauth, cache_control);
+    return anthropic_json.buildMessagesValue(allocator, messages, tools, is_oauth, cache_control, allow_empty_signature);
 }
 
 fn buildUserMessageValue(allocator: std.mem.Allocator, user: types.UserMessage) !std.json.Value {
@@ -3155,8 +3156,9 @@ fn buildAssistantMessageValue(
     allocator: std.mem.Allocator,
     assistant: types.AssistantMessage,
     is_oauth: bool,
+    allow_empty_signature: bool,
 ) !std.json.Value {
-    return anthropic_json.buildAssistantMessageValue(allocator, assistant, is_oauth);
+    return anthropic_json.buildAssistantMessageValue(allocator, assistant, is_oauth, allow_empty_signature);
 }
 
 fn buildToolResultUserMessageValue(
