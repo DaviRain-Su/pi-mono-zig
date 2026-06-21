@@ -841,7 +841,7 @@ interface BindExtensionsOptions {
 
 class FixtureSession {
 	readonly scenario: RuntimeScenario;
-	readonly agent = { waitForIdle: async () => {} };
+	readonly agent = { waitForIdle: async () => {}, subscribe: () => () => {} };
 	readonly sessionManager = { getLeafId: () => "entry_fixture_1" };
 	readonly modelRegistry = {
 		getAvailable: async () => [model],

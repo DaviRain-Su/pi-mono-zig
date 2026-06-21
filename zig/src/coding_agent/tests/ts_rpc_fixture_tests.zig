@@ -137,7 +137,7 @@ test "TS RPC response fixtures preserve parse and unsupported-command schema err
     );
     try expectContains(
         bytes,
-        "{\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
+        "{\"id\":\"mystery\",\"type\":\"response\",\"command\":\"mystery_command\",\"success\":false,\"error\":\"Unknown command: mystery_command\"}\n",
     );
     try std.testing.expect(std.mem.indexOf(u8, bytes, "mystery_command") != null);
 }
