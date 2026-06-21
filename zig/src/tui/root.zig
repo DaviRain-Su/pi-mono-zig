@@ -15,9 +15,10 @@ pub const test_helpers = vw.test_helpers;
 pub const cell_rows = @import("cell_rows.zig");
 pub const style = @import("style.zig");
 pub const terminal = @import("terminal.zig");
+pub const terminal_capabilities = @import("terminal_capabilities.zig");
+pub const terminal_osc = @import("terminal_osc.zig");
 pub const theme = @import("theme.zig");
 pub const tui = @import("tui.zig");
-pub const visual_parity = @import("visual_parity.zig");
 
 // Components: generic ones from vaxis-widgets, pi-specific ones local
 pub const components = struct {
@@ -108,8 +109,10 @@ pub const KeybindingsManager = keybindings.KeybindingsManager;
 pub const KillRing = kill_ring.KillRing;
 pub const StdinBuffer = stdin_buffer.StdinBuffer;
 pub const TerminalCapabilities = terminal_image.TerminalCapabilities;
-pub const TerminalImageDimensions = terminal_image.ImageDimensions;
+pub const TerminalFeatures = terminal_capabilities.TerminalFeatures;
+pub const TerminalFlavor = terminal_capabilities.TerminalFlavor;
 pub const ImageProtocol = terminal_image.ImageProtocol;
+pub const TerminalCapabilityImageProtocol = terminal_capabilities.ImageProtocol;
 
 // Widget re-exports
 pub const Text = vw.Text;
@@ -231,9 +234,10 @@ test {
     _ = @import("cell_rows.zig");
     _ = @import("style.zig");
     _ = @import("terminal.zig");
+    _ = @import("terminal_capabilities.zig");
+    _ = @import("terminal_osc.zig");
     _ = @import("theme.zig");
     _ = @import("tui.zig");
-    _ = @import("visual_parity.zig");
     _ = @import("autocomplete.zig");
     _ = @import("editor_component.zig");
     _ = @import("fuzzy.zig");

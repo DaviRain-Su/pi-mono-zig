@@ -43,7 +43,7 @@ pub const package_manager_cli = @import("package_manager_cli.zig");
 pub const missing_cwd_selector = @import("sessions/missing_cwd_selector.zig");
 pub const system_prompt = @import("resources/system_prompt.zig");
 pub const tool_selection = @import("tool_selection.zig");
-pub const core = @import("core/index.zig");
+pub const runtime = @import("runtime/root.zig");
 pub const core_tools = @import("core/tools/index.zig");
 pub const auth_guidance = @import("core/auth_guidance.zig");
 pub const auth_storage = @import("core/auth_storage.zig");
@@ -203,6 +203,7 @@ test {
     _ = @import("sessions/missing_cwd_selector.zig");
     _ = @import("resources/system_prompt.zig");
     _ = @import("tool_selection.zig");
+    _ = @import("runtime/root.zig");
     _ = @import("core/index.zig");
     _ = @import("core/tools/index.zig");
     _ = @import("core/auth_guidance.zig");
@@ -264,4 +265,13 @@ test {
     _ = @import("config/migrations.zig");
     _ = @import("tests/provider_stream_contract_matrix_test.zig");
     _ = @import("modes/mcp_stdio.zig");
+}
+
+test "root exports stable product namespaces" {
+    try std.testing.expect(@hasDecl(@This(), "tools"));
+    try std.testing.expect(@hasDecl(@This(), "runtime"));
+    try std.testing.expect(@hasDecl(@This(), "session"));
+    try std.testing.expect(@hasDecl(@This(), "modes"));
+    try std.testing.expect(@hasDecl(@This(), "extension_registry"));
+    try std.testing.expect(@hasDecl(@This(), "system_prompt"));
 }

@@ -3,6 +3,7 @@ const ai = @import("ai");
 const string_utils = ai.shared.string_utils;
 const agent = @import("agent");
 const extension_runtime = @import("../extensions/extension_runtime.zig");
+const runtime_hooks = @import("../runtime/hooks.zig");
 const extension_protocol = @import("../extensions/extension_protocol.zig");
 const session_manager = @import("session_manager.zig");
 const session_compaction = @import("session_compaction.zig");
@@ -341,9 +342,11 @@ pub const AgentSession = struct {
             return;
         }
         const context = try self.allocator.create(ExtensionHookContext);
+        errdefer self.allocator.destroy(context);
         context.* = .{
             .allocator = self.allocator,
-            .hosts = extension_hosts,
+            .hosts = try runtime_hooks.wrapRuntimeAdapters(self.allocator, extension_hosts),
+            .owns_hosts = true,
             .timeout_ms = timeout_ms,
             .diagnostics = .empty,
         };
@@ -711,9 +714,11 @@ pub const AgentSession = struct {
 
         const extension_hook_context: ?*ExtensionHookContext = if (extension_hosts.len > 0) blk: {
             const context = try allocator.create(ExtensionHookContext);
+            errdefer allocator.destroy(context);
             context.* = .{
                 .allocator = allocator,
-                .hosts = extension_hosts,
+                .hosts = try runtime_hooks.wrapRuntimeAdapters(allocator, extension_hosts),
+                .owns_hosts = true,
                 .timeout_ms = extension_hook_timeout_ms,
                 .diagnostics = .empty,
             };
@@ -913,7 +918,8 @@ pub const AgentSession = struct {
 
 const ExtensionHookContext = struct {
     allocator: std.mem.Allocator,
-    hosts: []const extension_runtime.RuntimeAdapter,
+    hosts: []const runtime_hooks.HookRuntime,
+    owns_hosts: bool = false,
     timeout_ms: u64,
     next_turn_index: usize = 0,
     active_turn_index: ?usize = null,
@@ -922,6 +928,7 @@ const ExtensionHookContext = struct {
     fn deinit(self: *ExtensionHookContext, allocator: std.mem.Allocator) void {
         for (self.diagnostics.items) |diagnostic| allocator.free(diagnostic);
         self.diagnostics.deinit(allocator);
+        if (self.owns_hosts and self.hosts.len > 0) allocator.free(self.hosts);
         self.* = undefined;
     }
 
@@ -931,7 +938,7 @@ const ExtensionHookContext = struct {
 
     fn hasHook(self: *const ExtensionHookContext, event_name: []const u8) bool {
         for (self.hosts) |host| {
-            if (host.hasRegisteredHook(event_name)) return true;
+            if (host.hasHook(event_name)) return true;
         }
         return false;
     }
@@ -963,18 +970,18 @@ const ExtensionHookContext = struct {
         var dispatch_entries = std.ArrayList(HookDispatchEntry).empty;
         defer dispatch_entries.deinit(allocator);
         for (self.hosts, 0..) |host, host_index| {
-            if (!host.hasRegisteredHook(event_name)) continue;
+            if (!host.hasHook(event_name)) continue;
             try dispatch_entries.append(allocator, hookDispatchEntryForHost(host, event_name, host_index));
         }
         std.mem.sort(HookDispatchEntry, dispatch_entries.items, {}, hookDispatchEntryLessThan);
 
         for (dispatch_entries.items) |entry| {
             const host = entry.host;
-            if (try host.invokeExtensionEvent(allocator, event_name, event, self.timeout_ms)) |result| {
+            if (try host.invoke(allocator, event_name, event, self.timeout_ms)) |result| {
                 if (last_result) |old| tools_common.deinitJsonValue(allocator, old);
                 if (last_extension_id) |old_id| allocator.free(old_id);
                 last_result = result;
-                last_extension_id = try describeHookSource(allocator, host, event_name);
+                last_extension_id = try host.describeSource(allocator, event_name);
             }
         }
         const result = last_result orelse return null;
@@ -1017,40 +1024,20 @@ const ExtensionHookContext = struct {
 };
 
 const HookDispatchEntry = struct {
-    host: extension_runtime.RuntimeAdapter,
+    host: runtime_hooks.HookRuntime,
     host_index: usize,
     priority: i64 = 0,
     declaration_order: usize = 0,
 };
 
-const HookDispatchLookup = struct {
-    event_name: []const u8,
-    priority: i64 = 0,
-    declaration_order: usize = 0,
-};
-
-fn hookDispatchEntryForHost(host: extension_runtime.RuntimeAdapter, event_name: []const u8, host_index: usize) HookDispatchEntry {
-    var lookup = HookDispatchLookup{
-        .event_name = event_name,
-        .declaration_order = host_index,
-    };
-    host.withRegistry(&lookup, captureHookDispatchMetadata) catch {};
+fn hookDispatchEntryForHost(host: runtime_hooks.HookRuntime, event_name: []const u8, host_index: usize) HookDispatchEntry {
+    const metadata = host.metadata(event_name);
     return .{
         .host = host,
         .host_index = host_index,
-        .priority = lookup.priority,
-        .declaration_order = lookup.declaration_order,
+        .priority = metadata.priority,
+        .declaration_order = metadata.declaration_order,
     };
-}
-
-fn captureHookDispatchMetadata(context: ?*anyopaque, registry: *const extension_runtime.Registry) !void {
-    const lookup: *HookDispatchLookup = @ptrCast(@alignCast(context orelse return));
-    for (registry.hooks.items) |hook| {
-        if (!std.mem.eql(u8, hook.event_name, lookup.event_name)) continue;
-        lookup.priority = hook.priority;
-        lookup.declaration_order = hook.declaration_order;
-        return;
-    }
 }
 
 fn hookDispatchEntryLessThan(_: void, lhs: HookDispatchEntry, rhs: HookDispatchEntry) bool {

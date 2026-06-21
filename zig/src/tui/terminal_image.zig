@@ -1,4 +1,5 @@
 const std = @import("std");
+const terminal_capabilities = @import("terminal_capabilities.zig");
 
 pub const ImageProtocol = enum {
     kitty,
@@ -19,6 +20,20 @@ pub const CellDimensions = struct {
 pub const ImageDimensions = struct {
     width_px: usize,
     height_px: usize,
+};
+
+pub const ImageRenderPolicy = struct {
+    enabled: bool = true,
+    width_cells: usize = 60,
+    preserve_aspect_ratio: bool = true,
+
+    pub fn effectiveWidth(self: ImageRenderPolicy, available_width_cells: usize) usize {
+        if (available_width_cells == 0) return 1;
+        return @max(@as(usize, 1), if (self.enabled)
+            @min(available_width_cells, self.width_cells)
+        else
+            available_width_cells);
+    }
 };
 
 pub const ImageRenderOptions = struct {
@@ -54,32 +69,15 @@ pub fn setCellDimensions(dims: CellDimensions) void {
 }
 
 pub fn detectCapabilities(env_map: *const std.process.Environ.Map) TerminalCapabilities {
-    const term_program = envValue(env_map, "TERM_PROGRAM");
-    const term = envValue(env_map, "TERM");
-    const color_term = envValue(env_map, "COLORTERM");
-    const true_color = std.ascii.eqlIgnoreCase(color_term, "truecolor") or std.ascii.eqlIgnoreCase(color_term, "24bit");
-
-    const in_tmux_or_screen = env_map.get("TMUX") != null or
-        startsWithIgnoreCase(term, "tmux") or
-        startsWithIgnoreCase(term, "screen");
-    if (in_tmux_or_screen) return .{ .images = null, .true_color = true_color, .hyperlinks = false };
-
-    if (env_map.get("KITTY_WINDOW_ID") != null or std.ascii.eqlIgnoreCase(term_program, "kitty")) {
-        return .{ .images = .kitty, .true_color = true, .hyperlinks = true };
-    }
-    if (std.ascii.eqlIgnoreCase(term_program, "ghostty") or containsIgnoreCase(term, "ghostty") or env_map.get("GHOSTTY_RESOURCES_DIR") != null) {
-        return .{ .images = .kitty, .true_color = true, .hyperlinks = true };
-    }
-    if (env_map.get("WEZTERM_PANE") != null or std.ascii.eqlIgnoreCase(term_program, "wezterm")) {
-        return .{ .images = .kitty, .true_color = true, .hyperlinks = true };
-    }
-    if (env_map.get("ITERM_SESSION_ID") != null or std.ascii.eqlIgnoreCase(term_program, "iterm.app")) {
-        return .{ .images = .iterm2, .true_color = true, .hyperlinks = true };
-    }
-    if (std.ascii.eqlIgnoreCase(term_program, "vscode") or std.ascii.eqlIgnoreCase(term_program, "alacritty")) {
-        return .{ .images = null, .true_color = true, .hyperlinks = true };
-    }
-    return .{ .images = null, .true_color = true_color, .hyperlinks = false };
+    const features = terminal_capabilities.detect(env_map, .{});
+    return .{
+        .images = if (features.image_protocol) |protocol| switch (protocol) {
+            .kitty => .kitty,
+            .iterm2 => .iterm2,
+        } else null,
+        .true_color = features.true_color,
+        .hyperlinks = features.hyperlinks,
+    };
 }
 
 pub fn isImageLine(line: []const u8) bool {

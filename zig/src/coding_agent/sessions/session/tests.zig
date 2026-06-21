@@ -5,8 +5,8 @@ const session_mod = @import("../session.zig");
 const session_manager = @import("../session_manager.zig");
 const session_json_helpers = @import("../session_json_helpers.zig");
 const tools_common = @import("../../tools/common.zig");
+const runtime_hooks = @import("../../runtime/hooks.zig");
 const extension_runtime = @import("../../extensions/extension_runtime.zig");
-const extension_registry = @import("../../extensions/extension_registry.zig");
 
 const AgentSession = session_mod.AgentSession;
 const ExtensionHookContext = session_mod.testing.ExtensionHookContext;
@@ -1108,11 +1108,13 @@ test "extension tool hooks mutate arguments and patch results" {
         .tool_result = true,
     };
     const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
-    const hook_context = ExtensionHookContext{
+    var hook_context = ExtensionHookContext{
         .allocator = std.testing.allocator,
-        .hosts = adapters[0..],
+        .hosts = try runtime_hooks.wrapRuntimeAdapters(std.testing.allocator, adapters[0..]),
+        .owns_hosts = true,
         .timeout_ms = 1000,
     };
+    defer hook_context.deinit(std.testing.allocator);
     var args = try makeObject(std.testing.allocator);
     defer tools_common.deinitJsonValue(std.testing.allocator, args);
     try putString(std.testing.allocator, &args.object, "value", "original");
@@ -1464,9 +1466,11 @@ test "Stage B: tool_execution_start / update / end events forward to extension h
     const adapters = [_]extension_runtime.RuntimeAdapter{fixture.adapter()};
     var hook_context = ExtensionHookContext{
         .allocator = allocator,
-        .hosts = adapters[0..],
+        .hosts = try runtime_hooks.wrapRuntimeAdapters(allocator, adapters[0..]),
+        .owns_hosts = true,
         .timeout_ms = 1000,
     };
+    defer hook_context.deinit(allocator);
 
     // Build a synthetic args JSON value to thread through events.
     var args = try makeObject(allocator);

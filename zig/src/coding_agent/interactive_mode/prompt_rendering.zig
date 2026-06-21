@@ -18,17 +18,18 @@ pub fn measureHeight(
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
     pending_images: []const PendingEditorImage,
+    policy: tui.terminal_image.ImageRenderPolicy,
     width: usize,
 ) !usize {
     _ = allocator;
     _ = theme;
     _ = editor;
-    const editor_width = promptEditorWidth(width);
+    const editor_width = policy.effectiveWidth(promptEditorWidth(width));
     const prompt_rows: usize = switch (layoutMode(width)) {
         .full, .medium, .narrow => PROMPT_BOX_HEIGHT,
         .mini, .compact => 1,
     };
-    return prompt_rows + pendingImagesRenderHeight(pending_images, editor_width);
+    return prompt_rows + pendingImagesRenderHeight(pending_images, editor_width, policy);
 }
 
 pub fn drawLines(
@@ -37,6 +38,7 @@ pub fn drawLines(
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
     pending_images: []const PendingEditorImage,
+    policy: tui.terminal_image.ImageRenderPolicy,
 ) !tui.DrawSize {
     const prompt_style = styleForToken(theme, .prompt);
     const glyph_style = styleForToken(theme, .prompt_glyph);
@@ -44,6 +46,7 @@ pub fn drawLines(
     const width = @as(usize, window.width);
     const mode = layoutMode(width);
     const editor_width = promptEditorWidth(width);
+    const image_width = policy.effectiveWidth(editor_width);
     const prompt_rows: usize = switch (mode) {
         .full, .medium, .narrow => PROMPT_BOX_HEIGHT,
         .mini, .compact => 1,
@@ -111,7 +114,7 @@ pub fn drawLines(
     @memset(blank_prefix, ' ');
     var image_row: usize = 0;
     for (pending_images, 0..) |image, index| {
-        const row_count = pendingImageRenderHeight(image, editor_width);
+        const row_count = pendingImageRenderHeight(image, image_width, policy);
         if (prompt_rows + image_row >= window.height) break;
 
         const continuation_window = window.child(.{
@@ -120,22 +123,27 @@ pub fn drawLines(
             .height = @intCast(@min(row_count, @as(usize, window.height) -| (prompt_rows + image_row))),
         });
 
-        if (image.kitty_image) |kitty| {
-            const image_window = continuation_window.child(.{
-                .x_off = @intCast(prefix_width),
-                .width = @intCast(editor_width),
-                .height = @intCast(@min(row_count, @as(usize, continuation_window.height))),
-            });
-            const image_component = tui.Image{
-                .mime_type = image.mime_type,
-                .kitty_image = kitty,
-                .max_width_cells = editor_width,
-                .max_height_cells = row_count,
-            };
-            _ = try image_component.drawComponent().draw(image_window, .{
-                .window = image_window,
-                .arena = ctx.arena,
-            });
+        if (policy.enabled) {
+            if (image.kitty_image) |kitty| {
+                const image_window = continuation_window.child(.{
+                    .x_off = @intCast(prefix_width),
+                    .width = @intCast(image_width),
+                    .height = @intCast(@min(row_count, @as(usize, continuation_window.height))),
+                });
+                const image_component = tui.Image{
+                    .mime_type = image.mime_type,
+                    .kitty_image = kitty,
+                    .max_width_cells = image_width,
+                    .max_height_cells = row_count,
+                };
+                _ = try image_component.drawComponent().draw(image_window, .{
+                    .window = image_window,
+                    .arena = ctx.arena,
+                });
+            } else {
+                const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
+                drawFittedLine(continuation_window, 0, placeholder, prompt_style);
+            }
         } else {
             const placeholder = try std.fmt.allocPrint(ctx.arena, "{s}[image {d}: {s}]", .{ blank_prefix, index + 1, image.mime_type });
             drawFittedLine(continuation_window, 0, placeholder, prompt_style);
@@ -149,15 +157,23 @@ pub fn drawLines(
     };
 }
 
-fn pendingImagesRenderHeight(images: []const PendingEditorImage, width: usize) usize {
+fn pendingImagesRenderHeight(
+    images: []const PendingEditorImage,
+    width: usize,
+    policy: tui.terminal_image.ImageRenderPolicy,
+) usize {
     var height: usize = 0;
-    for (images) |image| height += pendingImageRenderHeight(image, width);
+    for (images) |image| height += pendingImageRenderHeight(image, width, policy);
     return height;
 }
 
-fn pendingImageRenderHeight(image: PendingEditorImage, width: usize) usize {
+fn pendingImageRenderHeight(
+    image: PendingEditorImage,
+    width: usize,
+    policy: tui.terminal_image.ImageRenderPolicy,
+) usize {
     _ = width;
-    return if (image.kitty_image != null) 4 else 1;
+    return if (policy.enabled and image.kitty_image != null) 4 else 1;
 }
 
 fn measureEditorHeight(
@@ -242,7 +258,7 @@ test "drawLines places Kitty image cells for transmitted pending images" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-    }, null, &editor, &pending);
+    }, null, &editor, &pending, .{});
 
     const image_col: u16 = @intCast(promptEditorOffsetX(80));
     const image_cell = screen.readCell(image_col, PROMPT_BOX_HEIGHT) orelse return error.TestUnexpectedResult;
@@ -277,7 +293,7 @@ test "drawLines renders bordered prompt with glyph prefix" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-    }, &theme, &editor, &.{});
+    }, &theme, &editor, &.{}, .{});
 
     const top_left = screen.readCell(0, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("╭", top_left.char.grapheme);
@@ -320,7 +336,7 @@ test "drawLines places cursor after border and glyph offset" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-    }, null, &editor, &.{});
+    }, null, &editor, &.{}, .{});
 
     try std.testing.expect(screen.cursor_vis);
     try std.testing.expectEqual(@as(u16, 8), screen.cursor.col);
@@ -335,7 +351,7 @@ test "measureHeight uses fixed border height and editor width overhead" {
     _ = try editor.handlePaste("a long prompt that would previously grow the prompt area");
 
     try std.testing.expectEqual(@as(usize, 76), promptEditorWidth(80));
-    try std.testing.expectEqual(@as(usize, 3), try measureHeight(allocator, null, &editor, &.{}, 80));
+    try std.testing.expectEqual(@as(usize, 3), try measureHeight(allocator, null, &editor, &.{}, .{}, 80));
 }
 
 test "drawLines shows overflow indicator on bottom border" {
@@ -362,7 +378,7 @@ test "drawLines shows overflow indicator on bottom border" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-    }, null, &editor, &.{});
+    }, null, &editor, &.{}, .{});
 
     var rendered = try tui.vaxis.AllocatingScreen.init(allocator, 60, 3);
     defer rendered.deinit(allocator);
@@ -401,7 +417,7 @@ test "drawLines keeps CJK text visible inside bordered prompt" {
     _ = try drawLines(window, .{
         .window = window,
         .arena = arena.allocator(),
-    }, null, &editor, &.{});
+    }, null, &editor, &.{}, .{});
 
     const first = screen.readCell(3, 1) orelse return error.TestUnexpectedResult;
     const second = screen.readCell(5, 1) orelse return error.TestUnexpectedResult;

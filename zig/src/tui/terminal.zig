@@ -2,6 +2,7 @@ const std = @import("std");
 const ESC = "\x1b";
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
+const terminal_capabilities = @import("terminal_capabilities.zig");
 const keys = @import("vaxis-widgets").keys;
 
 pub const Size = struct {
@@ -103,6 +104,7 @@ pub const Terminal = struct {
     },
     started: bool = false,
     raw_mode_enabled: bool = false,
+    features: terminal_capabilities.TerminalFeatures = terminal_capabilities.detectFromParts(.{}, .{}),
     use_kitty_keyboard_protocol: bool = true,
     use_mouse_reporting: bool = false,
     current_size: Size = .{ .width = 80, .height = 24 },
@@ -147,8 +149,9 @@ pub const Terminal = struct {
                 try backend.enterRawMode();
                 errdefer backend.restoreMode() catch {};
 
-                self.use_kitty_keyboard_protocol = shouldUseKittyKeyboardProtocol();
-                self.use_mouse_reporting = shouldUseMouseReporting();
+                self.features = terminal_capabilities.detectCurrentProcess(.{});
+                self.use_kitty_keyboard_protocol = self.features.keyboard_protocol_allowed;
+                self.use_mouse_reporting = self.features.mouse_reporting;
                 try backend.write(startupSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting));
                 errdefer backend.write(stopSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting)) catch {};
 
@@ -159,8 +162,9 @@ pub const Terminal = struct {
                 errdefer native.stop();
 
                 const writer = try native.writer();
-                self.use_kitty_keyboard_protocol = shouldUseKittyKeyboardProtocol();
-                self.use_mouse_reporting = shouldUseMouseReporting();
+                self.features = terminal_capabilities.detect(native.env_map, .{});
+                self.use_kitty_keyboard_protocol = self.features.keyboard_protocol_allowed;
+                self.use_mouse_reporting = self.features.mouse_reporting;
                 try writer.writeAll(startupSequence(self.use_kitty_keyboard_protocol, self.use_mouse_reporting));
                 try writer.flush();
                 errdefer {
@@ -233,6 +237,10 @@ pub const Terminal = struct {
         }
     }
 
+    pub fn capabilities(self: *const Terminal) terminal_capabilities.TerminalFeatures {
+        return self.features;
+    }
+
     pub fn initInputLoop(
         self: *Terminal,
         allocator: std.mem.Allocator,
@@ -252,44 +260,25 @@ pub const Terminal = struct {
 };
 
 fn shouldUseKittyKeyboardProtocol() bool {
-    return shouldUseKittyKeyboardProtocolForEnv(
-        getenv("TERM_PROGRAM"),
-        getenv("GHOSTTY_RESOURCES_DIR"),
-        getenv("TERM"),
-    );
-}
-
-fn getenv(name: [*:0]const u8) ?[]const u8 {
-    const value = std.c.getenv(name) orelse return null;
-    return std.mem.span(value);
+    return terminal_capabilities.detectCurrentProcess(.{}).keyboard_protocol_allowed;
 }
 
 fn shouldUseMouseReporting() bool {
-    return shouldUseMouseReportingForEnv(getenv("PI_ENABLE_MOUSE"));
+    return terminal_capabilities.detectCurrentProcess(.{}).mouse_reporting;
 }
 
 fn shouldUseMouseReportingForEnv(value: ?[]const u8) bool {
-    const raw = value orelse return true;
-    if (std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or
-        std.ascii.eqlIgnoreCase(raw, "no") or
-        std.ascii.eqlIgnoreCase(raw, "off"))
-    {
-        return false;
-    }
-    return true;
+    return terminal_capabilities.detectFromParts(.{
+        .pi_enable_mouse = value,
+    }, .{}).mouse_reporting;
 }
 
 fn shouldUseKittyKeyboardProtocolForEnv(term_program: ?[]const u8, ghostty_resources_dir: ?[]const u8, term: ?[]const u8) bool {
-    if (term_program) |value| {
-        // Ghostty/Fcitx IME can drop committed text with Kitty enabled; raw UTF-8 works.
-        if (std.ascii.eqlIgnoreCase(value, "Ghostty")) return false;
-    }
-    if (ghostty_resources_dir != null) return false;
-    if (term) |value| {
-        if (std.ascii.indexOfIgnoreCase(value, "ghostty") != null) return false;
-    }
-    return true;
+    return terminal_capabilities.detectFromParts(.{
+        .term_program = term_program orelse "",
+        .term = term orelse "",
+        .ghostty_resources_dir_present = ghostty_resources_dir != null,
+    }, .{}).keyboard_protocol_allowed;
 }
 
 fn startupSequence(use_kitty_keyboard_protocol: bool, use_mouse_reporting: bool) []const u8 {

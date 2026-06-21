@@ -166,6 +166,16 @@ pub fn build(b: *std.Build) void {
     tidy_step.dependOn(&run_tidy_tests.step);
     tidy_step.dependOn(&run_tidy.step);
 
+    const import_boundaries = addParityScriptStep(b, external_tool_check_step, .{
+        .script_path = "test/import-boundaries.sh",
+        .step_name = "test-import-boundaries",
+        .step_description = "Run Zig import boundary guardrails",
+        .command_depends_on_external_tools = true,
+        .step_depends_on_external_tools = true,
+    });
+    tidy_step.dependOn(&import_boundaries.step);
+    test_step.dependOn(&import_boundaries.step);
+
     const ts_rpc_parity = addParityScriptStep(b, external_tool_check_step, .{
         .script_path = "test/ts-rpc-parity.sh",
         .step_name = "test-ts-rpc-parity",

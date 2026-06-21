@@ -7,7 +7,7 @@ const session_manager_mod = @import("../sessions/session_manager.zig");
 const session_mod = @import("../sessions/session.zig");
 const shared = @import("shared.zig");
 const session_lifecycle = @import("session_lifecycle.zig");
-const tool_adapters = @import("tool_adapters.zig");
+const tool_registry = @import("../runtime/tool_registry.zig");
 const system_prompt_mod = @import("../resources/system_prompt.zig");
 
 const AppContext = shared.AppContext;
@@ -76,7 +76,7 @@ pub fn preflightInteractiveMissingCwd(
 pub const InteractiveBootstrap = struct {
     allocator: std.mem.Allocator,
     current_provider: provider_config.ResolvedProviderConfig,
-    built_tools: tool_adapters.BuiltTools,
+    built_tools: tool_registry.BuiltTools,
     session: session_mod.AgentSession,
     owned_system_prompt: ?[]u8 = null,
 
@@ -129,7 +129,7 @@ pub fn bootstrapInteractiveStateWithMissingCwd(
     );
     errdefer current_provider.deinit(allocator);
 
-    var built_tools = try tool_adapters.buildAgentToolsWithExtensionsSelection(allocator, app_context, options.selected_tools, .{
+    var built_tools = try tool_registry.buildAgentToolsWithExtensionsSelection(allocator, app_context, options.selected_tools, .{
         .extensions = options.extensions,
         .env_map = env_map,
         .cwd = options.cwd,

@@ -27,10 +27,11 @@ const session_lifecycle = @import("interactive_mode/session_lifecycle.zig");
 const input_dispatch = @import("interactive_mode/input_dispatch.zig");
 const system_prompt_mod = @import("resources/system_prompt.zig");
 const clipboard_image = @import("interactive_mode/clipboard_image.zig");
-const tool_adapters = @import("interactive_mode/tool_adapters.zig");
+const tool_registry = @import("runtime/tool_registry.zig");
+const interactive_hooks = @import("runtime/interactive_hooks.zig");
+const ui_runtime = @import("runtime/ui_runtime.zig");
 const session_bootstrap = @import("interactive_mode/session_bootstrap.zig");
 const extension_ui_bridge = @import("interactive_mode/extension_ui_bridge.zig");
-const extension_runtime = @import("extensions/extension_runtime.zig");
 
 pub const RunInteractiveModeOptions = shared.RunInteractiveModeOptions;
 pub const LiveResources = shared.LiveResources;
@@ -130,14 +131,14 @@ pub const renderedLinesContain = rendering.renderedLinesContain;
 pub const PromptWorker = prompt_worker_mod.PromptWorker;
 pub const cloneImageContents = prompt_worker_mod.cloneImageContents;
 pub const deinitImageContents = prompt_worker_mod.deinitImageContents;
-pub const BuiltTools = tool_adapters.BuiltTools;
-pub const ToolBuildOptions = tool_adapters.ToolBuildOptions;
-pub const buildAgentTools = tool_adapters.buildAgentTools;
-pub const buildAgentToolsWithOptions = tool_adapters.buildAgentToolsWithOptions;
-pub const buildAgentToolsWithSelection = tool_adapters.buildAgentToolsWithSelection;
-pub const buildAgentToolsWithExtensions = tool_adapters.buildAgentToolsWithExtensions;
-pub const buildAgentToolsWithExtensionsSelection = tool_adapters.buildAgentToolsWithExtensionsSelection;
-pub const writeStartupDiagnostics = tool_adapters.writeStartupDiagnostics;
+pub const BuiltTools = tool_registry.BuiltTools;
+pub const ToolBuildOptions = tool_registry.ToolBuildOptions;
+pub const buildAgentTools = tool_registry.buildAgentTools;
+pub const buildAgentToolsWithOptions = tool_registry.buildAgentToolsWithOptions;
+pub const buildAgentToolsWithSelection = tool_registry.buildAgentToolsWithSelection;
+pub const buildAgentToolsWithExtensions = tool_registry.buildAgentToolsWithExtensions;
+pub const buildAgentToolsWithExtensionsSelection = tool_registry.buildAgentToolsWithExtensionsSelection;
+pub const writeStartupDiagnostics = tool_registry.writeStartupDiagnostics;
 pub const InteractiveBootstrap = session_bootstrap.InteractiveBootstrap;
 pub const bootstrapInteractiveState = session_bootstrap.bootstrapInteractiveState;
 pub const bootstrapInteractiveStateWithMissingCwd = session_bootstrap.bootstrapInteractiveStateWithMissingCwd;
@@ -188,7 +189,7 @@ fn reloadExtensionToolsForInteractiveMode(
 ) !void {
     const reload_context: *ReloadExtensionToolsContext = @ptrCast(@alignCast(context.?));
     const extensions = if (live_resources.owned_resource_bundle) |*bundle| bundle.extensions else &.{};
-    try tool_adapters.replaceAgentToolsForReload(
+    try tool_registry.replaceAgentToolsForReload(
         allocator,
         reload_context.app_context,
         session,
@@ -235,7 +236,7 @@ fn reloadExtensionToolsForInteractiveMode(
 
 fn appendExtensionStartupDiagnosticsToAppState(
     allocator: std.mem.Allocator,
-    diagnostics: []const tool_adapters.ExtensionStartupDiagnostic,
+    diagnostics: []const tool_registry.ExtensionStartupDiagnostic,
     app_state: *AppState,
     show_optional: bool,
 ) !void {
@@ -251,7 +252,7 @@ fn appendExtensionStartupDiagnosticsToAppState(
 }
 
 fn shouldShowExtensionLifecycleDiagnosticInAppState(
-    diagnostic: tool_adapters.ExtensionStartupDiagnostic,
+    diagnostic: tool_registry.ExtensionStartupDiagnostic,
     show_optional: bool,
 ) bool {
     return show_optional or diagnostic.required or diagnostic.severity == .@"error";
@@ -344,7 +345,7 @@ pub fn runInteractiveMode(
     defer bootstrap.deinit();
 
     if (bootstrap.built_tools.required_startup_failed) {
-        try tool_adapters.writeStartupDiagnostics(stderr_writer, bootstrap.built_tools.startup_diagnostics);
+        try tool_registry.writeStartupDiagnostics(stderr_writer, bootstrap.built_tools.startup_diagnostics);
         try stderr_writer.flush();
         return 1;
     }
@@ -360,8 +361,12 @@ pub fn runInteractiveMode(
     };
     try bootstrap.session.agent.subscribe(subscriber);
     defer _ = bootstrap.session.agent.unsubscribe(subscriber);
-    installSessionUiCallbacks(&bootstrap.session, &app_state);
-    defer clearSessionUiCallbacks(&bootstrap.session);
+    interactive_hooks.installSessionUiCallbacks(
+        &bootstrap.session,
+        .{ .context = &app_state, .callback = handleAppRetryLifecycleEvent },
+        .{ .context = &app_state, .callback = handleAppCompactionLifecycleEvent },
+    );
+    defer interactive_hooks.clearSessionUiCallbacks(&bootstrap.session);
 
     try rebuildAppStateFromSession(allocator, io, &app_state, &bootstrap.session, &bootstrap.current_provider);
     try appendExtensionStartupDiagnosticsToAppState(allocator, bootstrap.built_tools.startup_diagnostics, &app_state, options.verbose);
@@ -388,9 +393,9 @@ pub fn runInteractiveMode(
     defer terminal.stop();
     var last_terminal_title: ?[]u8 = null;
     defer if (last_terminal_title) |title| allocator.free(title);
-    try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
-    defer if (showTerminalProgress(live_resources.runtime_config)) {
-        writeTerminalProgress(&terminal, false) catch {};
+    try ui_runtime.updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
+    defer if (ui_runtime.showTerminalProgress(live_resources.runtime_config)) {
+        ui_runtime.writeTerminalProgress(&terminal, false) catch {};
     };
 
     var input_loop = try terminal.initInputLoop(allocator, io, env_map);
@@ -424,6 +429,10 @@ pub fn runInteractiveMode(
         .keybindings = live_resources.keybindings,
         .theme = live_resources.theme,
         .terminal_name = live_resources.terminal_name,
+        .image_render_policy = if (live_resources.runtime_config) |config|
+            .{ .enabled = config.showImages(), .width_cells = config.imageWidthCells() }
+        else
+            .{},
     };
 
     var overlay: ?SelectorOverlay = null;
@@ -471,6 +480,12 @@ pub fn runInteractiveMode(
     var should_exit = false;
     var input_buffer = std.ArrayList(u8).empty;
     defer input_buffer.deinit(allocator);
+    var semantic_command_active = prompt_worker_active;
+    if (semantic_command_active) {
+        try ui_runtime.writeCommandStartMarker(&terminal);
+    } else {
+        try ui_runtime.writePromptReadyMarkers(&terminal);
+    }
 
     while (true) {
         if (prompt_worker_active and !prompt_worker.running.load(.seq_cst)) {
@@ -478,9 +493,24 @@ pub fn runInteractiveMode(
             prompt_worker_active = false;
             app_state.setToolOutputExpanded(true);
             renderer.markDirty();
+            if (semantic_command_active) {
+                const success = bootstrap.session.agent.getErrorMessage() == null;
+                try ui_runtime.writeCommandDoneAndPromptReady(&terminal, success);
+                try ui_runtime.writeCompletionNotification(
+                    allocator,
+                    &terminal,
+                    "pi",
+                    if (success) "Response complete" else "Response finished with an error",
+                );
+                semantic_command_active = false;
+            }
             if (should_exit) break;
         }
-        installSessionUiCallbacks(&bootstrap.session, &app_state);
+        interactive_hooks.installSessionUiCallbacks(
+            &bootstrap.session,
+            .{ .context = &app_state, .callback = handleAppRetryLifecycleEvent },
+            .{ .context = &app_state, .callback = handleAppCompactionLifecycleEvent },
+        );
         if (app_state.pollBashExecution(allocator)) renderer.markDirty();
 
         try app_state.pollClipboardPaste(.{
@@ -529,11 +559,15 @@ pub fn runInteractiveMode(
         };
 
         if (app_state.takeTerminalProgressUpdate()) |active| {
-            if (showTerminalProgress(live_resources.runtime_config)) {
-                try writeTerminalProgress(&terminal, active);
+            if (ui_runtime.showTerminalProgress(live_resources.runtime_config)) {
+                try ui_runtime.writeTerminalProgress(&terminal, active);
             }
         }
-        try updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
+        if (!semantic_command_active and prompt_worker_active) {
+            try ui_runtime.writeCommandStartMarker(&terminal);
+            semantic_command_active = true;
+        }
+        try ui_runtime.updateInteractiveTerminalTitle(allocator, &terminal, &bootstrap.session, &last_terminal_title);
 
         if (should_exit and !prompt_worker_active) break;
 
@@ -586,6 +620,10 @@ pub fn runInteractiveMode(
         screen.keybindings = live_resources.keybindings;
         screen.theme = live_resources.theme;
         screen.terminal_name = live_resources.terminal_name;
+        screen.image_render_policy = if (live_resources.runtime_config) |config|
+            .{ .enabled = config.showImages(), .width_cells = config.imageWidthCells() }
+        else
+            .{};
         screen.now_ms = now_ms;
 
         if (overlay) |*overlay_value| {
@@ -627,55 +665,6 @@ pub fn runInteractiveMode(
     }
 
     return 0;
-}
-
-fn installSessionUiCallbacks(session: *session_mod.AgentSession, app_state: *AppState) void {
-    session.setRetryLifecycleCallback(.{
-        .context = app_state,
-        .callback = handleAppRetryLifecycleEvent,
-    });
-    session.setCompactionLifecycleCallback(.{
-        .context = app_state,
-        .callback = handleAppCompactionLifecycleEvent,
-    });
-}
-
-fn clearSessionUiCallbacks(session: *session_mod.AgentSession) void {
-    session.clearRetryLifecycleCallback();
-    session.clearCompactionLifecycleCallback();
-}
-
-fn showTerminalProgress(runtime_config: ?*const config_mod.RuntimeConfig) bool {
-    return if (runtime_config) |config| config.showTerminalProgress() else false;
-}
-
-fn writeTerminalProgress(terminal: *tui.Terminal, active: bool) !void {
-    try terminal.write(if (active) "\x1b]9;4;3\x07" else "\x1b]9;4;0;\x07");
-}
-
-fn updateInteractiveTerminalTitle(
-    allocator: std.mem.Allocator,
-    terminal: *tui.Terminal,
-    session: *const session_mod.AgentSession,
-    last_title: *?[]u8,
-) !void {
-    const cwd_basename = std.fs.path.basename(session.cwd);
-    const title = if (session.session_manager.getSessionName()) |name|
-        try std.fmt.allocPrint(allocator, "pi - {s} - {s}", .{ name, cwd_basename })
-    else
-        try std.fmt.allocPrint(allocator, "pi - {s}", .{cwd_basename});
-    defer allocator.free(title);
-
-    if (last_title.*) |existing| {
-        if (std.mem.eql(u8, existing, title)) return;
-        allocator.free(existing);
-        last_title.* = null;
-    }
-
-    const sequence = try std.fmt.allocPrint(allocator, "\x1b]0;{s}\x07", .{title});
-    defer allocator.free(sequence);
-    try terminal.write(sequence);
-    last_title.* = try allocator.dupe(u8, title);
 }
 
 fn suspendInteractiveTerminal(
@@ -1023,7 +1012,7 @@ pub const testing = struct {
     }
 
     pub fn callWriteTerminalProgress(terminal: *tui.Terminal, active: bool) !void {
-        return writeTerminalProgress(terminal, active);
+        return ui_runtime.writeTerminalProgress(terminal, active);
     }
 
     pub fn callUpdateInteractiveTerminalTitle(
@@ -1032,7 +1021,7 @@ pub const testing = struct {
         session: *const session_mod.AgentSession,
         last_title: *?[]u8,
     ) !void {
-        return updateInteractiveTerminalTitle(allocator, terminal, session, last_title);
+        return ui_runtime.updateInteractiveTerminalTitle(allocator, terminal, session, last_title);
     }
 
     pub fn callAppendConfigErrorsStartupWarning(
@@ -1045,7 +1034,7 @@ pub const testing = struct {
 
     pub fn callAppendExtensionStartupDiagnosticsToAppState(
         allocator: std.mem.Allocator,
-        diagnostics: []const tool_adapters.ExtensionStartupDiagnostic,
+        diagnostics: []const tool_registry.ExtensionStartupDiagnostic,
         app_state: *AppState,
         show_optional: bool,
     ) !void {

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+pub const registry = @import("registry.zig");
 pub const common = @import("common.zig");
 pub const args_parser = @import("args_parser.zig");
 pub const parseArgsFromJson = args_parser.parseArgsFromJson;
@@ -72,25 +73,19 @@ pub const LsTool = ls.LsTool;
 
 /// Compile-time list of all built-in tool types, in registration order.
 /// Each entry must expose: name, description, fn schema(), and have an `init(cwd, io)` constructor.
-pub const ALL: []const type = &.{
-    ReadTool,
-    BashTool,
-    WriteTool,
-    EditTool,
-    GrepTool,
-    FindTool,
-    LsTool,
-};
+pub const BuiltinToolCatalog = registry.BuiltinToolCatalog;
+pub const ALL: []const type = BuiltinToolCatalog.all;
+pub const schemaFor = registry.schemaFor;
+pub const validateNoDuplicateNames = registry.validateNoDuplicateNames;
 
 /// Visitor callback invoked once per built-in tool type at comptime.
 /// `ctx` is caller-supplied runtime context; `T` is the tool type.
 pub fn forEach(comptime ctx: anytype, comptime callback: fn (comptime ctx: @TypeOf(ctx), comptime T: type) void) void {
-    inline for (ALL) |T| {
-        callback(ctx, T);
-    }
+    registry.forEachBuiltin(ctx, callback);
 }
 
 test {
+    _ = @import("registry.zig");
     _ = @import("common.zig");
     _ = @import("args_parser.zig");
     _ = @import("file_mutation_queue.zig");

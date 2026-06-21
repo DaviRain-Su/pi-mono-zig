@@ -45,6 +45,18 @@ pub const TerminalImageContext = struct {
     tty: *std.Io.Writer,
 };
 
+fn deleteTerminalImage(context: ?*anyopaque, image_id: u32) void {
+    const terminal_image_context: *const TerminalImageContext = @ptrCast(@alignCast(context.?));
+    terminal_image_context.vx.freeImage(terminal_image_context.tty, image_id);
+}
+
+fn terminalImageDeleteSink(context: *const TerminalImageContext) pending_editor_images_mod.DeleteImageSink {
+    return .{
+        .context = @constCast(context),
+        .callback = deleteTerminalImage,
+    };
+}
+
 pub const FooterUsageTotals = struct {
     input: u64 = 0,
     output: u64 = 0,
@@ -204,71 +216,39 @@ pub const TimingState = struct {
 };
 
 pub const ImageState = struct {
-    pending_editor_images: std.ArrayList(PendingEditorImage) = .empty,
-    retired_kitty_images: std.ArrayList(u32) = .empty,
+    store: pending_editor_images_mod.Store = .{},
     clipboard_paste: clipboard_paste_task.ClipboardPasteTask = undefined,
 
     pub fn appendPending(self: *ImageState, allocator: std.mem.Allocator, image: ai.ImageContent) !void {
-        try self.pending_editor_images.append(allocator, .{
-            .data = image.data,
-            .mime_type = image.mime_type,
-        });
+        try self.store.appendPendingContent(allocator, image);
+    }
+
+    pub fn appendPendingOwned(self: *ImageState, allocator: std.mem.Allocator, image: PendingEditorImage) !void {
+        try self.store.appendPendingOwned(allocator, image);
     }
 
     pub fn clearPending(self: *ImageState, allocator: std.mem.Allocator) void {
-        for (self.pending_editor_images.items) |*image| pending_editor_images_mod.deinit(allocator, image);
-        self.pending_editor_images.clearRetainingCapacity();
+        self.store.clearPending(allocator);
     }
 
     pub fn clonePending(self: *ImageState, allocator: std.mem.Allocator) ![]ai.ImageContent {
-        if (self.pending_editor_images.items.len == 0) return &.{};
-        const cloned = try allocator.alloc(ai.ImageContent, self.pending_editor_images.items.len);
-        errdefer allocator.free(cloned);
-        for (self.pending_editor_images.items, 0..) |image, index| {
-            cloned[index] = .{
-                .data = try allocator.dupe(u8, image.data),
-                .mime_type = try allocator.dupe(u8, image.mime_type),
-            };
-        }
-        return cloned;
+        return try self.store.cloneContents(allocator);
+    }
+
+    pub fn retirePendingImage(self: *ImageState, allocator: std.mem.Allocator, image: *PendingEditorImage) void {
+        self.store.retirePendingImage(allocator, image);
     }
 
     pub fn flushRetiredTerminalImages(self: *ImageState, terminal_image_context: TerminalImageContext) void {
-        for (self.pending_editor_images.items) |*image| {
-            if (image.kitty_image) |kitty| {
-                if (kitty.id > 0) {
-                    terminal_image_context.delete_image(kitty.id);
-                }
-            }
-        }
-        self.image.pending_editor_images.clearRetainingCapacity();
-        for (self.retired_kitty_images.items) |id| {
-            if (id > 0) terminal_image_context.delete_image(id);
-        }
-        self.image.retired_kitty_images.clearRetainingCapacity();
+        self.store.flushRetired(terminalImageDeleteSink(&terminal_image_context));
     }
 
     pub fn freeActiveTerminalImages(self: *ImageState, allocator: std.mem.Allocator, terminal_image_context: TerminalImageContext) void {
-        for (self.pending_editor_images.items) |*image| {
-            if (image.kitty_image) |kitty| {
-                if (kitty.id > 0) {
-                    terminal_image_context.delete_image(kitty.id);
-                }
-                allocator.free(kitty.data);
-            }
-            pending_editor_images_mod.deinit(allocator, image);
-        }
-        self.image.pending_editor_images.clearRetainingCapacity();
-        for (self.retired_kitty_images.items) |id| {
-            if (id > 0) terminal_image_context.delete_image(id);
-        }
-        self.image.retired_kitty_images.clearRetainingCapacity();
+        self.store.freeActive(allocator, terminalImageDeleteSink(&terminal_image_context));
     }
 
     pub fn deinit(self: *ImageState, allocator: std.mem.Allocator) void {
-        for (self.pending_editor_images.items) |*image| pending_editor_images_mod.deinit(allocator, image);
-        self.pending_editor_images.deinit(allocator);
-        self.retired_kitty_images.deinit(allocator);
+        self.store.deinit(allocator);
         self.clipboard_paste.deinit();
     }
 };
@@ -396,7 +376,6 @@ pub const FooterState = struct {
         allocator.free(self.footer.recent_activity);
     }
 };
-
 
 pub const StreamState = struct {
     all_expanded: bool = false,
@@ -608,10 +587,7 @@ pub const AppState = struct {
     pub fn appendPendingEditorImage(self: *AppState, image: ai.ImageContent) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.image.pending_editor_images.append(self.allocator, .{
-            .data = image.data,
-            .mime_type = image.mime_type,
-        });
+        try self.image.appendPending(self.allocator, image);
     }
 
     pub fn clearPendingEditorImages(self: *AppState) void {
@@ -645,7 +621,7 @@ pub const AppState = struct {
                 {
                     self.mutex.lockUncancelable(self.io);
                     defer self.mutex.unlock(self.io);
-                    try self.image.pending_editor_images.append(self.allocator, pending);
+                    try self.image.appendPendingOwned(self.allocator, pending);
                     appended = true;
                 }
                 try self.setStatus("clipboard image pasted");
@@ -732,27 +708,7 @@ pub const AppState = struct {
     pub fn clonePendingEditorImages(self: *AppState, allocator: std.mem.Allocator) ![]ai.ImageContent {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        if (self.image.pending_editor_images.items.len == 0) return &.{};
-
-        const cloned = try allocator.alloc(ai.ImageContent, self.image.pending_editor_images.items.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (cloned[0..initialized]) |image| {
-                allocator.free(image.data);
-                allocator.free(image.mime_type);
-            }
-            allocator.free(cloned);
-        }
-
-        for (self.image.pending_editor_images.items, 0..) |image, index| {
-            cloned[index] = .{
-                .data = try allocator.dupe(u8, image.data),
-                .mime_type = try allocator.dupe(u8, image.mime_type),
-            };
-            initialized += 1;
-        }
-        return cloned;
+        return try self.image.clonePending(allocator);
     }
 
     pub fn flushRetiredTerminalImages(self: *AppState, terminal_image_context: TerminalImageContext) void {
@@ -764,16 +720,8 @@ pub const AppState = struct {
     pub fn freeActiveTerminalImages(self: *AppState, terminal_image_context: TerminalImageContext) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-
-        self.flushRetiredTerminalImagesLocked(terminal_image_context);
-        for (self.image.pending_editor_images.items) |*image| {
-            if (image.kitty_image) |kitty| {
-                terminal_image_context.vx.freeImage(terminal_image_context.tty, kitty.id);
-                image.kitty_image = null;
-            }
-        }
+        self.image.freeActiveTerminalImages(self.allocator, terminal_image_context);
     }
-
     pub fn snapshotForRender(self: *AppState, allocator: std.mem.Allocator) !RenderStateSnapshot {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -801,7 +749,7 @@ pub const AppState = struct {
         snapshot.items = try chat_items.clone(allocator, self.chat.items.items[start_index..]);
         snapshot.queued_steering = try cloneOwnedStringList(allocator, self.queue.steering.items);
         snapshot.queued_follow_up = try cloneOwnedStringList(allocator, self.queue.follow_up.items);
-        snapshot.pending_editor_images = try pending_editor_images_mod.cloneForRender(allocator, self.image.pending_editor_images.items);
+        snapshot.pending_editor_images = try pending_editor_images_mod.cloneForRender(allocator, self.image.store.pending_editor_images.items);
         snapshot.extension_header_lines = try cloneOwnedStringList(allocator, self.extension.header_lines);
         snapshot.extension_footer_lines = try cloneOwnedStringList(allocator, self.extension.footer_lines);
         snapshot.extension_editor_label = if (self.extension.editor_label) |label| try allocator.dupe(u8, label) else null;
@@ -2242,25 +2190,15 @@ pub const AppState = struct {
     }
 
     fn clearPendingEditorImagesLocked(self: *AppState) void {
-        for (self.image.pending_editor_images.items) |*image| {
-            self.retirePendingEditorImageLocked(image);
-            pending_editor_images_mod.deinit(self.allocator, image);
-        }
-        self.image.pending_editor_images.clearRetainingCapacity();
+        self.image.clearPending(self.allocator);
     }
 
     fn retirePendingEditorImageLocked(self: *AppState, image: *PendingEditorImage) void {
-        if (image.kitty_image) |kitty| {
-            self.image.retired_kitty_images.append(self.allocator, kitty.id) catch {};
-            image.kitty_image = null;
-        }
+        self.image.retirePendingImage(self.allocator, image);
     }
 
     fn flushRetiredTerminalImagesLocked(self: *AppState, terminal_image_context: TerminalImageContext) void {
-        for (self.image.retired_kitty_images.items) |id| {
-            terminal_image_context.vx.freeImage(terminal_image_context.tty, id);
-        }
-        self.image.retired_kitty_images.clearRetainingCapacity();
+        self.image.flushRetiredTerminalImages(terminal_image_context);
     }
 
     fn transmitKittyImage(
@@ -2374,8 +2312,6 @@ pub const AppState = struct {
         return null;
     }
 
-
-
     fn markTerminalProgressLocked(self: *AppState, active: bool) void {
         if (self.footer.terminal_progress_active == active and self.footer.terminal_progress_dirty) return;
         if (self.footer.terminal_progress_active != active or !self.footer.terminal_progress_dirty) {
@@ -2471,6 +2407,7 @@ pub const ScreenComponent = struct {
     keybindings: ?*const keybindings_mod.Keybindings = null,
     theme: ?*const resources_mod.Theme = null,
     terminal_name: []const u8 = "term",
+    image_render_policy: tui.terminal_image.ImageRenderPolicy = .{},
     after_snapshot_hook: ?RenderHook = null,
 
     pub fn drawComponent(self: *const ScreenComponent) tui.DrawComponent {
@@ -2611,6 +2548,7 @@ pub const ScreenComponent = struct {
                 self.theme,
                 self.editor,
                 snapshot.pending_editor_images,
+                self.image_render_policy,
             );
         }
         next_row += layout.core_prompt_height;
@@ -2697,6 +2635,7 @@ fn computeScreenLayout(
         screen.theme,
         screen.editor,
         snapshot.pending_editor_images,
+        screen.image_render_policy,
         width,
     );
     const prompt_height = core_prompt_height + extension_above_height + extension_editor_height + extension_below_height;
@@ -3295,9 +3234,10 @@ fn measurePromptHeight(
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
     pending_images: []const PendingEditorImage,
+    policy: tui.terminal_image.ImageRenderPolicy,
     width: usize,
 ) !usize {
-    return prompt_rendering.measureHeight(allocator, theme, editor, pending_images, width);
+    return prompt_rendering.measureHeight(allocator, theme, editor, pending_images, policy, width);
 }
 
 fn drawPromptLines(
@@ -3306,8 +3246,9 @@ fn drawPromptLines(
     theme: ?*const resources_mod.Theme,
     editor: *tui.Editor,
     pending_images: []const PendingEditorImage,
+    policy: tui.terminal_image.ImageRenderPolicy,
 ) !tui.DrawSize {
-    return prompt_rendering.drawLines(window, ctx, theme, editor, pending_images);
+    return prompt_rendering.drawLines(window, ctx, theme, editor, pending_images, policy);
 }
 
 fn measureAutocompleteHeight(
