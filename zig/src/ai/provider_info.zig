@@ -110,6 +110,14 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .default_api = "bedrock-converse-stream",
     },
     .{
+        .id = "ant-ling",
+        .display_name = "Ant Ling",
+        .default_model = "Ring-2.6-1T",
+        .missing_api_key_message = "Ant Ling credentials required.\nSet ANT_LING_API_KEY, pass --api-key, or run /login ant-ling.",
+        .env_var = "ANT_LING_API_KEY",
+        .default_api = "openai-completions",
+    },
+    .{
         .id = "anthropic",
         .display_name = "Anthropic",
         .default_model = "claude-opus-4-7",
@@ -271,6 +279,14 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .default_api = "openai-completions",
     },
     .{
+        .id = "nvidia",
+        .display_name = "NVIDIA NIM",
+        .default_model = "moonshotai/kimi-k2.6",
+        .missing_api_key_message = "NVIDIA NIM credentials required.\nSet NVIDIA_API_KEY, pass --api-key, or run /login nvidia.",
+        .env_var = "NVIDIA_API_KEY",
+        .default_api = "openai-completions",
+    },
+    .{
         .id = "opencode",
         .display_name = "OpenCode Zen",
         .default_model = "kimi-k2.6",
@@ -390,7 +406,15 @@ pub const PROVIDERS: []const ProviderInfo = &.{
         .env_var = "ZAI_API_KEY",
         .default_api = "openai-completions",
     },
-};
+    .{
+        .id = "zai-coding-cn",
+        .display_name = "ZAI Coding Plan (China)",
+        .default_model = "glm-5.2",
+        .missing_api_key_message = "ZAI Coding Plan (China) credentials required.\nSet ZAI_CODING_CN_API_KEY, pass --api-key, or run /login zai-coding-cn.",
+        .env_var = "ZAI_CODING_CN_API_KEY",
+        .default_api = "openai-completions",
+    },
+ };
 
 comptime {
     @setEvalBranchQuota(10_000);

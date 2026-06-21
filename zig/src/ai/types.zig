@@ -126,6 +126,8 @@ pub const Usage = struct {
     output: u32 = 0,
     cache_read: u32 = 0,
     cache_write: u32 = 0,
+    /// Subset of `cache_write` written with 1h retention. Only Anthropic reports this split.
+    cache_write_1h: u32 = 0,
     total_tokens: u32 = 0,
     cost: UsageCost = .{},
 

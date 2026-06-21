@@ -122,6 +122,7 @@ test "resolveEnvVar returns previously-known single-key mappings" {
     const KnownMapping = struct { provider: []const u8, env_var: []const u8 };
     const known = [_]KnownMapping{
         .{ .provider = "openai", .env_var = "OPENAI_API_KEY" },
+        .{ .provider = "ant-ling", .env_var = "ANT_LING_API_KEY" },
         .{ .provider = "openai-responses", .env_var = "OPENAI_API_KEY" },
         .{ .provider = "openai-codex", .env_var = "OPENAI_API_KEY" },
         .{ .provider = "azure-openai-responses", .env_var = "AZURE_OPENAI_API_KEY" },
@@ -133,12 +134,14 @@ test "resolveEnvVar returns previously-known single-key mappings" {
         .{ .provider = "openrouter", .env_var = "OPENROUTER_API_KEY" },
         .{ .provider = "vercel-ai-gateway", .env_var = "AI_GATEWAY_API_KEY" },
         .{ .provider = "zai", .env_var = "ZAI_API_KEY" },
+        .{ .provider = "zai-coding-cn", .env_var = "ZAI_CODING_CN_API_KEY" },
         .{ .provider = "mistral", .env_var = "MISTRAL_API_KEY" },
         .{ .provider = "minimax", .env_var = "MINIMAX_API_KEY" },
         .{ .provider = "minimax-cn", .env_var = "MINIMAX_CN_API_KEY" },
         .{ .provider = "moonshotai", .env_var = "MOONSHOT_API_KEY" },
         .{ .provider = "moonshotai-cn", .env_var = "MOONSHOT_API_KEY" },
         .{ .provider = "huggingface", .env_var = "HF_TOKEN" },
+        .{ .provider = "nvidia", .env_var = "NVIDIA_API_KEY" },
         .{ .provider = "fireworks", .env_var = "FIREWORKS_API_KEY" },
         .{ .provider = "together", .env_var = "TOGETHER_API_KEY" },
         .{ .provider = "opencode", .env_var = "OPENCODE_API_KEY" },
