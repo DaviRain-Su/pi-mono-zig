@@ -370,18 +370,35 @@ fn selectInitialModel(
         }
     }
 
+    // Try saved default from settings — but only if the model exists in the registry.
+    // Mirrors TS findInitialModel step 3: modelRegistry.find(defaultProvider, defaultModelId).
+    // If the default provider/model is not a registered built-in (e.g. a custom
+    // provider like "ollama-cloud" that was configured via extensions), fall through
+    // to findInitialDefaultModel which scans for any provider with credentials.
     if (options.provider != null or runtime_config.settings.default_provider != null) {
-        return .{
-            .provider_name = options.provider orelse runtime_config.settings.default_provider.?,
-            .model_name = runtime_config.settings.default_model,
-        };
+        const provider_name = options.provider orelse runtime_config.settings.default_provider.?;
+        const model_id = runtime_config.settings.default_model orelse provider_name;
+        const found = ai.model_registry.find(provider_name, model_id);
+        if (found) |_| {
+            return .{
+                .provider_name = provider_name,
+                .model_name = runtime_config.settings.default_model,
+            };
+        }
     }
 
-    if (runtime_config.settings.default_model != null) {
-        return .{
-            .provider_name = "openai",
-            .model_name = runtime_config.settings.default_model,
-        };
+    // If default_model is set but default_provider was not (or not found),
+    // check if the model exists under "openai" in the registry.
+    // Mirrors TS findInitialModel: no separate "default_model with openai" step —
+    // if the default provider/model isn't found, fall through to credential scan.
+    if (runtime_config.settings.default_model) |default_model| {
+        const found = ai.model_registry.find("openai", default_model);
+        if (found) |_| {
+            return .{
+                .provider_name = "openai",
+                .model_name = default_model,
+            };
+        }
     }
 
     const model = try coding_agent.provider_config.findInitialDefaultModel(allocator, env_map, .{

@@ -13,6 +13,7 @@ const runtime_prep = @import("cli/runtime_prep.zig");
 const run_mode_dispatch = @import("cli/run_mode_dispatch.zig");
 const session_picker = @import("cli/session_picker.zig");
 const output = @import("cli/output.zig");
+const auth = @import("coding_agent/auth/auth.zig");
 const coding_agent = @import("coding_agent/root.zig");
 
 const builtin = @import("builtin");
@@ -79,6 +80,7 @@ fn runCliWithInput(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) !u8 {
+    defer auth.clearCommandResultCache();
     if (try package_command_dispatch.dispatchPackageCommand(
         allocator,
         io,

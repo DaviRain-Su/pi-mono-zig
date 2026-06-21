@@ -730,8 +730,19 @@ fn buildApiKeyFromStoredEntryWithRefreshEndpoints(
 }
 
 // Shell command execution for "!" prefix support.
-// Uses module-level cache for process lifetime (single-threaded at startup).
+// Uses a module-level cache for the current process.
 var command_result_cache: ?std.StringHashMap(?[]u8) = null;
+
+pub fn clearCommandResultCache() void {
+    if (command_result_cache) |*cache| {
+        var values = cache.valueIterator();
+        while (values.next()) |value_ptr| {
+            if (value_ptr.*) |value| cache.allocator.free(value);
+        }
+        cache.deinit();
+        command_result_cache = null;
+    }
+}
 
 fn getOrInitCommandCache(allocator: std.mem.Allocator) *std.StringHashMap(?[]u8) {
     if (command_result_cache == null) {
@@ -749,41 +760,38 @@ fn executeShellCommand(allocator: std.mem.Allocator, io: std.Io, command: []cons
         return null;
     }
 
-    // Execute command using std.process.spawn
+    // Execute command via /bin/sh -c <command>
     const builtin = @import("builtin");
     const shell: []const u8 = if (builtin.os.tag == .windows) "bash" else "/bin/sh";
     const argv = [_][]const u8{ shell, "-c", command };
-    var child = std.process.spawn(io, .{
+    const run_result = std.process.run(allocator, io, .{
         .argv = argv[0..],
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return null;
+        .stdout_limit = .limited(8192),
+    }) catch {
+        try cache.put(command, null);
+        return null;
+    };
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
 
-    // Wait for child to finish (no explicit timeout - blocking wait)
-    const term = child.wait(io) catch return null;
-
-    // Read stdout if child exited successfully
     var result: ?[]u8 = null;
-    if (term == .exited and term.exited == 0) {
-        if (child.stdout) |stdout_file| {
-            // Read output in fixed buffer and trim
-            var read_buf: [8192]u8 = undefined;
-            const bytes_read = stdout_file.readStreaming(io, &.{&read_buf}) catch 0;
-            if (bytes_read > 0) {
-                // Trim whitespace
-                const trimmed = std.mem.trim(u8, read_buf[0..bytes_read], &std.ascii.whitespace);
-                if (trimmed.len > 0) {
-                    result = allocator.dupe(u8, trimmed) catch return null;
-                }
-            }
+    if (run_result.term == .exited and run_result.term.exited == 0) {
+        const trimmed = std.mem.trim(u8, run_result.stdout, &std.ascii.whitespace);
+        if (trimmed.len > 0) {
+            result = allocator.dupe(u8, trimmed) catch return null;
         }
     }
 
-    // Cache the result (including null failures)
-    try cache.put(command, result);
-
-    if (result) |r| return try allocator.dupe(u8, r);
+    // Cache a copy; caller gets the original. The cache copy persists for the
+    // process lifetime and is never freed (module-level singleton).
+    if (result) |r| {
+        const cached_copy = allocator.dupe(u8, r) catch null;
+        try cache.put(command, cached_copy);
+        if (cached_copy) |_| return r;
+        // If we couldn't allocate a cache copy, still return the result uncached.
+        return r;
+    }
+    try cache.put(command, null);
     return null;
 }
 
@@ -804,6 +812,7 @@ pub fn resolveApiKey(
                     return .{
                         .api_key = cmd_result,
                         .source = .runtime,
+                        .owned_api_key = cmd_result,
                     };
                 }
                 return null;
@@ -824,6 +833,7 @@ pub fn resolveApiKey(
                     return .{
                         .api_key = cmd_result,
                         .source = .stored,
+                        .owned_api_key = cmd_result,
                     };
                 }
                 return null;
@@ -2619,6 +2629,28 @@ test "resolveApiKey falls back to stored then environment credentials" {
     try std.testing.expectEqual(CredentialSource.environment, env_only.source);
     try std.testing.expectEqualStrings("env-openai-key", env_only.api_key);
     try std.testing.expect(env_only.owned_api_key != null);
+}
+
+test "resolveApiKey executes shell command credentials" {
+    const allocator = std.testing.allocator;
+    defer clearCommandResultCache();
+
+    var env_map = std.process.Environ.Map.init(allocator);
+    defer env_map.deinit();
+
+    const resolved = (try resolveApiKey(
+        allocator,
+        std.testing.io,
+        &env_map,
+        "openai",
+        null,
+        "!printf %s shell-openai-key",
+    )).?;
+    defer if (resolved.owned_api_key) |value| allocator.free(value);
+
+    try std.testing.expectEqual(CredentialSource.stored, resolved.source);
+    try std.testing.expectEqualStrings("shell-openai-key", resolved.api_key);
+    try std.testing.expect(resolved.owned_api_key != null);
 }
 
 test "resolveApiKey matches TypeScript environment fallback order for auth families" {
