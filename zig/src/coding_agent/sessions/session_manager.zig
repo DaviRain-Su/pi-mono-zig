@@ -633,7 +633,7 @@ pub const SessionManager = struct {
                 .compaction => |*compaction_entry| {
                     latest_compaction = compaction_entry;
                 },
-                .branch_summary, .custom, .custom_message, .label, .session_info => {},
+                .branch_summary, .custom, .custom_message, .label, .session_info, .active_tools_change => {},
             }
         }
 
@@ -1327,6 +1327,7 @@ fn appendContextEntry(
         },
         .thinking_level_change,
         .model_change,
+        .active_tools_change,
         .compaction,
         .custom,
         .label,

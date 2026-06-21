@@ -149,9 +149,12 @@ pub const MistralProvider = struct {
         try provider_stream.mergeHeaders(allocator, &headers, model.headers);
         if (options) |stream_options| {
             try provider_stream.mergeHeaders(allocator, &headers, stream_options.headers);
-            if (stream_options.session_id) |session_id| {
-                if (!provider_stream.containsHeaderCaseInsensitive(&headers, "x-affinity")) {
-                    try provider_stream.putOwnedHeader(allocator, &headers, "x-affinity", session_id);
+            // x-affinity header is only sent when prompt caching is active (cache_retention != .none).
+            if (stream_options.cache_retention != .none) {
+                if (stream_options.session_id) |session_id| {
+                    if (!provider_stream.containsHeaderCaseInsensitive(&headers, "x-affinity")) {
+                        try provider_stream.putOwnedHeader(allocator, &headers, "x-affinity", session_id);
+                    }
                 }
             }
         }
@@ -194,6 +197,7 @@ const RequestPayload = struct {
     metadata: ?std.json.Value = null,
     reasoning_effort: ?[]const u8 = null,
     prompt_mode: ?[]const u8 = null,
+    prompt_cache_key: ?[]const u8 = null,
 };
 
 const Message = union(enum) {
@@ -431,6 +435,7 @@ fn buildOwnedPayload(
     var metadata: ?std.json.Value = null;
     var reasoning_effort: ?[]const u8 = null;
     var prompt_mode: ?[]const u8 = null;
+    var prompt_cache_key: ?[]const u8 = null;
     if (options) |opts| {
         temperature = opts.temperature;
         max_tokens = if (opts.max_tokens) |m| @intCast(m) else null;
@@ -442,6 +447,10 @@ fn buildOwnedPayload(
         const mistral_opts = opts.providerOptions("mistral");
         reasoning_effort = mistral_opts.reasoning_effort;
         prompt_mode = mistral_opts.prompt_mode;
+        // Prompt caching: only when cache retention is not "none" and a session ID is set.
+        if (opts.cache_retention != .none) {
+            if (opts.session_id) |sid| prompt_cache_key = sid;
+        }
     }
 
     // Promote builder lists to owned slices (transfer ownership to OwnedPayload).
@@ -462,6 +471,7 @@ fn buildOwnedPayload(
             .metadata = metadata,
             .reasoning_effort = reasoning_effort,
             .prompt_mode = prompt_mode,
+            .prompt_cache_key = prompt_cache_key,
         },
         .messages_buf = messages_buf,
         .tools_buf = tools_buf,

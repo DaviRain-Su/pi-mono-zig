@@ -59,6 +59,8 @@ const AnthropicCompat = struct {
     supports_long_cache_retention: bool = true,
     send_session_affinity_headers: bool = false,
     supports_cache_control_on_tools: bool = true,
+    supports_temperature: bool = true,
+    allow_empty_signature: bool = false,
 };
 
 const ResolvedOptions = struct {
@@ -319,7 +321,7 @@ fn buildOwnedAnthropic(
     if (options) |stream_options| {
         const anthropic_opts = stream_options.providerOptions("anthropic");
         if (stream_options.temperature) |t| {
-            if (anthropic_opts.thinking_enabled != true) temperature = t;
+            if (anthropic_opts.thinking_enabled != true and compat.supports_temperature) temperature = t;
         }
         if (model.reasoning) {
             if (anthropic_opts.thinking_enabled == true) {
@@ -408,12 +410,21 @@ pub fn mapStopReason(reason: []const u8) types.StopReason {
     return stop_reason_mod.mapStopReasonFromTable(&stop_reason_mod.anthropic_mappings, reason, .error_reason);
 }
 
-fn applyProviderStopReason(allocator: std.mem.Allocator, output: *types.AssistantMessage, reason: []const u8) !void {
+fn applyProviderStopReason(
+    allocator: std.mem.Allocator,
+    output: *types.AssistantMessage,
+    reason: []const u8,
+    explanation: ?[]const u8,
+) !void {
     const mapped = mapStopReason(reason);
     output.stop_reason = mapped;
     if (mapped == .error_reason) {
         if (output.error_message) |existing| allocator.free(existing);
-        output.error_message = try std.fmt.allocPrint(allocator, "Provider stop_reason: {s}", .{reason});
+        if (explanation) |msg| {
+            output.error_message = try allocator.dupe(u8, msg);
+        } else {
+            output.error_message = try std.fmt.allocPrint(allocator, "Provider stop_reason: {s}", .{reason});
+        }
     } else if (output.error_message) |existing| {
         allocator.free(existing);
         output.error_message = null;
@@ -421,6 +432,8 @@ fn applyProviderStopReason(allocator: std.mem.Allocator, output: *types.Assistan
 }
 
 fn supportsAdaptiveThinking(model: types.Model) bool {
+    // Prefer the explicit compat flag when set; fall back to model ID heuristics.
+    if (compatBoolField(model.compat, "forceAdaptiveThinking")) |flag| return flag;
     return std.mem.indexOf(u8, model.id, "opus-4-6") != null or
         std.mem.indexOf(u8, model.id, "opus-4.6") != null or
         std.mem.indexOf(u8, model.id, "opus-4-7") != null or
@@ -2592,7 +2605,17 @@ fn processAnthropicSseEvent(
         if (value.object.get("delta")) |delta_value| {
             if (delta_value == .object) {
                 if (delta_value.object.get("stop_reason")) |stop_reason| {
-                    if (stop_reason == .string) try applyProviderStopReason(allocator, output, stop_reason.string);
+                    if (stop_reason == .string) {
+                        var explanation: ?[]const u8 = null;
+                        if (delta_value.object.get("stop_details")) |stop_details| {
+                            if (stop_details == .object) {
+                                if (stop_details.object.get("explanation")) |exp| {
+                                    if (exp == .string) explanation = exp.string;
+                                }
+                            }
+                        }
+                        try applyProviderStopReason(allocator, output, stop_reason.string, explanation);
+                    }
                 }
             }
         }
@@ -3062,6 +3085,8 @@ fn getAnthropicCompat(model: types.Model) AnthropicCompat {
         .supports_long_cache_retention = compatBoolField(model.compat, "supportsLongCacheRetention") orelse !is_fireworks,
         .send_session_affinity_headers = compatBoolField(model.compat, "sendSessionAffinityHeaders") orelse (is_fireworks or is_cloudflare_ai_gateway_anthropic),
         .supports_cache_control_on_tools = compatBoolField(model.compat, "supportsCacheControlOnTools") orelse !is_fireworks,
+        .supports_temperature = compatBoolField(model.compat, "supportsTemperature") orelse true,
+        .allow_empty_signature = compatBoolField(model.compat, "allowEmptySignature") orelse false,
     };
 }
 
@@ -3363,6 +3388,15 @@ fn updateUsage(usage: *types.Usage, usage_value: std.json.Value) void {
     }
     if (usage_value.object.get("cache_creation_input_tokens")) |value| {
         if (value == .integer) usage.cache_write = @intCast(value.integer);
+    }
+    // Anthropic splits cache creation into ephemeral (5min, included in cache_write above)
+    // and ephemeral_1h (1h retention). The 1h tokens are priced at 2x input.
+    if (usage_value.object.get("cache_creation")) |cache_creation| {
+        if (cache_creation == .object) {
+            if (cache_creation.object.get("ephemeral_1h_input_tokens")) |eph| {
+                if (eph == .integer) usage.cache_write_1h = @intCast(eph.integer);
+            }
+        }
     }
     usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }

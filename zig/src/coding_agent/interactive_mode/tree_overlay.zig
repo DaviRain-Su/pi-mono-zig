@@ -34,6 +34,7 @@ const NodeKind = enum {
     custom_message,
     label,
     session_info,
+    active_tools_change,
 };
 
 const NodeInfo = struct {
@@ -229,6 +230,7 @@ fn kindOfEntry(entry: session_manager_mod.SessionEntry) NodeKind {
         .custom => .custom,
         .custom_message => .custom_message,
         .label => .label,
+        .active_tools_change => .active_tools_change,
         .session_info => .session_info,
     };
 }
@@ -285,6 +287,18 @@ fn summarizeEntry(allocator: std.mem.Allocator, entry: session_manager_mod.Sessi
             std.fmt.allocPrint(allocator, "session name: {s}", .{name})
         else
             allocator.dupe(u8, "session name cleared"),
+        .active_tools_change => |tools_entry| blk: {
+            if (tools_entry.active_tool_names.len == 0) break :blk allocator.dupe(u8, "[tools: (none)]");
+            var parts = std.ArrayList(u8).empty;
+            defer parts.deinit(allocator);
+            try parts.appendSlice(allocator, "[tools: ");
+            for (tools_entry.active_tool_names, 0..) |name, i| {
+                if (i > 0) try parts.appendSlice(allocator, ", ");
+                try parts.appendSlice(allocator, name);
+            }
+            try parts.append(allocator, ']');
+            break :blk try parts.toOwnedSlice(allocator);
+        },
     };
 }
 

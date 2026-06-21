@@ -99,10 +99,18 @@ pub const SessionInfoEntry = struct {
     name: ?[]const u8,
 };
 
+pub const ActiveToolsChangeEntry = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    timestamp: []const u8,
+    active_tool_names: [][]const u8,
+};
+
 pub const SessionEntry = union(enum) {
     message: SessionMessageEntry,
     thinking_level_change: ThinkingLevelChangeEntry,
     model_change: ModelChangeEntry,
+    active_tools_change: ActiveToolsChangeEntry,
     compaction: CompactionEntry,
     branch_summary: BranchSummaryEntry,
     custom: CustomEntry,
@@ -115,6 +123,7 @@ pub const SessionEntry = union(enum) {
             .message => |entry| entry.id,
             .thinking_level_change => |entry| entry.id,
             .model_change => |entry| entry.id,
+            .active_tools_change => |entry| entry.id,
             .compaction => |entry| entry.id,
             .branch_summary => |entry| entry.id,
             .custom => |entry| entry.id,
@@ -129,6 +138,7 @@ pub const SessionEntry = union(enum) {
             .message => |entry| entry.parent_id,
             .thinking_level_change => |entry| entry.parent_id,
             .model_change => |entry| entry.parent_id,
+            .active_tools_change => |entry| entry.parent_id,
             .compaction => |entry| entry.parent_id,
             .branch_summary => |entry| entry.parent_id,
             .custom => |entry| entry.parent_id,
@@ -143,6 +153,7 @@ pub const SessionEntry = union(enum) {
             .message => |entry| entry.timestamp,
             .thinking_level_change => |entry| entry.timestamp,
             .model_change => |entry| entry.timestamp,
+            .active_tools_change => |entry| entry.timestamp,
             .compaction => |entry| entry.timestamp,
             .branch_summary => |entry| entry.timestamp,
             .custom => |entry| entry.timestamp,
@@ -187,6 +198,13 @@ pub fn deinitEntry(allocator: std.mem.Allocator, entry: *SessionEntry) void {
             allocator.free(model_entry.timestamp);
             allocator.free(model_entry.provider);
             allocator.free(model_entry.model_id);
+        },
+        .active_tools_change => |*tools_entry| {
+            allocator.free(tools_entry.id);
+            if (tools_entry.parent_id) |parent_id| allocator.free(parent_id);
+            allocator.free(tools_entry.timestamp);
+            for (tools_entry.active_tool_names) |name| allocator.free(name);
+            allocator.free(tools_entry.active_tool_names);
         },
         .compaction => |*compaction_entry| {
             allocator.free(compaction_entry.id);
@@ -258,6 +276,16 @@ pub fn cloneEntry(allocator: std.mem.Allocator, entry: SessionEntry) !SessionEnt
             .timestamp = try allocator.dupe(u8, model_entry.timestamp),
             .provider = try allocator.dupe(u8, model_entry.provider),
             .model_id = try allocator.dupe(u8, model_entry.model_id),
+        } },
+        .active_tools_change => |tools_entry| .{ .active_tools_change = .{
+            .id = try allocator.dupe(u8, tools_entry.id),
+            .parent_id = try cloneParentId(allocator, tools_entry.parent_id),
+            .timestamp = try allocator.dupe(u8, tools_entry.timestamp),
+            .active_tool_names = blk: {
+                const names = try allocator.alloc([]const u8, tools_entry.active_tool_names.len);
+                for (tools_entry.active_tool_names, 0..) |name, i| names[i] = try allocator.dupe(u8, name);
+                break :blk names;
+            },
         } },
         .compaction => |compaction_entry| .{ .compaction = .{
             .id = try allocator.dupe(u8, compaction_entry.id),
@@ -523,6 +551,16 @@ pub fn entryToJsonValue(allocator: std.mem.Allocator, entry: SessionEntry) !std.
             var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.model_change), model_entry.id, model_entry.parent_id, model_entry.timestamp);
             try common.putString(allocator, &object, "provider", model_entry.provider);
             try common.putString(allocator, &object, "modelId", model_entry.model_id);
+            break :blk .{ .object = object };
+        },
+        .active_tools_change => |tools_entry| blk: {
+            var object = try baseEntryObject(allocator, @tagName(SessionEntryTag.active_tools_change), tools_entry.id, tools_entry.parent_id, tools_entry.timestamp);
+            // Serialize active_tool_names as a JSON array of strings.
+            var names_array = std.json.Array.init(allocator);
+            for (tools_entry.active_tool_names) |name| {
+                try names_array.append(.{ .string = name });
+            }
+            try object.put(allocator, try allocator.dupe(u8, "activeToolNames"), .{ .array = names_array });
             break :blk .{ .object = object };
         },
         .compaction => |compaction_entry| blk: {
@@ -824,6 +862,7 @@ pub fn parseEntryLine(allocator: std.mem.Allocator, line: []const u8) !SessionEn
         .message => parseMessageEntry(allocator, object),
         .thinking_level_change => parseThinkingLevelChangeEntry(allocator, object),
         .model_change => parseModelChangeEntry(allocator, object),
+        .active_tools_change => parseActiveToolsChangeEntry(allocator, object),
         .compaction => parseCompactionEntry(allocator, object),
         .branch_summary => parseBranchSummaryEntry(allocator, object),
         .custom => parseCustomEntry(allocator, object),
@@ -882,6 +921,24 @@ fn parseModelChangeEntry(allocator: std.mem.Allocator, object: std.json.ObjectMa
     const model_id = try allocator.dupe(u8, try getRequiredString(object, "modelId"));
     errdefer allocator.free(model_id);
     return .{ .model_change = .{ .id = base.id, .parent_id = base.parent_id, .timestamp = base.timestamp, .provider = provider, .model_id = model_id } };
+}
+
+fn parseActiveToolsChangeEntry(allocator: std.mem.Allocator, object: std.json.ObjectMap) !SessionEntry {
+    var base = try parseEntryBase(allocator, object);
+    errdefer base.deinit(allocator);
+    const names_value = object.get("activeToolNames") orelse return error.InvalidSessionEntry;
+    if (names_value != .array) return error.InvalidSessionEntry;
+    var names_list = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (names_list.items) |name| allocator.free(name);
+        names_list.deinit(allocator);
+    }
+    for (names_value.array.items) |item| {
+        if (item != .string) return error.InvalidSessionEntry;
+        try names_list.append(allocator, try allocator.dupe(u8, item.string));
+    }
+    const names = try names_list.toOwnedSlice(allocator);
+    return .{ .active_tools_change = .{ .id = base.id, .parent_id = base.parent_id, .timestamp = base.timestamp, .active_tool_names = names } };
 }
 
 fn parseCompactionEntry(allocator: std.mem.Allocator, object: std.json.ObjectMap) !SessionEntry {

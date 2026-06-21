@@ -604,6 +604,13 @@ pub const StreamOptions = struct {
     /// Optional metadata to include in API requests.
     metadata: ?std.json.Value = null,
 
+    /// WebSocket connect timeout in milliseconds (for providers that use WebSocket).
+    websocket_connect_timeout_ms: ?u32 = null,
+
+    /// Provider-scoped environment overrides. Values take precedence over process env.
+    /// In Zig, this is an optional string-to-string map. The caller owns the map.
+    env: ?std.StringHashMap([]const u8) = null,
+
     /// Provider-specific options, composable across providers (see
     /// `ProviderStreamOptions`).
     provider: ProviderStreamOptions = .{},
@@ -634,6 +641,7 @@ pub const SimpleStreamOptions = struct {
     on_response: ?*const fn (u16, std.StringHashMap([]const u8), Model) anyerror!void = null,
     max_retry_delay_ms: u32 = 60000,
     metadata: ?std.json.Value = null,
+    websocket_connect_timeout_ms: ?u32 = null,
     signal: ?*const std.atomic.Value(bool) = null,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,

@@ -2085,7 +2085,7 @@ fn appendTranscriptEntry(
             try appendTranscriptSeparator(writer);
             try writer.writer.print("### Branch Summary\n\n{s}\n\n", .{branch_summary_entry.summary});
         },
-        .thinking_level_change, .model_change, .compaction, .custom, .label, .session_info => {},
+        .thinking_level_change, .model_change, .active_tools_change, .compaction, .custom, .label, .session_info => {},
     }
 }
 
