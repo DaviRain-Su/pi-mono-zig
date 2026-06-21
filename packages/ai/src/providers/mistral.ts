@@ -6,7 +6,7 @@ import type {
 	ContentChunk,
 	FunctionTool,
 } from "@mistralai/mistralai/models/components";
-import { getEnvApiKey } from "../env-api-keys.ts";
+import { registerApiProvider } from "../api-registry.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -57,7 +57,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 		const output = createOutput(model);
 
 		try {
-			const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
@@ -113,7 +113,7 @@ export const streamSimpleMistral: StreamFunction<"mistral-conversations", Simple
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey;
 	if (!apiKey) {
 		throw new Error(`No API key for provider: ${model.provider}`);
 	}
@@ -130,6 +130,14 @@ export const streamSimpleMistral: StreamFunction<"mistral-conversations", Simple
 			shouldUseReasoning && usesReasoningEffort(model) ? mapReasoningEffort(model, reasoning) : undefined,
 	} satisfies MistralOptions);
 };
+
+export function register(): void {
+	registerApiProvider({
+		api: "mistral-conversations",
+		stream: streamMistral,
+		streamSimple: streamSimpleMistral,
+	});
+}
 
 function createOutput(model: Model<"mistral-conversations">): AssistantMessage {
 	return {
@@ -227,7 +235,7 @@ function buildRequestOptions(model: Model<"mistral-conversations">, options?: Mi
 
 	// Mistral infrastructure uses `x-affinity` for KV-cache reuse (prefix caching).
 	// Respect explicit caller-provided header values.
-	if (options?.sessionId && !headers["x-affinity"]) {
+	if (shouldUsePromptCaching(options) && !headers["x-affinity"]) {
 		headers["x-affinity"] = options.sessionId;
 	}
 
@@ -256,6 +264,7 @@ function buildChatPayload(
 	if (options?.toolChoice) payload.toolChoice = mapToolChoice(options.toolChoice);
 	if (options?.promptMode) payload.promptMode = options.promptMode;
 	if (options?.reasoningEffort) payload.reasoningEffort = options.reasoningEffort;
+	if (shouldUsePromptCaching(options)) payload.promptCacheKey = options.sessionId;
 
 	if (context.systemPrompt) {
 		payload.messages.unshift({
@@ -265,6 +274,31 @@ function buildChatPayload(
 	}
 
 	return payload;
+}
+
+function shouldUsePromptCaching(options?: MistralOptions): options is MistralOptions & { sessionId: string } {
+	return options?.cacheRetention !== "none" && !!options?.sessionId;
+}
+
+function getMistralCachedPromptTokens(usage: unknown, promptTokens: number): number {
+	const rawUsage = usage as {
+		promptTokensDetails?: { cachedTokens?: unknown } | null;
+		prompt_tokens_details?: { cached_tokens?: unknown } | null;
+		promptTokenDetails?: { cachedTokens?: unknown } | null;
+		prompt_token_details?: { cached_tokens?: unknown } | null;
+		numCachedTokens?: unknown;
+		num_cached_tokens?: unknown;
+	};
+	const rawCachedTokens =
+		rawUsage.promptTokensDetails?.cachedTokens ??
+		rawUsage.prompt_tokens_details?.cached_tokens ??
+		rawUsage.promptTokenDetails?.cachedTokens ??
+		rawUsage.prompt_token_details?.cached_tokens ??
+		rawUsage.numCachedTokens ??
+		rawUsage.num_cached_tokens ??
+		0;
+	const cachedTokens = typeof rawCachedTokens === "number" && Number.isFinite(rawCachedTokens) ? rawCachedTokens : 0;
+	return Math.min(promptTokens, Math.max(0, cachedTokens));
 }
 
 async function consumeChatStream(
@@ -306,11 +340,16 @@ async function consumeChatStream(
 		output.responseId ||= chunk.id;
 
 		if (chunk.usage) {
-			output.usage.input = chunk.usage.promptTokens || 0;
+			const promptTokens = chunk.usage.promptTokens || 0;
+			const cachedPromptTokens = getMistralCachedPromptTokens(chunk.usage, promptTokens);
+
+			output.usage.input = Math.max(0, promptTokens - cachedPromptTokens);
 			output.usage.output = chunk.usage.completionTokens || 0;
-			output.usage.cacheRead = 0;
+			output.usage.cacheRead = cachedPromptTokens;
 			output.usage.cacheWrite = 0;
-			output.usage.totalTokens = chunk.usage.totalTokens || output.usage.input + output.usage.output;
+			output.usage.totalTokens =
+				chunk.usage.totalTokens ||
+				output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 			calculateCost(model, output.usage);
 		}
 

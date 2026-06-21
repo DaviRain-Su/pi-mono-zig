@@ -1,5 +1,4 @@
-import type { Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { completeSimple, type Model } from "@earendil-works/pi-ai/base";
 import type { AgentMessage } from "../../types.ts";
 import {
 	convertToLlm,
@@ -112,6 +111,7 @@ function getMessageFromEntry(entry: SessionTreeEntry): AgentMessage | undefined 
 			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
 		case "thinking_level_change":
 		case "model_change":
+		case "active_tools_change":
 		case "custom":
 		case "label":
 		case "session_info":

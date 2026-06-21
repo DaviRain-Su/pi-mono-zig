@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-tui",
-	"version": "0.75.3",
+	"version": "0.79.9",
 	"description": "Terminal User Interface library with differential rendering for efficient text-based applications",
 	"type": "module",
 	"main": "dist/index.js",
@@ -12,6 +12,8 @@
 	},
 	"files": [
 		"dist/**/*",
+		"native/win32/prebuilds/**/*.node",
+		"native/darwin/prebuilds/**/*.node",
 		"README.md"
 	],
 	"keywords": [
@@ -27,7 +29,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/earendil-works/pi-mono.git",
+		"url": "git+https://github.com/earendil-works/pi.git",
 		"directory": "packages/tui"
 	},
 	"engines": {
@@ -36,14 +38,10 @@
 	"types": "./dist/index.d.ts",
 	"dependencies": {
 		"get-east-asian-width": "1.6.0",
-		"marked": "15.0.12"
-	},
-	"optionalDependencies": {
-		"koffi": "2.16.2"
+		"marked": "18.0.5"
 	},
 	"devDependencies": {
 		"@xterm/headless": "5.5.0",
-		"@xterm/xterm": "5.5.0",
 		"chalk": "5.6.2"
 	}
 }

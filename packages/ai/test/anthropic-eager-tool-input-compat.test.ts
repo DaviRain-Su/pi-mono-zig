@@ -12,8 +12,8 @@ interface CapturedRequest {
 
 function createModel(baseUrl: string, compat?: Model<"anthropic-messages">["compat"]): Model<"anthropic-messages"> {
 	return {
-		id: "claude-opus-4-7",
-		name: "Claude Opus 4.7",
+		id: "claude-opus-4-8",
+		name: "Claude Opus 4.8",
 		api: "anthropic-messages",
 		provider: "test-anthropic",
 		baseUrl,
@@ -22,7 +22,7 @@ function createModel(baseUrl: string, compat?: Model<"anthropic-messages">["comp
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200000,
 		maxTokens: 32000,
-		compat,
+		compat: { forceAdaptiveThinking: true, ...compat },
 	};
 }
 

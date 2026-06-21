@@ -4,6 +4,7 @@ import {
 	type EditorTheme,
 	getCapabilities,
 	type MarkdownTheme,
+	type RgbColor,
 	type SelectListTheme,
 	type SettingsListTheme,
 } from "@earendil-works/pi-tui";
@@ -440,20 +441,7 @@ function getBuiltinThemes(): Record<string, ThemeJson> {
 }
 
 export function getAvailableThemes(): string[] {
-	const themes = new Set<string>(Object.keys(getBuiltinThemes()));
-	const customThemesDir = getCustomThemesDir();
-	if (fs.existsSync(customThemesDir)) {
-		const files = fs.readdirSync(customThemesDir);
-		for (const file of files) {
-			if (file.endsWith(".json")) {
-				themes.add(file.slice(0, -5));
-			}
-		}
-	}
-	for (const name of registeredThemes.keys()) {
-		themes.add(name);
-	}
-	return Array.from(themes).sort();
+	return getAvailableThemesWithPaths().map(({ name }) => name);
 }
 
 export interface ThemeInfo {
@@ -463,33 +451,64 @@ export interface ThemeInfo {
 
 export function getAvailableThemesWithPaths(): ThemeInfo[] {
 	const themesDir = getThemesDir();
-	const customThemesDir = getCustomThemesDir();
 	const result: ThemeInfo[] = [];
+	const seen = new Set<string>();
+	const addTheme = (themeInfo: ThemeInfo) => {
+		if (seen.has(themeInfo.name)) {
+			return;
+		}
+		seen.add(themeInfo.name);
+		result.push(themeInfo);
+	};
 
 	// Built-in themes
 	for (const name of Object.keys(getBuiltinThemes())) {
-		result.push({ name, path: path.join(themesDir, `${name}.json`) });
+		addTheme({ name, path: path.join(themesDir, `${name}.json`) });
 	}
 
 	// Custom themes
-	if (fs.existsSync(customThemesDir)) {
-		for (const file of fs.readdirSync(customThemesDir)) {
-			if (file.endsWith(".json")) {
-				const name = file.slice(0, -5);
-				if (!result.some((t) => t.name === name)) {
-					result.push({ name, path: path.join(customThemesDir, file) });
-				}
-			}
-		}
+	for (const themeInfo of getCustomThemeInfos()) {
+		addTheme(themeInfo);
 	}
 
 	for (const [name, theme] of registeredThemes.entries()) {
-		if (!result.some((t) => t.name === name)) {
-			result.push({ name, path: theme.sourcePath });
-		}
+		addTheme({ name, path: theme.sourcePath });
 	}
 
 	return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function getCustomThemeInfos(): ThemeInfo[] {
+	const customThemesDir = getCustomThemesDir();
+	const result: ThemeInfo[] = [];
+	if (!fs.existsSync(customThemesDir)) {
+		return result;
+	}
+
+	for (const file of fs.readdirSync(customThemesDir)) {
+		if (!file.endsWith(".json")) {
+			continue;
+		}
+		const themePath = path.join(customThemesDir, file);
+		try {
+			const customTheme = loadThemeFromPath(themePath);
+			if (customTheme.name) {
+				result.push({ name: customTheme.name, path: themePath });
+			}
+		} catch {
+			// Invalid themes are ignored here; the resource loader reports them
+			// during normal startup/reload.
+		}
+	}
+	return result;
+}
+
+function assertThemeNameIsValid(name: string): void {
+	if (name.includes("/")) {
+		throw new Error(
+			`Invalid theme name "${name}": theme names cannot contain "/" because it is reserved for automatic light/dark theme settings.`,
+		);
+	}
 }
 
 function parseThemeJson(label: string, json: unknown): ThemeJson {
@@ -528,7 +547,9 @@ function parseThemeJson(label: string, json: unknown): ThemeJson {
 		throw new Error(errorMessage);
 	}
 
-	return json as ThemeJson;
+	const themeJson = json as ThemeJson;
+	assertThemeNameIsValid(themeJson.name);
+	return themeJson;
 }
 
 function parseThemeJsonContent(label: string, content: string): ThemeJson {
@@ -614,10 +635,34 @@ export function getThemeByName(name: string): Theme | undefined {
 
 export type TerminalTheme = "dark" | "light";
 
-export interface RgbColor {
-	r: number;
-	g: number;
-	b: number;
+export function parseAutoThemeSetting(
+	themeSetting: string | undefined,
+): { lightTheme: string; darkTheme: string } | undefined {
+	if (!themeSetting) return undefined;
+	const slashIndex = themeSetting.indexOf("/");
+	if (slashIndex === -1 || themeSetting.indexOf("/", slashIndex + 1) !== -1) {
+		return undefined;
+	}
+
+	const lightTheme = themeSetting.slice(0, slashIndex).trim();
+	const darkTheme = themeSetting.slice(slashIndex + 1).trim();
+	if (!lightTheme || !darkTheme) {
+		return undefined;
+	}
+	return { lightTheme, darkTheme };
+}
+
+export function resolveThemeSetting(
+	themeSetting: string | undefined,
+	terminalTheme: TerminalTheme,
+): string | undefined {
+	const autoTheme = parseAutoThemeSetting(themeSetting);
+	if (autoTheme) {
+		return terminalTheme === "light" ? autoTheme.lightTheme : autoTheme.darkTheme;
+	}
+	if (themeSetting?.includes("/")) return undefined;
+	if (typeof themeSetting === "string") return themeSetting;
+	return undefined;
 }
 
 export interface TerminalThemeDetection {
@@ -629,6 +674,15 @@ export interface TerminalThemeDetection {
 
 export interface TerminalThemeDetectionOptions {
 	env?: NodeJS.ProcessEnv;
+}
+
+export interface TerminalBackgroundThemeDetector {
+	queryTerminalBackgroundColor({ timeoutMs }: { timeoutMs: number }): Promise<RgbColor | undefined>;
+}
+
+export interface TerminalBackgroundThemeDetectionOptions extends TerminalThemeDetectionOptions {
+	ui: TerminalBackgroundThemeDetector;
+	timeoutMs: number;
 }
 
 function getColorFgBgBackgroundIndex(colorfgbg: string): number | undefined {
@@ -658,50 +712,7 @@ export function getThemeForRgbColor(rgb: RgbColor): TerminalTheme {
 	return getRgbColorLuminance(rgb) >= 0.5 ? "light" : "dark";
 }
 
-function parseOscHexChannel(channel: string): number | undefined {
-	if (!/^[0-9a-f]+$/i.test(channel)) {
-		return undefined;
-	}
-	const max = 16 ** channel.length - 1;
-	if (max <= 0) {
-		return undefined;
-	}
-	return Math.round((parseInt(channel, 16) / max) * 255);
-}
-
-export function parseOsc11BackgroundColor(data: string): RgbColor | undefined {
-	const match = data.match(/^\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)$/i);
-	if (!match) {
-		return undefined;
-	}
-
-	const value = match[1].trim();
-	if (value.startsWith("#")) {
-		const hex = value.slice(1);
-		if (/^[0-9a-f]{6}$/i.test(hex)) {
-			return hexToRgb(value);
-		}
-		if (/^[0-9a-f]{12}$/i.test(hex)) {
-			const r = parseOscHexChannel(hex.slice(0, 4));
-			const g = parseOscHexChannel(hex.slice(4, 8));
-			const b = parseOscHexChannel(hex.slice(8, 12));
-			return r !== undefined && g !== undefined && b !== undefined ? { r, g, b } : undefined;
-		}
-		return undefined;
-	}
-
-	const rgbValue = value.replace(/^rgba?:/i, "");
-	const [red, green, blue] = rgbValue.split("/");
-	if (red === undefined || green === undefined || blue === undefined) {
-		return undefined;
-	}
-	const r = parseOscHexChannel(red);
-	const g = parseOscHexChannel(green);
-	const b = parseOscHexChannel(blue);
-	return r !== undefined && g !== undefined && b !== undefined ? { r, g, b } : undefined;
-}
-
-export function detectTerminalBackground(options: TerminalThemeDetectionOptions = {}): TerminalThemeDetection {
+export function detectTerminalBackgroundFromEnv(options: TerminalThemeDetectionOptions = {}): TerminalThemeDetection {
 	const env = options.env ?? process.env;
 	const colorfgbg = env.COLORFGBG || "";
 	const bg = getColorFgBgBackgroundIndex(colorfgbg);
@@ -722,8 +733,30 @@ export function detectTerminalBackground(options: TerminalThemeDetectionOptions 
 	};
 }
 
+export async function detectTerminalBackgroundTheme({
+	ui,
+	timeoutMs,
+	env,
+}: TerminalBackgroundThemeDetectionOptions): Promise<TerminalThemeDetection> {
+	try {
+		const rgb = await ui.queryTerminalBackgroundColor({ timeoutMs });
+		if (rgb) {
+			return {
+				theme: getThemeForRgbColor(rgb),
+				source: "terminal background",
+				detail: `OSC 11 background rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`,
+				confidence: "high",
+			};
+		}
+	} catch {
+		// Fall back to environment-based detection when the terminal query fails.
+	}
+
+	return detectTerminalBackgroundFromEnv({ env });
+}
+
 export function getDefaultTheme(): string {
-	return detectTerminalBackground().theme;
+	return detectTerminalBackgroundFromEnv().theme;
 }
 
 // ============================================================================
@@ -759,6 +792,7 @@ export function setRegisteredThemes(themes: Theme[]): void {
 	registeredThemes.clear();
 	for (const theme of themes) {
 		if (theme.name) {
+			assertThemeNameIsValid(theme.name);
 			registeredThemes.set(theme.name, theme);
 		}
 	}
@@ -1032,17 +1066,27 @@ function buildCliHighlightTheme(t: Theme): CliHighlightTheme {
 		built_in: (s: string) => t.fg("syntaxType", s),
 		literal: (s: string) => t.fg("syntaxNumber", s),
 		number: (s: string) => t.fg("syntaxNumber", s),
+		regexp: (s: string) => t.fg("syntaxString", s),
 		string: (s: string) => t.fg("syntaxString", s),
 		comment: (s: string) => t.fg("syntaxComment", s),
+		doctag: (s: string) => t.fg("syntaxComment", s),
+		meta: (s: string) => t.fg("muted", s),
 		function: (s: string) => t.fg("syntaxFunction", s),
 		title: (s: string) => t.fg("syntaxFunction", s),
 		class: (s: string) => t.fg("syntaxType", s),
 		type: (s: string) => t.fg("syntaxType", s),
+		tag: (s: string) => t.fg("syntaxPunctuation", s),
+		name: (s: string) => t.fg("syntaxKeyword", s),
 		attr: (s: string) => t.fg("syntaxVariable", s),
 		variable: (s: string) => t.fg("syntaxVariable", s),
 		params: (s: string) => t.fg("syntaxVariable", s),
 		operator: (s: string) => t.fg("syntaxOperator", s),
 		punctuation: (s: string) => t.fg("syntaxPunctuation", s),
+		emphasis: (s: string) => t.italic(s),
+		strong: (s: string) => t.bold(s),
+		link: (s: string) => t.underline(s),
+		addition: (s: string) => t.fg("toolDiffAdded", s),
+		deletion: (s: string) => t.fg("toolDiffRemoved", s),
 	};
 }
 

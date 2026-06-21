@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ExtensionRunner } from "../src/core/extensions/runner.ts";
@@ -186,6 +187,53 @@ Project skill`,
 			expect(extensionsResult.extensions[0].path).toBe(join(cwd, ".pi", "extensions", "shared.ts"));
 		});
 
+		it("should load user extensions before trust and reuse them after trust resolves", async () => {
+			const userExtDir = join(agentDir, "extensions");
+			const projectExtDir = join(cwd, ".pi", "extensions");
+			mkdirSync(userExtDir, { recursive: true });
+			mkdirSync(projectExtDir, { recursive: true });
+			const loadCountKey = `__piTrustPreloadCount_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+			const globalState = globalThis as typeof globalThis & Record<string, number | undefined>;
+
+			writeFileSync(
+				join(userExtDir, "user.ts"),
+				`globalThis[${JSON.stringify(loadCountKey)}] = (globalThis[${JSON.stringify(loadCountKey)}] ?? 0) + 1;
+export default function(pi) {
+	pi.on("project_trust", () => ({ trusted: "yes" }));
+	pi.registerCommand("user-trust", {
+		description: "user trust",
+		handler: async () => {},
+	});
+}`,
+			);
+			writeFileSync(
+				join(projectExtDir, "project.ts"),
+				`export default function(pi) {
+	pi.registerCommand("project-trusted", {
+		description: "project trusted",
+		handler: async () => {},
+	});
+}`,
+			);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload({
+				resolveProjectTrust: async ({ extensionsResult }) => {
+					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual([
+						join(userExtDir, "user.ts"),
+					]);
+					return true;
+				},
+			});
+
+			const extensionsResult = loader.getExtensions();
+			expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual([
+				join(cwd, ".pi", "extensions", "project.ts"),
+				join(userExtDir, "user.ts"),
+			]);
+			expect(globalState[loadCountKey]).toBe(1);
+		});
+
 		it("should keep both extensions loaded when command names collide", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			const projectExtDir = join(cwd, ".pi", "extensions");
@@ -328,6 +376,52 @@ Content`,
 			expect(loader.getSystemPrompt()).toBe("You are a helpful assistant.");
 		});
 
+		it("should skip project resources that require trust when project is not trusted", async () => {
+			const piDir = join(cwd, ".pi");
+			const extensionsDir = join(piDir, "extensions");
+			const skillDir = join(piDir, "skills", "project-skill");
+			const promptsDir = join(piDir, "prompts");
+			const themesDir = join(piDir, "themes");
+			mkdirSync(extensionsDir, { recursive: true });
+			mkdirSync(skillDir, { recursive: true });
+			mkdirSync(promptsDir, { recursive: true });
+			mkdirSync(themesDir, { recursive: true });
+			writeFileSync(join(piDir, "SYSTEM.md"), "Project system prompt.");
+			writeFileSync(join(agentDir, "SYSTEM.md"), "Global system prompt.");
+			writeFileSync(join(agentDir, "AGENTS.md"), "Global instructions");
+			writeFileSync(join(cwd, "AGENTS.md"), "Project instructions");
+			writeFileSync(join(extensionsDir, "project.ts"), `throw new Error("should not load");`);
+			writeFileSync(
+				join(skillDir, "SKILL.md"),
+				`---
+name: project-skill
+description: Project skill
+---
+Project skill content`,
+			);
+			writeFileSync(join(promptsDir, "project.md"), "Project prompt");
+			const themeData = JSON.parse(
+				readFileSync(join(process.cwd(), "src", "modes", "interactive", "theme", "dark.json"), "utf-8"),
+			) as { name: string };
+			themeData.name = "project-theme";
+			writeFileSync(join(themesDir, "project.json"), JSON.stringify(themeData, null, 2));
+			const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			expect(loader.getSystemPrompt()).toBe("Global system prompt.");
+			expect(loader.getAgentsFiles().agentsFiles.some((file) => file.path === join(agentDir, "AGENTS.md"))).toBe(
+				true,
+			);
+			expect(loader.getAgentsFiles().agentsFiles.some((file) => file.path === join(cwd, "AGENTS.md"))).toBe(true);
+			expect(loader.getExtensions().extensions).toHaveLength(0);
+			expect(loader.getExtensions().errors).toEqual([]);
+			expect(loader.getSkills().skills.some((skill) => skill.name === "project-skill")).toBe(false);
+			expect(loader.getPrompts().prompts.some((prompt) => prompt.name === "project")).toBe(false);
+			expect(loader.getThemes().themes.some((theme) => theme.name === "project-theme")).toBe(false);
+		});
+
 		it("should discover APPEND_SYSTEM.md", async () => {
 			const piDir = join(cwd, ".pi");
 			mkdirSync(piDir, { recursive: true });
@@ -404,6 +498,44 @@ Extra prompt content`,
 			expect(loadedPrompt).toBeDefined();
 			expect(loadedPrompt?.sourceInfo?.source).toBe("extension:extra");
 			expect(loadedPrompt?.sourceInfo?.path).toBe(promptPath);
+		});
+
+		it("should load extension resources returned as file URLs", async () => {
+			const extraSkillDir = join(tempDir, "extra skills", "file-url-skill");
+			mkdirSync(extraSkillDir, { recursive: true });
+			const skillPath = join(extraSkillDir, "SKILL.md");
+			writeFileSync(
+				skillPath,
+				`---
+name: file-url-skill
+description: File URL skill
+---
+Extra content`,
+			);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			loader.extendResources({
+				skillPaths: [
+					{
+						path: pathToFileURL(extraSkillDir).href,
+						metadata: {
+							source: "extension:file-url",
+							scope: "temporary",
+							origin: "top-level",
+							baseDir: extraSkillDir,
+						},
+					},
+				],
+			});
+
+			const { skills, diagnostics } = loader.getSkills();
+			expect(diagnostics).toEqual([]);
+			const loadedSkill = skills.find((skill) => skill.name === "file-url-skill");
+			expect(loadedSkill).toBeDefined();
+			expect(loadedSkill?.filePath).toBe(skillPath);
+			expect(loadedSkill?.sourceInfo?.source).toBe("extension:file-url");
 		});
 	});
 

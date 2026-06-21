@@ -1,8 +1,8 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
-import { homedir } from "os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "path";
+import { basename, dirname, join, resolve, sep } from "path";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { parseFrontmatter } from "../utils/frontmatter.ts";
+import { resolvePath } from "../utils/paths.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 
 /**
@@ -59,46 +59,45 @@ export function parseCommandArgs(argsString: string): string[] {
  * Supports:
  * - $1, $2, ... for positional args
  * - $@ and $ARGUMENTS for all args
+ * - ${N:-default} for positional arg N with default when missing/empty
  * - ${@:N} for args from Nth onwards (bash-style slicing)
  * - ${@:N:L} for L args starting from Nth
  *
- * Note: Replacement happens on the template string only. Argument values
+ * Note: Replacement happens on the template string only. Argument and default values
  * containing patterns like $1, $@, or $ARGUMENTS are NOT recursively substituted.
  */
 export function substituteArgs(content: string, args: string[]): string {
-	let result = content;
-
-	// Replace $1, $2, etc. with positional args FIRST (before wildcards)
-	// This prevents wildcard replacement values containing $<digit> patterns from being re-substituted
-	result = result.replace(/\$(\d+)/g, (_, num) => {
-		const index = parseInt(num, 10) - 1;
-		return args[index] ?? "";
-	});
-
-	// Replace ${@:start} or ${@:start:length} with sliced args (bash-style)
-	// Process BEFORE simple $@ to avoid conflicts
-	result = result.replace(/\$\{@:(\d+)(?::(\d+))?\}/g, (_, startStr, lengthStr) => {
-		let start = parseInt(startStr, 10) - 1; // Convert to 0-indexed (user provides 1-indexed)
-		// Treat 0 as 1 (bash convention: args start at 1)
-		if (start < 0) start = 0;
-
-		if (lengthStr) {
-			const length = parseInt(lengthStr, 10);
-			return args.slice(start, start + length).join(" ");
-		}
-		return args.slice(start).join(" ");
-	});
-
-	// Pre-compute all args joined (optimization)
 	const allArgs = args.join(" ");
 
-	// Replace $ARGUMENTS with all args joined (new syntax, aligns with Claude, Codex, OpenCode)
-	result = result.replace(/\$ARGUMENTS/g, allArgs);
+	return content.replace(
+		/\$\{(\d+):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+		(_match, defaultNum, defaultValue, sliceStart, sliceLength, simple) => {
+			if (defaultNum) {
+				const index = parseInt(defaultNum, 10) - 1;
+				const value = args[index];
+				return value ? value : defaultValue;
+			}
 
-	// Replace $@ with all args joined (existing syntax)
-	result = result.replace(/\$@/g, allArgs);
+			if (sliceStart) {
+				let start = parseInt(sliceStart, 10) - 1; // Convert to 0-indexed (user provides 1-indexed)
+				// Treat 0 as 1 (bash convention: args start at 1)
+				if (start < 0) start = 0;
 
-	return result;
+				if (sliceLength) {
+					const length = parseInt(sliceLength, 10);
+					return args.slice(start, start + length).join(" ");
+				}
+				return args.slice(start).join(" ");
+			}
+
+			if (simple === "ARGUMENTS" || simple === "@") {
+				return allArgs;
+			}
+
+			const index = parseInt(simple, 10) - 1;
+			return args[index] ?? "";
+		},
+	);
 }
 
 function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptTemplate | null {
@@ -185,19 +184,6 @@ export interface LoadPromptTemplatesOptions {
 	includeDefaults: boolean;
 }
 
-function normalizePath(input: string): string {
-	const trimmed = input.trim();
-	if (trimmed === "~") return homedir();
-	if (trimmed.startsWith("~/")) return join(homedir(), trimmed.slice(2));
-	if (trimmed.startsWith("~")) return join(homedir(), trimmed.slice(1));
-	return trimmed;
-}
-
-function resolvePromptPath(p: string, cwd: string): string {
-	const normalized = normalizePath(p);
-	return isAbsolute(normalized) ? normalized : resolve(cwd, normalized);
-}
-
 /**
  * Load all prompt templates from:
  * 1. Global: agentDir/prompts/
@@ -205,14 +191,14 @@ function resolvePromptPath(p: string, cwd: string): string {
  * 3. Explicit prompt paths
  */
 export function loadPromptTemplates(options: LoadPromptTemplatesOptions): PromptTemplate[] {
-	const resolvedCwd = options.cwd;
-	const resolvedAgentDir = options.agentDir;
+	const resolvedCwd = resolvePath(options.cwd);
+	const resolvedAgentDir = resolvePath(options.agentDir);
 	const promptPaths = options.promptPaths;
 	const includeDefaults = options.includeDefaults;
 
 	const templates: PromptTemplate[] = [];
 
-	const globalPromptsDir = options.agentDir ? join(options.agentDir, "prompts") : resolvedAgentDir;
+	const globalPromptsDir = join(resolvedAgentDir, "prompts");
 	const projectPromptsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "prompts");
 
 	const isUnderPath = (target: string, root: string): boolean => {
@@ -252,7 +238,7 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions): Prompt
 
 	// 3. Load explicit prompt paths
 	for (const rawPath of promptPaths) {
-		const resolvedPath = resolvePromptPath(rawPath, resolvedCwd);
+		const resolvedPath = resolvePath(rawPath, resolvedCwd, { trim: true });
 		if (!existsSync(resolvedPath)) {
 			continue;
 		}

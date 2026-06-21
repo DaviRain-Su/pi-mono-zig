@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
-import { getModel } from "../src/models.ts";
+import { getModel, getModels } from "../src/models.ts";
 import { streamAnthropic } from "../src/providers/anthropic.ts";
 import type { Context, Model, Tool } from "../src/types.ts";
 
@@ -38,12 +38,14 @@ describe("Fireworks models", () => {
 	});
 
 	it("registers the Fire Pass turbo router model", () => {
-		const model = getModel("fireworks", "accounts/fireworks/routers/kimi-k2p5-turbo");
+		const model = getModels("fireworks").find(
+			(candidate) => candidate.id.startsWith("accounts/fireworks/routers/") && candidate.id.endsWith("-turbo"),
+		);
 
 		expect(model).toBeDefined();
-		expect(model.api).toBe("anthropic-messages");
-		expect(model.baseUrl).toBe("https://api.fireworks.ai/inference");
-		expect(model.input).toEqual(["text", "image"]);
+		expect(model?.api).toBe("anthropic-messages");
+		expect(model?.baseUrl).toBe("https://api.fireworks.ai/inference");
+		expect(model?.input).toEqual(["text", "image"]);
 	});
 
 	it("resolves FIREWORKS_API_KEY from the environment", () => {
@@ -95,8 +97,8 @@ function createFireworksModel(compat?: Model<"anthropic-messages">["compat"]): M
 
 function createAnthropicModel(): Model<"anthropic-messages"> {
 	return {
-		id: "claude-opus-4-7",
-		name: "Claude Opus 4.7",
+		id: "claude-opus-4-8",
+		name: "Claude Opus 4.8",
 		api: "anthropic-messages",
 		provider: "anthropic",
 		baseUrl: "http://127.0.0.1:0", // overridden by captureAnthropicRequest

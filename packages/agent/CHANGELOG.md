@@ -2,6 +2,66 @@
 
 ## [Unreleased]
 
+## [0.79.9] - 2026-06-20
+
+### Fixed
+
+- Fixed Node execution environment commands through legacy WSL `bash.exe` to pass scripts over stdin so shell variables expand in the target bash ([#5893](https://github.com/earendil-works/pi/issues/5893)).
+
+## [0.79.8] - 2026-06-19
+
+### Added
+
+- Added `@earendil-works/pi-agent-core/base` for bundlers that want to pair the agent core with selective `@earendil-works/pi-ai/base` provider registration ([#5348](https://github.com/earendil-works/pi/pull/5348) by [@FredKSchott](https://github.com/FredKSchott)).
+
+## [0.79.7] - 2026-06-18
+
+## [0.79.6] - 2026-06-16
+
+## [0.79.5] - 2026-06-16
+
+## [0.79.4] - 2026-06-15
+
+## [0.79.3] - 2026-06-13
+
+## [0.79.2] - 2026-06-12
+
+### Fixed
+
+- Fixed late tool progress callbacks after tool settlement to be ignored instead of emitting stale `tool_execution_update` events ([#5573](https://github.com/earendil-works/pi/issues/5573)).
+
+## [0.79.1] - 2026-06-09
+
+## [0.79.0] - 2026-06-08
+
+### Fixed
+
+- Fixed the compaction summarization system prompt to use neutral AI assistant wording for non-coding agents ([#5401](https://github.com/earendil-works/pi/issues/5401)).
+
+## [0.78.1] - 2026-06-04
+
+## [0.78.0] - 2026-05-29
+
+## [0.77.0] - 2026-05-28
+
+### Breaking Changes
+
+- Renamed agent harness `model_select` and `thinking_level_select` events to `model_update` and `thinking_level_update`.
+
+### Added
+
+- Added agent harness tool registry APIs, `tools_update` events, branch-scoped active-tool persistence, and duplicate tool validation.
+
+## [0.76.0] - 2026-05-27
+
+### Fixed
+
+- Fixed context token estimates to count user image attachments consistently with tool result images ([#4983](https://github.com/earendil-works/pi/issues/4983)).
+
+## [0.75.5] - 2026-05-23
+
+## [0.75.4] - 2026-05-20
+
 ### Changed
 
 - Changed source syntax to avoid TypeScript constructs that require JavaScript emit, keeping the package compatible with Node.js strip-only TypeScript checks.

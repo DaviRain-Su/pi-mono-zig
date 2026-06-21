@@ -57,4 +57,9 @@ zig/vendor/zwasm/*
 .pi/*
 !.pi/agents/
 !.pi/agents/**
-.pi
+!.pi/extensions/
+!.pi/extensions/**
+!.pi/prompts/
+!.pi/prompts/**
+!.pi/skills/
+!.pi/skills/**

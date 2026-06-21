@@ -23,6 +23,13 @@ export type OAuthAuthInfo = {
 	instructions?: string;
 };
 
+export type OAuthDeviceCodeInfo = {
+	userCode: string;
+	verificationUri: string;
+	intervalSeconds?: number;
+	expiresInSeconds?: number;
+};
+
 export type OAuthSelectOption = {
 	id: string;
 	label: string;
@@ -35,11 +42,12 @@ export type OAuthSelectPrompt = {
 
 export interface OAuthLoginCallbacks {
 	onAuth: (info: OAuthAuthInfo) => void;
+	onDeviceCode: (info: OAuthDeviceCodeInfo) => void;
 	onPrompt: (prompt: OAuthPrompt) => Promise<string>;
 	onProgress?: (message: string) => void;
 	onManualCodeInput?: () => Promise<string>;
 	/** Show an interactive selector and return the selected option id, or undefined on cancel. */
-	onSelect?: (prompt: OAuthSelectPrompt) => Promise<string | undefined>;
+	onSelect: (prompt: OAuthSelectPrompt) => Promise<string | undefined>;
 	signal?: AbortSignal;
 }
 

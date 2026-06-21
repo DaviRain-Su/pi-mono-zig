@@ -13,9 +13,11 @@ export function buildBaseOptions(_model: Model<Api>, options?: SimpleStreamOptio
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		timeoutMs: options?.timeoutMs,
+		websocketConnectTimeoutMs: options?.websocketConnectTimeoutMs,
 		maxRetries: options?.maxRetries,
 		maxRetryDelayMs: options?.maxRetryDelayMs,
 		metadata: options?.metadata,
+		env: options?.env,
 	};
 }
 

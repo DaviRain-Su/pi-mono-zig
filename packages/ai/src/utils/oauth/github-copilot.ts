@@ -4,10 +4,12 @@
 
 import { getModels } from "../../models.ts";
 import type { Api, Model } from "../../types.ts";
-import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.ts";
+import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
+import type { OAuthCredentials, OAuthDeviceCodeInfo, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.ts";
 
 type CopilotCredentials = OAuthCredentials & {
 	enterpriseUrl?: string;
+	availableModelIds: string[];
 };
 
 const decode = (s: string) => atob(s);
@@ -19,15 +21,13 @@ const COPILOT_HEADERS = {
 	"Editor-Plugin-Version": "copilot-chat/0.35.0",
 	"Copilot-Integration-Id": "vscode-chat",
 } as const;
-
-const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
-const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
+const COPILOT_API_VERSION = "2026-06-01";
 
 type DeviceCodeResponse = {
 	device_code: string;
 	user_code: string;
 	verification_uri: string;
-	interval: number;
+	interval?: number;
 	expires_in: number;
 };
 
@@ -40,7 +40,6 @@ type DeviceTokenSuccessResponse = {
 type DeviceTokenErrorResponse = {
 	error: string;
 	error_description?: string;
-	interval?: number;
 };
 
 export function normalizeDomain(input: string): string | null {
@@ -91,6 +90,48 @@ export function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: strin
 	return "https://api.individual.githubcopilot.com";
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+}
+
+function isSelectableCopilotModel(item: Record<string, unknown>): boolean {
+	const policy = asRecord(item.policy);
+	const capabilities = asRecord(item.capabilities);
+	const supports = asRecord(capabilities?.supports);
+	return item.model_picker_enabled === true && policy?.state !== "disabled" && supports?.tool_calls !== false;
+}
+
+function parseAvailableCopilotModelIds(raw: unknown): string[] {
+	const data = asRecord(raw)?.data;
+	if (!Array.isArray(data)) {
+		throw new Error("Invalid Copilot models response");
+	}
+
+	const ids: string[] = [];
+	for (const rawItem of data) {
+		const item = asRecord(rawItem);
+		const id = item?.id;
+		if (typeof id === "string" && item && isSelectableCopilotModel(item)) {
+			ids.push(id);
+		}
+	}
+	return ids;
+}
+
+async function fetchAvailableGitHubCopilotModelIds(copilotToken: string, enterpriseDomain?: string): Promise<string[]> {
+	const baseUrl = getGitHubCopilotBaseUrl(copilotToken, enterpriseDomain);
+	const raw = await fetchJson(`${baseUrl}/models`, {
+		headers: {
+			Accept: "application/json",
+			Authorization: `Bearer ${copilotToken}`,
+			...COPILOT_HEADERS,
+			"X-GitHub-Api-Version": COPILOT_API_VERSION,
+		},
+		signal: AbortSignal.timeout(5000),
+	});
+	return parseAvailableCopilotModelIds(raw);
+}
+
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
@@ -129,116 +170,82 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		typeof deviceCode !== "string" ||
 		typeof userCode !== "string" ||
 		typeof verificationUri !== "string" ||
-		typeof interval !== "number" ||
+		(interval !== undefined && typeof interval !== "number") ||
 		typeof expiresIn !== "number"
 	) {
 		throw new Error("Invalid device code response fields");
 	}
 
+	// The verification URI is opened in the user's browser and to prevent `open` from
+	// opening an executable or similar, we force it to be a URL.
+	let parsedUri: URL;
+	try {
+		parsedUri = new URL(verificationUri);
+	} catch {
+		throw new Error("Untrusted verification_uri in device code response");
+	}
+	if (parsedUri.protocol !== "https:" && parsedUri.protocol !== "http:") {
+		throw new Error("Untrusted verification_uri in device code response");
+	}
+
 	return {
 		device_code: deviceCode,
 		user_code: userCode,
-		verification_uri: verificationUri,
+		verification_uri: parsedUri.href,
 		interval,
 		expires_in: expiresIn,
 	};
 }
 
-/**
- * Sleep that can be interrupted by an AbortSignal
- */
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Login cancelled"));
-			return;
-		}
+async function pollForGitHubAccessToken(
+	domain: string,
+	device: DeviceCodeResponse,
+	signal?: AbortSignal,
+): Promise<string> {
+	const urls = getUrls(domain);
+	return pollOAuthDeviceCodeFlow<string>({
+		intervalSeconds: device.interval,
+		expiresInSeconds: device.expires_in,
+		signal,
+		poll: async () => {
+			const raw = await fetchJson(urls.accessTokenUrl, {
+				method: "POST",
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": "GitHubCopilotChat/0.35.0",
+				},
+				body: new URLSearchParams({
+					client_id: CLIENT_ID,
+					device_code: device.device_code,
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+				}),
+			});
 
-		const timeout = setTimeout(resolve, ms);
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
+				return { status: "complete", value: (raw as DeviceTokenSuccessResponse).access_token };
+			}
 
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new Error("Login cancelled"));
-			},
-			{ once: true },
-		);
+			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
+				const { error, error_description: description } = raw as DeviceTokenErrorResponse;
+				if (error === "authorization_pending") {
+					return { status: "pending" };
+				}
+
+				if (error === "slow_down") {
+					return { status: "slow_down" };
+				}
+
+				const descriptionSuffix = description ? `: ${description}` : "";
+				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
+			}
+
+			return { status: "failed", message: "Invalid device token response" };
+		},
 	});
 }
 
-async function pollForGitHubAccessToken(
-	domain: string,
-	deviceCode: string,
-	intervalSeconds: number,
-	expiresIn: number,
-	signal?: AbortSignal,
-) {
-	const urls = getUrls(domain);
-	const deadline = Date.now() + expiresIn * 1000;
-	let intervalMs = Math.max(1000, Math.floor(intervalSeconds * 1000));
-	let intervalMultiplier = INITIAL_POLL_INTERVAL_MULTIPLIER;
-	let slowDownResponses = 0;
-
-	while (Date.now() < deadline) {
-		if (signal?.aborted) {
-			throw new Error("Login cancelled");
-		}
-
-		const remainingMs = deadline - Date.now();
-		const waitMs = Math.min(Math.ceil(intervalMs * intervalMultiplier), remainingMs);
-		await abortableSleep(waitMs, signal);
-
-		const raw = await fetchJson(urls.accessTokenUrl, {
-			method: "POST",
-			headers: {
-				Accept: "application/json",
-				"Content-Type": "application/x-www-form-urlencoded",
-				"User-Agent": "GitHubCopilotChat/0.35.0",
-			},
-			body: new URLSearchParams({
-				client_id: CLIENT_ID,
-				device_code: deviceCode,
-				grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-			}),
-		});
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {
-			return (raw as DeviceTokenSuccessResponse).access_token;
-		}
-
-		if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-			const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
-			if (error === "authorization_pending") {
-				continue;
-			}
-
-			if (error === "slow_down") {
-				slowDownResponses += 1;
-				intervalMs =
-					typeof interval === "number" && interval > 0 ? interval * 1000 : Math.max(1000, intervalMs + 5000);
-				intervalMultiplier = SLOW_DOWN_POLL_INTERVAL_MULTIPLIER;
-				continue;
-			}
-
-			const descriptionSuffix = description ? `: ${description}` : "";
-			throw new Error(`Device flow failed: ${error}${descriptionSuffix}`);
-		}
-	}
-
-	if (slowDownResponses > 0) {
-		throw new Error(
-			"Device flow timed out after one or more slow_down responses. This is often caused by clock drift in WSL or VM environments. Please sync or restart the VM clock and try again.",
-		);
-	}
-
-	throw new Error("Device flow timed out");
-}
-
-/**
- * Refresh GitHub Copilot token
- */
-export async function refreshGitHubCopilotToken(
+async function refreshGitHubCopilotAccessToken(
 	refreshToken: string,
 	enterpriseDomain?: string,
 ): Promise<OAuthCredentials> {
@@ -269,6 +276,20 @@ export async function refreshGitHubCopilotToken(
 		access: token,
 		expires: expiresAt * 1000 - 5 * 60 * 1000,
 		enterpriseUrl: enterpriseDomain,
+	};
+}
+
+/**
+ * Refresh GitHub Copilot token
+ */
+export async function refreshGitHubCopilotToken(
+	refreshToken: string,
+	enterpriseDomain?: string,
+): Promise<OAuthCredentials> {
+	const credentials = await refreshGitHubCopilotAccessToken(refreshToken, enterpriseDomain);
+	return {
+		...credentials,
+		availableModelIds: await fetchAvailableGitHubCopilotModelIds(credentials.access, enterpriseDomain),
 	};
 }
 
@@ -319,13 +340,13 @@ async function enableAllGitHubCopilotModels(
 /**
  * Login with GitHub Copilot OAuth (device code flow)
  *
- * @param options.onAuth - Callback with URL and optional instructions (user code)
+ * @param options.onDeviceCode - Callback with URL and user code
  * @param options.onPrompt - Callback to prompt user for input
  * @param options.onProgress - Optional progress callback
  * @param options.signal - Optional AbortSignal for cancellation
  */
 export async function loginGitHubCopilot(options: {
-	onAuth: (url: string, instructions?: string) => void;
+	onDeviceCode: (info: OAuthDeviceCodeInfo) => void;
 	onPrompt: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean }) => Promise<string>;
 	onProgress?: (message: string) => void;
 	signal?: AbortSignal;
@@ -348,21 +369,26 @@ export async function loginGitHubCopilot(options: {
 	const domain = enterpriseDomain || "github.com";
 
 	const device = await startDeviceFlow(domain);
-	options.onAuth(device.verification_uri, `Enter code: ${device.user_code}`);
+	options.onDeviceCode({
+		userCode: device.user_code,
+		verificationUri: device.verification_uri,
+		intervalSeconds: device.interval,
+		expiresInSeconds: device.expires_in,
+	});
 
-	const githubAccessToken = await pollForGitHubAccessToken(
-		domain,
-		device.device_code,
-		device.interval,
-		device.expires_in,
-		options.signal,
-	);
-	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
+	const githubAccessToken = await pollForGitHubAccessToken(domain, device, options.signal);
+	const credentials = await refreshGitHubCopilotAccessToken(githubAccessToken, enterpriseDomain ?? undefined);
 
 	// Enable all models after successful login
 	options.onProgress?.("Enabling models...");
 	await enableAllGitHubCopilotModels(credentials.access, enterpriseDomain ?? undefined);
-	return credentials;
+
+	// Fetch availability after policy enable so newly enabled models are included,
+	// while unavailable models are still filtered out.
+	return {
+		...credentials,
+		availableModelIds: await fetchAvailableGitHubCopilotModelIds(credentials.access, enterpriseDomain ?? undefined),
+	};
 }
 
 export const githubCopilotOAuthProvider: OAuthProviderInterface = {
@@ -371,7 +397,7 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 
 	async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 		return loginGitHubCopilot({
-			onAuth: (url, instructions) => callbacks.onAuth({ url, instructions }),
+			onDeviceCode: callbacks.onDeviceCode,
 			onPrompt: callbacks.onPrompt,
 			onProgress: callbacks.onProgress,
 			signal: callbacks.signal,
@@ -391,6 +417,14 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 		const creds = credentials as CopilotCredentials;
 		const domain = creds.enterpriseUrl ? (normalizeDomain(creds.enterpriseUrl) ?? undefined) : undefined;
 		const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-		return models.map((m) => (m.provider === "github-copilot" ? { ...m, baseUrl } : m));
+		// Older stored Pi auth entries do not have account-specific model IDs yet;
+		// keep their existing generated-catalog behavior until the next refresh/login.
+		const availableModelIds = "availableModelIds" in creds ? new Set(creds.availableModelIds) : undefined;
+
+		return models.flatMap((m) => {
+			if (m.provider !== "github-copilot") return [m];
+			if (availableModelIds && !availableModelIds.has(m.id)) return [];
+			return [{ ...m, baseUrl }];
+		});
 	},
 };

@@ -1,3 +1,5 @@
+import { execSync } from "node:child_process";
+
 export type ImageProtocol = "kitty" | "iterm2" | null;
 
 export interface TerminalCapabilities {
@@ -39,18 +41,42 @@ export function setCellDimensions(dims: CellDimensions): void {
 	cellDimensions = dims;
 }
 
-export function detectCapabilities(): TerminalCapabilities {
+/**
+ * Checks whether the attached tmux client forwards OSC 8 hyperlinks to the
+ * outer terminal. tmux only re-emits them when its `client_termfeatures` lists
+ * `hyperlinks`, and strips them otherwise. On any error fallbacks `false`.
+ */
+function probeTmuxHyperlinks(): boolean {
+	try {
+		const termfeatures = execSync("tmux display-message -p '#{client_termfeatures}'", {
+			encoding: "utf8",
+			timeout: 250,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return termfeatures
+			.split(",")
+			.map((feature) => feature.trim())
+			.includes("hyperlinks");
+	} catch {
+		return false;
+	}
+}
+
+export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks): TerminalCapabilities {
 	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() || "";
+	const terminalEmulator = process.env.TERMINAL_EMULATOR?.toLowerCase() || "";
 	const term = process.env.TERM?.toLowerCase() || "";
 	const colorTerm = process.env.COLORTERM?.toLowerCase() || "";
 	const hasTrueColorHint = colorTerm === "truecolor" || colorTerm === "24bit";
 
-	// tmux and screen swallow OSC 8 by default (passthrough is opt-in and wraps
-	// sequences differently). Force hyperlinks off whenever we detect them, even
-	// when the outer terminal would otherwise support OSC 8. Image protocols are
-	// also unreliable under tmux/screen, so leave `images: null` for safety.
-	const inTmuxOrScreen = !!process.env.TMUX || term.startsWith("tmux") || term.startsWith("screen");
-	if (inTmuxOrScreen) {
+	// Emit OSC 8 hyperlinks only when tmux confirms it forwards.
+	// Image protocols are unreliable under tmux, so leave `images: null`.
+	if (process.env.TMUX || term.startsWith("tmux")) {
+		return { images: null, trueColor: hasTrueColorHint, hyperlinks: tmuxForwardsHyperlink() };
+	}
+
+	// screen does not forward OSC 8 hyperlinks, so keep them off there.
+	if (term.startsWith("screen")) {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 	}
 
@@ -66,8 +92,17 @@ export function detectCapabilities(): TerminalCapabilities {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
 
+	// Warp supports the Kitty graphics protocol and OSC 8 hyperlinks.
+	if (termProgram === "warpterminal" || process.env.WARP_SESSION_ID || process.env.WARP_TERMINAL_SESSION_UUID) {
+		return { images: "kitty", trueColor: true, hyperlinks: true };
+	}
+
 	if (process.env.ITERM_SESSION_ID || termProgram === "iterm.app") {
 		return { images: "iterm2", trueColor: true, hyperlinks: true };
+	}
+
+	if (process.env.WT_SESSION) {
+		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
 	if (termProgram === "vscode") {
@@ -78,11 +113,15 @@ export function detectCapabilities(): TerminalCapabilities {
 		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
+	if (terminalEmulator === "jetbrains-jediterm") {
+		return { images: null, trueColor: true, hyperlinks: false };
+	}
+
 	// Unknown terminal: be conservative. OSC 8 is rendered invisibly as "just
 	// text" on terminals that swallow it, which means the URL disappears from
 	// the rendered output. Default to the legacy `text (url)` behavior unless we
 	// have positively identified a hyperlink-capable terminal above.
-	return { images: null, trueColor: hasTrueColorHint || !!process.env.WT_SESSION, hyperlinks: false };
+	return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 }
 
 export function getCapabilities(): TerminalCapabilities {
