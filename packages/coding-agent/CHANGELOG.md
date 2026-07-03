@@ -17,6 +17,10 @@
 - Fixed custom session entries appended during assistant streaming to render before the live assistant message, matching persisted session order.
 - Fixed oversized bash tool timeouts to fail with a clear validation error instead of being clamped to an immediate timeout ([#6181](https://github.com/earendil-works/pi/issues/6181)).
 
+### Removed
+
+- Removed default attribution headers from Vercel AI Gateway requests.
+
 ## [0.80.3] - 2026-06-30
 
 ### New Features
